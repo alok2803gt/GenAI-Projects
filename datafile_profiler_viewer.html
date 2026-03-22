@@ -1,0 +1,1024 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Source Data File Profiler</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #0c0e14;
+  --surface: #13161f;
+  --surface2: #1a1e2b;
+  --surface3: #222738;
+  --border: #2a3045;
+  --border-hover: #3d4663;
+  --text: #e2e6f0;
+  --text-dim: #8892a8;
+  --text-muted: #5a6380;
+  --accent: #3b82f6;
+  --accent-glow: rgba(59, 130, 246, 0.15);
+  --green: #22c55e;
+  --green-dim: rgba(34, 197, 94, 0.12);
+  --amber: #f59e0b;
+  --amber-dim: rgba(245, 158, 11, 0.12);
+  --red: #ef4444;
+  --red-dim: rgba(239, 68, 68, 0.12);
+  --cyan: #06b6d4;
+  --purple: #a855f7;
+  --mono: 'JetBrains Mono', monospace;
+  --sans: 'DM Sans', sans-serif;
+}
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: var(--sans);
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100vh;
+  overflow-x: hidden;
+}
+/* Subtle grid background */
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  background-image: 
+    linear-gradient(rgba(59, 130, 246, 0.03) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(59, 130, 246, 0.03) 1px, transparent 1px);
+  background-size: 40px 40px;
+  pointer-events: none;
+  z-index: 0;
+}
+
+.app { position: relative; z-index: 1; max-width: 1600px; margin: 0 auto; padding: 24px; }
+
+/* Header */
+.header {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin-bottom: 28px;
+  padding-bottom: 20px;
+  border-bottom: 1px solid var(--border);
+}
+.header-icon {
+  width: 44px; height: 44px;
+  background: linear-gradient(135deg, var(--accent), var(--cyan));
+  border-radius: 10px;
+  display: grid; place-items: center;
+  font-size: 20px;
+}
+.header h1 {
+  font-family: var(--mono);
+  font-size: 22px;
+  font-weight: 700;
+  letter-spacing: -0.5px;
+}
+.header p {
+  font-size: 13px;
+  color: var(--text-dim);
+  margin-top: 2px;
+}
+.badge {
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 600;
+  padding: 3px 8px;
+  border-radius: 4px;
+  background: var(--accent-glow);
+  color: var(--accent);
+  border: 1px solid rgba(59,130,246,0.2);
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+}
+
+/* Drop zone */
+.dropzone {
+  border: 2px dashed var(--border);
+  border-radius: 12px;
+  padding: 48px;
+  text-align: center;
+  cursor: pointer;
+  transition: all 0.2s;
+  background: var(--surface);
+  position: relative;
+  overflow: hidden;
+}
+.dropzone::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(circle at center, var(--accent-glow), transparent 70%);
+  opacity: 0;
+  transition: opacity 0.3s;
+}
+.dropzone:hover, .dropzone.dragover {
+  border-color: var(--accent);
+  background: var(--surface2);
+}
+.dropzone:hover::before, .dropzone.dragover::before { opacity: 1; }
+.dropzone-icon { font-size: 40px; margin-bottom: 12px; position: relative; }
+.dropzone h3 { font-size: 16px; font-weight: 600; margin-bottom: 6px; position: relative; }
+.dropzone p { color: var(--text-dim); font-size: 13px; position: relative; }
+.dropzone .formats {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-top: 12px;
+  position: relative;
+}
+input[type="file"] { display: none; }
+
+/* File info bar */
+.file-info {
+  display: none;
+  align-items: center;
+  gap: 16px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px 20px;
+  margin-top: 16px;
+  flex-wrap: wrap;
+}
+.file-info.visible { display: flex; }
+.file-meta { display: flex; gap: 20px; flex: 1; flex-wrap: wrap; }
+.file-meta-item { display: flex; align-items: center; gap: 6px; }
+.file-meta-item .label { font-size: 11px; color: var(--text-muted); text-transform: uppercase; font-family: var(--mono); letter-spacing: 0.5px; }
+.file-meta-item .value { font-family: var(--mono); font-size: 13px; font-weight: 600; }
+.delimiter-tag {
+  background: var(--surface3);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 2px 8px;
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--cyan);
+}
+
+/* Buttons */
+.btn {
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 600;
+  padding: 8px 16px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--surface2);
+  color: var(--text);
+  cursor: pointer;
+  transition: all 0.15s;
+  white-space: nowrap;
+}
+.btn:hover { background: var(--surface3); border-color: var(--border-hover); }
+.btn-accent { background: var(--accent); border-color: var(--accent); color: #fff; }
+.btn-accent:hover { background: #2563eb; }
+.btn-sm { padding: 5px 10px; font-size: 11px; }
+
+/* Tabs */
+.tabs {
+  display: none;
+  gap: 2px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 4px;
+  margin-top: 20px;
+  flex-wrap: wrap;
+}
+.tabs.visible { display: flex; }
+.tab {
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 500;
+  padding: 8px 16px;
+  border-radius: 7px;
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  transition: all 0.15s;
+  display: flex; align-items: center; gap: 6px;
+}
+.tab:hover { color: var(--text); background: var(--surface2); }
+.tab.active { background: var(--surface3); color: var(--text); box-shadow: 0 1px 3px rgba(0,0,0,0.2); }
+.tab .count {
+  font-size: 10px;
+  background: var(--surface2);
+  padding: 1px 6px;
+  border-radius: 3px;
+  color: var(--text-muted);
+}
+.tab.active .count { background: var(--accent-glow); color: var(--accent); }
+
+/* Tab content */
+.tab-content { display: none; margin-top: 16px; }
+.tab-content.active { display: block; }
+
+/* Data table */
+.table-wrap {
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+  max-height: 70vh;
+  overflow-y: auto;
+}
+.table-wrap table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+.table-wrap th {
+  font-family: var(--mono);
+  font-weight: 600;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-dim);
+  background: var(--surface2);
+  padding: 10px 14px;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  white-space: nowrap;
+}
+.table-wrap td {
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 7px 14px;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+  max-width: 300px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.table-wrap tr:hover td { background: var(--surface2); }
+.table-wrap tr:last-child td { border-bottom: none; }
+.row-num {
+  color: var(--text-muted);
+  font-size: 10px;
+  text-align: right;
+  min-width: 40px;
+  user-select: none;
+}
+td.null-val { color: var(--text-muted); font-style: italic; }
+td.error-cell { background: var(--red-dim); color: var(--red); }
+
+/* Stats grid */
+.stats-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 12px;
+  margin-bottom: 20px;
+}
+.stat-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 14px 16px;
+}
+.stat-card .stat-label {
+  font-size: 11px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  font-family: var(--mono);
+  letter-spacing: 0.5px;
+  margin-bottom: 4px;
+}
+.stat-card .stat-value {
+  font-family: var(--mono);
+  font-size: 22px;
+  font-weight: 700;
+}
+.stat-card.green .stat-value { color: var(--green); }
+.stat-card.amber .stat-value { color: var(--amber); }
+.stat-card.red .stat-value { color: var(--red); }
+.stat-card.blue .stat-value { color: var(--accent); }
+.stat-card.cyan .stat-value { color: var(--cyan); }
+
+/* Profiling table */
+.profile-table { width: 100%; }
+.profile-table th {
+  position: sticky;
+  top: 0;
+}
+.profile-bar-bg {
+  width: 80px;
+  height: 6px;
+  background: var(--surface3);
+  border-radius: 3px;
+  overflow: hidden;
+  display: inline-block;
+  vertical-align: middle;
+  margin-left: 6px;
+}
+.profile-bar {
+  height: 100%;
+  border-radius: 3px;
+  transition: width 0.4s;
+}
+.bar-green { background: var(--green); }
+.bar-amber { background: var(--amber); }
+.bar-red { background: var(--red); }
+.bar-blue { background: var(--accent); }
+
+/* Issues */
+.issue-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+}
+.issue-item:last-child { border-bottom: none; }
+.issue-icon {
+  width: 22px; height: 22px;
+  border-radius: 5px;
+  display: grid; place-items: center;
+  font-size: 12px;
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+.issue-error .issue-icon { background: var(--red-dim); color: var(--red); }
+.issue-warning .issue-icon { background: var(--amber-dim); color: var(--amber); }
+.issue-info .issue-icon { background: var(--accent-glow); color: var(--accent); }
+.issue-text { flex: 1; }
+.issue-text strong { font-weight: 600; }
+.issue-text .issue-detail { color: var(--text-dim); font-size: 12px; margin-top: 2px; font-family: var(--mono); }
+
+/* Loading */
+.loading {
+  display: none;
+  text-align: center;
+  padding: 40px;
+  color: var(--text-dim);
+}
+.loading.visible { display: block; }
+.spinner {
+  width: 32px; height: 32px;
+  border: 3px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+  margin: 0 auto 12px;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* Responsive */
+@media (max-width: 768px) {
+  .app { padding: 14px; }
+  .dropzone { padding: 28px 16px; }
+  .stats-grid { grid-template-columns: repeat(2, 1fr); }
+}
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="header">
+    <div class="header-icon">📊</div>
+    <div>
+      <h1>Source Data File Profiler</h1>
+      <p>Drop any data file — auto-detect format, profile, and inspect</p>
+    </div>
+    <div class="badge">v1.0</div>
+  </div>
+
+  <!-- Drop Zone -->
+  <div class="dropzone" id="dropzone">
+    <div class="dropzone-icon">📁</div>
+    <h3>Drop a file here or click to browse</h3>
+    <p>Supports any delimited text file — delimiter and line endings auto-detected</p>
+    <div class="formats">.csv · .tsv · .txt · .dat · .pipe · .psv · .log · .fixed · any text file</div>
+    <input type="file" id="fileInput" accept=".csv,.tsv,.txt,.dat,.pipe,.psv,.log,.fixed,.json,.xml,*/*">
+  </div>
+
+  <!-- File Info Bar -->
+  <div class="file-info" id="fileInfo">
+    <div class="file-meta" id="fileMeta"></div>
+    <button class="btn" id="btnReset" onclick="resetAll()">✕ Clear</button>
+  </div>
+
+  <!-- Tabs -->
+  <div class="tabs" id="tabs">
+    <button class="tab active" data-tab="preview" onclick="switchTab('preview')">⊞ Preview <span class="count" id="previewCount"></span></button>
+    <button class="tab" data-tab="profiling" onclick="switchTab('profiling')">◎ Column Profiling</button>
+    <button class="tab" data-tab="issues" onclick="switchTab('issues')">⚠ Issues <span class="count" id="issueCount"></span></button>
+    <button class="tab" data-tab="fulldata" onclick="switchTab('fulldata')">▤ Full Data <span class="count" id="fullCount"></span></button>
+  </div>
+
+  <!-- Loading -->
+  <div class="loading" id="loading">
+    <div class="spinner"></div>
+    <div id="loadingText">Analyzing file...</div>
+  </div>
+
+  <!-- Tab: Preview -->
+  <div class="tab-content active" id="tab-preview">
+    <div class="stats-grid" id="summaryStats"></div>
+    <div class="table-wrap" id="previewTable"></div>
+  </div>
+
+  <!-- Tab: Profiling -->
+  <div class="tab-content" id="tab-profiling">
+    <div class="table-wrap" id="profilingTable"></div>
+  </div>
+
+  <!-- Tab: Issues -->
+  <div class="tab-content" id="tab-issues">
+    <div id="issuesList" style="background:var(--surface);border:1px solid var(--border);border-radius:10px;overflow:hidden;"></div>
+  </div>
+
+  <!-- Tab: Full Data -->
+  <div class="tab-content" id="tab-fulldata">
+    <div style="margin-bottom:12px;display:flex;align-items:center;gap:12px;">
+      <button class="btn btn-accent" id="btnLoadFull" onclick="loadFullData()">▶ Load all rows</button>
+      <span id="fullDataStatus" style="font-size:12px;color:var(--text-dim);font-family:var(--mono);"></span>
+    </div>
+    <div class="table-wrap" id="fullDataTable"></div>
+  </div>
+</div>
+
+<script>
+// ============================================================================
+// STATE
+// ============================================================================
+let rawText = '';
+let fileName = '';
+let fileSize = 0;
+let detectedDelimiter = ',';
+let detectedLineEnd = '\\n';
+let headers = [];
+let allRows = [];
+let issues = [];
+let fullLoaded = false;
+
+const PREVIEW_ROWS = 100;
+
+// ============================================================================
+// FILE HANDLING
+// ============================================================================
+const dropzone = document.getElementById('dropzone');
+const fileInput = document.getElementById('fileInput');
+
+dropzone.addEventListener('click', () => fileInput.click());
+dropzone.addEventListener('dragover', e => { e.preventDefault(); dropzone.classList.add('dragover'); });
+dropzone.addEventListener('dragleave', () => dropzone.classList.remove('dragover'));
+dropzone.addEventListener('drop', e => {
+  e.preventDefault();
+  dropzone.classList.remove('dragover');
+  if (e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0]);
+});
+fileInput.addEventListener('change', e => { if (e.target.files.length) handleFile(e.target.files[0]); });
+
+function handleFile(file) {
+  fileName = file.name;
+  fileSize = file.size;
+  showLoading('Reading file...');
+  
+  const reader = new FileReader();
+  reader.onload = e => {
+    rawText = e.target.result;
+    showLoading('Detecting format...');
+    setTimeout(() => processFile(), 50);
+  };
+  reader.onerror = () => { hideLoading(); alert('Error reading file'); };
+  reader.readAsText(file);
+}
+
+// ============================================================================
+// AUTO-DETECT DELIMITERS
+// ============================================================================
+function detectLineEnding(text) {
+  const crlf = (text.match(/\r\n/g) || []).length;
+  const lf = (text.match(/(?<!\r)\n/g) || []).length;
+  const cr = (text.match(/\r(?!\n)/g) || []).length;
+  if (crlf >= lf && crlf >= cr) return { sep: '\r\n', name: 'CRLF (\\r\\n)' };
+  if (cr > lf) return { sep: '\r', name: 'CR (\\r)' };
+  return { sep: '\n', name: 'LF (\\n)' };
+}
+
+function detectFieldDelimiter(lines) {
+  const candidates = [
+    { ch: ',',  name: 'Comma' },
+    { ch: '\t', name: 'Tab' },
+    { ch: '|',  name: 'Pipe' },
+    { ch: ';',  name: 'Semicolon' },
+    { ch: '~',  name: 'Tilde' },
+    { ch: '^',  name: 'Caret' },
+    { ch: '\x01', name: 'SOH (\\x01)' },
+    { ch: '\x1e', name: 'RS (\\x1e)' },
+  ];
+  
+  const testLines = lines.slice(0, Math.min(20, lines.length)).filter(l => l.trim());
+  if (!testLines.length) return { ch: ',', name: 'Comma' };
+  
+  let best = null;
+  let bestScore = -1;
+  
+  for (const cand of candidates) {
+    const counts = testLines.map(l => countDelimiters(l, cand.ch));
+    if (counts[0] === 0) continue;
+    
+    // Check consistency — all lines should have same count
+    const firstCount = counts[0];
+    const consistent = counts.every(c => c === firstCount);
+    const avgCount = counts.reduce((a, b) => a + b, 0) / counts.length;
+    
+    // Score: higher average count + consistency bonus
+    let score = avgCount;
+    if (consistent && firstCount > 0) score += 1000;
+    
+    if (score > bestScore) {
+      bestScore = score;
+      best = cand;
+    }
+  }
+  
+  return best || { ch: ',', name: 'Comma' };
+}
+
+function countDelimiters(line, delim) {
+  // Count delimiters outside of quoted strings
+  let count = 0;
+  let inQuote = false;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (c === '"') {
+      if (inQuote && i + 1 < line.length && line[i+1] === '"') { i++; continue; }
+      inQuote = !inQuote;
+    } else if (c === delim && !inQuote) {
+      count++;
+    }
+  }
+  return count;
+}
+
+// ============================================================================
+// CSV PARSER (handles quoting)
+// ============================================================================
+function parseCSVLine(line, delim) {
+  const fields = [];
+  let current = '';
+  let inQuote = false;
+  
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (inQuote) {
+      if (c === '"') {
+        if (i + 1 < line.length && line[i+1] === '"') {
+          current += '"';
+          i++;
+        } else {
+          inQuote = false;
+        }
+      } else {
+        current += c;
+      }
+    } else {
+      if (c === '"') {
+        inQuote = true;
+      } else if (c === delim) {
+        fields.push(current);
+        current = '';
+      } else {
+        current += c;
+      }
+    }
+  }
+  fields.push(current);
+  return fields;
+}
+
+// ============================================================================
+// PROCESS FILE
+// ============================================================================
+function processFile() {
+  issues = [];
+  fullLoaded = false;
+  
+  // Detect line endings
+  const lineInfo = detectLineEnding(rawText);
+  detectedLineEnd = lineInfo.sep;
+  
+  const allLines = rawText.split(lineInfo.sep);
+  
+  // Remove trailing empty line
+  while (allLines.length && !allLines[allLines.length - 1].trim()) allLines.pop();
+  
+  if (allLines.length === 0) {
+    hideLoading();
+    issues.push({ type: 'error', title: 'Empty file', detail: 'The file contains no data' });
+    renderIssues();
+    return;
+  }
+  
+  // Detect field delimiter
+  const delimInfo = detectFieldDelimiter(allLines);
+  detectedDelimiter = delimInfo.ch;
+  
+  showLoading('Parsing data...');
+  
+  // Parse all rows
+  const parsedRows = allLines.map(line => parseCSVLine(line, detectedDelimiter));
+  
+  // Determine headers (first row)
+  headers = parsedRows[0].map((h, i) => h.trim() || `Column_${i + 1}`);
+  const expectedCols = headers.length;
+  
+  // Data rows
+  allRows = parsedRows.slice(1);
+  
+  // ---- Issue Detection ----
+  
+  // Check for empty headers
+  const emptyHeaders = parsedRows[0].filter(h => !h.trim()).length;
+  if (emptyHeaders > 0) {
+    issues.push({ type: 'warning', title: `${emptyHeaders} empty header name(s)`, detail: `Auto-assigned names: Column_N` });
+  }
+  
+  // Check for duplicate headers
+  const headerCounts = {};
+  headers.forEach(h => { headerCounts[h] = (headerCounts[h] || 0) + 1; });
+  const dupes = Object.entries(headerCounts).filter(([,c]) => c > 1);
+  if (dupes.length) {
+    issues.push({ type: 'warning', title: 'Duplicate column names', detail: dupes.map(([n,c]) => `"${n}" (×${c})`).join(', ') });
+    // Deduplicate
+    const seen = {};
+    headers = headers.map(h => {
+      seen[h] = (seen[h] || 0) + 1;
+      return seen[h] > 1 ? `${h}_${seen[h]}` : h;
+    });
+  }
+  
+  // Check for inconsistent column counts
+  const badRows = [];
+  allRows.forEach((row, i) => {
+    if (row.length !== expectedCols) badRows.push({ idx: i + 2, got: row.length });
+  });
+  if (badRows.length > 0) {
+    const pct = ((badRows.length / allRows.length) * 100).toFixed(1);
+    const examples = badRows.slice(0, 5).map(r => `Row ${r.idx}: ${r.got} fields`).join(', ');
+    issues.push({
+      type: badRows.length > allRows.length * 0.1 ? 'error' : 'warning',
+      title: `${badRows.length} rows with inconsistent column count (${pct}%)`,
+      detail: `Expected ${expectedCols} columns. ${examples}${badRows.length > 5 ? '...' : ''}`
+    });
+  }
+  
+  // Check for completely empty rows
+  const emptyRows = allRows.filter(r => r.every(c => !c.trim())).length;
+  if (emptyRows > 0) {
+    issues.push({ type: 'warning', title: `${emptyRows} completely empty row(s)`, detail: `Rows where every field is blank` });
+  }
+  
+  // Check for BOM
+  if (rawText.charCodeAt(0) === 0xFEFF) {
+    issues.push({ type: 'info', title: 'UTF-8 BOM detected', detail: 'File starts with a byte order mark — stripped automatically' });
+    if (headers.length && headers[0].charCodeAt(0) === 0xFEFF) headers[0] = headers[0].slice(1);
+  }
+  
+  // Check for control characters in data
+  let controlCharRows = 0;
+  const controlRe = /[\x00-\x08\x0b\x0c\x0e-\x1f]/;
+  allRows.slice(0, 500).forEach(r => {
+    if (r.some(c => controlRe.test(c))) controlCharRows++;
+  });
+  if (controlCharRows > 0) {
+    issues.push({ type: 'warning', title: `Control characters detected`, detail: `Found in ${controlCharRows}+ rows (checked first 500). Common with mainframe data.` });
+  }
+  
+  // Check for very long fields (>1000 chars)
+  let longFields = 0;
+  allRows.slice(0, 500).forEach(r => { r.forEach(c => { if (c.length > 1000) longFields++; }); });
+  if (longFields > 0) {
+    issues.push({ type: 'info', title: `${longFields}+ fields exceed 1000 characters`, detail: `Large text fields detected (checked first 500 rows)` });
+  }
+  
+  // Good news
+  if (issues.length === 0) {
+    issues.push({ type: 'info', title: 'No issues detected', detail: 'File structure looks clean' });
+  }
+  
+  // ---- Render ----
+  renderFileInfo(lineInfo, delimInfo, allLines.length - 1);
+  renderSummaryStats();
+  renderPreviewTable();
+  renderProfiling();
+  renderIssues();
+  
+  document.getElementById('tabs').classList.add('visible');
+  document.getElementById('previewCount').textContent = Math.min(PREVIEW_ROWS, allRows.length);
+  document.getElementById('fullCount').textContent = allRows.length.toLocaleString();
+  document.getElementById('issueCount').textContent = issues.filter(i => i.type !== 'info').length || '';
+  
+  switchTab('preview');
+  hideLoading();
+}
+
+// ============================================================================
+// RENDERERS
+// ============================================================================
+
+function renderFileInfo(lineInfo, delimInfo, rowCount) {
+  const fi = document.getElementById('fileInfo');
+  fi.classList.add('visible');
+  
+  const delimDisplay = delimInfo.ch === '\t' ? '\\t' : 
+                       delimInfo.ch === '\x01' ? '\\x01' : 
+                       delimInfo.ch === '\x1e' ? '\\x1e' : delimInfo.ch;
+  
+  document.getElementById('fileMeta').innerHTML = `
+    <div class="file-meta-item">
+      <span class="label">File</span>
+      <span class="value">${escHtml(fileName)}</span>
+    </div>
+    <div class="file-meta-item">
+      <span class="label">Size</span>
+      <span class="value">${formatBytes(fileSize)}</span>
+    </div>
+    <div class="file-meta-item">
+      <span class="label">Rows</span>
+      <span class="value">${rowCount.toLocaleString()}</span>
+    </div>
+    <div class="file-meta-item">
+      <span class="label">Columns</span>
+      <span class="value">${headers.length}</span>
+    </div>
+    <div class="file-meta-item">
+      <span class="label">Delimiter</span>
+      <span class="delimiter-tag">${escHtml(delimDisplay)} ${escHtml(delimInfo.name)}</span>
+    </div>
+    <div class="file-meta-item">
+      <span class="label">Line End</span>
+      <span class="delimiter-tag">${escHtml(lineInfo.name)}</span>
+    </div>
+  `;
+}
+
+function renderSummaryStats() {
+  const totalCells = allRows.length * headers.length;
+  let nullCells = 0;
+  allRows.forEach(r => { r.forEach(c => { if (!c.trim()) nullCells++; }); });
+  const completeness = totalCells > 0 ? ((1 - nullCells / totalCells) * 100).toFixed(1) : 0;
+  const compClass = completeness >= 95 ? 'green' : completeness >= 80 ? 'amber' : 'red';
+  const errorCount = issues.filter(i => i.type === 'error').length;
+  const warnCount = issues.filter(i => i.type === 'warning').length;
+  
+  document.getElementById('summaryStats').innerHTML = `
+    <div class="stat-card blue"><div class="stat-label">Rows</div><div class="stat-value">${allRows.length.toLocaleString()}</div></div>
+    <div class="stat-card cyan"><div class="stat-label">Columns</div><div class="stat-value">${headers.length}</div></div>
+    <div class="stat-card ${compClass}"><div class="stat-label">Completeness</div><div class="stat-value">${completeness}%</div></div>
+    <div class="stat-card ${errorCount ? 'red' : 'green'}"><div class="stat-label">Errors</div><div class="stat-value">${errorCount}</div></div>
+    <div class="stat-card ${warnCount ? 'amber' : 'green'}"><div class="stat-label">Warnings</div><div class="stat-value">${warnCount}</div></div>
+  `;
+}
+
+function renderPreviewTable() {
+  const rows = allRows.slice(0, PREVIEW_ROWS);
+  document.getElementById('previewTable').innerHTML = buildDataTable(rows, true);
+}
+
+function buildDataTable(rows, showRowNum) {
+  if (!headers.length) return '<p style="padding:20px;color:var(--text-dim)">No data</p>';
+  const expectedCols = headers.length;
+  
+  let html = '<table><thead><tr>';
+  if (showRowNum) html += '<th class="row-num">#</th>';
+  headers.forEach(h => { html += `<th>${escHtml(h)}</th>`; });
+  html += '</tr></thead><tbody>';
+  
+  rows.forEach((row, i) => {
+    const isInconsistent = row.length !== expectedCols;
+    html += '<tr>';
+    if (showRowNum) html += `<td class="row-num">${i + 1}</td>`;
+    
+    // Pad or limit to expected column count for display
+    for (let c = 0; c < expectedCols; c++) {
+      const val = c < row.length ? row[c] : '';
+      const isEmpty = !val.trim();
+      const cls = isInconsistent && c >= row.length ? 'error-cell' : isEmpty ? 'null-val' : '';
+      const display = isEmpty ? '(null)' : val.length > 200 ? val.slice(0, 200) + '…' : val;
+      html += `<td class="${cls}" title="${escAttr(val)}">${escHtml(display)}</td>`;
+    }
+    html += '</tr>';
+  });
+  
+  html += '</tbody></table>';
+  return html;
+}
+
+function renderProfiling() {
+  showLoading('Profiling columns...');
+  
+  // Profile each column using sample (up to 5000 rows for performance)
+  const sampleRows = allRows.slice(0, 5000);
+  const sampleSize = sampleRows.length;
+  const profiles = [];
+  
+  headers.forEach((h, colIdx) => {
+    const values = sampleRows.map(r => colIdx < r.length ? r[colIdx] : '');
+    const nonEmpty = values.filter(v => v.trim());
+    const nullCount = sampleSize - nonEmpty.length;
+    const nullPct = sampleSize > 0 ? ((nullCount / sampleSize) * 100).toFixed(1) : 0;
+    
+    // Distinct values
+    const distinctSet = new Set(nonEmpty.map(v => v.trim()));
+    const distinctCount = distinctSet.size;
+    
+    // Data type inference
+    let numericCount = 0, intCount = 0, dateCount = 0;
+    const lengths = [];
+    nonEmpty.forEach(v => {
+      const t = v.trim();
+      lengths.push(t.length);
+      if (/^-?\d+(\.\d+)?$/.test(t)) { numericCount++; if (/^-?\d+$/.test(t)) intCount++; }
+      if (/^\d{4}[-/]\d{2}[-/]\d{2}/.test(t) || /^\d{2}[-/]\d{2}[-/]\d{4}/.test(t)) dateCount++;
+    });
+    
+    let inferredType = 'string';
+    if (nonEmpty.length > 0) {
+      const pct = n => n / nonEmpty.length;
+      if (pct(intCount) > 0.95) inferredType = 'integer';
+      else if (pct(numericCount) > 0.95) inferredType = 'decimal';
+      else if (pct(dateCount) > 0.85) inferredType = 'date';
+    }
+    
+    const minLen = lengths.length ? Math.min(...lengths) : 0;
+    const maxLen = lengths.length ? Math.max(...lengths) : 0;
+    const avgLen = lengths.length ? (lengths.reduce((a,b) => a+b, 0) / lengths.length).toFixed(1) : 0;
+    
+    // Top values for low-cardinality
+    let topValues = '';
+    if (distinctCount <= 25 && distinctCount > 0) {
+      const sorted = [...distinctSet].sort();
+      topValues = sorted.slice(0, 15).join(' | ');
+      if (sorted.length > 15) topValues += ` … +${sorted.length - 15} more`;
+    } else if (distinctCount > 25) {
+      // Frequency top 5
+      const freq = {};
+      nonEmpty.forEach(v => { const t = v.trim(); freq[t] = (freq[t]||0)+1; });
+      const top5 = Object.entries(freq).sort((a,b) => b[1]-a[1]).slice(0, 5);
+      topValues = top5.map(([v,c]) => `${v.length > 30 ? v.slice(0,30)+'…' : v} (${c})`).join(' | ');
+    }
+    
+    const isTypelist = distinctCount <= 50 && distinctCount > 0 && sampleSize > 50;
+    
+    // Min / Max for numeric
+    let minVal = '', maxVal = '';
+    if (inferredType === 'integer' || inferredType === 'decimal') {
+      const nums = nonEmpty.map(v => parseFloat(v.trim())).filter(n => !isNaN(n));
+      if (nums.length) {
+        minVal = Math.min(...nums);
+        maxVal = Math.max(...nums);
+      }
+    }
+    
+    profiles.push({
+      name: h, nullCount, nullPct, distinctCount,
+      inferredType, minLen, maxLen, avgLen,
+      topValues, isTypelist, sampleSize,
+      minVal, maxVal
+    });
+  });
+  
+  // Render profiling table
+  let html = '<table class="profile-table"><thead><tr>';
+  html += '<th>#</th><th>Column Name</th><th>Inferred Type</th>';
+  html += '<th>Null %</th><th>Distinct</th>';
+  html += '<th>Min Len</th><th>Max Len</th><th>Avg Len</th>';
+  html += '<th>Min Val</th><th>Max Val</th>';
+  html += '<th>Typelist?</th>';
+  html += '<th>Top Values / Frequency</th>';
+  html += '</tr></thead><tbody>';
+  
+  profiles.forEach((p, i) => {
+    const nullBarColor = p.nullPct > 50 ? 'bar-red' : p.nullPct > 20 ? 'bar-amber' : 'bar-green';
+    const typeColor = p.inferredType === 'integer' ? 'color:var(--cyan)' :
+                      p.inferredType === 'decimal' ? 'color:var(--purple)' :
+                      p.inferredType === 'date' ? 'color:var(--amber)' : '';
+    
+    html += `<tr>
+      <td class="row-num">${i+1}</td>
+      <td style="font-weight:600">${escHtml(p.name)}</td>
+      <td style="${typeColor}">${p.inferredType}</td>
+      <td>
+        ${p.nullPct}%
+        <div class="profile-bar-bg"><div class="profile-bar ${nullBarColor}" style="width:${p.nullPct}%"></div></div>
+      </td>
+      <td>${p.distinctCount.toLocaleString()}</td>
+      <td>${p.minLen}</td>
+      <td>${p.maxLen}</td>
+      <td>${p.avgLen}</td>
+      <td>${p.minVal !== '' ? p.minVal : ''}</td>
+      <td>${p.maxVal !== '' ? p.maxVal : ''}</td>
+      <td>${p.isTypelist ? '<span style="color:var(--green)">✓ Yes</span>' : ''}</td>
+      <td style="max-width:400px;white-space:normal;word-break:break-all;font-size:11px;color:var(--text-dim)">${escHtml(p.topValues)}</td>
+    </tr>`;
+  });
+  
+  html += '</tbody></table>';
+  document.getElementById('profilingTable').innerHTML = html;
+  hideLoading();
+}
+
+function renderIssues() {
+  const el = document.getElementById('issuesList');
+  if (!issues.length) {
+    el.innerHTML = '<div class="issue-item issue-info"><div class="issue-icon">✓</div><div class="issue-text"><strong>No issues found</strong></div></div>';
+    return;
+  }
+  el.innerHTML = issues.map(iss => {
+    const cls = iss.type === 'error' ? 'issue-error' : iss.type === 'warning' ? 'issue-warning' : 'issue-info';
+    const icon = iss.type === 'error' ? '✕' : iss.type === 'warning' ? '!' : 'i';
+    return `<div class="issue-item ${cls}">
+      <div class="issue-icon">${icon}</div>
+      <div class="issue-text">
+        <strong>${escHtml(iss.title)}</strong>
+        ${iss.detail ? `<div class="issue-detail">${escHtml(iss.detail)}</div>` : ''}
+      </div>
+    </div>`;
+  }).join('');
+}
+
+// ============================================================================
+// FULL DATA LOAD
+// ============================================================================
+function loadFullData() {
+  const btn = document.getElementById('btnLoadFull');
+  const status = document.getElementById('fullDataStatus');
+  
+  if (allRows.length > 50000) {
+    if (!confirm(`This will render ${allRows.length.toLocaleString()} rows in the browser. This may be slow for very large files. Continue?`)) return;
+  }
+  
+  btn.disabled = true;
+  btn.textContent = '⟳ Loading...';
+  status.textContent = `Rendering ${allRows.length.toLocaleString()} rows...`;
+  
+  setTimeout(() => {
+    const start = performance.now();
+    document.getElementById('fullDataTable').innerHTML = buildDataTable(allRows, true);
+    const elapsed = ((performance.now() - start) / 1000).toFixed(1);
+    
+    btn.textContent = '✓ Loaded';
+    btn.disabled = true;
+    status.textContent = `${allRows.length.toLocaleString()} rows rendered in ${elapsed}s`;
+    fullLoaded = true;
+  }, 50);
+}
+
+// ============================================================================
+// UI HELPERS
+// ============================================================================
+function switchTab(tabName) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === tabName));
+  document.querySelectorAll('.tab-content').forEach(t => t.classList.toggle('active', t.id === `tab-${tabName}`));
+}
+
+function showLoading(msg) {
+  document.getElementById('loading').classList.add('visible');
+  document.getElementById('loadingText').textContent = msg || 'Processing...';
+}
+function hideLoading() { document.getElementById('loading').classList.remove('visible'); }
+
+function resetAll() {
+  rawText = ''; fileName = ''; fileSize = 0; headers = []; allRows = []; issues = []; fullLoaded = false;
+  document.getElementById('fileInfo').classList.remove('visible');
+  document.getElementById('tabs').classList.remove('visible');
+  document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+  document.getElementById('tab-preview').classList.add('active');
+  document.getElementById('summaryStats').innerHTML = '';
+  document.getElementById('previewTable').innerHTML = '';
+  document.getElementById('profilingTable').innerHTML = '';
+  document.getElementById('issuesList').innerHTML = '';
+  document.getElementById('fullDataTable').innerHTML = '';
+  document.getElementById('fullDataStatus').textContent = '';
+  const btn = document.getElementById('btnLoadFull');
+  btn.disabled = false; btn.textContent = '▶ Load all rows';
+  fileInput.value = '';
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelector('.tab[data-tab="preview"]').classList.add('active');
+}
+
+function formatBytes(bytes) {
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1048576) return (bytes / 1024).toFixed(1) + ' KB';
+  if (bytes < 1073741824) return (bytes / 1048576).toFixed(1) + ' MB';
+  return (bytes / 1073741824).toFixed(2) + ' GB';
+}
+
+function escHtml(s) {
+  if (s === null || s === undefined) return '';
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+function escAttr(s) {
+  return String(s || '').replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+</script>
+</body>
+</html>
