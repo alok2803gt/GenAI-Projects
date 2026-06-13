@@ -1,0 +1,468 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>XGBoost IBKR Trader</title>
+  <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;700;800&display=swap" rel="stylesheet" />
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #080c18; color: #e2e8f0; font-family: 'Inter', sans-serif; }
+    ::-webkit-scrollbar { width: 4px; height: 4px; }
+    ::-webkit-scrollbar-track { background: #080c18; }
+    ::-webkit-scrollbar-thumb { background: #1e2a3a; border-radius: 2px; }
+    @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.3} }
+    @keyframes fadeIn { from{opacity:0;transform:translateY(6px)} to{opacity:1;transform:translateY(0)} }
+    @keyframes pulse-ring { 0%{box-shadow:0 0 0 0 rgba(0,212,255,0.4)} 70%{box-shadow:0 0 0 10px transparent} 100%{box-shadow:0 0 0 0 transparent} }
+  </style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel">
+const { useState, useEffect, useRef, useCallback } = React;
+
+const API = "http://localhost:8000";
+
+const C = {
+  bg: "#080c18", surface: "#0f1623", card: "#131d2e",
+  border: "#1e2d42", accent: "#00d4ff", bull: "#00e5a0",
+  bear: "#ff4d6a", neutral: "#fbbf24", text: "#e2e8f0",
+  muted: "#4a6080", white: "#f8fafc", dim: "#1a2540",
+};
+
+const mono = { fontFamily: "'JetBrains Mono', monospace" };
+const sans = { fontFamily: "'Inter', sans-serif" };
+
+// ── tiny fetch helpers ────────────────────────────────────────────────────
+async function apiFetch(path) {
+  const r = await fetch(API + path);
+  if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+  return r.json();
+}
+
+// ── Candlestick SVG ───────────────────────────────────────────────────────
+function CandleChart({ bars, signal }) {
+  if (!bars || bars.length < 5) return (
+    <div style={{ height: 180, display:"flex", alignItems:"center", justifyContent:"center", color: C.muted, fontSize: 12 }}>
+      Waiting for bars…
+    </div>
+  );
+
+  const W = 580, H = 180, padL = 10, padR = 50, padT = 10, padB = 22;
+  const visible = bars.slice(-60);
+  const prices = visible.flatMap(c => [+c.high, +c.low]);
+  const minP = Math.min(...prices), maxP = Math.max(...prices);
+  const rng = maxP - minP || 1;
+  const sy = p => padT + ((maxP - p) / rng) * (H - padT - padB);
+  const cw = (W - padL - padR) / visible.length;
+  const bw = Math.max(2, cw * 0.65);
+
+  // price labels
+  const priceLabels = [minP, (minP+maxP)/2, maxP].map(p => ({
+    y: sy(p), val: p.toFixed(2)
+  }));
+
+  // x-axis times: show every ~10 bars
+  const timeLabels = visible.filter((_,i) => i % Math.ceil(visible.length/6) === 0).map((b,_,arr) => {
+    const idx = visible.indexOf(b);
+    const x = padL + idx * cw + cw/2;
+    const t = new Date(b.time);
+    const label = `${t.getMonth()+1}/${t.getDate()} ${t.getHours()}:${String(t.getMinutes()).padStart(2,'0')}`;
+    return { x, label };
+  });
+
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} style={{ width:"100%", height: H }}>
+      <rect width={W} height={H} fill={C.card} rx={6} />
+      {/* grid lines */}
+      {priceLabels.map((pl,i) => (
+        <g key={i}>
+          <line x1={padL} y1={pl.y} x2={W-padR+4} y2={pl.y} stroke={C.border} strokeDasharray="3 3" />
+          <text x={W-padR+8} y={pl.y+4} fill={C.muted} fontSize={9} style={mono}>{pl.val}</text>
+        </g>
+      ))}
+      {/* candles */}
+      {visible.map((c, i) => {
+        const x = padL + i * cw;
+        const isUp = +c.close >= +c.open;
+        const col = isUp ? C.bull : C.bear;
+        const bodyTop = sy(Math.max(+c.open, +c.close));
+        const bodyBot = sy(Math.min(+c.open, +c.close));
+        const bh = Math.max(1.5, bodyBot - bodyTop);
+        const cx = x + cw/2;
+        const isLast = i === visible.length - 1;
+        return (
+          <g key={i} opacity={isLast ? 1 : 0.8}>
+            <line x1={cx} y1={sy(+c.high)} x2={cx} y2={sy(+c.low)} stroke={col} strokeWidth={1} />
+            <rect x={x + (cw-bw)/2} y={bodyTop} width={bw} height={bh}
+              fill={col} rx={0.5}
+              style={isLast ? { filter:`drop-shadow(0 0 3px ${col})` } : {}} />
+          </g>
+        );
+      })}
+      {/* signal dot on last candle */}
+      {signal && signal.label !== "HOLD" && visible.length > 0 && (() => {
+        const last = visible[visible.length - 1];
+        const cx = padL + (visible.length - 1) * cw + cw/2;
+        const isBuy = signal.label === "BUY";
+        const cy = isBuy ? sy(+last.low) + 10 : sy(+last.high) - 10;
+        const col = isBuy ? C.bull : C.bear;
+        return (
+          <g>
+            <circle cx={cx} cy={cy} r={5} fill={col} style={{ filter:`drop-shadow(0 0 5px ${col})` }} />
+            <text x={cx} y={isBuy ? cy+16 : cy-8} fill={col} fontSize={8} textAnchor="middle" style={mono} fontWeight={700}>
+              {signal.label}
+            </text>
+          </g>
+        );
+      })()}
+      {/* x-axis labels */}
+      {timeLabels.map((tl,i) => (
+        <text key={i} x={tl.x} y={H-4} fill={C.muted} fontSize={8} textAnchor="middle" style={sans}>{tl.label}</text>
+      ))}
+    </svg>
+  );
+}
+
+// ── Signal badge ──────────────────────────────────────────────────────────
+function SignalBadge({ label, prob, confidence }) {
+  const col = label === "BUY" ? C.bull : label === "SELL" ? C.bear : C.neutral;
+  return (
+    <div style={{
+      display:"flex", flexDirection:"column", alignItems:"center",
+      padding:"14px 32px", borderRadius:10, border:`2px solid ${col}`,
+      background:`${col}0e`, boxShadow:`0 0 20px ${col}33`,
+      minWidth:160, animation:"pulse-ring 2s infinite",
+    }}>
+      <span style={{ ...mono, fontSize:30, fontWeight:800, color:col, letterSpacing:3 }}>{label}</span>
+      <span style={{ ...sans, fontSize:11, color:C.muted, marginTop:5 }}>
+        prob {(prob*100).toFixed(1)}% · conf {(confidence*100).toFixed(0)}%
+      </span>
+      <div style={{ marginTop:8, width:"100%", height:4, background:C.border, borderRadius:2, overflow:"hidden" }}>
+        <div style={{ width:`${prob*100}%`, height:"100%", background:col, transition:"width 0.5s ease" }} />
+      </div>
+    </div>
+  );
+}
+
+// ── Stat card ─────────────────────────────────────────────────────────────
+function Stat({ label, value, color }) {
+  return (
+    <div style={{
+      background:C.card, border:`1px solid ${C.border}`, borderRadius:8,
+      padding:"10px 14px", flex:"1 1 100px",
+    }}>
+      <div style={{ ...sans, fontSize:10, color:C.muted, textTransform:"uppercase", letterSpacing:1, marginBottom:4 }}>{label}</div>
+      <div style={{ ...mono, fontSize:15, fontWeight:700, color: color || C.white }}>{value ?? "—"}</div>
+    </div>
+  );
+}
+
+// ── Feature bar ───────────────────────────────────────────────────────────
+const FEAT_INFO = {
+  rsi:        { label:"RSI (14)",      desc:"Momentum oscillator — <30 oversold, >70 overbought" },
+  sma5:       { label:"SMA-5",         desc:"5-bar simple moving average" },
+  sma14:      { label:"SMA-14",        desc:"14-bar simple moving average" },
+  momentum:   { label:"Momentum",      desc:"(close − SMA14) / SMA14" },
+  vol_ratio:  { label:"Vol Ratio",     desc:"Current vs 14-bar avg volume" },
+  body_pct:   { label:"Body %",        desc:"Candle body / full range" },
+  upper_wick: { label:"Upper Wick",    desc:"Upper shadow / full range" },
+  lower_wick: { label:"Lower Wick",    desc:"Lower shadow / full range — buying pressure" },
+  volatility: { label:"Volatility",    desc:"14-bar return std deviation" },
+};
+
+function FeaturePanel({ features }) {
+  if (!features) return null;
+  const entries = Object.entries(features);
+  return (
+    <div>
+      {entries.map(([k, v]) => {
+        const info = FEAT_INFO[k] || { label: k, desc: "" };
+        const norm = Math.min(1, Math.abs(+v) / (k === "rsi" ? 100 : k.includes("sma") ? Math.abs(+v)*2 : 1));
+        return (
+          <div key={k} style={{ marginBottom:8 }}>
+            <div style={{ display:"flex", justifyContent:"space-between", fontSize:11, marginBottom:3 }}>
+              <span style={{ ...sans, color:C.text }}>{info.label}</span>
+              <span style={{ ...mono, color:C.accent }}>{typeof v === "number" ? v.toFixed(4) : v}</span>
+            </div>
+            <div style={{ background:C.border, borderRadius:3, height:5 }}>
+              <div style={{ width:`${norm*100}%`, height:"100%", background:`linear-gradient(90deg,${C.accent},${C.bull})`, transition:"width 0.6s" }} />
+            </div>
+            <div style={{ ...sans, fontSize:9, color:C.muted, marginTop:2 }}>{info.desc}</div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ── Signal history table ──────────────────────────────────────────────────
+function HistoryTable({ history }) {
+  if (!history.length) return <div style={{ color:C.muted, fontSize:12, padding:"12px 0" }}>No signals yet…</div>;
+  return (
+    <div style={{ overflowX:"auto" }}>
+      <table style={{ width:"100%", borderCollapse:"collapse", fontSize:12 }}>
+        <thead>
+          <tr>
+            {["Time","Ticker","Close","Signal","Prob","Conf"].map(h => (
+              <th key={h} style={{ ...sans, textAlign:"left", padding:"5px 10px", color:C.muted, fontWeight:500, borderBottom:`1px solid ${C.border}` }}>{h}</th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {history.map((r, i) => {
+            const col = r.label === "BUY" ? C.bull : r.label === "SELL" ? C.bear : C.neutral;
+            return (
+              <tr key={i} style={{ opacity: 1 - i*0.07, animation:"fadeIn 0.3s ease" }}>
+                <td style={{ ...mono, padding:"5px 10px", color:C.muted, fontSize:11 }}>{r.ts}</td>
+                <td style={{ ...mono, padding:"5px 10px", color:C.accent }}>{r.ticker}</td>
+                <td style={{ ...mono, padding:"5px 10px" }}>${r.close}</td>
+                <td style={{ ...mono, padding:"5px 10px", color:col, fontWeight:700 }}>{r.label}</td>
+                <td style={{ ...mono, padding:"5px 10px" }}>{(r.prob*100).toFixed(1)}%</td>
+                <td style={{ ...mono, padding:"5px 10px" }}>{(r.confidence*100).toFixed(0)}%</td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+// ── Status pill ───────────────────────────────────────────────────────────
+function StatusPill({ connected, error }) {
+  const col = connected ? C.bull : C.bear;
+  const label = connected ? "IBKR LIVE" : error ? "DISCONNECTED" : "CONNECTING…";
+  return (
+    <div style={{
+      display:"inline-flex", alignItems:"center", gap:6,
+      padding:"4px 10px", borderRadius:20, border:`1px solid ${col}33`,
+      background:`${col}0e`,
+    }}>
+      <div style={{
+        width:7, height:7, borderRadius:"50%", background:col,
+        animation: connected ? "blink 2s infinite" : "none",
+      }} />
+      <span style={{ ...mono, fontSize:10, color:col, letterSpacing:1 }}>{label}</span>
+    </div>
+  );
+}
+
+// ── Main App ──────────────────────────────────────────────────────────────
+function App() {
+  const [status, setStatus]       = useState({ connected:false, error:null, model_accuracy:null });
+  const [tickers]                  = useState(["AAPL","MSFT","NVDA","SPY"]);
+  const [activeTicker, setActive]  = useState("AAPL");
+  const [signals, setSignals]      = useState({});
+  const [bars, setBars]            = useState({});
+  const [history, setHistory]      = useState([]);
+  const [newTicker, setNewTicker]  = useState("");
+  const [customTickers, setCustom] = useState([]);
+  const prevSignalRef              = useRef({});
+
+  const allTickers = [...tickers, ...customTickers];
+
+  const refresh = useCallback(async () => {
+    try {
+      const [st, sigs] = await Promise.all([
+        apiFetch("/status"),
+        apiFetch("/signals"),
+      ]);
+      setStatus(st);
+      setSignals(sigs);
+
+      // fetch bars for active ticker
+      try {
+        const b = await apiFetch(`/bars/${activeTicker}?limit=80`);
+        setBars(prev => ({ ...prev, [activeTicker]: b }));
+      } catch (_) {}
+
+      // add new signals to history
+      Object.entries(sigs).forEach(([ticker, sig]) => {
+        const prev = prevSignalRef.current[ticker];
+        if (!prev || prev.timestamp !== sig.timestamp) {
+          setHistory(h => [{
+            ts: new Date(sig.timestamp).toLocaleTimeString(),
+            ticker, ...sig
+          }, ...h].slice(0, 50));
+        }
+      });
+      prevSignalRef.current = sigs;
+
+    } catch (e) {
+      setStatus(s => ({ ...s, connected:false, error: e.message }));
+    }
+  }, [activeTicker]);
+
+  useEffect(() => {
+    refresh();
+    const iv = setInterval(refresh, 15000);
+    return () => clearInterval(iv);
+  }, [refresh]);
+
+  const addTicker = async () => {
+    const t = newTicker.trim().toUpperCase();
+    if (!t || allTickers.includes(t)) return;
+    try {
+      await fetch(`${API}/add_ticker`, {
+        method:"POST", headers:{"Content-Type":"application/json"},
+        body: JSON.stringify({ ticker: t })
+      });
+      setCustom(c => [...c, t]);
+      setNewTicker("");
+      setActive(t);
+    } catch(e) { alert("Error adding ticker: " + e.message); }
+  };
+
+  const retrain = async () => {
+    try {
+      const r = await fetch(`${API}/retrain/${activeTicker}`, { method:"POST" });
+      const d = await r.json();
+      alert(`Retrained on ${activeTicker}  accuracy=${(d.accuracy*100).toFixed(1)}%`);
+      setStatus(s => ({ ...s, model_accuracy: d.accuracy }));
+    } catch(e) { alert("Retrain failed: " + e.message); }
+  };
+
+  const activeSig  = signals[activeTicker];
+  const activeBars = bars[activeTicker];
+
+  return (
+    <div style={{ minHeight:"100vh", background:C.bg, padding:"20px 16px" }}>
+      <div style={{ maxWidth:900, margin:"0 auto" }}>
+
+        {/* Header */}
+        <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", flexWrap:"wrap", gap:10, marginBottom:20 }}>
+          <div>
+            <div style={{ ...mono, fontSize:10, color:C.accent, letterSpacing:3, textTransform:"uppercase", marginBottom:4 }}>
+              XGBoost · IBKR Live
+            </div>
+            <h1 style={{ ...sans, fontSize:20, fontWeight:800, color:C.white, letterSpacing:-0.5 }}>
+              Day Trading Signal Engine
+            </h1>
+          </div>
+          <div style={{ display:"flex", flexDirection:"column", alignItems:"flex-end", gap:6 }}>
+            <StatusPill connected={status.connected} error={status.error} />
+            {status.model_accuracy && (
+              <span style={{ ...mono, fontSize:10, color:C.muted }}>
+                model acc {(status.model_accuracy*100).toFixed(1)}%
+              </span>
+            )}
+            {status.error && (
+              <span style={{ ...sans, fontSize:10, color:C.bear }}>{status.error}</span>
+            )}
+          </div>
+        </div>
+
+        {/* Ticker tabs */}
+        <div style={{ display:"flex", gap:6, flexWrap:"wrap", marginBottom:16, alignItems:"center" }}>
+          {allTickers.map(t => (
+            <button key={t} onClick={() => setActive(t)} style={{
+              ...mono, fontSize:12, padding:"6px 14px", borderRadius:6, cursor:"pointer",
+              background: activeTicker === t ? C.accent : C.card,
+              color: activeTicker === t ? C.bg : C.muted,
+              border: `1px solid ${activeTicker === t ? C.accent : C.border}`,
+              fontWeight: activeTicker === t ? 700 : 400,
+              transition:"all 0.15s",
+            }}>{t}</button>
+          ))}
+          <div style={{ display:"flex", gap:6, marginLeft:4 }}>
+            <input value={newTicker} onChange={e=>setNewTicker(e.target.value.toUpperCase())}
+              onKeyDown={e=>e.key==="Enter" && addTicker()}
+              placeholder="+ Ticker"
+              style={{
+                ...mono, fontSize:12, padding:"6px 10px", borderRadius:6, width:90,
+                background:C.card, border:`1px solid ${C.border}`, color:C.white, outline:"none",
+              }} />
+            <button onClick={addTicker} style={{
+              ...sans, fontSize:12, padding:"6px 12px", borderRadius:6,
+              background:C.dim, border:`1px solid ${C.border}`, color:C.accent,
+              cursor:"pointer",
+            }}>Add</button>
+          </div>
+        </div>
+
+        {/* Chart */}
+        <div style={{ background:C.card, border:`1px solid ${C.border}`, borderRadius:10, padding:16, marginBottom:16 }}>
+          <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:10 }}>
+            <span style={{ ...mono, fontSize:12, color:C.accent }}>{activeTicker} · {BAR_SIZE_LABEL}</span>
+            <div style={{ display:"flex", gap:8 }}>
+              <button onClick={refresh} style={{
+                ...sans, fontSize:11, padding:"4px 12px", borderRadius:5,
+                background:C.dim, border:`1px solid ${C.border}`, color:C.muted, cursor:"pointer",
+              }}>↻ Refresh</button>
+              <button onClick={retrain} style={{
+                ...sans, fontSize:11, padding:"4px 12px", borderRadius:5,
+                background:C.dim, border:`1px solid ${C.border}`, color:C.neutral, cursor:"pointer",
+              }}>Retrain</button>
+            </div>
+          </div>
+          <CandleChart bars={activeBars} signal={activeSig} />
+        </div>
+
+        {/* Stats + Signal */}
+        {activeSig && (
+          <div style={{ display:"flex", gap:12, flexWrap:"wrap", marginBottom:16 }}>
+            <Stat label="Last Close"  value={`$${activeSig.close}`} />
+            <Stat label="RSI (14)"    value={activeSig.features?.rsi?.toFixed(2)} color={
+              activeSig.features?.rsi < 30 ? C.bull : activeSig.features?.rsi > 70 ? C.bear : C.white
+            } />
+            <Stat label="Momentum"    value={`${((activeSig.features?.momentum||0)*100).toFixed(2)}%`}
+              color={(activeSig.features?.momentum||0) > 0 ? C.bull : C.bear} />
+            <Stat label="Vol Ratio"   value={activeSig.features?.vol_ratio?.toFixed(2)} />
+            <Stat label="Volatility"  value={`${((activeSig.features?.volatility||0)*100).toFixed(3)}%`} />
+            <Stat label="Updated"     value={new Date(activeSig.timestamp).toLocaleTimeString()} />
+          </div>
+        )}
+
+        {/* Signal + Features */}
+        <div style={{ display:"flex", gap:14, flexWrap:"wrap", marginBottom:16 }}>
+          <div style={{
+            flex:"0 0 auto", background:C.card, border:`1px solid ${C.border}`,
+            borderRadius:10, padding:20, display:"flex", flexDirection:"column",
+            alignItems:"center", gap:16, minWidth:200,
+          }}>
+            <div style={{ ...sans, fontSize:10, textTransform:"uppercase", letterSpacing:2, color:C.muted }}>Model Signal</div>
+            {activeSig
+              ? <SignalBadge {...activeSig} />
+              : <div style={{ color:C.muted, fontSize:12 }}>No signal yet</div>
+            }
+          </div>
+          <div style={{ flex:1, minWidth:240, background:C.card, border:`1px solid ${C.border}`, borderRadius:10, padding:"16px 18px" }}>
+            <div style={{ ...sans, fontSize:10, textTransform:"uppercase", letterSpacing:2, color:C.muted, marginBottom:12 }}>
+              Feature Values
+            </div>
+            <FeaturePanel features={activeSig?.features} />
+          </div>
+        </div>
+
+        {/* History */}
+        <div style={{ background:C.card, border:`1px solid ${C.border}`, borderRadius:10, padding:"16px 18px" }}>
+          <div style={{ ...sans, fontSize:10, textTransform:"uppercase", letterSpacing:2, color:C.muted, marginBottom:12 }}>
+            Signal History
+          </div>
+          <HistoryTable history={history} />
+        </div>
+
+        {/* Footer note */}
+        <div style={{ marginTop:16, ...sans, fontSize:11, color:C.muted, lineHeight:1.7 }}>
+          ⚠ For paper trading / research only. Past signals do not guarantee future performance.
+          Model retrained on demand via the <span style={{ ...mono, color:C.accent }}>Retrain</span> button.
+          Auto-refreshes every 15s.
+        </div>
+
+      </div>
+    </div>
+  );
+}
+
+const BAR_SIZE_LABEL = "5-min bars";
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
