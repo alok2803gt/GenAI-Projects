@@ -1,26 +1,27 @@
 """
-XGBoost Day Trading Signal Engine — IBKR Backend
+XGBoost Day Trading Signal Engine — IBKR Backend  (v2 — Live Streaming)
 FastAPI server that:
   1. Connects to TWS / IB Gateway via ib_insync
-  2. Pulls live 5-min OHLCV bars
-  3. Engineers 9 features
-  4. Scores with a trained XGBoost model (or trains one on-the-fly)
-  5. Serves /signal, /bars, /status endpoints to the React dashboard
+  2. Subscribes to 5-min OHLCV bars with keepUpToDate=True (event-driven streaming)
+  3. Includes extended / after-hours data (useRTH=False)
+  4. Engineers 9 features on every bar event
+  5. Scores with XGBoost (or trains on-the-fly from seeded history)
+  6. Serves /signal, /bars, /status endpoints to the React dashboard
 """
 
 import asyncio
 import logging
 import threading
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional
+from datetime import datetime
+from typing import Dict, List
 
 import numpy as np
 import pandas as pd
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from ib_insync import IB, Stock, util, BarData
+from ib_insync import IB, Stock, util
 from pydantic import BaseModel
 from xgboost import XGBClassifier
 from sklearn.model_selection import TimeSeriesSplit
@@ -38,12 +39,11 @@ log = logging.getLogger("ibkr_trader")
 
 # ── Config ─────────────────────────────────────────────────────────────────
 TWS_HOST = "127.0.0.1"
-TWS_PORT = 7496          # 7497 = TWS paper | 7496 = TWS live | 4002 = IB Gateway paper
-TWS_CLIENT_ID = 10       # any unused client ID
+TWS_PORT = 7496          # 7497=TWS paper | 7496=TWS live | 4002=IB Gateway paper
+TWS_CLIENT_ID = 10
 MODEL_PATH = "model.joblib"
 BAR_SIZE = "5 mins"
-HISTORY_DURATION = "3 D"
-POLL_INTERVAL = 30       # seconds between live bar refreshes
+HISTORY_DURATION = "5 D"   # Seed with 5 days so RSI/SMA have enough history
 BUY_THRESHOLD = 0.55
 SELL_THRESHOLD = 0.45
 
@@ -58,214 +58,248 @@ state: Dict = {
     "connected": False,
     "model": None,
     "model_accuracy": None,
-    "bars": {},          # ticker -> list[dict]
-    "signals": {},       # ticker -> latest signal dict
-    "last_update": {},   # ticker -> datetime
+    "bars": {},            # ticker -> list[dict]  (last 80 bars)
+    "signals": {},         # ticker -> latest signal dict
+    "last_update": {},     # ticker -> ISO datetime str
+    "subscriptions": {},   # ticker -> BarDataList (live handle)
     "error": None,
 }
 
+# Thread-safe mutable ticker list (API writes, streaming thread reads)
+TICKERS: List[str] = ["AAPL", "MSFT", "NVDA", "SPY"]
+_tickers_lock = threading.Lock()
+
 # ── Feature engineering ────────────────────────────────────────────────────
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Compute all features in-place. Returns df with feature cols + target."""
     df = df.copy()
-    df["close"] = df["close"].astype(float)
-    df["open"]  = df["open"].astype(float)
-    df["high"]  = df["high"].astype(float)
-    df["low"]   = df["low"].astype(float)
-    df["volume"]= df["volume"].astype(float)
+    for col in ["close", "open", "high", "low", "volume"]:
+        df[col] = df[col].astype(float)
 
-    # SMA
-    df["sma5"]  = df["close"].rolling(5).mean()
-    df["sma14"] = df["close"].rolling(14).mean()
-
-    # Momentum = deviation from SMA14
+    df["sma5"]     = df["close"].rolling(5).mean()
+    df["sma14"]    = df["close"].rolling(14).mean()
     df["momentum"] = (df["close"] - df["sma14"]) / (df["sma14"] + 1e-9)
+    df["vol_ratio"]= df["volume"] / (df["volume"].rolling(14).mean() + 1e-9)
 
-    # Volume ratio vs 14-bar avg
-    df["vol_ratio"] = df["volume"] / (df["volume"].rolling(14).mean() + 1e-9)
-
-    # Candle geometry
     rng = (df["high"] - df["low"]).replace(0, 1e-6)
     df["body_pct"]   = (df["close"] - df["open"]).abs() / rng
-    df["upper_wick"] = (df["high"] - df[["open","close"]].max(axis=1)) / rng
-    df["lower_wick"] = (df[["open","close"]].min(axis=1) - df["low"]) / rng
+    df["upper_wick"] = (df["high"] - df[["open", "close"]].max(axis=1)) / rng
+    df["lower_wick"] = (df[["open", "close"]].min(axis=1) - df["low"]) / rng
 
-    # RSI (14)
-    delta  = df["close"].diff()
-    gain   = delta.clip(lower=0).rolling(14).mean()
-    loss   = (-delta.clip(upper=0)).rolling(14).mean()
-    rs     = gain / (loss + 1e-9)
-    df["rsi"] = 100 - 100 / (1 + rs)
-
-    # Volatility = rolling std of returns
+    delta = df["close"].diff()
+    gain  = delta.clip(lower=0).rolling(14).mean()
+    loss  = (-delta.clip(upper=0)).rolling(14).mean()
+    df["rsi"]        = 100 - 100 / (1 + gain / (loss + 1e-9))
     df["volatility"] = df["close"].pct_change().rolling(14).std()
-
-    # Target: did close go up next bar?
-    df["target"] = (df["close"].shift(-1) > df["close"]).astype(int)
+    df["target"]     = (df["close"].shift(-1) > df["close"]).astype(int)
 
     return df.dropna()
 
 
 # ── XGBoost model ──────────────────────────────────────────────────────────
 def train_model(df: pd.DataFrame):
-    """Train XGBoost on the given feature dataframe. Returns (model, accuracy)."""
     df = build_features(df)
     if len(df) < 60:
-        raise ValueError(f"Not enough data to train: {len(df)} rows (need ≥60)")
+        raise ValueError(f"Need ≥60 rows, got {len(df)}")
 
-    X = df[FEATURE_COLS].values
-    y = df["target"].values
-
+    X, y = df[FEATURE_COLS].values, df["target"].values
     tscv = TimeSeriesSplit(n_splits=3)
-    accs = []
-    model = None
+    accs, model = [], None
     for train_idx, val_idx in tscv.split(X):
         m = XGBClassifier(
-            n_estimators=200,
-            max_depth=4,
-            learning_rate=0.05,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            use_label_encoder=False,
-            eval_metric="logloss",
-            verbosity=0,
-            random_state=42,
+            n_estimators=200, max_depth=4, learning_rate=0.05,
+            subsample=0.8, colsample_bytree=0.8,
+            eval_metric="logloss", verbosity=0, random_state=42,
         )
         m.fit(X[train_idx], y[train_idx])
-        preds = m.predict(X[val_idx])
-        accs.append(accuracy_score(y[val_idx], preds))
+        accs.append(accuracy_score(y[val_idx], m.predict(X[val_idx])))
         model = m
 
-    accuracy = float(np.mean(accs))
-    log.info(f"Model trained  accuracy={accuracy:.3f}  rows={len(df)}")
-    return model, accuracy
+    acc = float(np.mean(accs))
+    log.info(f"Model trained  accuracy={acc:.3f}  rows={len(df)}")
+    return model, acc
 
 
 def predict(model, df: pd.DataFrame) -> dict:
-    """Score the last row. Returns signal dict."""
     df = build_features(df)
     if df.empty:
         return {"label": "HOLD", "prob": 0.5, "confidence": 0.0}
 
-    last = df[FEATURE_COLS].iloc[[-1]].values
-    prob = float(model.predict_proba(last)[0][1])
-    confidence = abs(prob - 0.5) * 2
+    last  = df[FEATURE_COLS].iloc[[-1]].values
+    prob  = float(model.predict_proba(last)[0][1])
+    conf  = abs(prob - 0.5) * 2
     label = "BUY" if prob > BUY_THRESHOLD else "SELL" if prob < SELL_THRESHOLD else "HOLD"
     feat  = df[FEATURE_COLS].iloc[-1].to_dict()
 
     return {
         "label": label,
         "prob": round(prob, 4),
-        "confidence": round(confidence, 4),
+        "confidence": round(conf, 4),
         "features": {k: round(float(v), 4) for k, v in feat.items()},
         "close": round(float(df["close"].iloc[-1]), 4),
         "timestamp": datetime.utcnow().isoformat() + "Z",
     }
 
 
-# ── IBKR helpers ──────────────────────────────────────────────────────────
-async def fetch_bars(ib: IB, ticker: str) -> pd.DataFrame:
-    """Async version — never blocks the event loop."""
+# ── Live bar callback ──────────────────────────────────────────────────────
+def _bars_to_df(bars) -> pd.DataFrame:
+    df = util.df(bars)[["date", "open", "high", "low", "close", "volume"]]
+    df.rename(columns={"date": "time"}, inplace=True)
+    df["time"] = pd.to_datetime(df["time"])
+    return df
+
+
+def on_bar_update(ticker: str, bars, has_new_bar: bool) -> None:
+    """
+    Called by ib_insync on every bar event — both partial (in-flight 5-min
+    bar updating) and completed (new bar appended).  has_new_bar=True means
+    a bar just closed and a fresh one started.
+    """
+    try:
+        df = _bars_to_df(bars)
+        if df.empty:
+            return
+
+        # Cache raw bars (keep last 80)
+        bars_list = df.tail(80).to_dict(orient="records")
+        for b in bars_list:
+            t = b.get("time")
+            if hasattr(t, "isoformat"):
+                b["time"] = t.isoformat()
+        state["bars"][ticker] = bars_list
+
+        # Lazy model training on first ticker that has enough history
+        if state["model"] is None and len(df) >= 60:
+            try:
+                model, acc = train_model(df)
+                state["model"] = model
+                state["model_accuracy"] = acc
+                joblib.dump(model, MODEL_PATH)
+            except Exception as e:
+                log.warning(f"Training failed for {ticker}: {e}")
+
+        if state["model"] is not None:
+            sig = predict(state["model"], df)
+            sig["ticker"] = ticker
+            sig["session"] = _session_label(df["time"].iloc[-1])
+            state["signals"][ticker] = sig
+            state["last_update"][ticker] = datetime.utcnow().isoformat()
+            if has_new_bar:
+                log.info(
+                    f"NEW BAR  {ticker}  {sig['label']}  "
+                    f"prob={sig['prob']}  close={sig['close']}  "
+                    f"session={sig['session']}"
+                )
+            else:
+                log.debug(f"BAR UPD  {ticker}  close={sig['close']}")
+
+    except Exception as e:
+        log.warning(f"on_bar_update error [{ticker}]: {e}", exc_info=True)
+
+
+def _session_label(ts: pd.Timestamp) -> str:
+    """Return PRE / RTH / POST / CLOSED based on Eastern time."""
+    try:
+        et = ts.tz_convert("America/New_York") if ts.tzinfo else ts
+        h = et.hour + et.minute / 60
+        if 4.0 <= h < 9.5:
+            return "PRE"
+        if 9.5 <= h < 16.0:
+            return "RTH"
+        if 16.0 <= h < 20.0:
+            return "POST"
+        return "CLOSED"
+    except Exception:
+        return "UNKNOWN"
+
+
+# ── Streaming subscription ─────────────────────────────────────────────────
+async def subscribe_ticker(ib: IB, ticker: str) -> None:
+    """Open a keepUpToDate streaming subscription for one ticker."""
     contract = Stock(ticker, "SMART", "USD")
     await ib.qualifyContractsAsync(contract)
+
     bars = await ib.reqHistoricalDataAsync(
         contract,
         endDateTime="",
         durationStr=HISTORY_DURATION,
         barSizeSetting=BAR_SIZE,
         whatToShow="TRADES",
-        useRTH=True,
+        useRTH=False,           # Extended hours included
         formatDate=1,
+        keepUpToDate=True,      # Event-driven streaming
     )
-    if not bars:
-        raise ValueError(f"No bars returned for {ticker} — market may be closed or contract invalid")
-    df = util.df(bars)[["date", "open", "high", "low", "close", "volume"]]
-    df.rename(columns={"date": "time"}, inplace=True)
-    df["time"] = pd.to_datetime(df["time"])
-    log.info(f"Fetched {len(df)} bars for {ticker}")
-    return df
+
+    state["subscriptions"][ticker] = bars
+
+    # Wire the live callback
+    bars.updateEvent += lambda b, h: on_bar_update(ticker, b, h)
+
+    # Seed state immediately from historical data already in `bars`
+    on_bar_update(ticker, bars, False)
+    log.info(f"Streaming  {ticker}  ({len(bars)} bars seeded, extended hours ON)")
 
 
-# ── Background polling loop ────────────────────────────────────────────────
-async def polling_loop_async(tickers: List[str]):
-    """Async polling loop — owns its own event loop via asyncio.run()."""
+async def _subscribe_pending(ib: IB, known: set) -> set:
+    """Subscribe any tickers added to TICKERS since last check."""
+    with _tickers_lock:
+        current = set(TICKERS)
+    for ticker in current - known:
+        try:
+            await subscribe_ticker(ib, ticker)
+        except Exception as e:
+            log.warning(f"Subscribe failed [{ticker}]: {e}")
+    return current
+
+
+# ── Background streaming loop ──────────────────────────────────────────────
+async def streaming_loop_async() -> None:
     while True:
         try:
             ib = IB()
             await ib.connectAsync(TWS_HOST, TWS_PORT, clientId=TWS_CLIENT_ID, timeout=15)
-            log.info(f"Connected to IBKR  host={TWS_HOST}  port={TWS_PORT}")
+            log.info(f"Connected to IBKR  {TWS_HOST}:{TWS_PORT}")
             state["ib"] = ib
             state["connected"] = True
             state["error"] = None
 
+            known: set = set()
+            known = await _subscribe_pending(ib, known)
+
+            # Keep the event loop alive; check for newly added tickers every 10 s
             while ib.isConnected():
-                for ticker in tickers:
-                    try:
-                        df = await fetch_bars(ib, ticker)
-                        bars_list = df.tail(80).to_dict(orient="records")
-                        # convert timestamps to strings
-                        for b in bars_list:
-                            if hasattr(b["time"], "isoformat"):
-                                b["time"] = b["time"].isoformat()
+                known = await _subscribe_pending(ib, known)
+                await asyncio.sleep(10)
 
-                        state["bars"][ticker] = bars_list
-
-                        # train / retrain model if not loaded (run in thread to avoid blocking)
-                        if state["model"] is None:
-                            loop = asyncio.get_event_loop()
-                            model, acc = await loop.run_in_executor(None, train_model, df)
-                            state["model"] = model
-                            state["model_accuracy"] = acc
-                            joblib.dump(model, MODEL_PATH)
-
-                        sig = predict(state["model"], df)
-                        sig["ticker"] = ticker
-                        state["signals"][ticker] = sig
-                        state["last_update"][ticker] = datetime.utcnow().isoformat()
-                        log.info(f"{ticker}  {sig['label']}  prob={sig['prob']}  close={sig['close']}")
-
-                    except Exception as e:
-                        log.warning(f"Error fetching {ticker}: {e}", exc_info=True)
-
-                await asyncio.sleep(POLL_INTERVAL)
+            state["connected"] = False
+            log.warning("IBKR disconnected — retrying in 15 s")
 
         except Exception as e:
             state["connected"] = False
             state["error"] = str(e)
-            log.error(f"IBKR connection lost: {e}  — retrying in 15s")
+            log.error(f"IBKR error: {e}  — retrying in 15 s")
             await asyncio.sleep(15)
 
 
-def polling_loop(tickers: List[str]):
-    """Entry point for the daemon thread — creates its own event loop."""
-    asyncio.run(polling_loop_async(tickers))
+def streaming_loop() -> None:
+    asyncio.run(streaming_loop_async())
 
 
 # ── FastAPI app ────────────────────────────────────────────────────────────
-DEFAULT_TICKERS = ["AAPL", "MSFT", "NVDA", "SPY"]
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Load cached model if available
     if os.path.exists(MODEL_PATH):
         state["model"] = joblib.load(MODEL_PATH)
         log.info("Loaded cached model from disk")
 
-    # Start IBKR polling thread
-    t = threading.Thread(
-        target=polling_loop,
-        args=(DEFAULT_TICKERS,),
-        daemon=True,
-    )
+    t = threading.Thread(target=streaming_loop, daemon=True)
     t.start()
-    log.info("Polling thread started")
+    log.info("Live streaming thread started")
     yield
     if state["ib"] and state["ib"].isConnected():
         state["ib"].disconnect()
 
 
-app = FastAPI(title="XGBoost IBKR Trader", lifespan=lifespan)
-
+app = FastAPI(title="XGBoost IBKR Trader — Live Streaming", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -275,10 +309,6 @@ app.add_middleware(
 
 
 # ── Pydantic models ────────────────────────────────────────────────────────
-class TrainRequest(BaseModel):
-    ticker: str
-
-
 class AddTickerRequest(BaseModel):
     ticker: str
 
@@ -291,6 +321,7 @@ def get_status():
         "error": state["error"],
         "model_accuracy": state["model_accuracy"],
         "tickers": list(state["signals"].keys()),
+        "subscriptions": list(state["subscriptions"].keys()),
         "last_updates": state["last_update"],
     }
 
@@ -299,7 +330,7 @@ def get_status():
 def get_signal(ticker: str):
     ticker = ticker.upper()
     if ticker not in state["signals"]:
-        raise HTTPException(404, f"{ticker} not found. Add it via POST /add_ticker first.")
+        raise HTTPException(404, f"{ticker} not subscribed. POST /add_ticker first.")
     return state["signals"][ticker]
 
 
@@ -319,9 +350,10 @@ def get_bars(ticker: str, limit: int = 80):
 @app.post("/add_ticker")
 def add_ticker(req: AddTickerRequest):
     ticker = req.ticker.upper()
-    if ticker not in DEFAULT_TICKERS:
-        DEFAULT_TICKERS.append(ticker)
-        log.info(f"Added ticker {ticker}")
+    with _tickers_lock:
+        if ticker not in TICKERS:
+            TICKERS.append(ticker)
+            log.info(f"Queued {ticker} — streaming loop will subscribe within 10 s")
     return {"ok": True, "ticker": ticker}
 
 
