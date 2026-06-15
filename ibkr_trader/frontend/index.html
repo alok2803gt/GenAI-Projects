@@ -174,6 +174,25 @@ function StatusPill({ connected, error }) {
   );
 }
 
+function OPRAPill({ opraActive }) {
+  if (opraActive === null || opraActive === undefined) return null;
+  const col   = opraActive ? C.bull : C.bear;
+  const label = opraActive ? "OPRA LIVE" : "OPRA DELAYED";
+  const tip   = opraActive
+    ? "Real-time options data — Greeks and quotes are live"
+    : "OPRA not subscribed — options quotes are 15-min delayed";
+  return (
+    <div title={tip} style={{
+      display:"inline-flex", alignItems:"center", gap:5,
+      padding:"4px 10px", borderRadius:20, border:`1px solid ${col}33`, background:`${col}0e`,
+      cursor:"default",
+    }}>
+      <span style={{ fontSize:9 }}>{opraActive ? "●" : "○"}</span>
+      <span style={{ ...mono, fontSize:10, color:col, letterSpacing:1 }}>{label}</span>
+    </div>
+  );
+}
+
 // ── Signals Tab components ─────────────────────────────────────────────────
 function CandleChart({ bars, signal }) {
   if (!bars || bars.length < 5) return (
@@ -382,34 +401,48 @@ function CSPTab({ connected }) {
   };
 
   const cols = [
-    { key:"score",             label:"Score",      render: r => <b style={{color:C.accent}}>{r.score}</b> },
-    { key:"ticker",            label:"Ticker",     render: r => <span style={{...mono,color:C.accent,fontWeight:700}}>{r.ticker}</span> },
-    { key:"expiry",            label:"Expiry",     render: r => r.expiry },
-    { key:"strike",            label:"Strike",     render: r => fmt$(r.strike) },
-    { key:"stock_price",       label:"Stock $",    render: r => fmt$(r.stock_price) },
-    { key:"otm_pct",           label:"OTM %",      render: r => <span style={{color:C.neutral}}>{fmtP(r.otm_pct)}</span> },
-    { key:"sigma_otm",         label:"σ OTM",      render: r => <span style={{color: r.sigma_otm>=2?C.bull:r.sigma_otm>=1?C.neutral:C.bear}}>{fmtN(r.sigma_otm,1)}σ</span> },
-    { key:"weekly_return_pct", label:"Wkly %",     render: r => <b style={{color:C.bull}}>{fmtP(r.weekly_return_pct)}</b> },
-    { key:"annualized_return", label:"Ann. %",     render: r => <span style={{color:C.bull}}>{fmtP(r.annualized_return)}</span> },
-    { key:"delta",             label:"Delta",      render: r => fmtN(r.delta,3) },
-    { key:"iv_pct",            label:"IV %",       render: r => fmtP(r.iv_pct) },
-    { key:"iv_rank",           label:"IV Rank",    render: r => {
+    { key:"score",                label:"Score",       render: r => <b style={{color:C.accent}}>{r.score}</b> },
+    { key:"ticker",               label:"Ticker",      render: r => <span style={{...mono,color:C.accent,fontWeight:700}}>{r.ticker}</span> },
+    { key:"expiry",               label:"Expiry",      render: r => r.expiry },
+    { key:"strike",               label:"Strike",      render: r => fmt$(r.strike) },
+    { key:"stock_price",          label:"Stock $",     render: r => fmt$(r.stock_price) },
+    { key:"otm_pct",              label:"OTM %",       render: r => <span style={{color:C.neutral}}>{fmtP(r.otm_pct)}</span> },
+    { key:"sigma_otm",            label:"σ OTM",       render: r => <span style={{color: r.sigma_otm>=2?C.bull:r.sigma_otm>=1?C.neutral:C.bear}}>{fmtN(r.sigma_otm,1)}σ</span> },
+    // Return trio — always show realistic (primary), bid (conservative) on hover via title
+    { key:"weekly_return_pct",    label:"Wkly % (real)", render: r => (
+      <span title={`Conservative (bid): ${fmtP(r.weekly_return_bid)}  |  Optimistic (mid): ${fmtP(r.weekly_return_mid)}`}>
+        <b style={{color:C.bull}}>{fmtP(r.weekly_return_pct)}</b>
+      </span>
+    )},
+    { key:"weekly_return_bid",    label:"Wkly % (bid)", render: r => <span style={{color:C.muted}}>{fmtP(r.weekly_return_bid)}</span> },
+    { key:"annualized_return",    label:"Ann. %",      render: r => <span style={{color:C.bull}}>{fmtP(r.annualized_return)}</span> },
+    { key:"return_on_risk_ann",   label:"RoR Ann %",   render: r => <span style={{color:C.accent}}>{r.return_on_risk_ann}%</span> },
+    { key:"premium_collected",    label:"Premium",     render: r => <b style={{color:C.bull}}>{fmt$(r.premium_collected)}</b> },
+    { key:"max_loss_per_contract",label:"Max Loss",    render: r => <span style={{color:C.bear}}>{fmt$(r.max_loss_per_contract)}</span> },
+    { key:"breakeven",            label:"B/E Price",   render: r => fmt$(r.breakeven) },
+    { key:"delta",                label:"Delta",       render: r => fmtN(r.delta,3) },
+    { key:"iv_pct",               label:"IV %",        render: r => fmtP(r.iv_pct) },
+    { key:"iv_rank",              label:"IV Rank",     render: r => {
       const v = r.iv_rank; if (v==null) return "—";
       const c = v>=50?C.bull:v>=25?C.neutral:C.bear;
-      return <span style={{color:c,fontWeight:600}}>{v.toFixed(0)}</span>;
+      return <span style={{color:c,fontWeight:600}} title="IV Rank: 100=historic high premium, 0=historic low">{v.toFixed(0)}</span>;
     }},
-    { key:"assignment_risk",   label:"Risk",       render: r => <Pill color={RISK_COLOR[r.assignment_risk]||C.orange}>{r.assignment_risk}</Pill> },
-    { key:"earnings_days_out", label:"Earnings",   render: r => {
+    { key:"liquidity_score",      label:"Liquidity",   render: r => {
+      const v = r.liquidity_score; if (v==null) return "—";
+      const c = v>=70?C.bull:v>=40?C.neutral:C.bear;
+      return <span style={{color:c,fontWeight:600}} title="Liquidity: OI+Volume+Spread composite 0-100">{v}</span>;
+    }},
+    { key:"assignment_risk",      label:"Risk",        render: r => <Pill color={RISK_COLOR[r.assignment_risk]||C.orange}>{r.assignment_risk}</Pill> },
+    { key:"earnings_days_out",    label:"Earnings",    render: r => {
       const d = r.earnings_days_out;
       if (d==null) return <span style={{color:C.muted}}>—</span>;
       const c = d<=7?C.bear:d<=14?C.neutral:C.bull;
       return <span style={{color:c,fontWeight:600}}>{d}d</span>;
     }},
-    { key:"cash_required",     label:"Cash Req",   render: r => fmt$(r.cash_required) },
-    { key:"premium_collected", label:"Premium",    render: r => <b style={{color:C.bull}}>{fmt$(r.premium_collected)}</b> },
-    { key:"xgb_signal",        label:"XGB",        render: r => <Pill color={SIG_COLOR[r.xgb_signal]||C.muted}>{r.xgb_signal}</Pill> },
-    { key:"open_interest",     label:"OI",         render: r => r.open_interest?.toLocaleString() },
-    { key:"warnings",          label:"Warnings",   render: r => <WarningBadges warnings={r.warnings} /> },
+    { key:"cash_required",        label:"Cash Req",    render: r => fmt$(r.cash_required) },
+    { key:"xgb_signal",           label:"XGB",         render: r => <Pill color={SIG_COLOR[r.xgb_signal]||C.muted}>{r.xgb_signal}</Pill> },
+    { key:"open_interest",        label:"OI",          render: r => r.open_interest?.toLocaleString() },
+    { key:"warnings",             label:"Warnings",    render: r => <WarningBadges warnings={r.warnings} /> },
   ];
 
   return (
@@ -565,38 +598,49 @@ function LEAPTab({ connected }) {
   };
 
   const cols = [
-    { key:"score",            label:"Score",     render:r=><b style={{color:C.accent}}>{r.score}</b> },
-    { key:"ticker",           label:"Ticker",    render:r=><span style={{...mono,color:C.accent,fontWeight:700}}>{r.ticker}</span> },
-    { key:"xgb_signal",       label:"XGB",       render:r=><Pill color={SIG_COLOR[r.xgb_signal]||C.muted}>{r.xgb_signal}</Pill> },
-    { key:"stock_quality",    label:"Quality",   render:r=><span style={{color: r.stock_quality>=0.7?C.bull:r.stock_quality>=0.4?C.neutral:C.bear}}>{(r.stock_quality*100).toFixed(0)}%</span> },
-    { key:"expiry",           label:"Expiry",    render:r=>r.expiry },
-    { key:"dte",              label:"DTE",       render:r=><span style={{color:C.muted}}>{r.dte}d</span> },
-    { key:"strike",           label:"Strike",    render:r=>fmt$(r.strike) },
-    { key:"stock_price",      label:"Stock $",   render:r=>fmt$(r.stock_price) },
-    { key:"itm_otm_pct",      label:"ITM/OTM",   render:r=>{
+    { key:"score",             label:"Score",       render:r=><b style={{color:C.accent}}>{r.score}</b> },
+    { key:"ticker",            label:"Ticker",      render:r=><span style={{...mono,color:C.accent,fontWeight:700}}>{r.ticker}</span> },
+    { key:"xgb_signal",        label:"XGB",         render:r=><Pill color={SIG_COLOR[r.xgb_signal]||C.muted}>{r.xgb_signal}</Pill> },
+    { key:"stock_quality",     label:"Quality",     render:r=><span style={{color: r.stock_quality>=0.7?C.bull:r.stock_quality>=0.4?C.neutral:C.bear}}>{(r.stock_quality*100).toFixed(0)}%</span> },
+    { key:"expiry",            label:"Expiry",      render:r=>r.expiry },
+    { key:"dte",               label:"DTE",         render:r=><span style={{color:C.muted}}>{r.dte}d</span> },
+    { key:"strike",            label:"Strike",      render:r=>fmt$(r.strike) },
+    { key:"stock_price",       label:"Stock $",     render:r=>fmt$(r.stock_price) },
+    { key:"itm_otm_pct",       label:"ITM/OTM",     render:r=>{
       const c = r.itm_otm_pct>0?C.bull:C.bear;
       return <span style={{color:c}}>{r.itm_otm_pct>0?"+":""}{fmtP(r.itm_otm_pct)}</span>;
     }},
-    { key:"delta",            label:"Delta",     render:r=>fmtN(r.delta,3) },
-    { key:"iv_pct",           label:"IV %",      render:r=>fmtP(r.iv_pct) },
-    { key:"iv_rank",          label:"IV Rank",   render:r=>{
+    { key:"delta",             label:"Delta",       render:r=>fmtN(r.delta,3) },
+    { key:"iv_pct",            label:"IV %",        render:r=>fmtP(r.iv_pct) },
+    { key:"iv_rank",           label:"IV Rank",     render:r=>{
       const v = r.iv_rank; if (v==null) return "—";
-      // For LEAP buyers: LOW iv_rank = cheaper = better (inverted from CSP)
       const c = v<=40?C.bull:v<=65?C.neutral:C.bear;
-      return <span style={{color:c,fontWeight:600}}>{v.toFixed(0)}</span>;
+      return <span style={{color:c,fontWeight:600}} title="LEAP buyer wants LOW IV rank = cheaper premium">{v.toFixed(0)}</span>;
     }},
-    { key:"earnings_days_out",label:"Earnings",  render:r=>{
+    { key:"earnings_days_out", label:"Earnings",    render:r=>{
       const d = r.earnings_days_out;
       if (d==null) return <span style={{color:C.muted}}>—</span>;
       const c = d<=7?C.bear:d<=14?C.neutral:C.bull;
       return <span style={{color:c,fontWeight:600}}>{d}d</span>;
     }},
-    { key:"mid",              label:"Mid",       render:r=>fmt$(r.mid) },
-    { key:"cost_per_contract",label:"Cost/Cont", render:r=><b style={{color:C.neutral}}>{fmt$(r.cost_per_contract)}</b> },
-    { key:"breakeven",        label:"B/E Price", render:r=>fmt$(r.breakeven) },
-    { key:"breakeven_move_pct",label:"B/E Move", render:r=><span style={{color:C.bear}}>{fmtP(r.breakeven_move_pct)}</span> },
-    { key:"theta_daily",      label:"Θ/day",     render:r=><span style={{color:C.bear}}>{fmtN(r.theta_daily,4)}</span> },
-    { key:"warnings",         label:"Warnings",  render:r=><WarningBadges warnings={r.warnings} /> },
+    // Cost trio — realistic is primary; conservative (ask) shown as safety reference
+    { key:"cost_per_contract", label:"Cost (real)", render:r=>(
+      <span title={`Conservative (ask): ${fmt$(r.cost_conservative)}  |  Optimistic (mid): ${fmt$(r.cost_mid)}`}>
+        <b style={{color:C.neutral}}>{fmt$(r.cost_per_contract)}</b>
+      </span>
+    )},
+    { key:"cost_conservative", label:"Cost (ask)",  render:r=><span style={{color:C.muted}}>{fmt$(r.cost_conservative)}</span> },
+    { key:"max_loss_per_contract",label:"Max Loss",  render:r=><span style={{color:C.bear}}>{fmt$(r.max_loss_per_contract)}</span> },
+    { key:"breakeven",         label:"B/E Price",   render:r=>fmt$(r.breakeven) },
+    { key:"breakeven_move_pct",label:"B/E Move",    render:r=><span style={{color:C.bear}}>{fmtP(r.breakeven_move_pct)}</span> },
+    { key:"liquidity_score",   label:"Liquidity",   render:r=>{
+      const v = r.liquidity_score; if (v==null) return "—";
+      const c = v>=70?C.bull:v>=40?C.neutral:C.bear;
+      return <span style={{color:c,fontWeight:600}}>{v}</span>;
+    }},
+    { key:"theta_daily",       label:"Θ/day",       render:r=><span style={{color:C.bear}}>{fmtN(r.theta_daily,4)}</span> },
+    { key:"theta_weekly",      label:"Θ/wk",        render:r=><span style={{color:C.bear}}>{fmtN(r.theta_weekly,3)}</span> },
+    { key:"warnings",          label:"Warnings",    render:r=><WarningBadges warnings={r.warnings} /> },
   ];
 
   return (
@@ -766,7 +810,10 @@ function SignalsTab({ connected }) {
     <div>
       {/* Status bar */}
       <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", flexWrap:"wrap", gap:8, marginBottom:14 }}>
-        <StatusPill connected={status.connected} error={status.error} />
+        <div style={{ display:"flex", gap:8, alignItems:"center", flexWrap:"wrap" }}>
+          <StatusPill connected={status.connected} error={status.error} />
+          <OPRAPill opraActive={status.opra_active} />
+        </div>
         <div style={{ display:"flex", gap:12, alignItems:"center" }}>
           {status.model_accuracy && (
             <span style={{ ...mono, fontSize:10, color:C.muted }}>

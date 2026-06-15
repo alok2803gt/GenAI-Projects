@@ -114,6 +114,8 @@ state: Dict = {
         "iv_rank":  {},   # ticker → {"iv": float|None, "rank": float, "rv_lo": float|None, "rv_hi": float|None, "ts": datetime}
         "regime":   None, # full market regime dict
     },
+    # OPRA subscription status — set once at startup, re-checked on reconnect
+    "opra_active": None,   # None = not yet checked, True/False thereafter
 }
 
 TICKERS: List[str] = ["AAPL", "MSFT", "NVDA", "SPY"]
@@ -303,6 +305,9 @@ async def streaming_loop_async() -> None:
 
             ctx["known"] = await _subscribe_pending(ib, ctx["known"])
 
+            # Check OPRA data subscription once per connection
+            state["opra_active"] = await _check_opra_subscription(ib)
+
             while ib.isConnected():
                 ctx["known"] = await _subscribe_pending(ib, ctx["known"])
                 await asyncio.sleep(10)
@@ -386,19 +391,21 @@ def _assignment_risk(delta: float, otm_pct: float) -> str:
 
 
 def _score_csp(row: dict) -> float:
-    """Composite rank score — higher is better."""
+    """
+    Composite rank score — higher is better.
+    Uses realistic fill return (bid + 40% spread) as the primary return metric.
+    """
     s = 0.0
-    # 1) Weekly return above the 4 % target (capped at 3×)
-    s += min(row["weekly_return_pct"] / CSP_MIN_RETURN_PCT, 3.0) * 28
-    # 2) Distance from assignment (lower delta = safer)
-    s += (CSP_MAX_DELTA - abs(row["delta"])) / CSP_MAX_DELTA * 22
-    # 3) Tight bid-ask spread
-    spread_frac = row["spread_pct"] / 100
-    s += max(0, (CSP_MAX_SPREAD_PCT - spread_frac) / CSP_MAX_SPREAD_PCT) * 18
-    # 4) Underlying stock quality
-    s += row.get("stock_quality", 0.5) * 22
-    # 5) IV rank — high rank means elevated premium, better time to sell
-    s += (row.get("iv_rank", 50) / 100) * 10
+    # 1) Realistic weekly return above 4% target (capped at 3×)
+    s += min(row["weekly_return_pct"] / CSP_MIN_RETURN_PCT, 3.0) * 25
+    # 2) Distance from assignment
+    s += (CSP_MAX_DELTA - abs(row["delta"])) / CSP_MAX_DELTA * 20
+    # 3) Liquidity (OI + volume + spread combined)
+    s += (row.get("liquidity_score", 50) / 100) * 20
+    # 4) Stock quality (technical trend strength)
+    s += row.get("stock_quality", 0.5) * 20
+    # 5) IV rank — elevated IV = better premium selling environment
+    s += (row.get("iv_rank", 50) / 100) * 15
     return round(s, 2)
 
 
@@ -586,6 +593,45 @@ def _build_warnings(earnings_days: Optional[int], iv_rank: float, mode: str = "c
     return warnings
 
 
+async def _check_opra_subscription(ib: IB) -> bool:
+    """
+    Probe whether real-time OPRA options data is active on this account.
+    Tests a SPY ATM put snapshot — NaN bid/ask means delayed or no subscription.
+    """
+    try:
+        spy_price = await _get_stock_price(ib, "SPY")
+        if spy_price <= 0:
+            spy_price = 740.0
+        strike = float(round(spy_price / 5) * 5)
+        expiry = _next_expiry(0)
+        contract = Option("SPY", expiry, strike, "P", "SMART")
+        await ib.qualifyContractsAsync(contract)
+        if not contract.conId:
+            return False
+        [td] = await ib.reqTickersAsync(contract)
+        bid = td.bid if td.bid and not math.isnan(td.bid) else None
+        ask = td.ask if td.ask and not math.isnan(td.ask) else None
+        active = bid is not None and ask is not None and bid > 0 and ask > 0
+        log.info(f"OPRA subscription: {'ACTIVE' if active else 'NOT SUBSCRIBED / DELAYED'}")
+        return active
+    except Exception as e:
+        log.warning(f"OPRA check failed: {e}")
+        return False
+
+
+def _liquidity_score(oi: int, vol: int, spread_pct: float) -> float:
+    """
+    0-100 composite liquidity score.
+    OI   (40 pts): depth — capped at 1 000 contracts
+    Vol  (30 pts): today's activity — capped at 100 contracts
+    Spread (30 pts): tighter = better execution
+    """
+    oi_pts  = min(oi  / 1_000, 1.0) * 40
+    vol_pts = min(vol / 100,   1.0) * 30
+    spr_pts = max(0.0, 1.0 - (spread_pct / 100) / CSP_MAX_SPREAD_PCT) * 30
+    return round(oi_pts + vol_pts + spr_pts, 1)
+
+
 async def _get_stock_price(ib: IB, ticker: str) -> float:
     """Live price: prefer streaming bar cache (always fresh), else IBKR snapshot."""
     # Streaming bars are the freshest source — use them if available
@@ -704,51 +750,98 @@ async def scan_csp(
                     iv    = greeks.impliedVol
                     theta = greeks.theta or 0.0
 
+                    # ── Greek sanity check (bad OPRA data will fail this) ──
+                    if delta >= 0:          continue   # put delta must be negative
+                    if iv < 0.05 or iv > 3.0: continue  # IV out of sane range
+
                     strike = td.contract.strike
                     otm_pct = (stock_price - strike) / stock_price * 100
-                    weekly_return_pct = mid / strike * 100
                     spread_pct = (ask - bid) / mid * 100
-                    oi  = td.openInterest or 0
-                    vol = td.volume or 0
+                    oi  = getattr(td, 'openInterest', None) or 0
+                    vol = getattr(td, 'volume', None) or 0
 
+                    # ── Fill estimates (selling a put: you receive near the BID) ──
+                    # Conservative: bid (worst case — market order)
+                    # Realistic:    bid + 40% of spread (limit order near mid)
+                    fill_conservative = bid
+                    fill_realistic    = bid + (mid - bid) * 0.40
+
+                    weekly_return_bid      = fill_conservative / strike * 100
+                    weekly_return_pct      = fill_realistic    / strike * 100   # primary metric
+                    weekly_return_mid      = mid               / strike * 100   # optimistic
+                    annualized_return      = weekly_return_pct * 52
+
+                    # Max loss = assigned at strike, offset by premium received
+                    max_loss_per_contract  = round((strike - fill_realistic) * 100, 2)
+                    # Return on capital at risk (annualised)
+                    return_on_risk = round(
+                        fill_realistic / max(strike - fill_realistic, 0.01) * 52 * 100, 1
+                    )
+
+                    # ── Liquidity ─────────────────────────────────────────
+                    liq = _liquidity_score(oi, vol, spread_pct)
+
+                    # ── Filter gates ──────────────────────────────────────
                     if weekly_return_pct < min_return:        continue
                     if abs(delta) > max_delta:                continue
                     if oi < CSP_MIN_OI:                       continue
                     if spread_pct / 100 > CSP_MAX_SPREAD_PCT: continue
 
-                    exp_move = _expected_weekly_move(stock_price, iv)
+                    exp_move  = _expected_weekly_move(stock_price, iv)
                     sigma_otm = (stock_price - strike) / exp_move if exp_move > 0 else 0
+
+                    # ── IV cross-validation (IBKR OPRA vs yfinance) ───────
+                    warnings = _build_warnings(earnings_days, iv_info["rank"], "csp")
+                    if iv_info["iv"] is not None and iv > 0:
+                        divergence = abs(iv * 100 - iv_info["iv"]) / max(iv_info["iv"], 1)
+                        if divergence > 0.35:
+                            warnings.append(
+                                f"IV mismatch: IBKR {iv*100:.0f}% vs YF {iv_info['iv']:.0f}%"
+                            )
+                    if not state["opra_active"]:
+                        warnings.append("OPRA not subscribed — quotes may be delayed")
 
                     sq = _stock_quality_score(ticker)
                     row = {
-                        "ticker":             ticker,
-                        "expiry":             expiry,
-                        "dte":                dte,
-                        "strike":             strike,
-                        "stock_price":        round(stock_price, 2),
-                        "otm_pct":            round(otm_pct, 2),
-                        "sigma_otm":          round(sigma_otm, 2),
-                        "bid":                round(bid, 2),
-                        "ask":                round(ask, 2),
-                        "mid":                round(mid, 2),
-                        "weekly_return_pct":  round(weekly_return_pct, 2),
-                        "annualized_return":  round(weekly_return_pct * 52, 1),
-                        "delta":              round(delta, 4),
-                        "iv_pct":             round(iv * 100, 1),
-                        "theta_daily":        round(theta, 4),
-                        "open_interest":      oi,
-                        "volume":             vol,
-                        "spread_pct":         round(spread_pct, 2),
-                        "stock_quality":      sq,
-                        "assignment_risk":    _assignment_risk(delta, otm_pct),
-                        "xgb_signal":         state["signals"].get(ticker, {}).get("label", "N/A"),
-                        "cash_required":      round(strike * 100, 2),
-                        "premium_collected":  round(mid * 100, 2),
-                        # ── External validation columns ────────────────────
-                        "earnings_days_out":  earnings_days,
-                        "iv_rank":            iv_info["rank"],
-                        "iv_yf":              iv_info["iv"],
-                        "warnings":           _build_warnings(earnings_days, iv_info["rank"], "csp"),
+                        "ticker":                  ticker,
+                        "expiry":                  expiry,
+                        "dte":                     dte,
+                        "strike":                  strike,
+                        "stock_price":             round(stock_price, 2),
+                        "otm_pct":                 round(otm_pct, 2),
+                        "sigma_otm":               round(sigma_otm, 2),
+                        "bid":                     round(bid, 2),
+                        "ask":                     round(ask, 2),
+                        "mid":                     round(mid, 2),
+                        # Return trio: conservative / realistic / optimistic
+                        "weekly_return_bid":        round(weekly_return_bid, 2),
+                        "weekly_return_pct":        round(weekly_return_pct, 2),
+                        "weekly_return_mid":        round(weekly_return_mid, 2),
+                        "annualized_return":        round(annualized_return, 1),
+                        # Risk metrics
+                        "max_loss_per_contract":   max_loss_per_contract,
+                        "return_on_risk_ann":      return_on_risk,
+                        "breakeven":               round(strike - fill_realistic, 2),
+                        # Greeks
+                        "delta":                   round(delta, 4),
+                        "iv_pct":                  round(iv * 100, 1),
+                        "theta_daily":             round(theta, 4),
+                        # Liquidity
+                        "open_interest":           oi,
+                        "volume":                  vol,
+                        "spread_pct":              round(spread_pct, 2),
+                        "liquidity_score":         liq,
+                        # Quality / classification
+                        "stock_quality":           sq,
+                        "assignment_risk":         _assignment_risk(delta, otm_pct),
+                        "xgb_signal":              state["signals"].get(ticker, {}).get("label", "N/A"),
+                        "cash_required":           round(strike * 100, 2),
+                        "premium_collected":       round(fill_realistic * 100, 2),
+                        # External validation
+                        "earnings_days_out":       earnings_days,
+                        "iv_rank":                 iv_info["rank"],
+                        "iv_yf":                   iv_info["iv"],
+                        "warnings":                warnings,
                     }
                     row["score"] = _score_csp(row)
                     rows.append(row)
@@ -862,6 +955,10 @@ async def scan_leaps(ib: IB) -> dict:
                     theta = greeks.theta or 0.0
                     vega  = greeks.vega  or 0.0
 
+                    # ── Greek sanity check ────────────────────────────────
+                    if delta <= 0:             continue   # call delta must be positive
+                    if iv < 0.05 or iv > 3.0:  continue
+
                     if not (LEAP_MIN_DELTA <= delta <= LEAP_MAX_DELTA):
                         continue
                     if iv > LEAP_MAX_IV:
@@ -869,41 +966,90 @@ async def scan_leaps(ib: IB) -> dict:
 
                     strike = td.contract.strike
                     itm_otm_pct = (stock_price - strike) / stock_price * 100
-                    cost_per_contract = round(mid * 100, 2)
-                    spread_pct = (ask - bid) / mid * 100
-                    breakeven = strike + mid
+                    spread_pct  = (ask - bid) / mid * 100
+                    oi  = getattr(td, 'openInterest', None) or 0
+                    vol = getattr(td, 'volume', None) or 0
 
-                    # For LEAP buyers: lower iv_rank = cheaper premium = higher value score
+                    # ── Fill estimates (buying a call: you PAY near the ASK) ──
+                    # Conservative: ask (worst case — market order)
+                    # Realistic:    ask - 40% of spread (limit order near mid)
+                    fill_conservative = ask
+                    fill_realistic    = ask - (ask - mid) * 0.40
+
+                    cost_conservative      = round(fill_conservative * 100, 2)
+                    cost_per_contract      = round(fill_realistic    * 100, 2)  # primary
+                    cost_mid               = round(mid               * 100, 2)  # optimistic
+
+                    breakeven              = strike + fill_realistic
+                    breakeven_move_pct     = (breakeven - stock_price) / stock_price * 100
+
+                    # Max loss = total premium paid (realistic fill)
+                    max_loss_per_contract  = cost_per_contract
+                    # Weekly theta decay
+                    theta_weekly           = round(theta * 7, 4)
+
+                    liq = _liquidity_score(oi, vol, spread_pct)
+
+                    # ── IV cross-validation ───────────────────────────────
+                    warnings = _build_warnings(earnings_days, iv_info["rank"], "leap")
+                    if iv_info["iv"] is not None and iv > 0:
+                        divergence = abs(iv * 100 - iv_info["iv"]) / max(iv_info["iv"], 1)
+                        if divergence > 0.35:
+                            warnings.append(
+                                f"IV mismatch: IBKR {iv*100:.0f}% vs YF {iv_info['iv']:.0f}%"
+                            )
+                    if not state["opra_active"]:
+                        warnings.append("OPRA not subscribed — quotes may be delayed")
+
+                    # Low iv_rank = cheaper for LEAP buyers
                     leap_iv_bonus = (1 - iv_info["rank"] / 100) * 15
 
                     row = {
-                        "ticker":             ticker,
-                        "expiry":             chosen_expiry,
-                        "dte":                dte,
-                        "strike":             strike,
-                        "stock_price":        round(stock_price, 2),
-                        "itm_otm_pct":        round(itm_otm_pct, 2),
-                        "breakeven":          round(breakeven, 2),
-                        "breakeven_move_pct": round((breakeven - stock_price) / stock_price * 100, 2),
-                        "bid":                round(bid, 2),
-                        "ask":                round(ask, 2),
-                        "mid":                round(mid, 2),
-                        "cost_per_contract":  cost_per_contract,
-                        "delta":              round(delta, 4),
-                        "iv_pct":             round(iv * 100, 1),
-                        "theta_daily":        round(theta, 4),
-                        "vega":               round(vega, 4),
-                        "spread_pct":         round(spread_pct, 2),
-                        "stock_quality":      sq,
-                        "xgb_signal":         sig.get("label", "N/A"),
-                        "xgb_prob":           sig.get("prob", None),
-                        # ── External validation columns ────────────────────
-                        "earnings_days_out":  earnings_days,
-                        "iv_rank":            iv_info["rank"],
-                        "iv_yf":              iv_info["iv"],
-                        "warnings":           _build_warnings(earnings_days, iv_info["rank"], "leap"),
+                        "ticker":              ticker,
+                        "expiry":              chosen_expiry,
+                        "dte":                 dte,
+                        "strike":              strike,
+                        "stock_price":         round(stock_price, 2),
+                        "itm_otm_pct":         round(itm_otm_pct, 2),
+                        "breakeven":           round(breakeven, 2),
+                        "breakeven_move_pct":  round(breakeven_move_pct, 2),
+                        "bid":                 round(bid, 2),
+                        "ask":                 round(ask, 2),
+                        "mid":                 round(mid, 2),
+                        # Cost trio: conservative / realistic / optimistic
+                        "cost_conservative":   cost_conservative,
+                        "cost_per_contract":   cost_per_contract,
+                        "cost_mid":            cost_mid,
+                        # Risk
+                        "max_loss_per_contract": max_loss_per_contract,
+                        # Greeks
+                        "delta":               round(delta, 4),
+                        "iv_pct":              round(iv * 100, 1),
+                        "theta_daily":         round(theta, 4),
+                        "theta_weekly":        theta_weekly,
+                        "vega":                round(vega, 4),
+                        # Liquidity
+                        "spread_pct":          round(spread_pct, 2),
+                        "open_interest":       oi,
+                        "volume":              vol,
+                        "liquidity_score":     liq,
+                        # Quality
+                        "stock_quality":       sq,
+                        "xgb_signal":          sig.get("label", "N/A"),
+                        "xgb_prob":            sig.get("prob", None),
+                        # External validation
+                        "earnings_days_out":   earnings_days,
+                        "iv_rank":             iv_info["rank"],
+                        "iv_yf":               iv_info["iv"],
+                        "warnings":            warnings,
                     }
-                    row["score"] = round(sq * 60 + (1 - abs(delta - 0.60)) * 40 + leap_iv_bonus, 2)
+                    row["score"] = round(
+                        sq * 55
+                        + (1 - abs(delta - 0.60)) * 35
+                        + leap_iv_bonus
+                        + (liq / 100) * 10,
+                        2
+                    )
                     rows.append(row)
 
                 return rows
@@ -1021,6 +1167,7 @@ class AddTickerRequest(BaseModel):
 def get_status():
     return {
         "connected":      state["connected"],
+        "opra_active":    state["opra_active"],
         "error":          state["error"],
         "model_accuracy": state["model_accuracy"],
         "tickers":        list(state["signals"].keys()),
