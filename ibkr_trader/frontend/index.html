@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>XGBoost IBKR Trader</title>
+  <title>IBKR Trader — v3</title>
   <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
   <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
@@ -15,9 +15,14 @@
     ::-webkit-scrollbar { width: 4px; height: 4px; }
     ::-webkit-scrollbar-track { background: #080c18; }
     ::-webkit-scrollbar-thumb { background: #1e2a3a; border-radius: 2px; }
-    @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.3} }
-    @keyframes fadeIn { from{opacity:0;transform:translateY(6px)} to{opacity:1;transform:translateY(0)} }
+    @keyframes blink    { 0%,100%{opacity:1} 50%{opacity:0.3} }
+    @keyframes fadeIn   { from{opacity:0;transform:translateY(6px)} to{opacity:1;transform:translateY(0)} }
+    @keyframes spin     { to { transform: rotate(360deg); } }
     @keyframes pulse-ring { 0%{box-shadow:0 0 0 0 rgba(0,212,255,0.4)} 70%{box-shadow:0 0 0 10px transparent} 100%{box-shadow:0 0 0 0 transparent} }
+    .spin { animation: spin 0.9s linear infinite; display:inline-block; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { text-align: left; padding: 6px 10px; white-space: nowrap; }
+    tr:hover td { background: rgba(0,212,255,0.04); }
   </style>
 </head>
 <body>
@@ -25,35 +30,100 @@
 
 <script type="text/babel">
 const { useState, useEffect, useRef, useCallback } = React;
-
 const API = "http://localhost:8000";
 
 const C = {
-  bg: "#080c18", surface: "#0f1623", card: "#131d2e",
-  border: "#1e2d42", accent: "#00d4ff", bull: "#00e5a0",
-  bear: "#ff4d6a", neutral: "#fbbf24", text: "#e2e8f0",
-  muted: "#4a6080", white: "#f8fafc", dim: "#1a2540",
+  bg:"#080c18", surface:"#0f1623", card:"#131d2e",
+  border:"#1e2d42", accent:"#00d4ff", bull:"#00e5a0",
+  bear:"#ff4d6a", neutral:"#fbbf24", text:"#e2e8f0",
+  muted:"#4a6080", white:"#f8fafc", dim:"#1a2540", orange:"#f97316",
 };
+const mono = { fontFamily:"'JetBrains Mono', monospace" };
+const sans = { fontFamily:"'Inter', sans-serif" };
 
-const mono = { fontFamily: "'JetBrains Mono', monospace" };
-const sans = { fontFamily: "'Inter', sans-serif" };
-
-// ── tiny fetch helpers ────────────────────────────────────────────────────
-async function apiFetch(path) {
-  const r = await fetch(API + path);
+// ── helpers ───────────────────────────────────────────────────────────────
+async function apiFetch(path, opts) {
+  const r = await fetch(API + path, opts);
   if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
   return r.json();
 }
 
-// ── Candlestick SVG ───────────────────────────────────────────────────────
+function fmt$(n)  { return n == null ? "—" : `$${Number(n).toFixed(2)}`; }
+function fmtP(n)  { return n == null ? "—" : `${Number(n).toFixed(2)}%`; }
+function fmtN(n,d=3) { return n == null ? "—" : Number(n).toFixed(d); }
+
+const RISK_COLOR = {
+  "VERY LOW":   C.bull,
+  "LOW":        "#4ade80",
+  "LOW-MEDIUM": C.neutral,
+  "MEDIUM":     C.orange,
+};
+const SIG_COLOR = { BUY: C.bull, SELL: C.bear, HOLD: C.neutral };
+
+// ── reusable UI pieces ────────────────────────────────────────────────────
+function Pill({ children, color }) {
+  return (
+    <span style={{
+      ...mono, fontSize:10, padding:"2px 8px", borderRadius:12,
+      background:`${color}22`, color, border:`1px solid ${color}44`,
+      fontWeight:700, letterSpacing:0.5,
+    }}>{children}</span>
+  );
+}
+
+function Btn({ onClick, children, color, style: sx }) {
+  return (
+    <button onClick={onClick} style={{
+      ...sans, fontSize:11, padding:"5px 14px", borderRadius:6,
+      background:C.dim, border:`1px solid ${color||C.border}`,
+      color: color||C.muted, cursor:"pointer", ...sx,
+    }}>{children}</button>
+  );
+}
+
+function Card({ children, style: sx }) {
+  return (
+    <div style={{ background:C.card, border:`1px solid ${C.border}`, borderRadius:10, padding:"16px 18px", ...sx }}>
+      {children}
+    </div>
+  );
+}
+
+function SectionTitle({ children }) {
+  return (
+    <div style={{ ...sans, fontSize:10, textTransform:"uppercase", letterSpacing:2, color:C.muted, marginBottom:12 }}>
+      {children}
+    </div>
+  );
+}
+
+function Spinner() {
+  return <span className="spin" style={{ fontSize:18, color:C.accent }}>⟳</span>;
+}
+
+function StatusPill({ connected, error }) {
+  const col = connected ? C.bull : C.bear;
+  const label = connected ? "IBKR LIVE" : error ? "DISCONNECTED" : "CONNECTING…";
+  return (
+    <div style={{
+      display:"inline-flex", alignItems:"center", gap:6,
+      padding:"4px 10px", borderRadius:20, border:`1px solid ${col}33`, background:`${col}0e`,
+    }}>
+      <div style={{ width:7, height:7, borderRadius:"50%", background:col,
+        animation: connected ? "blink 2s infinite" : "none" }} />
+      <span style={{ ...mono, fontSize:10, color:col, letterSpacing:1 }}>{label}</span>
+    </div>
+  );
+}
+
+// ── Signals Tab components ─────────────────────────────────────────────────
 function CandleChart({ bars, signal }) {
   if (!bars || bars.length < 5) return (
-    <div style={{ height: 180, display:"flex", alignItems:"center", justifyContent:"center", color: C.muted, fontSize: 12 }}>
+    <div style={{ height:180, display:"flex", alignItems:"center", justifyContent:"center", color:C.muted, fontSize:12 }}>
       Waiting for bars…
     </div>
   );
-
-  const W = 580, H = 180, padL = 10, padR = 50, padT = 10, padB = 22;
+  const W=580, H=180, padL=10, padR=50, padT=10, padB=22;
   const visible = bars.slice(-60);
   const prices = visible.flatMap(c => [+c.high, +c.low]);
   const minP = Math.min(...prices), maxP = Math.max(...prices);
@@ -61,33 +131,24 @@ function CandleChart({ bars, signal }) {
   const sy = p => padT + ((maxP - p) / rng) * (H - padT - padB);
   const cw = (W - padL - padR) / visible.length;
   const bw = Math.max(2, cw * 0.65);
-
-  // price labels
-  const priceLabels = [minP, (minP+maxP)/2, maxP].map(p => ({
-    y: sy(p), val: p.toFixed(2)
-  }));
-
-  // x-axis times: show every ~10 bars
-  const timeLabels = visible.filter((_,i) => i % Math.ceil(visible.length/6) === 0).map((b,_,arr) => {
-    const idx = visible.indexOf(b);
-    const x = padL + idx * cw + cw/2;
-    const t = new Date(b.time);
-    const label = `${t.getMonth()+1}/${t.getDate()} ${t.getHours()}:${String(t.getMinutes()).padStart(2,'0')}`;
-    return { x, label };
-  });
-
+  const priceLabels = [minP, (minP+maxP)/2, maxP].map(p => ({ y:sy(p), val:p.toFixed(2) }));
+  const timeLabels = visible
+    .filter((_,i) => i % Math.ceil(visible.length/6) === 0)
+    .map(b => {
+      const idx = visible.indexOf(b);
+      const t = new Date(b.time);
+      return { x: padL + idx*cw + cw/2, label:`${t.getMonth()+1}/${t.getDate()} ${t.getHours()}:${String(t.getMinutes()).padStart(2,'0')}` };
+    });
   return (
-    <svg viewBox={`0 0 ${W} ${H}`} style={{ width:"100%", height: H }}>
+    <svg viewBox={`0 0 ${W} ${H}`} style={{ width:"100%", height:H }}>
       <rect width={W} height={H} fill={C.card} rx={6} />
-      {/* grid lines */}
       {priceLabels.map((pl,i) => (
         <g key={i}>
           <line x1={padL} y1={pl.y} x2={W-padR+4} y2={pl.y} stroke={C.border} strokeDasharray="3 3" />
           <text x={W-padR+8} y={pl.y+4} fill={C.muted} fontSize={9} style={mono}>{pl.val}</text>
         </g>
       ))}
-      {/* candles */}
-      {visible.map((c, i) => {
+      {visible.map((c,i) => {
         const x = padL + i * cw;
         const isUp = +c.close >= +c.open;
         const col = isUp ? C.bull : C.bear;
@@ -95,33 +156,29 @@ function CandleChart({ bars, signal }) {
         const bodyBot = sy(Math.min(+c.open, +c.close));
         const bh = Math.max(1.5, bodyBot - bodyTop);
         const cx = x + cw/2;
-        const isLast = i === visible.length - 1;
         return (
-          <g key={i} opacity={isLast ? 1 : 0.8}>
+          <g key={i} opacity={i===visible.length-1 ? 1 : 0.8}>
             <line x1={cx} y1={sy(+c.high)} x2={cx} y2={sy(+c.low)} stroke={col} strokeWidth={1} />
-            <rect x={x + (cw-bw)/2} y={bodyTop} width={bw} height={bh}
-              fill={col} rx={0.5}
-              style={isLast ? { filter:`drop-shadow(0 0 3px ${col})` } : {}} />
+            <rect x={x+(cw-bw)/2} y={bodyTop} width={bw} height={bh} fill={col} rx={0.5}
+              style={i===visible.length-1 ? {filter:`drop-shadow(0 0 3px ${col})`} : {}} />
           </g>
         );
       })}
-      {/* signal dot on last candle */}
       {signal && signal.label !== "HOLD" && visible.length > 0 && (() => {
-        const last = visible[visible.length - 1];
-        const cx = padL + (visible.length - 1) * cw + cw/2;
+        const last = visible[visible.length-1];
+        const cx = padL + (visible.length-1)*cw + cw/2;
         const isBuy = signal.label === "BUY";
-        const cy = isBuy ? sy(+last.low) + 10 : sy(+last.high) - 10;
+        const cy = isBuy ? sy(+last.low)+10 : sy(+last.high)-10;
         const col = isBuy ? C.bull : C.bear;
         return (
           <g>
-            <circle cx={cx} cy={cy} r={5} fill={col} style={{ filter:`drop-shadow(0 0 5px ${col})` }} />
+            <circle cx={cx} cy={cy} r={5} fill={col} style={{filter:`drop-shadow(0 0 5px ${col})`}} />
             <text x={cx} y={isBuy ? cy+16 : cy-8} fill={col} fontSize={8} textAnchor="middle" style={mono} fontWeight={700}>
               {signal.label}
             </text>
           </g>
         );
       })()}
-      {/* x-axis labels */}
       {timeLabels.map((tl,i) => (
         <text key={i} x={tl.x} y={H-4} fill={C.muted} fontSize={8} textAnchor="middle" style={sans}>{tl.label}</text>
       ))}
@@ -129,20 +186,25 @@ function CandleChart({ bars, signal }) {
   );
 }
 
-// ── Signal badge ──────────────────────────────────────────────────────────
-function SignalBadge({ label, prob, confidence }) {
+function SignalBadge({ label, prob, confidence, session }) {
   const col = label === "BUY" ? C.bull : label === "SELL" ? C.bear : C.neutral;
+  const sessColor = { PRE:C.accent, RTH:C.bull, POST:C.neutral, CLOSED:C.muted }[session] || C.muted;
   return (
     <div style={{
       display:"flex", flexDirection:"column", alignItems:"center",
       padding:"14px 32px", borderRadius:10, border:`2px solid ${col}`,
       background:`${col}0e`, boxShadow:`0 0 20px ${col}33`,
-      minWidth:160, animation:"pulse-ring 2s infinite",
+      minWidth:180, animation:"pulse-ring 2s infinite",
     }}>
       <span style={{ ...mono, fontSize:30, fontWeight:800, color:col, letterSpacing:3 }}>{label}</span>
-      <span style={{ ...sans, fontSize:11, color:C.muted, marginTop:5 }}>
+      <span style={{ ...sans, fontSize:11, color:C.muted, marginTop:4 }}>
         prob {(prob*100).toFixed(1)}% · conf {(confidence*100).toFixed(0)}%
       </span>
+      {session && (
+        <span style={{ ...mono, fontSize:10, color:sessColor, marginTop:4, letterSpacing:1 }}>
+          ● {session}
+        </span>
+      )}
       <div style={{ marginTop:8, width:"100%", height:4, background:C.border, borderRadius:2, overflow:"hidden" }}>
         <div style={{ width:`${prob*100}%`, height:"100%", background:col, transition:"width 0.5s ease" }} />
       </div>
@@ -150,45 +212,39 @@ function SignalBadge({ label, prob, confidence }) {
   );
 }
 
-// ── Stat card ─────────────────────────────────────────────────────────────
 function Stat({ label, value, color }) {
   return (
-    <div style={{
-      background:C.card, border:`1px solid ${C.border}`, borderRadius:8,
-      padding:"10px 14px", flex:"1 1 100px",
-    }}>
+    <div style={{ background:C.card, border:`1px solid ${C.border}`, borderRadius:8, padding:"10px 14px", flex:"1 1 100px" }}>
       <div style={{ ...sans, fontSize:10, color:C.muted, textTransform:"uppercase", letterSpacing:1, marginBottom:4 }}>{label}</div>
-      <div style={{ ...mono, fontSize:15, fontWeight:700, color: color || C.white }}>{value ?? "—"}</div>
+      <div style={{ ...mono, fontSize:15, fontWeight:700, color: color||C.white }}>{value ?? "—"}</div>
     </div>
   );
 }
 
-// ── Feature bar ───────────────────────────────────────────────────────────
 const FEAT_INFO = {
-  rsi:        { label:"RSI (14)",      desc:"Momentum oscillator — <30 oversold, >70 overbought" },
-  sma5:       { label:"SMA-5",         desc:"5-bar simple moving average" },
-  sma14:      { label:"SMA-14",        desc:"14-bar simple moving average" },
-  momentum:   { label:"Momentum",      desc:"(close − SMA14) / SMA14" },
-  vol_ratio:  { label:"Vol Ratio",     desc:"Current vs 14-bar avg volume" },
-  body_pct:   { label:"Body %",        desc:"Candle body / full range" },
-  upper_wick: { label:"Upper Wick",    desc:"Upper shadow / full range" },
-  lower_wick: { label:"Lower Wick",    desc:"Lower shadow / full range — buying pressure" },
-  volatility: { label:"Volatility",    desc:"14-bar return std deviation" },
+  rsi:{label:"RSI (14)",desc:"Momentum oscillator — <30 oversold, >70 overbought"},
+  sma5:{label:"SMA-5",desc:"5-bar simple moving average"},
+  sma14:{label:"SMA-14",desc:"14-bar simple moving average"},
+  momentum:{label:"Momentum",desc:"(close − SMA14) / SMA14"},
+  vol_ratio:{label:"Vol Ratio",desc:"Current vs 14-bar avg volume"},
+  body_pct:{label:"Body %",desc:"Candle body / full range"},
+  upper_wick:{label:"Upper Wick",desc:"Upper shadow / full range"},
+  lower_wick:{label:"Lower Wick",desc:"Lower shadow / full range"},
+  volatility:{label:"Volatility",desc:"14-bar return std deviation"},
 };
 
 function FeaturePanel({ features }) {
   if (!features) return null;
-  const entries = Object.entries(features);
   return (
     <div>
-      {entries.map(([k, v]) => {
-        const info = FEAT_INFO[k] || { label: k, desc: "" };
-        const norm = Math.min(1, Math.abs(+v) / (k === "rsi" ? 100 : k.includes("sma") ? Math.abs(+v)*2 : 1));
+      {Object.entries(features).map(([k,v]) => {
+        const info = FEAT_INFO[k] || { label:k, desc:"" };
+        const norm = Math.min(1, Math.abs(+v) / (k==="rsi" ? 100 : k.includes("sma") ? Math.abs(+v)*2 : 1));
         return (
           <div key={k} style={{ marginBottom:8 }}>
             <div style={{ display:"flex", justifyContent:"space-between", fontSize:11, marginBottom:3 }}>
               <span style={{ ...sans, color:C.text }}>{info.label}</span>
-              <span style={{ ...mono, color:C.accent }}>{typeof v === "number" ? v.toFixed(4) : v}</span>
+              <span style={{ ...mono, color:C.accent }}>{typeof v==="number" ? v.toFixed(4) : v}</span>
             </div>
             <div style={{ background:C.border, borderRadius:3, height:5 }}>
               <div style={{ width:`${norm*100}%`, height:"100%", background:`linear-gradient(90deg,${C.accent},${C.bull})`, transition:"width 0.6s" }} />
@@ -201,30 +257,30 @@ function FeaturePanel({ features }) {
   );
 }
 
-// ── Signal history table ──────────────────────────────────────────────────
 function HistoryTable({ history }) {
   if (!history.length) return <div style={{ color:C.muted, fontSize:12, padding:"12px 0" }}>No signals yet…</div>;
   return (
     <div style={{ overflowX:"auto" }}>
-      <table style={{ width:"100%", borderCollapse:"collapse", fontSize:12 }}>
+      <table style={{ fontSize:12 }}>
         <thead>
           <tr>
-            {["Time","Ticker","Close","Signal","Prob","Conf"].map(h => (
-              <th key={h} style={{ ...sans, textAlign:"left", padding:"5px 10px", color:C.muted, fontWeight:500, borderBottom:`1px solid ${C.border}` }}>{h}</th>
+            {["Time","Ticker","Close","Signal","Prob","Conf","Session"].map(h => (
+              <th key={h} style={{ ...sans, color:C.muted, fontWeight:500, borderBottom:`1px solid ${C.border}` }}>{h}</th>
             ))}
           </tr>
         </thead>
         <tbody>
-          {history.map((r, i) => {
-            const col = r.label === "BUY" ? C.bull : r.label === "SELL" ? C.bear : C.neutral;
+          {history.map((r,i) => {
+            const col = SIG_COLOR[r.label] || C.neutral;
             return (
-              <tr key={i} style={{ opacity: 1 - i*0.07, animation:"fadeIn 0.3s ease" }}>
-                <td style={{ ...mono, padding:"5px 10px", color:C.muted, fontSize:11 }}>{r.ts}</td>
-                <td style={{ ...mono, padding:"5px 10px", color:C.accent }}>{r.ticker}</td>
-                <td style={{ ...mono, padding:"5px 10px" }}>${r.close}</td>
-                <td style={{ ...mono, padding:"5px 10px", color:col, fontWeight:700 }}>{r.label}</td>
-                <td style={{ ...mono, padding:"5px 10px" }}>{(r.prob*100).toFixed(1)}%</td>
-                <td style={{ ...mono, padding:"5px 10px" }}>{(r.confidence*100).toFixed(0)}%</td>
+              <tr key={i} style={{ opacity: 1 - i*0.06, animation:"fadeIn 0.3s ease" }}>
+                <td style={{ ...mono, color:C.muted, fontSize:11 }}>{r.ts}</td>
+                <td style={{ ...mono, color:C.accent }}>{r.ticker}</td>
+                <td style={{ ...mono }}>${r.close}</td>
+                <td style={{ ...mono, color:col, fontWeight:700 }}>{r.label}</td>
+                <td style={{ ...mono }}>{(r.prob*100).toFixed(1)}%</td>
+                <td style={{ ...mono }}>{(r.confidence*100).toFixed(0)}%</td>
+                <td style={{ ...mono, color:C.muted, fontSize:10 }}>{r.session||"—"}</td>
               </tr>
             );
           })}
@@ -234,27 +290,333 @@ function HistoryTable({ history }) {
   );
 }
 
-// ── Status pill ───────────────────────────────────────────────────────────
-function StatusPill({ connected, error }) {
-  const col = connected ? C.bull : C.bear;
-  const label = connected ? "IBKR LIVE" : error ? "DISCONNECTED" : "CONNECTING…";
+// ── CSP Scan Tab ──────────────────────────────────────────────────────────
+function CSPTab({ connected }) {
+  const [loading, setLoading]     = useState(false);
+  const [result, setResult]       = useState(null);
+  const [error, setError]         = useState(null);
+  const [minReturn, setMinReturn] = useState(4.0);
+  const [maxDelta, setMaxDelta]   = useState(0.20);
+  const [selected, setSelected]   = useState(null);
+  const [quote, setQuote]         = useState(null);
+  const [quoteLoading, setQL]     = useState(false);
+
+  const runScan = async (refresh=false) => {
+    setLoading(true); setError(null); setSelected(null); setQuote(null);
+    try {
+      const data = await apiFetch(
+        `/csp/scan?min_return=${minReturn}&max_delta=${maxDelta}&refresh=${refresh}`
+      );
+      setResult(data);
+    } catch(e) { setError(e.message); }
+    setLoading(false);
+  };
+
+  const fetchQuote = async (row) => {
+    setSelected(row); setQuote(null); setQL(true);
+    try {
+      const q = await apiFetch(
+        `/options/quote/${row.ticker}/${row.expiry}/${row.strike}/P`
+      );
+      setQuote(q);
+    } catch(e) { setQuote({ error: e.message }); }
+    setQL(false);
+  };
+
+  const cols = [
+    { key:"score",             label:"Score",      render: r => <b style={{color:C.accent}}>{r.score}</b> },
+    { key:"ticker",            label:"Ticker",     render: r => <span style={{...mono,color:C.accent,fontWeight:700}}>{r.ticker}</span> },
+    { key:"expiry",            label:"Expiry",     render: r => r.expiry },
+    { key:"strike",            label:"Strike",     render: r => fmt$(r.strike) },
+    { key:"stock_price",       label:"Stock $",    render: r => fmt$(r.stock_price) },
+    { key:"otm_pct",           label:"OTM %",      render: r => <span style={{color:C.neutral}}>{fmtP(r.otm_pct)}</span> },
+    { key:"sigma_otm",         label:"σ OTM",      render: r => <span style={{color: r.sigma_otm>=2?C.bull:r.sigma_otm>=1?C.neutral:C.bear}}>{fmtN(r.sigma_otm,1)}σ</span> },
+    { key:"weekly_return_pct", label:"Wkly %",     render: r => <b style={{color:C.bull}}>{fmtP(r.weekly_return_pct)}</b> },
+    { key:"annualized_return", label:"Ann. %",     render: r => <span style={{color:C.bull}}>{fmtP(r.annualized_return)}</span> },
+    { key:"delta",             label:"Delta",      render: r => fmtN(r.delta,3) },
+    { key:"iv_pct",            label:"IV %",       render: r => fmtP(r.iv_pct) },
+    { key:"assignment_risk",   label:"Risk",       render: r => <Pill color={RISK_COLOR[r.assignment_risk]||C.orange}>{r.assignment_risk}</Pill> },
+    { key:"cash_required",     label:"Cash Req",   render: r => fmt$(r.cash_required) },
+    { key:"premium_collected", label:"Premium",    render: r => <b style={{color:C.bull}}>{fmt$(r.premium_collected)}</b> },
+    { key:"xgb_signal",        label:"XGB",        render: r => <Pill color={SIG_COLOR[r.xgb_signal]||C.muted}>{r.xgb_signal}</Pill> },
+    { key:"open_interest",     label:"OI",         render: r => r.open_interest?.toLocaleString() },
+  ];
+
   return (
-    <div style={{
-      display:"inline-flex", alignItems:"center", gap:6,
-      padding:"4px 10px", borderRadius:20, border:`1px solid ${col}33`,
-      background:`${col}0e`,
-    }}>
-      <div style={{
-        width:7, height:7, borderRadius:"50%", background:col,
-        animation: connected ? "blink 2s infinite" : "none",
-      }} />
-      <span style={{ ...mono, fontSize:10, color:col, letterSpacing:1 }}>{label}</span>
+    <div>
+      {/* Controls */}
+      <Card style={{ marginBottom:14 }}>
+        <SectionTitle>CSP Scanner — 4% Weekly Income Strategy</SectionTitle>
+        <div style={{ display:"flex", gap:12, flexWrap:"wrap", alignItems:"flex-end" }}>
+          <div>
+            <div style={{ ...sans, fontSize:11, color:C.muted, marginBottom:4 }}>Min Weekly Return %</div>
+            <input type="number" step="0.5" value={minReturn}
+              onChange={e=>setMinReturn(+e.target.value)}
+              style={{ ...mono, fontSize:13, width:90, padding:"5px 8px", background:C.dim, border:`1px solid ${C.border}`, color:C.white, borderRadius:5, outline:"none" }} />
+          </div>
+          <div>
+            <div style={{ ...sans, fontSize:11, color:C.muted, marginBottom:4 }}>Max |Delta|</div>
+            <input type="number" step="0.01" min="0.05" max="0.30" value={maxDelta}
+              onChange={e=>setMaxDelta(+e.target.value)}
+              style={{ ...mono, fontSize:13, width:90, padding:"5px 8px", background:C.dim, border:`1px solid ${C.border}`, color:C.white, borderRadius:5, outline:"none" }} />
+          </div>
+          <Btn onClick={() => runScan(false)} color={C.accent} style={{ padding:"7px 20px", fontSize:12 }}>
+            {loading ? <Spinner /> : "▶ Scan"}
+          </Btn>
+          {result && (
+            <Btn onClick={() => runScan(true)} color={C.muted}>
+              ↻ Force Refresh
+            </Btn>
+          )}
+        </div>
+        {error && <div style={{ ...sans, fontSize:12, color:C.bear, marginTop:10 }}>⚠ {error}</div>}
+        {result && !loading && (
+          <div style={{ ...sans, fontSize:11, color:C.muted, marginTop:10 }}>
+            {result.cached ? `Cached result (${result.age_seconds}s ago)` : `Scanned at ${new Date(result.scanned_at).toLocaleTimeString()}`}
+            · {result.count} candidates found
+          </div>
+        )}
+      </Card>
+
+      {/* Loading state */}
+      {loading && (
+        <Card style={{ textAlign:"center", padding:"40px 0" }}>
+          <Spinner />
+          <div style={{ ...sans, color:C.muted, fontSize:13, marginTop:12 }}>
+            Scanning {19} stocks for CSP opportunities…
+            <br /><span style={{ fontSize:11 }}>Requesting live option chains + Greeks from IBKR</span>
+          </div>
+        </Card>
+      )}
+
+      {/* Results table */}
+      {!loading && result?.candidates?.length > 0 && (
+        <Card style={{ padding:0, overflow:"hidden" }}>
+          <div style={{ overflowX:"auto" }}>
+            <table style={{ fontSize:12 }}>
+              <thead>
+                <tr style={{ background:`${C.surface}` }}>
+                  {cols.map(c => (
+                    <th key={c.key} style={{ ...sans, color:C.muted, fontWeight:600, borderBottom:`1px solid ${C.border}`, fontSize:11 }}>
+                      {c.label}
+                    </th>
+                  ))}
+                  <th style={{ ...sans, color:C.muted, fontWeight:600, borderBottom:`1px solid ${C.border}`, fontSize:11 }}>Quote</th>
+                </tr>
+              </thead>
+              <tbody>
+                {result.candidates.map((r,i) => (
+                  <tr key={i} style={{
+                    borderBottom:`1px solid ${C.border}33`,
+                    background: selected?.ticker===r.ticker && selected?.strike===r.strike ? `${C.accent}0a` : "transparent",
+                  }}>
+                    {cols.map(c => <td key={c.key} style={{ ...mono, fontSize:12 }}>{c.render(r)}</td>)}
+                    <td>
+                      <Btn onClick={() => fetchQuote(r)} color={C.accent} style={{ padding:"3px 10px", fontSize:10 }}>
+                        Live Quote
+                      </Btn>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </Card>
+      )}
+
+      {!loading && result?.candidates?.length === 0 && (
+        <Card style={{ textAlign:"center", padding:"30px 0", color:C.muted, fontSize:13 }}>
+          No CSP candidates met the criteria. Try lowering min return or widening delta.
+        </Card>
+      )}
+
+      {/* Live quote panel */}
+      {selected && (
+        <Card style={{ marginTop:14 }}>
+          <SectionTitle>
+            Live Quote — {selected.ticker} {selected.expiry} ${selected.strike} PUT
+          </SectionTitle>
+          {quoteLoading && <div style={{ textAlign:"center", padding:"20px 0" }}><Spinner /></div>}
+          {quote && !quote.error && (
+            <div style={{ display:"flex", gap:12, flexWrap:"wrap" }}>
+              {[
+                ["Bid",    fmt$(quote.bid)],
+                ["Ask",    fmt$(quote.ask)],
+                ["Mid",    fmt$(quote.mid),       C.bull],
+                ["Stock",  fmt$(quote.stock_price)],
+                ["Delta",  fmtN(quote.delta,4)],
+                ["Gamma",  fmtN(quote.gamma,5)],
+                ["Theta",  fmtN(quote.theta,4),   C.bear],
+                ["Vega",   fmtN(quote.vega,4)],
+                ["IV %",   quote.iv_pct != null ? fmtP(quote.iv_pct) : "—"],
+                ["OI",     quote.open_interest?.toLocaleString()],
+                ["Vol",    quote.volume?.toLocaleString()],
+                ["As Of",  new Date(quote.timestamp).toLocaleTimeString()],
+              ].map(([l,v,c]) => <Stat key={l} label={l} value={v} color={c} />)}
+            </div>
+          )}
+          {quote?.error && <div style={{ color:C.bear, fontSize:12 }}>⚠ {quote.error}</div>}
+        </Card>
+      )}
     </div>
   );
 }
 
-// ── Main App ──────────────────────────────────────────────────────────────
-function App() {
+// ── LEAP Scan Tab ─────────────────────────────────────────────────────────
+function LEAPTab({ connected }) {
+  const [loading, setLoading] = useState(false);
+  const [result, setResult]   = useState(null);
+  const [error, setError]     = useState(null);
+  const [selected, setSelected] = useState(null);
+  const [quote, setQuote]     = useState(null);
+  const [quoteLoading, setQL] = useState(false);
+
+  const runScan = async (refresh=false) => {
+    setLoading(true); setError(null); setSelected(null); setQuote(null);
+    try {
+      const data = await apiFetch(`/leaps/scan?refresh=${refresh}`);
+      setResult(data);
+    } catch(e) { setError(e.message); }
+    setLoading(false);
+  };
+
+  const fetchQuote = async (row) => {
+    setSelected(row); setQuote(null); setQL(true);
+    try {
+      const q = await apiFetch(
+        `/options/quote/${row.ticker}/${row.expiry}/${row.strike}/C`
+      );
+      setQuote(q);
+    } catch(e) { setQuote({ error: e.message }); }
+    setQL(false);
+  };
+
+  const cols = [
+    { key:"score",            label:"Score",     render:r=><b style={{color:C.accent}}>{r.score}</b> },
+    { key:"ticker",           label:"Ticker",    render:r=><span style={{...mono,color:C.accent,fontWeight:700}}>{r.ticker}</span> },
+    { key:"xgb_signal",       label:"XGB",       render:r=><Pill color={SIG_COLOR[r.xgb_signal]||C.muted}>{r.xgb_signal}</Pill> },
+    { key:"stock_quality",    label:"Quality",   render:r=><span style={{color: r.stock_quality>=0.7?C.bull:r.stock_quality>=0.4?C.neutral:C.bear}}>{(r.stock_quality*100).toFixed(0)}%</span> },
+    { key:"expiry",           label:"Expiry",    render:r=>r.expiry },
+    { key:"dte",              label:"DTE",       render:r=><span style={{color:C.muted}}>{r.dte}d</span> },
+    { key:"strike",           label:"Strike",    render:r=>fmt$(r.strike) },
+    { key:"stock_price",      label:"Stock $",   render:r=>fmt$(r.stock_price) },
+    { key:"itm_otm_pct",      label:"ITM/OTM",   render:r=>{
+      const c = r.itm_otm_pct>0?C.bull:C.bear;
+      return <span style={{color:c}}>{r.itm_otm_pct>0?"+":""}{fmtP(r.itm_otm_pct)}</span>;
+    }},
+    { key:"delta",            label:"Delta",     render:r=>fmtN(r.delta,3) },
+    { key:"iv_pct",           label:"IV %",      render:r=>fmtP(r.iv_pct) },
+    { key:"mid",              label:"Mid",       render:r=>fmt$(r.mid) },
+    { key:"cost_per_contract",label:"Cost/Cont", render:r=><b style={{color:C.neutral}}>{fmt$(r.cost_per_contract)}</b> },
+    { key:"breakeven",        label:"B/E Price", render:r=>fmt$(r.breakeven) },
+    { key:"breakeven_move_pct",label:"B/E Move", render:r=><span style={{color:C.bear}}>{fmtP(r.breakeven_move_pct)}</span> },
+    { key:"theta_daily",      label:"Θ/day",     render:r=><span style={{color:C.bear}}>{fmtN(r.theta_daily,4)}</span> },
+  ];
+
+  return (
+    <div>
+      <Card style={{ marginBottom:14 }}>
+        <SectionTitle>LEAP Call Scanner — Long-Term Directional Plays</SectionTitle>
+        <div style={{ display:"flex", gap:10, alignItems:"center", flexWrap:"wrap" }}>
+          <Btn onClick={() => runScan(false)} color={C.bull} style={{ padding:"7px 20px", fontSize:12 }}>
+            {loading ? <Spinner /> : "▶ Scan LEAPs"}
+          </Btn>
+          {result && <Btn onClick={() => runScan(true)} color={C.muted}>↻ Force Refresh</Btn>}
+          <span style={{ ...sans, fontSize:11, color:C.muted }}>
+            6–18 month calls · delta 0.45–0.75 · IV ≤ 70% · BUY/HOLD stocks only
+          </span>
+        </div>
+        {error && <div style={{ ...sans, fontSize:12, color:C.bear, marginTop:10 }}>⚠ {error}</div>}
+        {result && !loading && (
+          <div style={{ ...sans, fontSize:11, color:C.muted, marginTop:10 }}>
+            {result.cached ? `Cached (${result.age_seconds}s ago)` : `Scanned ${new Date(result.scanned_at).toLocaleTimeString()}`}
+            · {result.count} candidates
+          </div>
+        )}
+      </Card>
+
+      {loading && (
+        <Card style={{ textAlign:"center", padding:"40px 0" }}>
+          <Spinner />
+          <div style={{ ...sans, color:C.muted, fontSize:13, marginTop:12 }}>
+            Scanning for LEAP call opportunities…
+            <br /><span style={{ fontSize:11 }}>Filtering to uptrending stocks and fetching 6–18 month chains</span>
+          </div>
+        </Card>
+      )}
+
+      {!loading && result?.candidates?.length > 0 && (
+        <Card style={{ padding:0, overflow:"hidden" }}>
+          <div style={{ overflowX:"auto" }}>
+            <table style={{ fontSize:12 }}>
+              <thead>
+                <tr style={{ background:C.surface }}>
+                  {cols.map(c => (
+                    <th key={c.key} style={{ ...sans, color:C.muted, fontWeight:600, borderBottom:`1px solid ${C.border}`, fontSize:11 }}>
+                      {c.label}
+                    </th>
+                  ))}
+                  <th style={{ ...sans, color:C.muted, fontWeight:600, borderBottom:`1px solid ${C.border}`, fontSize:11 }}>Quote</th>
+                </tr>
+              </thead>
+              <tbody>
+                {result.candidates.map((r,i) => (
+                  <tr key={i} style={{
+                    borderBottom:`1px solid ${C.border}33`,
+                    background: selected?.ticker===r.ticker && selected?.strike===r.strike ? `${C.bull}0a` : "transparent",
+                  }}>
+                    {cols.map(c => <td key={c.key} style={{ ...mono, fontSize:12 }}>{c.render(r)}</td>)}
+                    <td>
+                      <Btn onClick={() => fetchQuote(r)} color={C.bull} style={{ padding:"3px 10px", fontSize:10 }}>
+                        Live Quote
+                      </Btn>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </Card>
+      )}
+
+      {!loading && result?.candidates?.length === 0 && (
+        <Card style={{ textAlign:"center", padding:"30px 0", color:C.muted, fontSize:13 }}>
+          No LEAP candidates found — market may be closed or no tickers pass quality filter.
+        </Card>
+      )}
+
+      {selected && (
+        <Card style={{ marginTop:14 }}>
+          <SectionTitle>
+            Live Quote — {selected.ticker} {selected.expiry} ${selected.strike} CALL
+          </SectionTitle>
+          {quoteLoading && <div style={{ textAlign:"center", padding:"20px 0" }}><Spinner /></div>}
+          {quote && !quote.error && (
+            <div style={{ display:"flex", gap:12, flexWrap:"wrap" }}>
+              {[
+                ["Bid",   fmt$(quote.bid)],
+                ["Ask",   fmt$(quote.ask)],
+                ["Mid",   fmt$(quote.mid),       C.bull],
+                ["Stock", fmt$(quote.stock_price)],
+                ["Delta", fmtN(quote.delta,4)],
+                ["Gamma", fmtN(quote.gamma,5)],
+                ["Theta", fmtN(quote.theta,4),   C.bear],
+                ["Vega",  fmtN(quote.vega,4),    C.accent],
+                ["IV %",  quote.iv_pct!=null ? fmtP(quote.iv_pct) : "—"],
+                ["OI",    quote.open_interest?.toLocaleString()],
+                ["As Of", new Date(quote.timestamp).toLocaleTimeString()],
+              ].map(([l,v,c]) => <Stat key={l} label={l} value={v} color={c} />)}
+            </div>
+          )}
+          {quote?.error && <div style={{ color:C.bear, fontSize:12 }}>⚠ {quote.error}</div>}
+        </Card>
+      )}
+    </div>
+  );
+}
+
+// ── Signals Tab ───────────────────────────────────────────────────────────
+function SignalsTab({ connected }) {
   const [status, setStatus]       = useState({ connected:false, error:null, model_accuracy:null });
   const [tickers]                  = useState(["AAPL","MSFT","NVDA","SPY"]);
   const [activeTicker, setActive]  = useState("AAPL");
@@ -263,68 +625,48 @@ function App() {
   const [history, setHistory]      = useState([]);
   const [newTicker, setNewTicker]  = useState("");
   const [customTickers, setCustom] = useState([]);
-  const prevSignalRef              = useRef({});
-
-  const allTickers = [...tickers, ...customTickers];
+  const prevSigRef                 = useRef({});
+  const allTickers                 = [...tickers, ...customTickers];
 
   const refresh = useCallback(async () => {
     try {
-      const [st, sigs] = await Promise.all([
-        apiFetch("/status"),
-        apiFetch("/signals"),
-      ]);
+      const [st, sigs] = await Promise.all([apiFetch("/status"), apiFetch("/signals")]);
       setStatus(st);
       setSignals(sigs);
-
-      // fetch bars for active ticker
       try {
         const b = await apiFetch(`/bars/${activeTicker}?limit=80`);
         setBars(prev => ({ ...prev, [activeTicker]: b }));
-      } catch (_) {}
-
-      // add new signals to history
+      } catch(_) {}
       Object.entries(sigs).forEach(([ticker, sig]) => {
-        const prev = prevSignalRef.current[ticker];
+        const prev = prevSigRef.current[ticker];
         if (!prev || prev.timestamp !== sig.timestamp) {
-          setHistory(h => [{
-            ts: new Date(sig.timestamp).toLocaleTimeString(),
-            ticker, ...sig
-          }, ...h].slice(0, 50));
+          setHistory(h => [{ ts:new Date(sig.timestamp).toLocaleTimeString(), ticker, ...sig }, ...h].slice(0,50));
         }
       });
-      prevSignalRef.current = sigs;
-
-    } catch (e) {
-      setStatus(s => ({ ...s, connected:false, error: e.message }));
+      prevSigRef.current = sigs;
+    } catch(e) {
+      setStatus(s => ({ ...s, connected:false, error:e.message }));
     }
   }, [activeTicker]);
 
-  useEffect(() => {
-    refresh();
-    const iv = setInterval(refresh, 15000);
-    return () => clearInterval(iv);
-  }, [refresh]);
+  useEffect(() => { refresh(); const iv = setInterval(refresh,15000); return ()=>clearInterval(iv); }, [refresh]);
 
   const addTicker = async () => {
     const t = newTicker.trim().toUpperCase();
     if (!t || allTickers.includes(t)) return;
     try {
-      await fetch(`${API}/add_ticker`, {
-        method:"POST", headers:{"Content-Type":"application/json"},
-        body: JSON.stringify({ ticker: t })
-      });
+      await fetch(`${API}/add_ticker`, { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({ticker:t}) });
       setCustom(c => [...c, t]);
       setNewTicker("");
       setActive(t);
-    } catch(e) { alert("Error adding ticker: " + e.message); }
+    } catch(e) { alert("Error: " + e.message); }
   };
 
   const retrain = async () => {
     try {
-      const r = await fetch(`${API}/retrain/${activeTicker}`, { method:"POST" });
-      const d = await r.json();
+      const d = await apiFetch(`/retrain/${activeTicker}`, { method:"POST" });
       alert(`Retrained on ${activeTicker}  accuracy=${(d.accuracy*100).toFixed(1)}%`);
-      setStatus(s => ({ ...s, model_accuracy: d.accuracy }));
+      setStatus(s => ({ ...s, model_accuracy:d.accuracy }));
     } catch(e) { alert("Retrain failed: " + e.message); }
   };
 
@@ -332,135 +674,156 @@ function App() {
   const activeBars = bars[activeTicker];
 
   return (
+    <div>
+      {/* Status bar */}
+      <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", flexWrap:"wrap", gap:8, marginBottom:14 }}>
+        <StatusPill connected={status.connected} error={status.error} />
+        <div style={{ display:"flex", gap:12, alignItems:"center" }}>
+          {status.model_accuracy && (
+            <span style={{ ...mono, fontSize:10, color:C.muted }}>
+              model acc {(status.model_accuracy*100).toFixed(1)}%
+            </span>
+          )}
+          {status.error && <span style={{ ...sans, fontSize:10, color:C.bear }}>{status.error}</span>}
+        </div>
+      </div>
+
+      {/* Ticker tabs */}
+      <div style={{ display:"flex", gap:6, flexWrap:"wrap", marginBottom:14, alignItems:"center" }}>
+        {allTickers.map(t => (
+          <button key={t} onClick={() => setActive(t)} style={{
+            ...mono, fontSize:12, padding:"6px 14px", borderRadius:6, cursor:"pointer",
+            background: activeTicker===t ? C.accent : C.card,
+            color: activeTicker===t ? C.bg : C.muted,
+            border:`1px solid ${activeTicker===t ? C.accent : C.border}`,
+            fontWeight: activeTicker===t ? 700 : 400, transition:"all 0.15s",
+          }}>{t}</button>
+        ))}
+        <div style={{ display:"flex", gap:6, marginLeft:4 }}>
+          <input value={newTicker} onChange={e=>setNewTicker(e.target.value.toUpperCase())}
+            onKeyDown={e=>e.key==="Enter"&&addTicker()} placeholder="+ Ticker"
+            style={{ ...mono, fontSize:12, padding:"6px 10px", borderRadius:6, width:90,
+              background:C.card, border:`1px solid ${C.border}`, color:C.white, outline:"none" }} />
+          <Btn onClick={addTicker}>Add</Btn>
+        </div>
+      </div>
+
+      {/* Chart */}
+      <Card style={{ marginBottom:14 }}>
+        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:10 }}>
+          <span style={{ ...mono, fontSize:12, color:C.accent }}>{activeTicker} · 5-min bars</span>
+          <div style={{ display:"flex", gap:8 }}>
+            <Btn onClick={refresh}>↻ Refresh</Btn>
+            <Btn onClick={retrain} color={C.neutral}>Retrain</Btn>
+          </div>
+        </div>
+        <CandleChart bars={activeBars} signal={activeSig} />
+      </Card>
+
+      {/* Stats */}
+      {activeSig && (
+        <div style={{ display:"flex", gap:10, flexWrap:"wrap", marginBottom:14 }}>
+          <Stat label="Last Close" value={`$${activeSig.close}`} />
+          <Stat label="RSI (14)"   value={activeSig.features?.rsi?.toFixed(2)}
+            color={activeSig.features?.rsi<30?C.bull:activeSig.features?.rsi>70?C.bear:C.white} />
+          <Stat label="Momentum"   value={`${((activeSig.features?.momentum||0)*100).toFixed(2)}%`}
+            color={(activeSig.features?.momentum||0)>0?C.bull:C.bear} />
+          <Stat label="Vol Ratio"  value={activeSig.features?.vol_ratio?.toFixed(2)} />
+          <Stat label="Volatility" value={`${((activeSig.features?.volatility||0)*100).toFixed(3)}%`} />
+          <Stat label="Session"    value={activeSig.session||"—"} color={
+            {PRE:C.accent,RTH:C.bull,POST:C.neutral,CLOSED:C.muted}[activeSig.session]||C.muted
+          } />
+        </div>
+      )}
+
+      {/* Signal + features */}
+      <div style={{ display:"flex", gap:14, flexWrap:"wrap", marginBottom:14 }}>
+        <Card style={{ flex:"0 0 auto", display:"flex", flexDirection:"column", alignItems:"center", gap:14, minWidth:200 }}>
+          <SectionTitle>Model Signal</SectionTitle>
+          {activeSig
+            ? <SignalBadge {...activeSig} />
+            : <div style={{ color:C.muted, fontSize:12 }}>No signal yet</div>}
+        </Card>
+        <Card style={{ flex:1, minWidth:240 }}>
+          <SectionTitle>Feature Values</SectionTitle>
+          <FeaturePanel features={activeSig?.features} />
+        </Card>
+      </div>
+
+      {/* History */}
+      <Card>
+        <SectionTitle>Signal History</SectionTitle>
+        <HistoryTable history={history} />
+      </Card>
+    </div>
+  );
+}
+
+// ── Root App ──────────────────────────────────────────────────────────────
+function App() {
+  const [tab, setTab]         = useState("signals");
+  const [connected, setConn]  = useState(false);
+
+  // Poll connection status at top level for header
+  useEffect(() => {
+    const check = async () => {
+      try { const s = await apiFetch("/status"); setConn(s.connected); } catch(_) { setConn(false); }
+    };
+    check();
+    const iv = setInterval(check, 10000);
+    return () => clearInterval(iv);
+  }, []);
+
+  const tabs = [
+    { id:"signals", label:"📊 Signals"  },
+    { id:"csp",     label:"💰 CSP Scan" },
+    { id:"leaps",   label:"🚀 LEAPs"    },
+  ];
+
+  return (
     <div style={{ minHeight:"100vh", background:C.bg, padding:"20px 16px" }}>
-      <div style={{ maxWidth:900, margin:"0 auto" }}>
+      <div style={{ maxWidth:1100, margin:"0 auto" }}>
 
         {/* Header */}
         <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", flexWrap:"wrap", gap:10, marginBottom:20 }}>
           <div>
             <div style={{ ...mono, fontSize:10, color:C.accent, letterSpacing:3, textTransform:"uppercase", marginBottom:4 }}>
-              XGBoost · IBKR Live
+              XGBoost · IBKR Live · v3
             </div>
             <h1 style={{ ...sans, fontSize:20, fontWeight:800, color:C.white, letterSpacing:-0.5 }}>
-              Day Trading Signal Engine
+              Day Trading + Options Strategy Engine
             </h1>
           </div>
-          <div style={{ display:"flex", flexDirection:"column", alignItems:"flex-end", gap:6 }}>
-            <StatusPill connected={status.connected} error={status.error} />
-            {status.model_accuracy && (
-              <span style={{ ...mono, fontSize:10, color:C.muted }}>
-                model acc {(status.model_accuracy*100).toFixed(1)}%
-              </span>
-            )}
-            {status.error && (
-              <span style={{ ...sans, fontSize:10, color:C.bear }}>{status.error}</span>
-            )}
-          </div>
+          <StatusPill connected={connected} />
         </div>
 
-        {/* Ticker tabs */}
-        <div style={{ display:"flex", gap:6, flexWrap:"wrap", marginBottom:16, alignItems:"center" }}>
-          {allTickers.map(t => (
-            <button key={t} onClick={() => setActive(t)} style={{
-              ...mono, fontSize:12, padding:"6px 14px", borderRadius:6, cursor:"pointer",
-              background: activeTicker === t ? C.accent : C.card,
-              color: activeTicker === t ? C.bg : C.muted,
-              border: `1px solid ${activeTicker === t ? C.accent : C.border}`,
-              fontWeight: activeTicker === t ? 700 : 400,
-              transition:"all 0.15s",
-            }}>{t}</button>
+        {/* Nav tabs */}
+        <div style={{ display:"flex", gap:4, marginBottom:20, borderBottom:`1px solid ${C.border}`, paddingBottom:0 }}>
+          {tabs.map(t => (
+            <button key={t.id} onClick={() => setTab(t.id)} style={{
+              ...sans, fontSize:13, fontWeight:600, padding:"8px 20px", cursor:"pointer",
+              background:"transparent", border:"none",
+              color: tab===t.id ? C.accent : C.muted,
+              borderBottom: tab===t.id ? `2px solid ${C.accent}` : "2px solid transparent",
+              marginBottom:-1, transition:"all 0.15s",
+            }}>{t.label}</button>
           ))}
-          <div style={{ display:"flex", gap:6, marginLeft:4 }}>
-            <input value={newTicker} onChange={e=>setNewTicker(e.target.value.toUpperCase())}
-              onKeyDown={e=>e.key==="Enter" && addTicker()}
-              placeholder="+ Ticker"
-              style={{
-                ...mono, fontSize:12, padding:"6px 10px", borderRadius:6, width:90,
-                background:C.card, border:`1px solid ${C.border}`, color:C.white, outline:"none",
-              }} />
-            <button onClick={addTicker} style={{
-              ...sans, fontSize:12, padding:"6px 12px", borderRadius:6,
-              background:C.dim, border:`1px solid ${C.border}`, color:C.accent,
-              cursor:"pointer",
-            }}>Add</button>
-          </div>
         </div>
 
-        {/* Chart */}
-        <div style={{ background:C.card, border:`1px solid ${C.border}`, borderRadius:10, padding:16, marginBottom:16 }}>
-          <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:10 }}>
-            <span style={{ ...mono, fontSize:12, color:C.accent }}>{activeTicker} · {BAR_SIZE_LABEL}</span>
-            <div style={{ display:"flex", gap:8 }}>
-              <button onClick={refresh} style={{
-                ...sans, fontSize:11, padding:"4px 12px", borderRadius:5,
-                background:C.dim, border:`1px solid ${C.border}`, color:C.muted, cursor:"pointer",
-              }}>↻ Refresh</button>
-              <button onClick={retrain} style={{
-                ...sans, fontSize:11, padding:"4px 12px", borderRadius:5,
-                background:C.dim, border:`1px solid ${C.border}`, color:C.neutral, cursor:"pointer",
-              }}>Retrain</button>
-            </div>
-          </div>
-          <CandleChart bars={activeBars} signal={activeSig} />
+        {/* Tab content */}
+        {tab === "signals" && <SignalsTab connected={connected} />}
+        {tab === "csp"     && <CSPTab    connected={connected} />}
+        {tab === "leaps"   && <LEAPTab   connected={connected} />}
+
+        <div style={{ marginTop:20, ...sans, fontSize:11, color:C.muted, lineHeight:1.7 }}>
+          ⚠ Research / paper trading only. CSP scan requires market hours for live Greeks.
+          LEAP scanner pre-filters to BUY/HOLD stocks with positive momentum.
+          Auto-refresh every 15s on Signals tab; CSP/LEAP cached for 5 min.
         </div>
-
-        {/* Stats + Signal */}
-        {activeSig && (
-          <div style={{ display:"flex", gap:12, flexWrap:"wrap", marginBottom:16 }}>
-            <Stat label="Last Close"  value={`$${activeSig.close}`} />
-            <Stat label="RSI (14)"    value={activeSig.features?.rsi?.toFixed(2)} color={
-              activeSig.features?.rsi < 30 ? C.bull : activeSig.features?.rsi > 70 ? C.bear : C.white
-            } />
-            <Stat label="Momentum"    value={`${((activeSig.features?.momentum||0)*100).toFixed(2)}%`}
-              color={(activeSig.features?.momentum||0) > 0 ? C.bull : C.bear} />
-            <Stat label="Vol Ratio"   value={activeSig.features?.vol_ratio?.toFixed(2)} />
-            <Stat label="Volatility"  value={`${((activeSig.features?.volatility||0)*100).toFixed(3)}%`} />
-            <Stat label="Updated"     value={new Date(activeSig.timestamp).toLocaleTimeString()} />
-          </div>
-        )}
-
-        {/* Signal + Features */}
-        <div style={{ display:"flex", gap:14, flexWrap:"wrap", marginBottom:16 }}>
-          <div style={{
-            flex:"0 0 auto", background:C.card, border:`1px solid ${C.border}`,
-            borderRadius:10, padding:20, display:"flex", flexDirection:"column",
-            alignItems:"center", gap:16, minWidth:200,
-          }}>
-            <div style={{ ...sans, fontSize:10, textTransform:"uppercase", letterSpacing:2, color:C.muted }}>Model Signal</div>
-            {activeSig
-              ? <SignalBadge {...activeSig} />
-              : <div style={{ color:C.muted, fontSize:12 }}>No signal yet</div>
-            }
-          </div>
-          <div style={{ flex:1, minWidth:240, background:C.card, border:`1px solid ${C.border}`, borderRadius:10, padding:"16px 18px" }}>
-            <div style={{ ...sans, fontSize:10, textTransform:"uppercase", letterSpacing:2, color:C.muted, marginBottom:12 }}>
-              Feature Values
-            </div>
-            <FeaturePanel features={activeSig?.features} />
-          </div>
-        </div>
-
-        {/* History */}
-        <div style={{ background:C.card, border:`1px solid ${C.border}`, borderRadius:10, padding:"16px 18px" }}>
-          <div style={{ ...sans, fontSize:10, textTransform:"uppercase", letterSpacing:2, color:C.muted, marginBottom:12 }}>
-            Signal History
-          </div>
-          <HistoryTable history={history} />
-        </div>
-
-        {/* Footer note */}
-        <div style={{ marginTop:16, ...sans, fontSize:11, color:C.muted, lineHeight:1.7 }}>
-          ⚠ For paper trading / research only. Past signals do not guarantee future performance.
-          Model retrained on demand via the <span style={{ ...mono, color:C.accent }}>Retrain</span> button.
-          Auto-refreshes every 15s.
-        </div>
-
       </div>
     </div>
   );
 }
-
-const BAR_SIZE_LABEL = "5-min bars";
 
 ReactDOM.createRoot(document.getElementById("root")).render(<App />);
 </script>
