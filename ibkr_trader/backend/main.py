@@ -686,25 +686,34 @@ async def _live_option_quote(
     [td] = await ib.reqTickersAsync(contract)
     greeks = td.modelGreeks
 
+    # Validate we got usable data — IBKR error 354 leaves bid/ask as NaN
+    bid = td.bid if td.bid and not math.isnan(td.bid) else None
+    ask = td.ask if td.ask and not math.isnan(td.ask) else None
+    if bid is None and ask is None and greeks is None:
+        raise ValueError(
+            f"No market data for {ticker} {expiry} {strike} {right} — "
+            "option market data subscription may be required in TWS"
+        )
+
     stock = Stock(ticker, "SMART", "USD")
     await ib.qualifyContractsAsync(stock)
     [st] = await ib.reqTickersAsync(stock)
     stock_price = float(st.marketPrice() or st.close or 0)
 
     return {
-        "ticker":      ticker,
-        "expiry":      expiry,
-        "strike":      strike,
-        "right":       right.upper(),
-        "bid":         td.bid,
-        "ask":         td.ask,
-        "mid":         round((td.bid + td.ask) / 2, 4) if td.bid and td.ask else None,
-        "last":        td.last,
-        "volume":      td.volume,
-        "open_interest": td.openInterest,
-        "stock_price": round(stock_price, 2),
-        "delta":       greeks.delta       if greeks else None,
-        "gamma":       greeks.gamma       if greeks else None,
+        "ticker":        ticker,
+        "expiry":        expiry,
+        "strike":        strike,
+        "right":         right.upper(),
+        "bid":           bid,
+        "ask":           ask,
+        "mid":           round((bid + ask) / 2, 4) if bid and ask else None,
+        "last":          td.last if not math.isnan(td.last or float('nan')) else None,
+        "volume":        getattr(td, 'volume', None),
+        "open_interest": getattr(td, 'openInterest', None),
+        "stock_price":   round(stock_price, 2),
+        "delta":         greeks.delta       if greeks else None,
+        "gamma":         greeks.gamma       if greeks else None,
         "theta":       greeks.theta       if greeks else None,
         "vega":        greeks.vega        if greeks else None,
         "iv_pct":      round(greeks.impliedVol * 100, 2) if greeks and greeks.impliedVol else None,
@@ -838,7 +847,7 @@ async def csp_scan(
     _require_connection()
 
     cache = state["scan_cache"]
-    if not refresh and cache["csp"] and cache["ts"]:
+    if not refresh and cache["csp"] is not None and cache["ts"]:
         age = (datetime.utcnow() - cache["ts"]).total_seconds()
         if age < SCAN_CACHE_TTL:
             return {
@@ -897,7 +906,7 @@ async def leaps_scan(
     _require_connection()
 
     cache = state["scan_cache"]
-    if not refresh and cache["leaps"] and cache["ts"]:
+    if not refresh and cache["leaps"] is not None and cache["ts"]:
         age = (datetime.utcnow() - cache["ts"]).total_seconds()
         if age < SCAN_CACHE_TTL:
             return {
@@ -955,7 +964,10 @@ async def option_quote(
             ),
         )
     except ValueError as e:
-        raise HTTPException(404, str(e))
+        # Unqualifiable contract → 404; no market data → 503
+        msg = str(e)
+        code = 503 if "subscription" in msg else 404
+        raise HTTPException(code, msg)
     except (TimeoutError, RuntimeError) as e:
         raise HTTPException(503, str(e))
 
