@@ -386,15 +386,18 @@ def _score_csp(row: dict) -> float:
 
 
 async def _get_stock_price(ib: IB, ticker: str) -> float:
-    """Live price: use cached signal if fresh (< 60 s), else snapshot."""
+    """Live price: prefer streaming bar cache (always fresh), else IBKR snapshot."""
+    # Streaming bars are the freshest source — use them if available
+    bars = state["bars"].get(ticker)
+    if bars:
+        return float(bars[-1].close)
+
+    # Fallback: cached signal close (may be up to one bar old)
     sig = state["signals"].get(ticker)
     if sig:
-        age = (datetime.utcnow() - datetime.fromisoformat(
-            state["last_update"].get(ticker, "2000-01-01T00:00:00")
-        )).total_seconds()
-        if age < 60:
-            return float(sig["close"])
+        return float(sig["close"])
 
+    # Last resort: one-shot snapshot
     contract = Stock(ticker, "SMART", "USD")
     await ib.qualifyContractsAsync(contract)
     [t] = await ib.reqTickersAsync(contract)
@@ -424,123 +427,124 @@ async def scan_csp(
 ) -> List[dict]:
     """
     For every ticker in CSP_UNIVERSE:
-      1. Fetch current price (cached or snapshot)
+      1. Fetch current price (streaming cache, then snapshot)
       2. Get option chain structure
       3. Select put strikes 5–28 % OTM on the nearest weekly expiry
       4. Snapshot quotes + Greeks
       5. Filter: return ≥ min_return, |delta| ≤ max_delta, OI ≥ 50
       6. Score and return sorted list
+    All tickers run concurrently (up to 5 at a time) to minimise scan latency.
     """
-    candidates: List[dict] = []
     expiry0 = _next_expiry(0)   # This Friday
     expiry1 = _next_expiry(1)   # Next Friday (fallback)
+    sem = asyncio.Semaphore(5)  # Max 5 concurrent IBKR request streams
 
-    for ticker in CSP_UNIVERSE:
-        try:
-            stock_price = await _get_stock_price(ib, ticker)
-            if stock_price <= 0:
-                log.debug(f"CSP [{ticker}]: no price — skipping")
-                continue
+    async def _scan_ticker(ticker: str) -> List[dict]:
+        async with sem:
+            try:
+                stock_price = await _get_stock_price(ib, ticker)
+                if stock_price <= 0:
+                    log.debug(f"CSP [{ticker}]: no price — skipping")
+                    return []
 
-            stock = Stock(ticker, "SMART", "USD")
-            await ib.qualifyContractsAsync(stock)
+                stock = Stock(ticker, "SMART", "USD")
+                await ib.qualifyContractsAsync(stock)
 
-            chains = await ib.reqSecDefOptParamsAsync(ticker, "", "STK", stock.conId)
-            if not chains:
-                log.debug(f"CSP [{ticker}]: no option chain — skipping")
-                continue
+                chains = await ib.reqSecDefOptParamsAsync(ticker, "", "STK", stock.conId)
+                if not chains:
+                    log.debug(f"CSP [{ticker}]: no option chain — skipping")
+                    return []
 
-            # Prefer SMART exchange chain; fall back to first available
-            chain = next((c for c in chains if c.exchange == "SMART"), chains[0])
+                chain = next((c for c in chains if c.exchange == "SMART"), chains[0])
 
-            # Nearest available weekly expiry
-            expiry = expiry0 if expiry0 in chain.expirations else (
-                expiry1 if expiry1 in chain.expirations else None
-            )
-            if not expiry:
-                log.debug(f"CSP [{ticker}]: no weekly expiry available")
-                continue
+                expiry = expiry0 if expiry0 in chain.expirations else (
+                    expiry1 if expiry1 in chain.expirations else None
+                )
+                if not expiry:
+                    log.debug(f"CSP [{ticker}]: no weekly expiry available")
+                    return []
 
-            dte = (datetime.strptime(expiry, "%Y%m%d").date() - date.today()).days
+                dte = (datetime.strptime(expiry, "%Y%m%d").date() - date.today()).days
 
-            # Select put strikes: 5 %–28 % below current price (far-OTM safety zone)
-            put_strikes = sorted([
-                s for s in chain.strikes
-                if 0.72 * stock_price <= s <= 0.95 * stock_price
-            ], reverse=True)[:8]  # Max 8 strikes per ticker to respect rate limits
+                put_strikes = sorted([
+                    s for s in chain.strikes
+                    if 0.72 * stock_price <= s <= 0.95 * stock_price
+                ], reverse=True)[:8]
 
-            if not put_strikes:
-                continue
+                if not put_strikes:
+                    return []
 
-            contracts = [Option(ticker, expiry, s, "P", "SMART") for s in put_strikes]
-            tickers_data = await _option_quotes(ib, contracts)
+                contracts = [Option(ticker, expiry, s, "P", "SMART") for s in put_strikes]
+                tickers_data = await _option_quotes(ib, contracts)
 
-            for td in tickers_data:
-                bid = td.bid if (td.bid and td.bid > 0) else 0.0
-                ask = td.ask if (td.ask and td.ask > 0) else 0.0
-                if bid <= 0 or ask <= 0:
-                    continue
+                rows: List[dict] = []
+                for td in tickers_data:
+                    bid = td.bid if (td.bid and td.bid > 0) else 0.0
+                    ask = td.ask if (td.ask and td.ask > 0) else 0.0
+                    if bid <= 0 or ask <= 0:
+                        continue
 
-                mid = (bid + ask) / 2.0
-                greeks = td.modelGreeks
-                if not greeks or greeks.delta is None or greeks.impliedVol is None:
-                    continue
+                    mid = (bid + ask) / 2.0
+                    greeks = td.modelGreeks
+                    if not greeks or greeks.delta is None or greeks.impliedVol is None:
+                        continue
 
-                delta = greeks.delta          # negative for puts
-                iv    = greeks.impliedVol
-                theta = greeks.theta or 0.0
+                    delta = greeks.delta
+                    iv    = greeks.impliedVol
+                    theta = greeks.theta or 0.0
 
-                strike = td.contract.strike
-                otm_pct = (stock_price - strike) / stock_price * 100
-                weekly_return_pct = mid / strike * 100
-                spread_pct = (ask - bid) / mid * 100
-                oi  = td.openInterest or 0
-                vol = td.volume or 0
+                    strike = td.contract.strike
+                    otm_pct = (stock_price - strike) / stock_price * 100
+                    weekly_return_pct = mid / strike * 100
+                    spread_pct = (ask - bid) / mid * 100
+                    oi  = td.openInterest or 0
+                    vol = td.volume or 0
 
-                # Filter gates
-                if weekly_return_pct < min_return:    continue
-                if abs(delta) > max_delta:            continue
-                if oi < CSP_MIN_OI:                   continue
-                if spread_pct / 100 > CSP_MAX_SPREAD_PCT: continue
+                    if weekly_return_pct < min_return:        continue
+                    if abs(delta) > max_delta:                continue
+                    if oi < CSP_MIN_OI:                       continue
+                    if spread_pct / 100 > CSP_MAX_SPREAD_PCT: continue
 
-                # Expected 1-sigma weekly move: strike should be > 1 σ OTM
-                exp_move = _expected_weekly_move(stock_price, iv)
-                sigma_otm = (stock_price - strike) / exp_move if exp_move > 0 else 0
+                    exp_move = _expected_weekly_move(stock_price, iv)
+                    sigma_otm = (stock_price - strike) / exp_move if exp_move > 0 else 0
 
-                sq = _stock_quality_score(ticker)
-                row = {
-                    "ticker":             ticker,
-                    "expiry":             expiry,
-                    "dte":                dte,
-                    "strike":             strike,
-                    "stock_price":        round(stock_price, 2),
-                    "otm_pct":            round(otm_pct, 2),
-                    "sigma_otm":          round(sigma_otm, 2),
-                    "bid":                round(bid, 2),
-                    "ask":                round(ask, 2),
-                    "mid":                round(mid, 2),
-                    "weekly_return_pct":  round(weekly_return_pct, 2),
-                    "annualized_return":  round(weekly_return_pct * 52, 1),
-                    "delta":              round(delta, 4),
-                    "iv_pct":             round(iv * 100, 1),
-                    "theta_daily":        round(theta, 4),
-                    "open_interest":      oi,
-                    "volume":             vol,
-                    "spread_pct":         round(spread_pct, 2),
-                    "stock_quality":      sq,
-                    "assignment_risk":    _assignment_risk(delta, otm_pct),
-                    "xgb_signal":         state["signals"].get(ticker, {}).get("label", "N/A"),
-                    "cash_required":      round(strike * 100, 2),
-                    "premium_collected":  round(mid * 100, 2),
-                }
-                row["score"] = _score_csp(row)
-                candidates.append(row)
+                    sq = _stock_quality_score(ticker)
+                    row = {
+                        "ticker":             ticker,
+                        "expiry":             expiry,
+                        "dte":                dte,
+                        "strike":             strike,
+                        "stock_price":        round(stock_price, 2),
+                        "otm_pct":            round(otm_pct, 2),
+                        "sigma_otm":          round(sigma_otm, 2),
+                        "bid":                round(bid, 2),
+                        "ask":                round(ask, 2),
+                        "mid":                round(mid, 2),
+                        "weekly_return_pct":  round(weekly_return_pct, 2),
+                        "annualized_return":  round(weekly_return_pct * 52, 1),
+                        "delta":              round(delta, 4),
+                        "iv_pct":             round(iv * 100, 1),
+                        "theta_daily":        round(theta, 4),
+                        "open_interest":      oi,
+                        "volume":             vol,
+                        "spread_pct":         round(spread_pct, 2),
+                        "stock_quality":      sq,
+                        "assignment_risk":    _assignment_risk(delta, otm_pct),
+                        "xgb_signal":         state["signals"].get(ticker, {}).get("label", "N/A"),
+                        "cash_required":      round(strike * 100, 2),
+                        "premium_collected":  round(mid * 100, 2),
+                    }
+                    row["score"] = _score_csp(row)
+                    rows.append(row)
 
-            await asyncio.sleep(0.3)   # Gentle pacing between tickers
+                return rows
 
-        except Exception as e:
-            log.warning(f"CSP scan error [{ticker}]: {e}")
+            except Exception as e:
+                log.warning(f"CSP scan error [{ticker}]: {e}")
+                return []
 
+    results = await asyncio.gather(*[_scan_ticker(t) for t in CSP_UNIVERSE])
+    candidates = [row for ticker_rows in results for row in ticker_rows]
     return sorted(candidates, key=lambda x: x["score"], reverse=True)
 
 
@@ -553,123 +557,121 @@ async def scan_leaps(ib: IB) -> List[dict]:
       • IV ≤ 70 % (don't overpay)
       • Only on tickers with BUY/HOLD XGB signal and positive momentum
     """
-    candidates: List[dict] = []
     today = date.today()
+    sem = asyncio.Semaphore(5)
 
-    for ticker in CSP_UNIVERSE:
-        try:
-            # Pre-filter: only trade LEAPs on stocks with upward bias
-            sig = state["signals"].get(ticker, {})
-            if sig.get("label") == "SELL":
-                continue
-            sq = _stock_quality_score(ticker)
-            if sq < 0.3:
-                continue
+    async def _scan_ticker(ticker: str) -> List[dict]:
+        async with sem:
+            try:
+                sig = state["signals"].get(ticker, {})
+                if sig.get("label") == "SELL":
+                    return []
+                sq = _stock_quality_score(ticker)
+                if sq < 0.3:
+                    return []
 
-            stock_price = await _get_stock_price(ib, ticker)
-            if stock_price <= 0:
-                continue
+                stock_price = await _get_stock_price(ib, ticker)
+                if stock_price <= 0:
+                    return []
 
-            stock = Stock(ticker, "SMART", "USD")
-            await ib.qualifyContractsAsync(stock)
+                stock = Stock(ticker, "SMART", "USD")
+                await ib.qualifyContractsAsync(stock)
 
-            chains = await ib.reqSecDefOptParamsAsync(ticker, "", "STK", stock.conId)
-            if not chains:
-                continue
+                chains = await ib.reqSecDefOptParamsAsync(ticker, "", "STK", stock.conId)
+                if not chains:
+                    return []
 
-            chain = next((c for c in chains if c.exchange == "SMART"), chains[0])
+                chain = next((c for c in chains if c.exchange == "SMART"), chains[0])
 
-            # Find expirations in the LEAP window
-            leap_expiries = []
-            for exp in chain.expirations:
-                try:
-                    exp_date = datetime.strptime(exp, "%Y%m%d").date()
-                    dte = (exp_date - today).days
-                    if LEAP_MIN_DTE <= dte <= LEAP_MAX_DTE:
-                        leap_expiries.append((dte, exp))
-                except ValueError:
-                    continue
+                leap_expiries = []
+                for exp in chain.expirations:
+                    try:
+                        exp_date = datetime.strptime(exp, "%Y%m%d").date()
+                        dte = (exp_date - today).days
+                        if LEAP_MIN_DTE <= dte <= LEAP_MAX_DTE:
+                            leap_expiries.append((dte, exp))
+                    except ValueError:
+                        continue
 
-            if not leap_expiries:
-                continue
+                if not leap_expiries:
+                    return []
 
-            leap_expiries.sort()
-            # Pick the expiry closest to the middle of the window (≈ 12 months)
-            mid_idx = len(leap_expiries) // 2
-            dte, chosen_expiry = leap_expiries[mid_idx]
+                leap_expiries.sort()
+                mid_idx = len(leap_expiries) // 2
+                dte, chosen_expiry = leap_expiries[mid_idx]
 
-            # Call strikes: ATM ± 12 %
-            call_strikes = sorted([
-                s for s in chain.strikes
-                if stock_price * 0.88 <= s <= stock_price * 1.12
-            ])[:8]
+                call_strikes = sorted([
+                    s for s in chain.strikes
+                    if stock_price * 0.88 <= s <= stock_price * 1.12
+                ])[:8]
 
-            if not call_strikes:
-                continue
+                if not call_strikes:
+                    return []
 
-            contracts = [Option(ticker, chosen_expiry, s, "C", "SMART") for s in call_strikes]
-            tickers_data = await _option_quotes(ib, contracts)
+                contracts = [Option(ticker, chosen_expiry, s, "C", "SMART") for s in call_strikes]
+                tickers_data = await _option_quotes(ib, contracts)
 
-            for td in tickers_data:
-                bid = td.bid if (td.bid and td.bid > 0) else 0.0
-                ask = td.ask if (td.ask and td.ask > 0) else 0.0
-                if bid <= 0 or ask <= 0:
-                    continue
+                rows: List[dict] = []
+                for td in tickers_data:
+                    bid = td.bid if (td.bid and td.bid > 0) else 0.0
+                    ask = td.ask if (td.ask and td.ask > 0) else 0.0
+                    if bid <= 0 or ask <= 0:
+                        continue
 
-                mid = (bid + ask) / 2.0
-                greeks = td.modelGreeks
-                if not greeks or greeks.delta is None or greeks.impliedVol is None:
-                    continue
+                    mid = (bid + ask) / 2.0
+                    greeks = td.modelGreeks
+                    if not greeks or greeks.delta is None or greeks.impliedVol is None:
+                        continue
 
-                delta = greeks.delta
-                iv    = greeks.impliedVol
-                theta = greeks.theta or 0.0
-                vega  = greeks.vega  or 0.0
+                    delta = greeks.delta
+                    iv    = greeks.impliedVol
+                    theta = greeks.theta or 0.0
+                    vega  = greeks.vega  or 0.0
 
-                if not (LEAP_MIN_DELTA <= delta <= LEAP_MAX_DELTA):
-                    continue
-                if iv > LEAP_MAX_IV:
-                    continue
+                    if not (LEAP_MIN_DELTA <= delta <= LEAP_MAX_DELTA):
+                        continue
+                    if iv > LEAP_MAX_IV:
+                        continue
 
-                strike = td.contract.strike
-                itm_otm_pct = (stock_price - strike) / stock_price * 100
-                cost_per_contract = round(mid * 100, 2)
-                spread_pct = (ask - bid) / mid * 100
+                    strike = td.contract.strike
+                    itm_otm_pct = (stock_price - strike) / stock_price * 100
+                    cost_per_contract = round(mid * 100, 2)
+                    spread_pct = (ask - bid) / mid * 100
+                    breakeven = strike + mid
 
-                # Break-even at expiry
-                breakeven = strike + mid
+                    row = {
+                        "ticker":             ticker,
+                        "expiry":             chosen_expiry,
+                        "dte":                dte,
+                        "strike":             strike,
+                        "stock_price":        round(stock_price, 2),
+                        "itm_otm_pct":        round(itm_otm_pct, 2),
+                        "breakeven":          round(breakeven, 2),
+                        "breakeven_move_pct": round((breakeven - stock_price) / stock_price * 100, 2),
+                        "bid":                round(bid, 2),
+                        "ask":                round(ask, 2),
+                        "mid":                round(mid, 2),
+                        "cost_per_contract":  cost_per_contract,
+                        "delta":              round(delta, 4),
+                        "iv_pct":             round(iv * 100, 1),
+                        "theta_daily":        round(theta, 4),
+                        "vega":               round(vega, 4),
+                        "spread_pct":         round(spread_pct, 2),
+                        "stock_quality":      sq,
+                        "xgb_signal":         sig.get("label", "N/A"),
+                        "xgb_prob":           sig.get("prob", None),
+                    }
+                    row["score"] = round(sq * 60 + (1 - abs(delta - 0.60)) * 40, 2)
+                    rows.append(row)
 
-                row = {
-                    "ticker":             ticker,
-                    "expiry":             chosen_expiry,
-                    "dte":                dte,
-                    "strike":             strike,
-                    "stock_price":        round(stock_price, 2),
-                    "itm_otm_pct":        round(itm_otm_pct, 2),   # + = ITM, - = OTM
-                    "breakeven":          round(breakeven, 2),
-                    "breakeven_move_pct": round((breakeven - stock_price) / stock_price * 100, 2),
-                    "bid":                round(bid, 2),
-                    "ask":                round(ask, 2),
-                    "mid":                round(mid, 2),
-                    "cost_per_contract":  cost_per_contract,
-                    "delta":              round(delta, 4),
-                    "iv_pct":             round(iv * 100, 1),
-                    "theta_daily":        round(theta, 4),
-                    "vega":               round(vega, 4),
-                    "spread_pct":         round(spread_pct, 2),
-                    "stock_quality":      sq,
-                    "xgb_signal":         sig.get("label", "N/A"),
-                    "xgb_prob":           sig.get("prob", None),
-                }
-                # Sort key: high quality stock + near-ATM delta (≈ 0.60 ideal)
-                row["score"] = round(sq * 60 + (1 - abs(delta - 0.60)) * 40, 2)
-                candidates.append(row)
+                return rows
 
-            await asyncio.sleep(0.3)
+            except Exception as e:
+                log.warning(f"LEAP scan error [{ticker}]: {e}")
+                return []
 
-        except Exception as e:
-            log.warning(f"LEAP scan error [{ticker}]: {e}")
-
+    results = await asyncio.gather(*[_scan_ticker(t) for t in CSP_UNIVERSE])
+    candidates = [row for ticker_rows in results for row in ticker_rows]
     return sorted(candidates, key=lambda x: x["score"], reverse=True)
 
 
@@ -695,10 +697,8 @@ async def _live_option_quote(
             "option market data subscription may be required in TWS"
         )
 
-    stock = Stock(ticker, "SMART", "USD")
-    await ib.qualifyContractsAsync(stock)
-    [st] = await ib.reqTickersAsync(stock)
-    stock_price = float(st.marketPrice() or st.close or 0)
+    # Use streaming price cache — avoids 2 extra IBKR round-trips
+    stock_price = await _get_stock_price(ib, ticker)
 
     return {
         "ticker":        ticker,
