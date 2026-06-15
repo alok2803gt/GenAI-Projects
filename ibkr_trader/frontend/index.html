@@ -101,6 +101,64 @@ function Spinner() {
   return <span className="spin" style={{ fontSize:18, color:C.accent }}>⟳</span>;
 }
 
+const REGIME_CFG = {
+  BULL:    { color: C.bull,    icon: "▲", label: "BULL MARKET" },
+  NEUTRAL: { color: C.neutral, icon: "●", label: "NEUTRAL" },
+  BEAR:    { color: C.bear,    icon: "▼", label: "BEAR MARKET" },
+  UNKNOWN: { color: C.muted,   icon: "?", label: "UNKNOWN" },
+};
+
+function RegimeBanner({ regime }) {
+  if (!regime) return null;
+  const cfg = REGIME_CFG[regime.regime] || REGIME_CFG.UNKNOWN;
+  const bearWarn = regime.regime === "BEAR";
+  return (
+    <div style={{
+      display:"flex", alignItems:"center", gap:14, flexWrap:"wrap",
+      padding:"10px 16px", borderRadius:8, marginBottom:12,
+      background:`${cfg.color}12`, border:`1px solid ${cfg.color}44`,
+    }}>
+      <span style={{ ...mono, fontSize:13, color:cfg.color, fontWeight:700 }}>
+        {cfg.icon} {cfg.label}
+      </span>
+      {regime.spy_close != null && (
+        <span style={{ ...sans, fontSize:11, color:C.muted }}>
+          SPY <b style={{color:C.white}}>{regime.spy_close}</b>
+          {" "}vs 50d SMA <b style={{color:C.white}}>{regime.spy_sma50}</b>
+          {" "}(<b style={{color: regime.spy_vs_50d_pct>=0?C.bull:C.bear}}>
+            {regime.spy_vs_50d_pct>=0?"+":""}{regime.spy_vs_50d_pct}%
+          </b>)
+        </span>
+      )}
+      {regime.vix != null && (
+        <span style={{ ...sans, fontSize:11, color:C.muted }}>
+          VIX <b style={{color: regime.vix<20?C.bull:regime.vix<25?C.neutral:C.bear}}>{regime.vix}</b>
+        </span>
+      )}
+      {bearWarn && (
+        <span style={{ ...sans, fontSize:11, color:C.bear, fontWeight:600 }}>
+          ⚠ Selling premium in a bear market carries elevated assignment risk
+        </span>
+      )}
+    </div>
+  );
+}
+
+function WarningBadges({ warnings }) {
+  if (!warnings || warnings.length === 0) return <span style={{color:C.muted}}>—</span>;
+  return (
+    <span style={{ display:"flex", gap:4, flexWrap:"wrap" }}>
+      {warnings.map((w,i) => (
+        <span key={i} style={{
+          ...mono, fontSize:9, padding:"2px 6px", borderRadius:10,
+          background:`${C.bear}22`, color:C.bear, border:`1px solid ${C.bear}44`,
+          fontWeight:700, whiteSpace:"nowrap",
+        }}>{w}</span>
+      ))}
+    </span>
+  );
+}
+
 function StatusPill({ connected, error }) {
   const col = connected ? C.bull : C.bear;
   const label = connected ? "IBKR LIVE" : error ? "DISCONNECTED" : "CONNECTING…";
@@ -335,15 +393,30 @@ function CSPTab({ connected }) {
     { key:"annualized_return", label:"Ann. %",     render: r => <span style={{color:C.bull}}>{fmtP(r.annualized_return)}</span> },
     { key:"delta",             label:"Delta",      render: r => fmtN(r.delta,3) },
     { key:"iv_pct",            label:"IV %",       render: r => fmtP(r.iv_pct) },
+    { key:"iv_rank",           label:"IV Rank",    render: r => {
+      const v = r.iv_rank; if (v==null) return "—";
+      const c = v>=50?C.bull:v>=25?C.neutral:C.bear;
+      return <span style={{color:c,fontWeight:600}}>{v.toFixed(0)}</span>;
+    }},
     { key:"assignment_risk",   label:"Risk",       render: r => <Pill color={RISK_COLOR[r.assignment_risk]||C.orange}>{r.assignment_risk}</Pill> },
+    { key:"earnings_days_out", label:"Earnings",   render: r => {
+      const d = r.earnings_days_out;
+      if (d==null) return <span style={{color:C.muted}}>—</span>;
+      const c = d<=7?C.bear:d<=14?C.neutral:C.bull;
+      return <span style={{color:c,fontWeight:600}}>{d}d</span>;
+    }},
     { key:"cash_required",     label:"Cash Req",   render: r => fmt$(r.cash_required) },
     { key:"premium_collected", label:"Premium",    render: r => <b style={{color:C.bull}}>{fmt$(r.premium_collected)}</b> },
     { key:"xgb_signal",        label:"XGB",        render: r => <Pill color={SIG_COLOR[r.xgb_signal]||C.muted}>{r.xgb_signal}</Pill> },
     { key:"open_interest",     label:"OI",         render: r => r.open_interest?.toLocaleString() },
+    { key:"warnings",          label:"Warnings",   render: r => <WarningBadges warnings={r.warnings} /> },
   ];
 
   return (
     <div>
+      {/* Market regime banner */}
+      {result?.market_regime && <RegimeBanner regime={result.market_regime} />}
+
       {/* Controls */}
       <Card style={{ marginBottom:14 }}>
         <SectionTitle>CSP Scanner — 4% Weekly Income Strategy</SectionTitle>
@@ -506,15 +579,31 @@ function LEAPTab({ connected }) {
     }},
     { key:"delta",            label:"Delta",     render:r=>fmtN(r.delta,3) },
     { key:"iv_pct",           label:"IV %",      render:r=>fmtP(r.iv_pct) },
+    { key:"iv_rank",          label:"IV Rank",   render:r=>{
+      const v = r.iv_rank; if (v==null) return "—";
+      // For LEAP buyers: LOW iv_rank = cheaper = better (inverted from CSP)
+      const c = v<=40?C.bull:v<=65?C.neutral:C.bear;
+      return <span style={{color:c,fontWeight:600}}>{v.toFixed(0)}</span>;
+    }},
+    { key:"earnings_days_out",label:"Earnings",  render:r=>{
+      const d = r.earnings_days_out;
+      if (d==null) return <span style={{color:C.muted}}>—</span>;
+      const c = d<=7?C.bear:d<=14?C.neutral:C.bull;
+      return <span style={{color:c,fontWeight:600}}>{d}d</span>;
+    }},
     { key:"mid",              label:"Mid",       render:r=>fmt$(r.mid) },
     { key:"cost_per_contract",label:"Cost/Cont", render:r=><b style={{color:C.neutral}}>{fmt$(r.cost_per_contract)}</b> },
     { key:"breakeven",        label:"B/E Price", render:r=>fmt$(r.breakeven) },
     { key:"breakeven_move_pct",label:"B/E Move", render:r=><span style={{color:C.bear}}>{fmtP(r.breakeven_move_pct)}</span> },
     { key:"theta_daily",      label:"Θ/day",     render:r=><span style={{color:C.bear}}>{fmtN(r.theta_daily,4)}</span> },
+    { key:"warnings",         label:"Warnings",  render:r=><WarningBadges warnings={r.warnings} /> },
   ];
 
   return (
     <div>
+      {/* Market regime banner */}
+      {result?.market_regime && <RegimeBanner regime={result.market_regime} />}
+
       <Card style={{ marginBottom:14 }}>
         <SectionTitle>LEAP Call Scanner — Long-Term Directional Plays</SectionTitle>
         <div style={{ display:"flex", gap:10, alignItems:"center", flexWrap:"wrap" }}>

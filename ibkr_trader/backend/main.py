@@ -21,6 +21,7 @@ from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
 import uvicorn
+import yfinance as yf
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from ib_insync import IB, Option, Stock, util
@@ -61,6 +62,14 @@ CSP_MIN_OI          = 50     # Open interest floor
 CSP_MAX_SPREAD_PCT  = 0.15   # Bid-ask spread as fraction of mid
 SCAN_CACHE_TTL      = 300    # Seconds before scan cache expires
 
+# ── Config — external validation (yfinance) ────────────────────────────────
+EARNINGS_BLOCK_DAYS = 7      # Skip CSP/LEAP entirely if earnings this close
+EARNINGS_WARN_DAYS  = 14     # Add warning flag if earnings within this window
+IV_RANK_MIN_CSP     = 25     # Flag CSP rows below this IV rank (thin premium env)
+EARNINGS_CACHE_TTL  = 21600  # 6 h — earnings dates don't change intraday
+IV_RANK_CACHE_TTL   = 3600   # 1 h
+REGIME_CACHE_TTL    = 300    # 5 min
+
 # ── Config — LEAP scanner ──────────────────────────────────────────────────
 LEAP_MIN_DTE   = 180   # ≥ 6 months
 LEAP_MAX_DTE   = 540   # ≤ 18 months
@@ -98,6 +107,12 @@ state: Dict = {
     "streaming_loop": None,   # event loop of the streaming thread
     "scan_cache": {
         "csp": None, "leaps": None, "ts": None,
+    },
+    # External validation cache (yfinance)
+    "ext_cache": {
+        "earnings": {},   # ticker → {"days": int|None, "ts": datetime}
+        "iv_rank":  {},   # ticker → {"iv": float|None, "rank": float, "rv_lo": float|None, "rv_hi": float|None, "ts": datetime}
+        "regime":   None, # full market regime dict
     },
 }
 
@@ -373,16 +388,202 @@ def _assignment_risk(delta: float, otm_pct: float) -> str:
 def _score_csp(row: dict) -> float:
     """Composite rank score — higher is better."""
     s = 0.0
-    # 1) Weekly return headroom above the 4 % target (capped at 3×)
-    s += min(row["weekly_return_pct"] / CSP_MIN_RETURN_PCT, 3.0) * 30
+    # 1) Weekly return above the 4 % target (capped at 3×)
+    s += min(row["weekly_return_pct"] / CSP_MIN_RETURN_PCT, 3.0) * 28
     # 2) Distance from assignment (lower delta = safer)
-    s += (CSP_MAX_DELTA - abs(row["delta"])) / CSP_MAX_DELTA * 25
-    # 3) Tight bid-ask spread (lower is better)
+    s += (CSP_MAX_DELTA - abs(row["delta"])) / CSP_MAX_DELTA * 22
+    # 3) Tight bid-ask spread
     spread_frac = row["spread_pct"] / 100
-    s += max(0, (CSP_MAX_SPREAD_PCT - spread_frac) / CSP_MAX_SPREAD_PCT) * 20
+    s += max(0, (CSP_MAX_SPREAD_PCT - spread_frac) / CSP_MAX_SPREAD_PCT) * 18
     # 4) Underlying stock quality
-    s += row.get("stock_quality", 0.5) * 25
+    s += row.get("stock_quality", 0.5) * 22
+    # 5) IV rank — high rank means elevated premium, better time to sell
+    s += (row.get("iv_rank", 50) / 100) * 10
     return round(s, 2)
+
+
+# ── External validation helpers (yfinance) ────────────────────────────────
+
+async def _earnings_days_out(ticker: str) -> Optional[int]:
+    """
+    Days until next earnings announcement, or None if none found within 60 days.
+    Cached 6 h per ticker.  Never blocks the scan on error — returns None.
+    """
+    cache = state["ext_cache"]["earnings"]
+    now = datetime.utcnow()
+    if ticker in cache and (now - cache[ticker]["ts"]).total_seconds() < EARNINGS_CACHE_TTL:
+        return cache[ticker]["days"]
+
+    loop = asyncio.get_event_loop()
+    try:
+        def _fetch() -> Optional[int]:
+            t = yf.Ticker(ticker)
+            try:
+                cal = t.calendar
+            except Exception:
+                return None
+            if cal is None:
+                return None
+            today = date.today()
+            # yfinance >= 0.2 returns dict; older versions return DataFrame
+            if isinstance(cal, dict):
+                raw = cal.get("Earnings Date", [])
+                if not raw:
+                    return None
+                d = pd.to_datetime(raw[0]).date()
+            elif hasattr(cal, "loc"):
+                try:
+                    d = pd.to_datetime(cal.loc["Earnings Date"].iloc[0]).date()
+                except Exception:
+                    return None
+            else:
+                return None
+            days = (d - today).days
+            return days if 0 <= days <= 60 else None
+
+        days = await loop.run_in_executor(None, _fetch)
+    except Exception as e:
+        log.debug(f"Earnings fetch [{ticker}]: {e}")
+        days = None
+
+    cache[ticker] = {"days": days, "ts": now}
+    return days
+
+
+async def _iv_rank_for_ticker(ticker: str) -> dict:
+    """
+    IV Rank proxy: where the nearest-expiry ATM put IV sits within the
+    ticker's 52-week realized vol range (0 = historic low, 100 = historic high).
+
+    Returns {"iv": float|None, "rank": float, "rv_lo": float|None, "rv_hi": float|None}
+    Falls back to rank=50 (neutral) on any error.  Cached 1 h per ticker.
+    """
+    cache = state["ext_cache"]["iv_rank"]
+    now = datetime.utcnow()
+    if ticker in cache and (now - cache[ticker]["ts"]).total_seconds() < IV_RANK_CACHE_TTL:
+        return {k: v for k, v in cache[ticker].items() if k != "ts"}
+
+    loop = asyncio.get_event_loop()
+    try:
+        def _fetch():
+            t = yf.Ticker(ticker)
+            # Current stock price
+            fi = t.fast_info
+            price = getattr(fi, "last_price", None) or getattr(fi, "previous_close", None)
+            if not price:
+                return None, None, None
+
+            # ATM put IV from the nearest available expiry
+            current_iv = None
+            try:
+                exps = t.options
+                if exps:
+                    chain = t.option_chain(exps[0])
+                    puts = chain.puts.copy()
+                    puts["dist"] = (puts["strike"] - price).abs()
+                    atm = puts.nsmallest(1, "dist")
+                    if not atm.empty:
+                        current_iv = float(atm["impliedVolatility"].iloc[0])
+            except Exception:
+                pass
+
+            # 52-week rolling-30d realized vol range
+            rv_lo, rv_hi = None, None
+            try:
+                hist = t.history(period="1y")
+                if len(hist) >= 30:
+                    rv = hist["Close"].pct_change().rolling(30).std() * math.sqrt(252)
+                    rv = rv.dropna()
+                    if not rv.empty:
+                        rv_lo = float(rv.min())
+                        rv_hi = float(rv.max())
+            except Exception:
+                pass
+
+            return current_iv, rv_lo, rv_hi
+
+        current_iv, rv_lo, rv_hi = await loop.run_in_executor(None, _fetch)
+    except Exception as e:
+        log.debug(f"IV rank fetch [{ticker}]: {e}")
+        current_iv, rv_lo, rv_hi = None, None, None
+
+    if current_iv and rv_lo is not None and rv_hi is not None and rv_hi > rv_lo:
+        rank = round(min(max((current_iv - rv_lo) / (rv_hi - rv_lo) * 100, 0), 100), 1)
+    else:
+        rank = 50.0
+
+    result = {
+        "iv":    round(current_iv * 100, 1) if current_iv else None,
+        "rank":  rank,
+        "rv_lo": round(rv_lo * 100, 1) if rv_lo else None,
+        "rv_hi": round(rv_hi * 100, 1) if rv_hi else None,
+        "ts":    now,
+    }
+    cache[ticker] = result
+    return {k: v for k, v in result.items() if k != "ts"}
+
+
+async def _market_regime() -> dict:
+    """
+    SPY vs its 50-day SMA + current VIX → BULL / NEUTRAL / BEAR.
+    Cached 5 min.  Falls back to UNKNOWN on network error.
+    """
+    cached = state["ext_cache"]["regime"]
+    now = datetime.utcnow()
+    if cached and (now - cached["ts"]).total_seconds() < REGIME_CACHE_TTL:
+        return {k: v for k, v in cached.items() if k != "ts"}
+
+    loop = asyncio.get_event_loop()
+    try:
+        def _fetch():
+            spy_hist = yf.Ticker("SPY").history(period="3mo")["Close"]
+            vix_hist = yf.Ticker("^VIX").history(period="5d")["Close"]
+            spy_close = float(spy_hist.iloc[-1])
+            spy_sma50 = float(spy_hist.rolling(50).mean().iloc[-1])
+            vix       = float(vix_hist.iloc[-1])
+            return spy_close, spy_sma50, vix
+
+        spy_close, spy_sma50, vix = await loop.run_in_executor(None, _fetch)
+        spy_vs_50d = round((spy_close - spy_sma50) / spy_sma50 * 100, 2)
+
+        if spy_close >= spy_sma50 and vix < 20:
+            regime = "BULL"
+        elif spy_close >= spy_sma50 and vix < 25:
+            regime = "NEUTRAL"
+        else:
+            regime = "BEAR"
+
+        result = {
+            "regime":         regime,
+            "spy_close":      round(spy_close, 2),
+            "spy_sma50":      round(spy_sma50, 2),
+            "spy_vs_50d_pct": spy_vs_50d,
+            "vix":            round(vix, 2),
+            "ts":             now,
+        }
+    except Exception as e:
+        log.warning(f"Market regime fetch failed: {e}")
+        result = {
+            "regime": "UNKNOWN",
+            "spy_close": None, "spy_sma50": None,
+            "spy_vs_50d_pct": None, "vix": None,
+            "ts": now,
+        }
+
+    state["ext_cache"]["regime"] = result
+    return {k: v for k, v in result.items() if k != "ts"}
+
+
+def _build_warnings(earnings_days: Optional[int], iv_rank: float, mode: str = "csp") -> List[str]:
+    """Human-readable warning tags attached to each candidate row."""
+    warnings: List[str] = []
+    if earnings_days is not None and earnings_days <= EARNINGS_WARN_DAYS:
+        warnings.append(f"Earnings in {earnings_days}d")
+    if mode == "csp" and iv_rank < IV_RANK_MIN_CSP:
+        warnings.append(f"Low IV rank ({iv_rank:.0f})")
+    if mode == "leap" and iv_rank > 75:
+        warnings.append(f"High IV rank ({iv_rank:.0f}) — expensive premium")
+    return warnings
 
 
 async def _get_stock_price(ib: IB, ticker: str) -> float:
@@ -424,23 +625,31 @@ async def scan_csp(
     ib: IB,
     min_return: float = CSP_MIN_RETURN_PCT,
     max_delta: float = CSP_MAX_DELTA,
-) -> List[dict]:
+) -> dict:
     """
     For every ticker in CSP_UNIVERSE:
-      1. Fetch current price (streaming cache, then snapshot)
-      2. Get option chain structure
-      3. Select put strikes 5–28 % OTM on the nearest weekly expiry
-      4. Snapshot quotes + Greeks
-      5. Filter: return ≥ min_return, |delta| ≤ max_delta, OI ≥ 50
-      6. Score and return sorted list
-    All tickers run concurrently (up to 5 at a time) to minimise scan latency.
+      1. Earnings gate — skip if earnings within EARNINGS_BLOCK_DAYS
+      2. Fetch current price (streaming cache → IBKR snapshot)
+      3. Get option chain + IV rank concurrently
+      4. Select put strikes 5–28 % OTM on the nearest weekly expiry
+      5. Snapshot quotes + Greeks
+      6. Filter: return ≥ min_return, |delta| ≤ max_delta, OI ≥ 50
+      7. Score (includes IV rank bonus) and return sorted list
+    Returns {"candidates": [...], "regime": {...}}
     """
-    expiry0 = _next_expiry(0)   # This Friday
-    expiry1 = _next_expiry(1)   # Next Friday (fallback)
-    sem = asyncio.Semaphore(5)  # Max 5 concurrent IBKR request streams
+    expiry0 = _next_expiry(0)
+    expiry1 = _next_expiry(1)
+    sem = asyncio.Semaphore(5)
 
+    # Market regime + ticker scans run concurrently
     async def _scan_ticker(ticker: str) -> List[dict]:
         async with sem:
+            # ── Earnings gate (fastest disqualifier) ──────────────────────
+            earnings_days = await _earnings_days_out(ticker)
+            if earnings_days is not None and earnings_days <= EARNINGS_BLOCK_DAYS:
+                log.info(f"CSP [{ticker}]: blocked — earnings in {earnings_days}d")
+                return []
+
             try:
                 stock_price = await _get_stock_price(ib, ticker)
                 if stock_price <= 0:
@@ -450,13 +659,16 @@ async def scan_csp(
                 stock = Stock(ticker, "SMART", "USD")
                 await ib.qualifyContractsAsync(stock)
 
-                chains = await ib.reqSecDefOptParamsAsync(ticker, "", "STK", stock.conId)
+                # Fetch option chain and IV rank in parallel
+                chains, iv_info = await asyncio.gather(
+                    ib.reqSecDefOptParamsAsync(ticker, "", "STK", stock.conId),
+                    _iv_rank_for_ticker(ticker),
+                )
                 if not chains:
                     log.debug(f"CSP [{ticker}]: no option chain — skipping")
                     return []
 
                 chain = next((c for c in chains if c.exchange == "SMART"), chains[0])
-
                 expiry = expiry0 if expiry0 in chain.expirations else (
                     expiry1 if expiry1 in chain.expirations else None
                 )
@@ -470,7 +682,6 @@ async def scan_csp(
                     s for s in chain.strikes
                     if 0.72 * stock_price <= s <= 0.95 * stock_price
                 ], reverse=True)[:8]
-
                 if not put_strikes:
                     return []
 
@@ -533,6 +744,11 @@ async def scan_csp(
                         "xgb_signal":         state["signals"].get(ticker, {}).get("label", "N/A"),
                         "cash_required":      round(strike * 100, 2),
                         "premium_collected":  round(mid * 100, 2),
+                        # ── External validation columns ────────────────────
+                        "earnings_days_out":  earnings_days,
+                        "iv_rank":            iv_info["rank"],
+                        "iv_yf":              iv_info["iv"],
+                        "warnings":           _build_warnings(earnings_days, iv_info["rank"], "csp"),
                     }
                     row["score"] = _score_csp(row)
                     rows.append(row)
@@ -543,25 +759,40 @@ async def scan_csp(
                 log.warning(f"CSP scan error [{ticker}]: {e}")
                 return []
 
-    results = await asyncio.gather(*[_scan_ticker(t) for t in CSP_UNIVERSE])
-    candidates = [row for ticker_rows in results for row in ticker_rows]
-    return sorted(candidates, key=lambda x: x["score"], reverse=True)
+    regime, *ticker_results = await asyncio.gather(
+        _market_regime(),
+        *[_scan_ticker(t) for t in CSP_UNIVERSE],
+    )
+    candidates = [row for ticker_rows in ticker_results for row in ticker_rows]
+    return {
+        "candidates": sorted(candidates, key=lambda x: x["score"], reverse=True),
+        "regime":     regime,
+    }
 
 
 # ── LEAP scan ──────────────────────────────────────────────────────────────
-async def scan_leaps(ib: IB) -> List[dict]:
+async def scan_leaps(ib: IB) -> dict:
     """
     For every ticker in CSP_UNIVERSE find LEAP calls:
-      • Expiry 6–18 months out
+      • Earnings gate — block if earnings within EARNINGS_BLOCK_DAYS (IV inflated pre-earnings)
+      • Expiry 6–18 months out (mid-window ≈ 12 months)
       • Delta 0.45–0.75 (near-ATM to 10 % OTM)
       • IV ≤ 70 % (don't overpay)
       • Only on tickers with BUY/HOLD XGB signal and positive momentum
+      • Low IV rank is favourable for LEAP buyers (cheaper premium)
+    Returns {"candidates": [...], "regime": {...}}
     """
     today = date.today()
     sem = asyncio.Semaphore(5)
 
     async def _scan_ticker(ticker: str) -> List[dict]:
         async with sem:
+            # ── Earnings gate — IV inflated before earnings, will crush after ──
+            earnings_days = await _earnings_days_out(ticker)
+            if earnings_days is not None and earnings_days <= EARNINGS_BLOCK_DAYS:
+                log.info(f"LEAP [{ticker}]: blocked — earnings in {earnings_days}d (IV inflated)")
+                return []
+
             try:
                 sig = state["signals"].get(ticker, {})
                 if sig.get("label") == "SELL":
@@ -577,7 +808,11 @@ async def scan_leaps(ib: IB) -> List[dict]:
                 stock = Stock(ticker, "SMART", "USD")
                 await ib.qualifyContractsAsync(stock)
 
-                chains = await ib.reqSecDefOptParamsAsync(ticker, "", "STK", stock.conId)
+                # Fetch option chain and IV rank concurrently
+                chains, iv_info = await asyncio.gather(
+                    ib.reqSecDefOptParamsAsync(ticker, "", "STK", stock.conId),
+                    _iv_rank_for_ticker(ticker),
+                )
                 if not chains:
                     return []
 
@@ -604,7 +839,6 @@ async def scan_leaps(ib: IB) -> List[dict]:
                     s for s in chain.strikes
                     if stock_price * 0.88 <= s <= stock_price * 1.12
                 ])[:8]
-
                 if not call_strikes:
                     return []
 
@@ -639,6 +873,9 @@ async def scan_leaps(ib: IB) -> List[dict]:
                     spread_pct = (ask - bid) / mid * 100
                     breakeven = strike + mid
 
+                    # For LEAP buyers: lower iv_rank = cheaper premium = higher value score
+                    leap_iv_bonus = (1 - iv_info["rank"] / 100) * 15
+
                     row = {
                         "ticker":             ticker,
                         "expiry":             chosen_expiry,
@@ -660,8 +897,13 @@ async def scan_leaps(ib: IB) -> List[dict]:
                         "stock_quality":      sq,
                         "xgb_signal":         sig.get("label", "N/A"),
                         "xgb_prob":           sig.get("prob", None),
+                        # ── External validation columns ────────────────────
+                        "earnings_days_out":  earnings_days,
+                        "iv_rank":            iv_info["rank"],
+                        "iv_yf":              iv_info["iv"],
+                        "warnings":           _build_warnings(earnings_days, iv_info["rank"], "leap"),
                     }
-                    row["score"] = round(sq * 60 + (1 - abs(delta - 0.60)) * 40, 2)
+                    row["score"] = round(sq * 60 + (1 - abs(delta - 0.60)) * 40 + leap_iv_bonus, 2)
                     rows.append(row)
 
                 return rows
@@ -670,9 +912,15 @@ async def scan_leaps(ib: IB) -> List[dict]:
                 log.warning(f"LEAP scan error [{ticker}]: {e}")
                 return []
 
-    results = await asyncio.gather(*[_scan_ticker(t) for t in CSP_UNIVERSE])
-    candidates = [row for ticker_rows in results for row in ticker_rows]
-    return sorted(candidates, key=lambda x: x["score"], reverse=True)
+    regime, *ticker_results = await asyncio.gather(
+        _market_regime(),
+        *[_scan_ticker(t) for t in CSP_UNIVERSE],
+    )
+    candidates = [row for ticker_rows in ticker_results for row in ticker_rows]
+    return {
+        "candidates": sorted(candidates, key=lambda x: x["score"], reverse=True),
+        "regime":     regime,
+    }
 
 
 # ── Real-time single option quote ──────────────────────────────────────────
@@ -834,6 +1082,19 @@ def health():
 
 
 # ── CSP endpoints ──────────────────────────────────────────────────────────
+@app.get("/market-regime")
+async def market_regime_endpoint():
+    """Current market regime: SPY vs 50-day SMA + VIX level."""
+    try:
+        result = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: _run_in_streaming_loop(_market_regime(), timeout=20),
+        )
+    except (TimeoutError, RuntimeError) as e:
+        raise HTTPException(503, str(e))
+    return result
+
+
 @app.get("/csp/scan")
 async def csp_scan(
     min_return: float = Query(CSP_MIN_RETURN_PCT, description="Min weekly premium/strike %"),
@@ -842,7 +1103,8 @@ async def csp_scan(
 ):
     """
     Scan the CSP universe for cash-secured put opportunities.
-    Results are cached for 5 minutes; pass refresh=true to bypass.
+    Includes earnings gate, IV rank, and market regime from yfinance.
+    Results cached 5 minutes; pass refresh=true to bypass.
     """
     _require_connection()
 
@@ -851,14 +1113,15 @@ async def csp_scan(
         age = (datetime.utcnow() - cache["ts"]).total_seconds()
         if age < SCAN_CACHE_TTL:
             return {
-                "cached": True,
-                "age_seconds": int(age),
-                "count": len(cache["csp"]),
-                "candidates": cache["csp"],
+                "cached":        True,
+                "age_seconds":   int(age),
+                "count":         len(cache["csp"]),
+                "candidates":    cache["csp"],
+                "market_regime": cache.get("regime"),
             }
 
     try:
-        candidates = await asyncio.get_event_loop().run_in_executor(
+        result = await asyncio.get_event_loop().run_in_executor(
             None,
             lambda: _run_in_streaming_loop(
                 scan_csp(state["ib"], min_return, max_delta), timeout=180
@@ -869,14 +1132,18 @@ async def csp_scan(
     except RuntimeError as e:
         raise HTTPException(503, str(e))
 
+    candidates = result["candidates"]
+    regime     = result["regime"]
     now = datetime.utcnow()
-    cache["csp"] = candidates
-    cache["ts"]  = now
+    cache["csp"]    = candidates
+    cache["regime"] = regime
+    cache["ts"]     = now
     return {
-        "cached": False,
-        "scanned_at": now.isoformat() + "Z",
-        "count": len(candidates),
-        "candidates": candidates,
+        "cached":        False,
+        "scanned_at":    now.isoformat() + "Z",
+        "count":         len(candidates),
+        "candidates":    candidates,
+        "market_regime": regime,
     }
 
 
@@ -901,6 +1168,7 @@ async def leaps_scan(
 ):
     """
     Scan the CSP universe for LEAP call opportunities (6–18 month expiry).
+    Includes earnings gate, IV rank (lower = better for buyers), and market regime.
     Only considers tickers with BUY/HOLD XGB signal and positive momentum.
     """
     _require_connection()
@@ -910,14 +1178,15 @@ async def leaps_scan(
         age = (datetime.utcnow() - cache["ts"]).total_seconds()
         if age < SCAN_CACHE_TTL:
             return {
-                "cached": True,
-                "age_seconds": int(age),
-                "count": len(cache["leaps"]),
-                "candidates": cache["leaps"],
+                "cached":        True,
+                "age_seconds":   int(age),
+                "count":         len(cache["leaps"]),
+                "candidates":    cache["leaps"],
+                "market_regime": cache.get("regime"),
             }
 
     try:
-        candidates = await asyncio.get_event_loop().run_in_executor(
+        result = await asyncio.get_event_loop().run_in_executor(
             None,
             lambda: _run_in_streaming_loop(scan_leaps(state["ib"]), timeout=180),
         )
@@ -926,14 +1195,18 @@ async def leaps_scan(
     except RuntimeError as e:
         raise HTTPException(503, str(e))
 
+    candidates = result["candidates"]
+    regime     = result["regime"]
     now = datetime.utcnow()
-    cache["leaps"] = candidates
-    cache["ts"]    = now
+    cache["leaps"]  = candidates
+    cache["regime"] = regime
+    cache["ts"]     = now
     return {
-        "cached": False,
-        "scanned_at": now.isoformat() + "Z",
-        "count": len(candidates),
-        "candidates": candidates,
+        "cached":        False,
+        "scanned_at":    now.isoformat() + "Z",
+        "count":         len(candidates),
+        "candidates":    candidates,
+        "market_regime": regime,
     }
 
 
