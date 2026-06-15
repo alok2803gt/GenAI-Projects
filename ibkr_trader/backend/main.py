@@ -256,18 +256,30 @@ async def streaming_loop_async() -> None:
     while True:
         try:
             ib = IB()
+
+            # Use a mutable dict so the error-event lambda can reset it
+            ctx = {"known": set()}
+
+            def _on_ib_error(reqId, errorCode, errorString, contract):
+                if errorCode == 1102:
+                    # IBKR restored connectivity — dead keepUpToDate subs must be renewed
+                    ctx["known"] = set()
+                    state["subscriptions"].clear()
+                    log.info("IBKR reconnected (1102) — will re-subscribe all tickers within 10 s")
+
+            ib.errorEvent += _on_ib_error
+
             await ib.connectAsync(TWS_HOST, TWS_PORT, clientId=TWS_CLIENT_ID, timeout=15)
             log.info(f"Connected to IBKR  {TWS_HOST}:{TWS_PORT}")
             state["ib"] = ib
             state["connected"] = True
             state["error"] = None
 
-            known: set = set()
-            known = await _subscribe_pending(ib, known)
+            ctx["known"] = await _subscribe_pending(ib, ctx["known"])
 
-            # Keep the event loop alive; check for newly added tickers every 10 s
+            # Keep the event loop alive; check for new/re-subscribe tickers every 10 s
             while ib.isConnected():
-                known = await _subscribe_pending(ib, known)
+                ctx["known"] = await _subscribe_pending(ib, ctx["known"])
                 await asyncio.sleep(10)
 
             state["connected"] = False
