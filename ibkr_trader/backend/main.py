@@ -16,6 +16,7 @@ import logging
 import math
 import sqlite3
 import threading
+import traceback
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta
 from typing import Dict, List, Optional
@@ -399,6 +400,28 @@ _RF_RATE = 0.045
 
 def _norm_cdf(x: float) -> float:
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def _safe_float(val, default=None):
+    """Convert IBKR/yfinance values to float, returning default for None/NaN/Inf."""
+    if val is None:
+        return default
+    try:
+        f = float(val)
+        return default if (math.isnan(f) or math.isinf(f)) else f
+    except (TypeError, ValueError):
+        return default
+
+
+def _json_safe(obj):
+    """Recursively replace NaN/Inf floats with None so the response serializes cleanly."""
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_json_safe(v) for v in obj]
+    if isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)):
+        return None
+    return obj
 
 def _bs_delta(S: float, K: float, T: float, sigma: float, is_put: bool) -> float:
     """Black-Scholes delta. T in years."""
@@ -1324,8 +1347,10 @@ async def _autotrader_place_coro(ib: IB, row: dict, cfg: dict, regime: str = "BU
     # ── Live IBKR/OPRA price for limit order (replaces stale yfinance bid) ──
     live_iv_entry = None
     lmt           = None
+    _flow_abort   = None   # set inside try; raised outside so except doesn't swallow it
     try:
-        tq = ib.reqMktData(contract, "106,13", False, False)
+        # 100=option volume, 101=option OI, 106=implied vol, 13=OI (standard)
+        tq = ib.reqMktData(contract, "106,13,100,101", False, False)
         await asyncio.sleep(2.0)   # allow snapshot to settle
         ibkr_bid = tq.bid if tq.bid and not math.isnan(tq.bid) and tq.bid > 0 else None
         ibkr_ask = tq.ask if tq.ask and not math.isnan(tq.ask) and tq.ask > 0 else None
@@ -1338,9 +1363,51 @@ async def _autotrader_place_coro(ib: IB, row: dict, cfg: dict, regime: str = "BU
             )
         if tq.modelGreeks:
             live_iv_entry = round(float(tq.modelGreeks.impliedVol or 0) * 100, 2)
+
+        # ── Live flow-signal gate: re-validate order-book pressure at execution ──
+        # The scan snapshot can be 1-5 min old; flow can flip on news or block trades.
+        # We store the abort reason rather than raising here — a ValueError raised inside
+        # this try block would be caught by the except below and silently swallowed.
+        live_bid_sz = int(_safe_float(getattr(tq, "bidSize", None), 0))
+        live_ask_sz = int(_safe_float(getattr(tq, "askSize", None), 0))
+        live_vol    = int(_safe_float(getattr(tq, "volume", None), 0))
+        live_oi     = int(_safe_float(getattr(tq, "openInterest", None), 0))
+        if live_bid_sz > 0 or live_ask_sz > 0:   # IBKR has live order-book data
+            if   live_ask_sz > live_bid_sz * 2: live_flow = "ASK HEAVY"
+            elif live_bid_sz > live_ask_sz * 2: live_flow = "BID HEAVY"
+            else:                               live_flow = "BALANCED"
+            live_voi = round(live_vol / max(live_oi, 1), 1) if live_oi > 0 else 0.0
+            if t == "csp" and live_flow == "BID HEAVY":
+                _flow_abort = (
+                    f"Flow reversed to BID HEAVY at execution (was {row.get('flow_flag','?')} at scan) "
+                    f"— aborting {ticker} ${strike}P to avoid selling into bearish put pressure"
+                )
+            elif t == "csp" and live_voi > 2.0 and live_flow != "ASK HEAVY":
+                _flow_abort = (
+                    f"Unusual put activity at execution (vol/OI {live_voi}x, flow={live_flow}) "
+                    f"— informed buyer likely entered since scan. Aborting {ticker} ${strike}P"
+                )
+            elif t == "leap" and live_flow == "BID HEAVY":
+                _flow_abort = (
+                    f"Call order book BID HEAVY at execution — sellers dumping calls. "
+                    f"Aborting {ticker} ${strike}C LEAP"
+                )
+            else:
+                log.info(
+                    "Flow gate [%s %s $%s%s]: bid_sz=%d ask_sz=%d flow=%s vol/OI=%.1f — PASS",
+                    ticker, t.upper(), strike, right, live_bid_sz, live_ask_sz, live_flow, live_voi,
+                )
+        else:
+            log.info("Flow gate [%s %s $%s%s]: no order-book data (market closed?) — skipping", ticker, t.upper(), strike, right)
+
         ib.cancelMktData(contract)
     except Exception as e:
         log.warning("IBKR price snapshot failed for %s %s $%s%s: %s", ticker, expiry, strike, right, e)
+
+    # Raise flow abort AFTER the try/except so it propagates to the caller
+    if _flow_abort:
+        _at_log("SKIP", f"Flow gate: {_flow_abort}")
+        raise ValueError(_flow_abort)
 
     # Fall back to yfinance if IBKR snapshot gave no data
     if not lmt or lmt <= 0:
@@ -1411,9 +1478,29 @@ async def _autotrader_hedge_coro(ib: IB) -> None:
     cfg       = state["autotrader"]["config"]
     threshold = float(cfg.get("hedge_threshold", 100.0))
 
-    # Compute net portfolio delta (quick BS estimate per position)
+    # ── Portfolio delta via live IBKR Greeks (batch reqTickersAsync) ──────────
+    portfolio = ib.portfolio()
+    opt_contracts = [
+        i.contract for i in portfolio
+        if getattr(i.contract, "secType", "") in ("OPT", "FOP")
+    ]
+    live_delta: dict = {}   # conId → float
+    if opt_contracts:
+        try:
+            await ib.qualifyContractsAsync(*opt_contracts)
+            valid = [c for c in opt_contracts if c.conId]
+            if valid:
+                tds = await ib.reqTickersAsync(*valid)
+                for td in tds:
+                    if td.contract and td.modelGreeks:
+                        d = _safe_float(td.modelGreeks.delta)
+                        if d is not None:
+                            live_delta[td.contract.conId] = d
+        except Exception as e:
+            log.warning("Hedge: portfolio Greeks snapshot failed (%s) — using BS fallback", e)
+
     net_delta = 0.0
-    for item in ib.portfolio():
+    for item in portfolio:
         c   = item.contract
         pos = float(item.position)
         sec = getattr(c, "secType", "")
@@ -1421,61 +1508,96 @@ async def _autotrader_hedge_coro(ib: IB) -> None:
             net_delta += pos
         elif sec in ("OPT", "FOP"):
             try:
-                tk     = yf.Ticker(c.symbol)
-                hist   = tk.history(period="5d", interval="1d")
-                S      = float(hist["Close"].iloc[-1]) if not hist.empty else 0.0
-                K      = float(c.strike)
-                exp_d  = datetime.strptime(c.lastTradeDateOrContractMonth[:8], "%Y%m%d").date()
-                T      = max((exp_d - date.today()).days / 365, 0.001)
-                iv_inf = state["ext_cache"]["iv_rank"].get(c.symbol, {})
-                sigma  = iv_inf.get("iv") or 0.25
-                is_put = c.right.upper() == "P"
-                d      = _bs_delta(S, K, T, sigma, is_put)
-                net_delta += d * pos * (float(getattr(c, "multiplier", 100) or 100))
+                cid  = c.conId
+                mult = float(getattr(c, "multiplier", 100) or 100)
+                if cid and cid in live_delta:
+                    d = live_delta[cid]
+                else:
+                    # BS fallback — uses cached yfinance IV
+                    K      = float(c.strike)
+                    exp_d  = datetime.strptime(c.lastTradeDateOrContractMonth[:8], "%Y%m%d").date()
+                    T      = max((exp_d - date.today()).days / 365, 0.001)
+                    S      = await _get_stock_price(ib, c.symbol) if sec == "OPT" else (
+                        float(state["bars"]["SPY"][-1]["close"]) * 10
+                        if state["bars"].get("SPY") else 5500.0
+                    )
+                    iv_inf = state["ext_cache"]["iv_rank"].get(c.symbol, {})
+                    sigma  = iv_inf.get("iv") or 0.25
+                    d      = _bs_delta(S, K, T, sigma, is_put=(c.right.upper() == "P"))
+                net_delta += (d or 0) * pos * mult
             except Exception:
                 pass
 
-    _at_log("HEDGE", f"Net portfolio delta = {net_delta:+.1f} (threshold ±{threshold:.0f})")
+    _at_log("HEDGE", f"Net portfolio delta = {net_delta:+.1f}  (threshold ±{threshold:.0f},"
+            f" IBKR Greeks for {len(live_delta)}/{len(opt_contracts)} positions)")
     if abs(net_delta) < threshold:
         return
 
-    # Choose hedge: long delta → buy put; short delta → buy call
     hedge_right  = "P" if net_delta > 0 else "C"
     hedge_action = "BUY"
 
-    # Nearest weekly SPY expiry
-    spy_tk   = yf.Ticker("SPY")
-    spy_hist = spy_tk.history(period="2d", interval="1d")
-    spy_spot = float(spy_hist["Close"].iloc[-1]) if not spy_hist.empty else 540.0
-    expiries = spy_tk.options
-    target_d = date.today()
-    exp_str  = expiries[0] if expiries else ""
-    for exp in expiries:
-        d_exp = datetime.strptime(exp, "%Y-%m-%d").date()
-        if (d_exp - target_d).days >= 3:
-            exp_str = exp
-            break
-
-    if not exp_str:
-        _at_log("HEDGE", "Could not find SPY expiry")
+    # ── SPY hedge contract pricing via IBKR/OPRA ──────────────────────────────
+    spy_spot = await _get_stock_price(ib, "SPY")
+    if spy_spot <= 0:
+        _at_log("HEDGE", "Could not get live SPY price")
         return
 
-    chain     = spy_tk.option_chain(exp_str)
-    df        = chain.puts if hedge_right == "P" else chain.calls
-    # Pick 2 % OTM strike
-    tgt_k     = round(spy_spot * (0.98 if hedge_right == "P" else 1.02), 0)
-    df["diff"]= abs(df["strike"] - tgt_k)
-    row       = df.sort_values("diff").iloc[0]
-    strike    = float(row["strike"])
-    bid       = float(row.get("bid", 0) or 0)
-    ask       = float(row.get("ask", 0) or 0)
-    if ask <= 0:
-        _at_log("HEDGE", "No valid SPY quote for hedge")
+    strike, lmt, expiry_k = None, None, None
+    try:
+        tgt_k = spy_spot * (0.98 if hedge_right == "P" else 1.02)
+        tds, chosen_exp, _ = await _fetch_opra_chain(
+            ib, "SPY", hedge_right, spy_spot,
+            dte_min=3, dte_max=14,
+            otm_lo_pct=0.0, otm_hi_pct=4.0, max_strikes=6,
+        )
+        best_td, best_dist = None, float("inf")
+        for td in tds:
+            K2  = _safe_float(td.contract.strike)
+            bid = _safe_float(td.bid, 0.0)
+            ask = _safe_float(td.ask, 0.0)
+            if K2 is None or ask <= 0:
+                continue
+            dist = abs(K2 - tgt_k)
+            if dist < best_dist:
+                best_dist, best_td = dist, td
+        if best_td:
+            strike   = best_td.contract.strike
+            expiry_k = chosen_exp
+            ask_live = _safe_float(best_td.ask, 0.0)
+            bid_live = _safe_float(best_td.bid, 0.0)
+            mid_live = (bid_live + ask_live) / 2 if ask_live > 0 else 0
+            # Pay slightly above ask to ensure fill (hedge is protective, not premium-seeking)
+            lmt = round(ask_live + (mid_live - ask_live) * 0.20, 2) if ask_live > 0 else None
+    except ValueError as e:
+        log.warning("Hedge: OPRA chain unavailable (%s) — trying yfinance", e)
+
+    # ── yfinance fallback for hedge pricing ───────────────────────────────────
+    if not lmt or lmt <= 0:
+        def _yf_hedge():
+            spy_tk = yf.Ticker("SPY")
+            expiries = spy_tk.options or []
+            exp_str = next(
+                (e for e in sorted(expiries)
+                 if (datetime.strptime(e, "%Y-%m-%d").date() - date.today()).days >= 3),
+                None,
+            )
+            if not exp_str:
+                return None, None, None
+            df    = spy_tk.option_chain(exp_str).puts if hedge_right == "P" else spy_tk.option_chain(exp_str).calls
+            tgt_k = spy_spot * (0.98 if hedge_right == "P" else 1.02)
+            df = df.copy(); df["_d"] = abs(df["strike"] - tgt_k)
+            row = df.sort_values("_d").iloc[0]
+            ask_yf = float(row.get("ask", 0) or 0)
+            if ask_yf <= 0:
+                return None, None, None
+            return float(row["strike"]), round(ask_yf * 1.01, 2), exp_str.replace("-", "")
+        strike, lmt, expiry_k = await asyncio.get_event_loop().run_in_executor(None, _yf_hedge)
+
+    if not lmt or lmt <= 0 or not strike or not expiry_k:
+        _at_log("HEDGE", "No valid SPY quote for hedge (IBKR + yfinance both failed)")
         return
 
-    lmt      = round(ask * 1.01, 2)
-    expiry_k = exp_str.replace("-", "")
-    contract = Option("SPY", expiry_k, strike, hedge_right, "SMART")
+    contract = Option("SPY", expiry_k, float(strike), hedge_right, "SMART")
     await ib.qualifyContractsAsync(contract)
     if not contract.conId:
         _at_log("HEDGE", "Could not qualify SPY hedge contract")
@@ -1484,7 +1606,7 @@ async def _autotrader_hedge_coro(ib: IB) -> None:
     trade = ib.placeOrder(contract, LimitOrder(hedge_action, 1, lmt))
     await asyncio.sleep(1)
     _at_log("HEDGE", (f"Placed SPY {hedge_right}{strike} {expiry_k} hedge @ ${lmt:.2f} "
-                      f"(delta={net_delta:+.0f}, order #{trade.order.orderId})"))
+                      f"(portfolio delta={net_delta:+.0f}, order #{trade.order.orderId})"))
 
 
 async def _autotrader_background() -> None:
@@ -1826,20 +1948,22 @@ async def scan_csp(
                 pc_vol_r   = inst.get("pc_vol_ratio", 1.0)
                 rows: list = []
 
-                for td in tds:
+                for td in (tds or []):
                     try:
-                        K   = float(td.contract.strike)
-                        bid = float(td.bid  or 0)
-                        ask = float(td.ask  or 0)
-                        if bid <= 0 or ask <= 0 or math.isnan(bid) or math.isnan(ask):
+                        K   = _safe_float(td.contract.strike)
+                        bid = _safe_float(td.bid, 0.0)
+                        ask = _safe_float(td.ask, 0.0)
+                        if K is None or bid <= 0 or ask <= 0:
                             continue
 
                         greeks = td.modelGreeks
                         if not greeks:
                             continue
-                        iv    = float(greeks.impliedVol  or 0)
-                        delta = float(greeks.delta       or 0)
-                        theta = float(greeks.theta       or 0)   # IBKR: $/day (negative)
+                        iv    = _safe_float(greeks.impliedVol)
+                        delta = _safe_float(greeks.delta)
+                        theta = _safe_float(greeks.theta, 0.0)
+                        if iv is None or delta is None:
+                            continue
                         if iv < 0.05 or iv > 3.0 or delta >= 0:
                             continue
                         if abs(delta) > max_delta:
@@ -1851,16 +1975,16 @@ async def scan_csp(
                         if otm_pct < 3 or otm_pct > 30:
                             continue
 
-                        oi  = int(td.openInterest or 0) if (td.openInterest and not math.isnan(float(td.openInterest))) else 0
-                        vol = int(td.volume       or 0) if (td.volume       and not math.isnan(float(td.volume)))       else 0
+                        oi  = int(_safe_float(td.openInterest, 0))
+                        vol = int(_safe_float(td.volume, 0))
                         if oi < CSP_MIN_OI:
                             continue
                         if spread_pct / 100 > CSP_MAX_SPREAD_PCT:
                             continue
 
                         # OPRA order-book pressure
-                        bid_sz  = int(td.bidSize or 0)
-                        ask_sz  = int(td.askSize or 0)
+                        bid_sz  = int(_safe_float(td.bidSize, 0))
+                        ask_sz  = int(_safe_float(td.askSize, 0))
                         if   ask_sz > bid_sz * 2: flow_flag = "ASK HEAVY"   # buyers lifting ask → bullish
                         elif bid_sz > ask_sz * 2: flow_flag = "BID HEAVY"   # sellers hitting bid → bearish
                         else:                     flow_flag = "BALANCED"
@@ -1942,6 +2066,8 @@ async def scan_csp(
                             "warnings":              warnings,
                         }
                         row["score"] = _score_csp(row)
+                        # Sanitize any NaN/Inf floats before JSON serialization
+                        row = {k: (None if isinstance(v, float) and (math.isnan(v) or math.isinf(v)) else v) for k, v in row.items()}
                         rows.append(row)
                     except Exception as exc:
                         log.debug("CSP row error %s $%s: %s", ticker, td.contract.strike if td.contract else "?", exc)
@@ -2040,8 +2166,8 @@ async def scan_csp(
                     log.info("CSP [%s]: %d yfinance fallback candidates", ticker, len(rows))
                 return rows
 
-            except Exception as e:
-                log.warning(f"CSP scan error [{ticker}]: {e}")
+            except BaseException as e:
+                log.warning("CSP scan error [%s]: %s\n%s", ticker, e, traceback.format_exc())
                 return []
 
     regime, *ticker_results = await asyncio.gather(
@@ -2116,21 +2242,23 @@ async def scan_leaps(ib: IB) -> dict:
                 pc_oi_r    = inst.get("pc_oi_ratio", 1.0)
                 rows: list = []
 
-                for td in tds:
+                for td in (tds or []):
                     try:
-                        K   = float(td.contract.strike)
-                        bid = float(td.bid  or 0)
-                        ask = float(td.ask  or 0)
-                        if bid <= 0 or ask <= 0 or math.isnan(bid) or math.isnan(ask):
+                        K   = _safe_float(td.contract.strike)
+                        bid = _safe_float(td.bid, 0.0)
+                        ask = _safe_float(td.ask, 0.0)
+                        if K is None or bid <= 0 or ask <= 0:
                             continue
 
                         greeks = td.modelGreeks
                         if not greeks:
                             continue
-                        iv    = float(greeks.impliedVol  or 0)
-                        delta = float(greeks.delta       or 0)
-                        theta = float(greeks.theta       or 0)
-                        vega  = float(greeks.vega        or 0)
+                        iv    = _safe_float(greeks.impliedVol)
+                        delta = _safe_float(greeks.delta)
+                        theta = _safe_float(greeks.theta, 0.0)
+                        vega  = _safe_float(greeks.vega, 0.0)
+                        if iv is None or delta is None:
+                            continue
                         if iv < 0.05 or iv > 3.0 or delta <= 0:
                             continue
                         if iv > LEAP_MAX_IV:
@@ -2140,12 +2268,12 @@ async def scan_leaps(ib: IB) -> dict:
 
                         mid        = (bid + ask) / 2.0
                         spread_pct = (ask - bid) / mid * 100
-                        oi  = int(td.openInterest or 0) if (td.openInterest and not math.isnan(float(td.openInterest))) else 0
-                        vol = int(td.volume       or 0) if (td.volume       and not math.isnan(float(td.volume)))       else 0
+                        oi  = int(_safe_float(td.openInterest, 0))
+                        vol = int(_safe_float(td.volume, 0))
 
                         # OPRA order-book pressure on LEAP calls
-                        bid_sz  = int(td.bidSize or 0)
-                        ask_sz  = int(td.askSize or 0)
+                        bid_sz  = int(_safe_float(td.bidSize, 0))
+                        ask_sz  = int(_safe_float(td.askSize, 0))
                         if   ask_sz > bid_sz * 2: flow_flag = "ASK HEAVY"   # aggressive call buyers
                         elif bid_sz > ask_sz * 2: flow_flag = "BID HEAVY"
                         else:                     flow_flag = "BALANCED"
@@ -2232,6 +2360,7 @@ async def scan_leaps(ib: IB) -> dict:
                             + inst_bonus,
                             2,
                         )
+                        row = {k: (None if isinstance(v, float) and (math.isnan(v) or math.isinf(v)) else v) for k, v in row.items()}
                         rows.append(row)
                     except Exception as exc:
                         log.debug("LEAP row error %s: %s", ticker, exc)
@@ -2318,8 +2447,8 @@ async def scan_leaps(ib: IB) -> dict:
                     log.info("LEAP [%s]: %d yfinance fallback candidates", ticker, len(rows))
                 return rows
 
-            except Exception as e:
-                log.warning(f"LEAP scan error [{ticker}]: {e}")
+            except BaseException as e:
+                log.warning("LEAP scan error [%s]: %s\n%s", ticker, e, traceback.format_exc())
                 return []
 
     regime, *ticker_results = await asyncio.gather(
@@ -2337,62 +2466,133 @@ async def scan_leaps(ib: IB) -> dict:
 ZERO_DTE_UNIVERSE = ["SPY", "QQQ", "IWM"]
 
 async def scan_0dte(ib: IB) -> dict:
-    """Scan SPY/QQQ/IWM for 0–7 DTE put premium-collection setups."""
+    """
+    Scan SPY/QQQ/IWM for 0–7 DTE put premium-collection setups.
+    IBKR/OPRA is the primary source (time-critical for 0DTE fills);
+    yfinance is the fallback when OPRA chain is unavailable.
+    """
     today      = date.today()
     candidates = []
+
     for ticker in ZERO_DTE_UNIVERSE:
         try:
             spot = await _get_stock_price(ib, ticker)
             if spot <= 0:
                 continue
-            tk       = yf.Ticker(ticker)
-            expiries = tk.options
-            near     = [(datetime.strptime(e, "%Y-%m-%d").date(), e)
-                        for e in expiries
-                        if 0 <= (datetime.strptime(e, "%Y-%m-%d").date() - today).days <= 7]
-            if not near:
-                continue
-            near.sort()
-            exp_d, exp_str = near[0]
-            dte = (exp_d - today).days
-            chain = tk.option_chain(exp_str)
-            puts  = chain.puts.copy()
-            puts["_diff"] = abs(puts["strike"] - spot * 0.98)
-            puts = puts.sort_values("_diff")
-            for _, r in puts.head(4).iterrows():
-                strike       = float(r["strike"])
-                bid          = float(r.get("bid", 0) or 0)
-                ask          = float(r.get("ask", 0) or 0)
-                oi           = int(r.get("openInterest", 0) or 0)
-                vol          = int(r.get("volume", 0) or 0)
-                iv           = float(r.get("impliedVolatility", 0) or 0)
-                if bid < 0.25 or ask <= 0:
-                    continue
-                mid          = (bid + ask) / 2
-                otm_pct      = (spot - strike) / spot * 100
-                daily_ret    = mid / spot * 100
-                liq          = _liquidity_score(oi, vol, (ask - bid) / mid * 100 if mid > 0 else 100)
-                candidates.append({
-                    "ticker":           ticker,
-                    "expiry":           exp_str.replace("-", ""),
-                    "expiry_display":   exp_str,
-                    "dte":              dte,
-                    "strike":           strike,
-                    "bid":              round(bid, 2),
-                    "ask":              round(ask, 2),
-                    "mid":              round(mid, 2),
-                    "iv_pct":           round(iv * 100, 1),
-                    "oi":               oi,
-                    "volume":           vol,
-                    "spot":             round(spot, 2),
-                    "otm_pct":          round(otm_pct, 1),
-                    "daily_return_pct": round(daily_ret, 3),
-                    "liquidity_score":  liq,
-                })
-                break
+
+            # ── Primary: IBKR/OPRA snapshot (real-time bid/ask + Greeks) ──
+            tds, chosen_exp, dte = None, None, 0
+            data_src = "yfinance"
+            try:
+                # Strikes in [96%, 100%] of spot — covers the 2 % OTM target
+                tds, chosen_exp, dte = await _fetch_opra_chain(
+                    ib, ticker, "P", spot,
+                    dte_min=0, dte_max=7,
+                    otm_lo_pct=0.0, otm_hi_pct=4.0, max_strikes=8,
+                )
+                data_src = "OPRA-LIVE" if state.get("opra_active") else "OPRA-DELAYED"
+            except ValueError as e:
+                log.warning("0DTE [%s]: OPRA unavailable (%s) — falling back to yfinance", ticker, e)
+
+            best = None
+
+            if tds:
+                tgt_strike = spot * 0.98
+                exp_display = f"{chosen_exp[:4]}-{chosen_exp[4:6]}-{chosen_exp[6:]}"
+                for td in tds:
+                    K   = _safe_float(td.contract.strike)
+                    bid = _safe_float(td.bid, 0.0)
+                    ask = _safe_float(td.ask, 0.0)
+                    if K is None or bid < 0.25 or ask <= 0:
+                        continue
+                    greeks = td.modelGreeks
+                    iv  = _safe_float(greeks.impliedVol) if greeks else None
+                    oi  = int(_safe_float(td.openInterest, 0))
+                    vol = int(_safe_float(td.volume, 0))
+                    mid = (bid + ask) / 2
+                    spread_pct = (ask - bid) / mid * 100 if mid > 0 else 100
+                    cand = {
+                        "ticker":           ticker,
+                        "expiry":           chosen_exp,
+                        "expiry_display":   exp_display,
+                        "dte":              dte,
+                        "strike":           K,
+                        "bid":              round(bid, 2),
+                        "ask":              round(ask, 2),
+                        "mid":              round(mid, 2),
+                        "iv_pct":           round(iv * 100, 1) if iv else None,
+                        "oi":               oi,
+                        "volume":           vol,
+                        "spot":             round(spot, 2),
+                        "otm_pct":          round((spot - K) / spot * 100, 1),
+                        "daily_return_pct": round(mid / spot * 100, 3),
+                        "liquidity_score":  _liquidity_score(oi, vol, spread_pct),
+                        "data_source":      data_src,
+                        "_dist":            abs(K - tgt_strike),
+                    }
+                    if best is None or cand["_dist"] < best["_dist"]:
+                        best = cand
+
+                if best:
+                    best.pop("_dist")
+                    candidates.append(best)
+
+            # ── Fallback: yfinance (market closed or OPRA unavailable) ──
+            if not best:
+                def _yf_0dte():
+                    tk = yf.Ticker(ticker)
+                    near = sorted(
+                        (datetime.strptime(e, "%Y-%m-%d").date(), e)
+                        for e in (tk.options or [])
+                        if 0 <= (datetime.strptime(e, "%Y-%m-%d").date() - today).days <= 7
+                    )
+                    if not near:
+                        return None
+                    exp_d, exp_str = near[0]
+                    dte_yf = (exp_d - today).days
+                    chain  = tk.option_chain(exp_str)
+                    puts   = chain.puts.copy()
+                    puts["_diff"] = abs(puts["strike"] - spot * 0.98)
+                    for _, r in puts.sort_values("_diff").head(4).iterrows():
+                        K2   = float(r["strike"])
+                        bid2 = float(r.get("bid", 0) or 0)
+                        ask2 = float(r.get("ask", 0) or 0)
+                        if bid2 < 0.25 or ask2 <= 0:
+                            continue
+                        mid2 = (bid2 + ask2) / 2
+                        oi2  = int(r.get("openInterest", 0) or 0)
+                        vol2 = int(r.get("volume", 0) or 0)
+                        iv2  = float(r.get("impliedVolatility", 0) or 0)
+                        sp2  = (ask2 - bid2) / mid2 * 100 if mid2 > 0 else 100
+                        return {
+                            "ticker":           ticker,
+                            "expiry":           exp_str.replace("-", ""),
+                            "expiry_display":   exp_str,
+                            "dte":              dte_yf,
+                            "strike":           K2,
+                            "bid":              round(bid2, 2),
+                            "ask":              round(ask2, 2),
+                            "mid":              round(mid2, 2),
+                            "iv_pct":           round(iv2 * 100, 1),
+                            "oi":               oi2,
+                            "volume":           vol2,
+                            "spot":             round(spot, 2),
+                            "otm_pct":          round((spot - K2) / spot * 100, 1),
+                            "daily_return_pct": round(mid2 / spot * 100, 3),
+                            "liquidity_score":  _liquidity_score(oi2, vol2, sp2),
+                            "data_source":      "yfinance",
+                        }
+                    return None
+
+                yf_cand = await asyncio.get_event_loop().run_in_executor(None, _yf_0dte)
+                if yf_cand:
+                    candidates.append(yf_cand)
+
         except Exception as exc:
             log.warning("0DTE scan %s: %s", ticker, exc)
-    candidates.sort(key=lambda x: x["daily_return_pct"], reverse=True)
+
+    candidates = [_json_safe(c) for c in candidates]
+    candidates.sort(key=lambda x: x.get("daily_return_pct") or 0, reverse=True)
     return {"candidates": candidates, "count": len(candidates), "date": today.isoformat()}
 
 
@@ -2620,6 +2820,9 @@ def _run_in_streaming_loop(coro, timeout: int = 180):
     except concurrent.futures.TimeoutError:
         future.cancel()
         raise TimeoutError(f"Scanner timed out after {timeout}s")
+    except BaseException as e:
+        log.error("_run_in_streaming_loop unhandled: %s — %s", type(e).__name__, e)
+        raise
 
 
 # ── FastAPI app ────────────────────────────────────────────────────────────
@@ -2853,9 +3056,16 @@ async def csp_scan(
         raise HTTPException(504, "CSP scan timed out — reduce universe or try later")
     except RuntimeError as e:
         raise HTTPException(503, str(e))
+    except BaseException as e:
+        tb = traceback.format_exc()
+        log.error("CSP scan unhandled exception: %s\n%s", e, tb)
+        raise HTTPException(500, f"{type(e).__name__}: {e}")
 
-    candidates = result["candidates"]
-    regime     = result["regime"]
+    if not result:
+        return {"cached": False, "count": 0, "candidates": [], "market_regime": {}}
+
+    candidates = _json_safe(result["candidates"])
+    regime     = _json_safe(result["regime"])
     now = datetime.utcnow()
     cache["csp"]    = candidates
     cache["regime"] = regime
@@ -2916,9 +3126,16 @@ async def leaps_scan(
         raise HTTPException(504, "LEAP scan timed out — try again shortly")
     except RuntimeError as e:
         raise HTTPException(503, str(e))
+    except BaseException as e:
+        tb = traceback.format_exc()
+        log.error("LEAP scan unhandled exception: %s\n%s", e, tb)
+        raise HTTPException(500, f"{type(e).__name__}: {e}")
 
-    candidates = result["candidates"]
-    regime     = result["regime"]
+    if not result:
+        return {"cached": False, "count": 0, "candidates": [], "market_regime": {}}
+
+    candidates = _json_safe(result["candidates"])
+    regime     = _json_safe(result["regime"])
     now = datetime.utcnow()
     cache["leaps"]  = candidates
     cache["regime"] = regime
@@ -2973,14 +3190,41 @@ async def option_quote(
 async def _portfolio_positions(ib: IB) -> dict:
     """
     Compute net portfolio delta from all open positions.
-    OPT:  BS delta × position × multiplier (IV from yfinance cache or 25% fallback).
-    FOP:  same, with SPY×10 as proxy for the ES underlying.
-    STK:  delta = 1.0 × shares.
+    OPT/FOP: live IBKR modelGreeks.delta via reqTickersAsync (preferred),
+             falling back to BS delta with cached yfinance IV.
+    STK:     delta = 1.0 × shares.
+    Adds delta_source ('IBKR' or 'BS') and iv_pct to each option row.
     """
-    items = ib.portfolio()
+    items   = ib.portfolio()
     today_d = date.today()
-    positions = []
-    total_delta = 0.0
+    positions    = []
+    total_delta  = 0.0
+
+    # ── Batch-fetch live Greeks for all option positions in one round-trip ──
+    opt_contracts = [
+        i.contract for i in items
+        if getattr(i.contract, "secType", "") in ("OPT", "FOP")
+    ]
+    live_delta: dict = {}   # conId → float
+    live_iv: dict    = {}   # conId → float (percent, e.g. 28.5)
+    if opt_contracts:
+        try:
+            await ib.qualifyContractsAsync(*opt_contracts)
+            valid = [c for c in opt_contracts if c.conId]
+            if valid:
+                tds = await ib.reqTickersAsync(*valid)
+                for td in tds:
+                    if not (td.contract and td.modelGreeks):
+                        continue
+                    cid = td.contract.conId
+                    d   = _safe_float(td.modelGreeks.delta)
+                    iv  = _safe_float(td.modelGreeks.impliedVol)
+                    if d  is not None: live_delta[cid] = d
+                    if iv is not None: live_iv[cid]    = round(iv * 100, 2)
+            log.info("Portfolio Greeks: %d/%d positions have live IBKR delta",
+                     len(live_delta), len(opt_contracts))
+        except Exception as e:
+            log.warning("Portfolio Greeks snapshot failed (%s) — using BS fallback for all options", e)
 
     for item in items:
         c   = item.contract
@@ -2991,11 +3235,11 @@ async def _portfolio_positions(ib: IB) -> dict:
             "symbol":          c.symbol,
             "sec_type":        sec,
             "position":        pos,
-            "avg_cost":        item.averageCost,
-            "market_value":    round(item.marketValue, 2),
-            "market_price":    item.marketPrice,
-            "unrealized_pnl":  round(item.unrealizedPNL, 2),
-            "realized_pnl":    round(item.realizedPNL, 2),
+            "avg_cost":        _safe_float(item.averageCost, 0.0),
+            "market_value":    _safe_float(item.marketValue, 0.0),
+            "market_price":    _safe_float(item.marketPrice),
+            "unrealized_pnl":  _safe_float(item.unrealizedPNL, 0.0),
+            "realized_pnl":    _safe_float(item.realizedPNL, 0.0),
             "delta":           None,
             "position_delta":  None,
         }
@@ -3010,38 +3254,50 @@ async def _portfolio_positions(ib: IB) -> dict:
                 expiry_str = getattr(c, "lastTradeDateOrContractMonth", "")[:8]
                 exp_date   = datetime.strptime(expiry_str, "%Y%m%d").date()
                 dte        = max((exp_date - today_d).days, 0)
-                T          = dte / 365.0
                 K          = float(getattr(c, "strike", 0))
                 right      = getattr(c, "right", "C")
                 mult       = float(getattr(c, "multiplier", 100) or 100)
+                cid        = c.conId
 
-                if sec == "OPT":
-                    S = await _get_stock_price(ib, c.symbol)
+                if cid and cid in live_delta:
+                    # Live IBKR model Greeks — most accurate
+                    delta      = live_delta[cid]
+                    iv_pct     = live_iv.get(cid)
+                    delta_src  = "IBKR"
                 else:
-                    # FOP (e.g. ES options) — use SPY×10 as SPX proxy
-                    spy_bars = state["bars"].get("SPY")
-                    S = float(spy_bars[-1]["close"]) * 10 if spy_bars else 5500.0
+                    # Black-Scholes fallback with cached yfinance IV
+                    delta_src = "BS"
+                    if sec == "OPT":
+                        S = await _get_stock_price(ib, c.symbol)
+                    else:
+                        spy_bars = state["bars"].get("SPY")
+                        S = float(spy_bars[-1]["close"]) * 10 if spy_bars else 5500.0
+                    T        = max(dte / 365.0, 0.001)
+                    iv_cache = state["ext_cache"]["iv_rank"].get(c.symbol)
+                    sigma    = (iv_cache["iv"] / 100) if iv_cache and iv_cache.get("iv") else 0.25
+                    delta    = _bs_delta(S, K, T, sigma, is_put=(right == "P"))
+                    iv_pct   = round(sigma * 100, 1)
 
-                iv_cache = state["ext_cache"]["iv_rank"].get(c.symbol)
-                sigma    = (iv_cache["iv"] / 100) if iv_cache and iv_cache.get("iv") else 0.25
+                if delta is None or math.isnan(delta):
+                    raise ValueError("no valid delta")
 
-                delta    = _bs_delta(S, K, T, sigma, is_put=(right == "P"))
-                pd_val   = round(pos * delta * mult, 2) if not math.isnan(delta) else 0.0
-
+                pd_val = round(pos * delta * mult, 2)
                 entry.update({
-                    "delta":          round(delta, 4) if not math.isnan(delta) else None,
+                    "delta":          round(delta, 4),
                     "position_delta": pd_val,
                     "strike":         K,
                     "expiry":         expiry_str,
                     "right":          right,
                     "multiplier":     int(mult),
                     "dte":            dte,
+                    "iv_pct":         iv_pct,
+                    "delta_source":   delta_src,
                 })
                 total_delta += pd_val
             except Exception as e:
-                log.debug(f"Delta calc [{c.symbol} {sec}]: {e}")
+                log.debug("Delta calc [%s %s]: %s", c.symbol, sec, e)
 
-        positions.append(entry)
+        positions.append(_json_safe(entry))
 
     return {
         "total_delta":   round(total_delta, 2),
