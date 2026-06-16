@@ -429,6 +429,124 @@ def _next_expiry(weeks_out: int = 0) -> str:
     return friday.strftime("%Y%m%d")
 
 
+async def _fetch_opra_chain(
+    ib: IB,
+    ticker: str,
+    right: str,
+    stock_price: float,
+    dte_min: int,
+    dte_max: int,
+    otm_lo_pct: float = 3.0,
+    otm_hi_pct: float = 30.0,
+    max_strikes: int = 10,
+) -> tuple:
+    """
+    Fetch live IBKR/OPRA options data for a ticker via reqSecDefOptParamsAsync
+    + reqTickersAsync.  Returns (list[Ticker], expiry_YYYYMMDD, dte_int).
+    Raises ValueError if chain unavailable — caller should fall back to yfinance.
+    """
+    stock = Stock(ticker, "SMART", "USD")
+    await ib.qualifyContractsAsync(stock)
+    if not stock.conId:
+        raise ValueError(f"qualify failed: {ticker}")
+
+    chains = await ib.reqSecDefOptParamsAsync(ticker, "", "STK", stock.conId)
+    if not chains:
+        raise ValueError(f"no chain params: {ticker}")
+    chain = next((c for c in chains if c.exchange == "SMART"), chains[0])
+
+    today_d = date.today()
+    chosen_exp, chosen_dte = None, 0
+    for exp in sorted(chain.expirations):
+        try:
+            exp_date = datetime.strptime(exp, "%Y%m%d").date()
+            dte = (exp_date - today_d).days
+            if dte_min <= dte <= dte_max:
+                chosen_exp, chosen_dte = exp, dte
+                break
+        except ValueError:
+            continue
+    if not chosen_exp:
+        raise ValueError(f"no expiry in {dte_min}-{dte_max} DTE for {ticker}")
+
+    lo = stock_price * (1 - otm_hi_pct / 100)
+    hi = stock_price * (1 - otm_lo_pct / 100) if right == "P" else stock_price * (1 + otm_hi_pct / 100)
+    strikes = sorted(
+        [s for s in chain.strikes if lo <= s <= hi],
+        reverse=(right == "P"),
+    )[:max_strikes]
+    if not strikes:
+        raise ValueError(f"no strikes in OTM range for {ticker} {right}")
+
+    contracts = [Option(ticker, chosen_exp, s, right, "SMART") for s in strikes]
+    await ib.qualifyContractsAsync(*contracts)
+    valid = [c for c in contracts if c.conId]
+    if not valid:
+        raise ValueError(f"no qualified contracts for {ticker} {right}")
+
+    tickers_data = await ib.reqTickersAsync(*valid)
+    return tickers_data, chosen_exp, chosen_dte
+
+
+async def _institutional_signals(ticker: str, stock_price: float) -> dict:
+    """
+    Derive max pain, gamma wall and put/call ratios from the full yfinance chain.
+    OI is a daily figure so 15-min staleness is acceptable for these aggregate signals.
+    """
+    def _calc():
+        try:
+            t    = yf.Ticker(ticker)
+            exps = t.options or []
+            if not exps:
+                return {}
+            chain    = t.option_chain(exps[0])
+            puts_df  = chain.puts
+            calls_df = chain.calls
+
+            tot_put_oi  = float(puts_df["openInterest"].fillna(0).sum())
+            tot_call_oi = float(calls_df["openInterest"].fillna(0).sum())
+            tot_put_vol = float(puts_df["volume"].fillna(0).sum())
+            tot_call_vol= float(calls_df["volume"].fillna(0).sum())
+
+            pc_oi_ratio  = round(tot_put_oi  / max(tot_call_oi,  1), 2)
+            pc_vol_ratio = round(tot_put_vol / max(tot_call_vol, 1), 2)
+
+            # Max pain: price at which total option pain (ITM value) is minimised
+            all_strikes = sorted(set(
+                list(puts_df["strike"].values) + list(calls_df["strike"].values)
+            ))
+            min_pain, max_pain_s = None, stock_price
+            for s in all_strikes:
+                pr = puts_df[puts_df["strike"] == s]
+                cr = calls_df[calls_df["strike"] == s]
+                pain = (
+                    (float(pr["openInterest"].iloc[0]) * max(0, s - stock_price) if not pr.empty else 0) +
+                    (float(cr["openInterest"].iloc[0]) * max(0, stock_price - s) if not cr.empty else 0)
+                )
+                if min_pain is None or pain < min_pain:
+                    min_pain, max_pain_s = pain, s
+
+            # Gamma wall: strike with highest combined OI (where MM hedging is heaviest)
+            all_oi: dict = {}
+            for _, r in puts_df.iterrows():
+                all_oi[r["strike"]] = all_oi.get(r["strike"], 0) + (r["openInterest"] or 0)
+            for _, r in calls_df.iterrows():
+                all_oi[r["strike"]] = all_oi.get(r["strike"], 0) + (r["openInterest"] or 0)
+            gamma_wall = max(all_oi, key=all_oi.get) if all_oi else stock_price
+
+            return {
+                "max_pain":    round(float(max_pain_s), 2),
+                "gamma_wall":  round(float(gamma_wall), 2),
+                "pc_oi_ratio": pc_oi_ratio,
+                "pc_vol_ratio":pc_vol_ratio,
+            }
+        except Exception as e:
+            log.debug("Institutional signals failed %s: %s", ticker, e)
+            return {}
+
+    return await asyncio.get_event_loop().run_in_executor(None, _calc)
+
+
 def _stock_quality_score(ticker: str) -> float:
     """
     0–1 composite from live signal features.
@@ -479,19 +597,41 @@ def _assignment_risk(delta: float, otm_pct: float) -> str:
 def _score_csp(row: dict) -> float:
     """
     Composite rank score — higher is better.
-    Uses realistic fill return (bid + 40% spread) as the primary return metric.
+    Uses realistic fill return (bid + 40% spread) as primary return metric.
+    Institutional OPRA signals adjust the score up or down.
     """
     s = 0.0
-    # 1) Realistic weekly return above 4% target (capped at 3×)
+    # 1) Realistic weekly return above min target (capped at 3×)          max 75
     s += min(row["weekly_return_pct"] / CSP_MIN_RETURN_PCT, 3.0) * 25
-    # 2) Distance from assignment
+    # 2) Delta safety — distance from assignment                           max 20
     s += (CSP_MAX_DELTA - abs(row["delta"])) / CSP_MAX_DELTA * 20
-    # 3) Liquidity (OI + volume + spread combined)
+    # 3) Liquidity (OI + volume + spread)                                  max 20
     s += (row.get("liquidity_score", 50) / 100) * 20
-    # 4) Stock quality (technical trend strength)
+    # 4) Stock quality (technical trend strength)                          max 20
     s += row.get("stock_quality", 0.5) * 20
-    # 5) IV rank — elevated IV = better premium selling environment
+    # 5) IV rank — high IV = better premium for sellers                    max 15
     s += (row.get("iv_rank", 50) / 100) * 15
+    # 6) OPRA institutional signals (bonus / penalty)
+    # Strike above max pain → market makers incentivised to keep price here +8
+    if row.get("max_pain") and row["strike"] >= row["max_pain"]:
+        s += 8
+    # Put/call volume ratio < 0.7 → call-dominant flow today (bullish)    +6
+    pc_vol = row.get("pc_vol_ratio", 1.0)
+    if pc_vol < 0.7:
+        s += 6
+    elif pc_vol > 1.5:
+        s -= 6   # heavy put buying — bearish flow
+    # No unusual put activity at this specific strike                      +4
+    if row.get("vol_oi_ratio", 1.0) < 1.0:
+        s += 4
+    elif row.get("vol_oi_ratio", 1.0) > 2.0:
+        s -= 8   # volume >> OI: someone is making a directional put bet
+    # Ask-heavy order book → buyers aggressively lifting offers (bullish)  +4
+    flow = row.get("flow_flag", "BALANCED")
+    if flow == "ASK HEAVY":
+        s += 4
+    elif flow == "BID HEAVY":
+        s -= 4
     return round(s, 2)
 
 
@@ -1181,34 +1321,46 @@ async def _autotrader_place_coro(ib: IB, row: dict, cfg: dict, regime: str = "BU
     await ib.qualifyContractsAsync(contract)
     if not contract.conId:
         raise ValueError(f"Could not qualify {ticker} {expiry} {strike}{right}")
-    exp_str = f"{expiry[:4]}-{expiry[4:6]}-{expiry[6:8]}"
-    def _fetch_mid() -> Optional[float]:
-        t_obj = yf.Ticker(ticker)
-        try:
-            chain = t_obj.option_chain(exp_str)
-            df    = chain.calls if right == "C" else chain.puts
-            df_r  = df[df["strike"] == strike]
-            if df_r.empty:
-                return None
-            b = float(df_r["bid"].iloc[0])
-            a = float(df_r["ask"].iloc[0])
-            m = (b + a) / 2
-            return round((b + (m - b) * 0.40) if action == "SELL" else (a - (a - m) * 0.40), 2)
-        except Exception:
-            return None
-    lmt = await asyncio.get_event_loop().run_in_executor(None, _fetch_mid)
-    if not lmt or lmt <= 0:
-        raise ValueError(f"Could not price {ticker} {expiry} ${strike}{right}")
-    # Request live IV snapshot at entry for journal
+    # ── Live IBKR/OPRA price for limit order (replaces stale yfinance bid) ──
     live_iv_entry = None
+    lmt           = None
     try:
         tq = ib.reqMktData(contract, "106,13", False, False)
-        await asyncio.sleep(1.5)
+        await asyncio.sleep(2.0)   # allow snapshot to settle
+        ibkr_bid = tq.bid if tq.bid and not math.isnan(tq.bid) and tq.bid > 0 else None
+        ibkr_ask = tq.ask if tq.ask and not math.isnan(tq.ask) and tq.ask > 0 else None
+        if ibkr_bid and ibkr_ask:
+            ibkr_mid = (ibkr_bid + ibkr_ask) / 2
+            lmt = round(
+                (ibkr_bid + (ibkr_mid - ibkr_bid) * 0.40) if action == "SELL"
+                else (ibkr_ask - (ibkr_ask - ibkr_mid) * 0.40),
+                2,
+            )
         if tq.modelGreeks:
             live_iv_entry = round(float(tq.modelGreeks.impliedVol or 0) * 100, 2)
         ib.cancelMktData(contract)
-    except Exception:
-        pass
+    except Exception as e:
+        log.warning("IBKR price snapshot failed for %s %s $%s%s: %s", ticker, expiry, strike, right, e)
+
+    # Fall back to yfinance if IBKR snapshot gave no data
+    if not lmt or lmt <= 0:
+        exp_str = f"{expiry[:4]}-{expiry[4:6]}-{expiry[6:8]}"
+        def _yf_fallback():
+            try:
+                df = (yf.Ticker(ticker).option_chain(exp_str).calls if right == "C"
+                      else yf.Ticker(ticker).option_chain(exp_str).puts)
+                r  = df[df["strike"] == strike]
+                if r.empty: return None
+                b, a = float(r["bid"].iloc[0]), float(r["ask"].iloc[0])
+                m = (b + a) / 2
+                return round((b + (m-b)*0.40) if action=="SELL" else (a-(a-m)*0.40), 2)
+            except Exception:
+                return None
+        lmt = await asyncio.get_event_loop().run_in_executor(None, _yf_fallback)
+        log.info("Auto-trader: used yfinance fallback price for %s %s $%s%s", ticker, expiry, strike, right)
+
+    if not lmt or lmt <= 0:
+        raise ValueError(f"Could not price {ticker} {expiry} ${strike}{right}")
 
     trade      = ib.placeOrder(contract, LimitOrder(action, qty, lmt))
     await asyncio.sleep(1)
@@ -1651,118 +1803,148 @@ async def scan_csp(
                     log.debug(f"CSP [{ticker}]: no price")
                     return []
 
-                today_d = date.today()
+                # ── Fetch live OPRA data + institutional signals concurrently ──
+                sq = _stock_quality_score(ticker)
+                try:
+                    (tds, expiry_ibkr, dte), inst = await asyncio.gather(
+                        _fetch_opra_chain(ib, ticker, "P", stock_price, 5, 35),
+                        _institutional_signals(ticker, stock_price),
+                    )
+                except ValueError as e:
+                    log.warning("CSP [%s]: OPRA unavailable (%s) — skipping", ticker, e)
+                    return []
 
-                def _fetch_yf_puts():
-                    t = yf.Ticker(ticker)
-                    exps = t.options or []
-                    rows = []
-                    for exp_str in exps:
-                        try:
-                            exp_date = datetime.strptime(exp_str, "%Y-%m-%d").date()
-                        except ValueError:
-                            continue
-                        dte = (exp_date - today_d).days
-                        if dte < 5:
-                            continue
-                        if dte > 35:
-                            break
-                        T = dte / 365.0
-                        expiry_fmt = exp_date.strftime("%Y%m%d")
-                        try:
-                            puts = t.option_chain(exp_str).puts
-                        except Exception:
-                            continue
-                        for _, r in puts.iterrows():
-                            try:
-                                K   = float(r["strike"])
-                                bid = float(r.get("bid") or 0)
-                                ask = float(r.get("ask") or 0)
-                                iv  = float(r.get("impliedVolatility") or 0)
-                                oi  = int(r.get("openInterest") or 0)
-                                vol = int(r.get("volume") or 0)
-                                if bid <= 0 or ask <= 0 or iv < 0.05 or iv > 3.0:
-                                    continue
-                                mid        = (bid + ask) / 2.0
-                                spread_pct = (ask - bid) / mid * 100
-                                otm_pct    = (stock_price - K) / stock_price * 100
-                                if otm_pct < 3 or otm_pct > 30:
-                                    continue
-                                delta = _bs_delta(stock_price, K, T, iv, is_put=True)
-                                if math.isnan(delta) or delta >= 0:
-                                    continue
-                                if abs(delta) > max_delta:
-                                    continue
-                                if oi < CSP_MIN_OI:
-                                    continue
-                                if spread_pct / 100 > CSP_MAX_SPREAD_PCT:
-                                    continue
-                                theta          = _bs_theta(stock_price, K, T, iv, is_put=True)
-                                fill_cons      = bid
-                                fill_real      = bid + (mid - bid) * 0.40
-                                wk_ret_bid     = fill_cons / K * 100
-                                wk_ret_pct     = fill_real / K * 100
-                                wk_ret_mid     = mid       / K * 100
-                                if wk_ret_pct < min_return:
-                                    continue
-                                ann_ret        = wk_ret_pct * 52
-                                max_loss       = round((K - fill_real) * 100, 2)
-                                ror            = round(fill_real / max(K - fill_real, 0.01) * 52 * 100, 1)
-                                liq            = _liquidity_score(oi, vol, spread_pct)
-                                exp_move       = _expected_weekly_move(stock_price, iv)
-                                sigma_otm      = (stock_price - K) / exp_move if exp_move > 0 else 0
-                                warnings       = _build_warnings(earnings_days, iv_info["rank"], "csp")
-                                sq             = _stock_quality_score(ticker)
-                                row = {
-                                    "ticker":               ticker,
-                                    "expiry":               expiry_fmt,
-                                    "dte":                  dte,
-                                    "strike":               K,
-                                    "stock_price":          round(stock_price, 2),
-                                    "otm_pct":              round(otm_pct, 2),
-                                    "sigma_otm":            round(sigma_otm, 2),
-                                    "bid":                  round(bid, 2),
-                                    "ask":                  round(ask, 2),
-                                    "mid":                  round(mid, 2),
-                                    "weekly_return_bid":    round(wk_ret_bid, 2),
-                                    "weekly_return_pct":    round(wk_ret_pct, 2),
-                                    "weekly_return_mid":    round(wk_ret_mid, 2),
-                                    "annualized_return":    round(ann_ret, 1),
-                                    "max_loss_per_contract": max_loss,
-                                    "return_on_risk_ann":   ror,
-                                    "breakeven":            round(K - fill_real, 2),
-                                    "delta":                round(delta, 4),
-                                    "iv_pct":               round(iv * 100, 1),
-                                    "theta_daily":          round(theta, 4),
-                                    "open_interest":        oi,
-                                    "volume":               vol,
-                                    "spread_pct":           round(spread_pct, 2),
-                                    "liquidity_score":      liq,
-                                    "stock_quality":        sq,
-                                    "assignment_risk":      _assignment_risk(delta, otm_pct),
-                                    "xgb_signal":           state["signals"].get(ticker, {}).get("label", "N/A"),
-                                    "cash_required":        round(K * 100, 2),
-                                    "premium_collected":    round(fill_real * 100, 2),
-                                    "earnings_days_out":    earnings_days,
-                                    "iv_rank":              iv_info["rank"],
-                                    "iv_yf":                iv_info["iv"],
-                                    "rsi14":                tech.get("rsi14"),
-                                    "macd_hist":            tech.get("macd_hist"),
-                                    "above_sma20":          tech.get("above_sma20"),
-                                    "above_sma50":          tech.get("above_sma50"),
-                                    "warnings":             warnings,
-                                }
-                                row["score"] = _score_csp(row)
-                                rows.append(row)
-                            except Exception:
-                                continue
-                        if rows:
-                            break  # got candidates from this expiry
-                    return rows
+                T          = dte / 365.0
+                today_d    = date.today()
+                max_pain   = inst.get("max_pain")
+                gamma_wall = inst.get("gamma_wall")
+                pc_oi_r    = inst.get("pc_oi_ratio", 1.0)
+                pc_vol_r   = inst.get("pc_vol_ratio", 1.0)
+                rows: list = []
 
-                loop = asyncio.get_event_loop()
-                rows = await loop.run_in_executor(None, _fetch_yf_puts)
-                log.info(f"CSP [{ticker}]: {len(rows)} candidates  price=${stock_price:.2f}")
+                for td in tds:
+                    try:
+                        K   = float(td.contract.strike)
+                        bid = float(td.bid  or 0)
+                        ask = float(td.ask  or 0)
+                        if bid <= 0 or ask <= 0 or math.isnan(bid) or math.isnan(ask):
+                            continue
+
+                        greeks = td.modelGreeks
+                        if not greeks:
+                            continue
+                        iv    = float(greeks.impliedVol  or 0)
+                        delta = float(greeks.delta       or 0)
+                        theta = float(greeks.theta       or 0)   # IBKR: $/day (negative)
+                        if iv < 0.05 or iv > 3.0 or delta >= 0:
+                            continue
+                        if abs(delta) > max_delta:
+                            continue
+
+                        mid        = (bid + ask) / 2.0
+                        spread_pct = (ask - bid) / mid * 100
+                        otm_pct    = (stock_price - K) / stock_price * 100
+                        if otm_pct < 3 or otm_pct > 30:
+                            continue
+
+                        oi  = int(td.openInterest or 0) if (td.openInterest and not math.isnan(float(td.openInterest))) else 0
+                        vol = int(td.volume       or 0) if (td.volume       and not math.isnan(float(td.volume)))       else 0
+                        if oi < CSP_MIN_OI:
+                            continue
+                        if spread_pct / 100 > CSP_MAX_SPREAD_PCT:
+                            continue
+
+                        # OPRA order-book pressure
+                        bid_sz  = int(td.bidSize or 0)
+                        ask_sz  = int(td.askSize or 0)
+                        if   ask_sz > bid_sz * 2: flow_flag = "ASK HEAVY"   # buyers lifting ask → bullish
+                        elif bid_sz > ask_sz * 2: flow_flag = "BID HEAVY"   # sellers hitting bid → bearish
+                        else:                     flow_flag = "BALANCED"
+
+                        vol_oi_ratio = round(vol / max(oi, 1), 2)
+
+                        fill_cons  = bid
+                        fill_real  = bid + (mid - bid) * 0.40
+                        wk_ret_bid = fill_cons / K * 100
+                        wk_ret_pct = fill_real / K * 100
+                        wk_ret_mid = mid       / K * 100
+                        if wk_ret_pct < min_return:
+                            continue
+
+                        ann_ret  = wk_ret_pct * 52
+                        max_loss = round((K - fill_real) * 100, 2)
+                        ror      = round(fill_real / max(K - fill_real, 0.01) * 52 * 100, 1)
+                        liq      = _liquidity_score(oi, vol, spread_pct)
+                        exp_move = _expected_weekly_move(stock_price, iv)
+                        sigma_otm= (stock_price - K) / exp_move if exp_move > 0 else 0
+                        warnings = _build_warnings(earnings_days, iv_info["rank"], "csp")
+                        if not state["opra_active"]:
+                            warnings.append("OPRA not subscribed — quotes may be delayed")
+                        if pc_vol_r > 1.5:
+                            warnings.append(f"Heavy put flow (P/C vol {pc_vol_r:.1f}x) — bearish sentiment")
+                        if vol_oi_ratio > 2.0:
+                            warnings.append(f"Unusual put activity at ${K:.0f} (vol/OI {vol_oi_ratio:.1f}x)")
+                        if max_pain and K < max_pain:
+                            warnings.append(f"Strike below max pain ${max_pain:.0f} — assignment risk elevated")
+
+                        row = {
+                            "ticker":                ticker,
+                            "expiry":                expiry_ibkr,
+                            "dte":                   dte,
+                            "strike":                K,
+                            "stock_price":           round(stock_price, 2),
+                            "otm_pct":               round(otm_pct, 2),
+                            "sigma_otm":             round(sigma_otm, 2),
+                            "bid":                   round(bid, 2),
+                            "ask":                   round(ask, 2),
+                            "mid":                   round(mid, 2),
+                            "bid_size":              bid_sz,
+                            "ask_size":              ask_sz,
+                            "flow_flag":             flow_flag,
+                            "weekly_return_bid":     round(wk_ret_bid, 2),
+                            "weekly_return_pct":     round(wk_ret_pct, 2),
+                            "weekly_return_mid":     round(wk_ret_mid, 2),
+                            "annualized_return":     round(ann_ret, 1),
+                            "max_loss_per_contract": max_loss,
+                            "return_on_risk_ann":    ror,
+                            "breakeven":             round(K - fill_real, 2),
+                            "delta":                 round(delta, 4),
+                            "iv_pct":                round(iv * 100, 1),
+                            "theta_daily":           round(theta, 4),
+                            "open_interest":         oi,
+                            "volume":                vol,
+                            "vol_oi_ratio":          vol_oi_ratio,
+                            "spread_pct":            round(spread_pct, 2),
+                            "liquidity_score":       liq,
+                            "stock_quality":         sq,
+                            "assignment_risk":       _assignment_risk(delta, otm_pct),
+                            "xgb_signal":            state["signals"].get(ticker, {}).get("label", "N/A"),
+                            "cash_required":         round(K * 100, 2),
+                            "premium_collected":     round(fill_real * 100, 2),
+                            "earnings_days_out":     earnings_days,
+                            "iv_rank":               iv_info["rank"],
+                            "iv_yf":                 iv_info["iv"],
+                            "rsi14":                 tech.get("rsi14"),
+                            "macd_hist":             tech.get("macd_hist"),
+                            "above_sma20":           tech.get("above_sma20"),
+                            "above_sma50":           tech.get("above_sma50"),
+                            # Institutional / OPRA signals
+                            "max_pain":              max_pain,
+                            "gamma_wall":            gamma_wall,
+                            "above_max_pain":        bool(max_pain and K >= max_pain),
+                            "pc_oi_ratio":           pc_oi_r,
+                            "pc_vol_ratio":          pc_vol_r,
+                            "warnings":              warnings,
+                        }
+                        row["score"] = _score_csp(row)
+                        rows.append(row)
+                    except Exception as exc:
+                        log.debug("CSP row error %s $%s: %s", ticker, td.contract.strike if td.contract else "?", exc)
+                        continue
+
+                log.info("CSP [%s]: %d OPRA candidates  price=$%.2f  max_pain=$%s  P/C_vol=%.2f",
+                         ticker, len(rows), stock_price,
+                         f"{max_pain:.0f}" if max_pain else "n/a", pc_vol_r)
                 return rows
 
             except Exception as e:
@@ -1818,113 +2000,147 @@ async def scan_leaps(ib: IB) -> dict:
                 if stock_price <= 0:
                     return []
 
-                def _fetch_yf_calls():
-                    t = yf.Ticker(ticker)
-                    exps = t.options or []
-                    rows = []
-                    # Pick the expiry closest to 12 months out within 6-18 month window
-                    candidates_exp = []
-                    for exp_str in exps:
-                        try:
-                            exp_date = datetime.strptime(exp_str, "%Y-%m-%d").date()
-                        except ValueError:
-                            continue
-                        dte = (exp_date - today).days
-                        if LEAP_MIN_DTE <= dte <= LEAP_MAX_DTE:
-                            candidates_exp.append((abs(dte - 365), dte, exp_str, exp_date))
-                    if not candidates_exp:
-                        return []
-                    candidates_exp.sort()
-                    _, dte, exp_str, exp_date = candidates_exp[0]
-                    T = dte / 365.0
-                    expiry_fmt = exp_date.strftime("%Y%m%d")
-                    try:
-                        calls = t.option_chain(exp_str).calls
-                    except Exception:
-                        return []
-                    for _, r in calls.iterrows():
-                        try:
-                            K   = float(r["strike"])
-                            bid = float(r.get("bid") or 0)
-                            ask = float(r.get("ask") or 0)
-                            iv  = float(r.get("impliedVolatility") or 0)
-                            oi  = int(r.get("openInterest") or 0)
-                            vol = int(r.get("volume") or 0)
-                            if bid <= 0 or ask <= 0 or iv < 0.05 or iv > 3.0:
-                                continue
-                            if iv > LEAP_MAX_IV:
-                                continue
-                            mid        = (bid + ask) / 2.0
-                            spread_pct = (ask - bid) / mid * 100
-                            delta = _bs_delta(stock_price, K, T, iv, is_put=False)
-                            if math.isnan(delta) or delta <= 0:
-                                continue
-                            if not (LEAP_MIN_DELTA <= delta <= LEAP_MAX_DELTA):
-                                continue
-                            theta      = _bs_theta(stock_price, K, T, iv, is_put=False)
-                            fill_cons  = ask
-                            fill_real  = ask - (ask - mid) * 0.40
-                            cost_cons  = round(fill_cons * 100, 2)
-                            cost_real  = round(fill_real * 100, 2)
-                            cost_mid_v = round(mid       * 100, 2)
-                            breakeven  = K + fill_real
-                            be_move    = (breakeven - stock_price) / stock_price * 100
-                            liq        = _liquidity_score(oi, vol, spread_pct)
-                            warnings   = _build_warnings(earnings_days, iv_info["rank"], "leap")
-                            leap_iv_bonus = (1 - iv_info["rank"] / 100) * 15
-                            itm_otm_pct   = (stock_price - K) / stock_price * 100
-                            row = {
-                                "ticker":               ticker,
-                                "expiry":               expiry_fmt,
-                                "dte":                  dte,
-                                "strike":               K,
-                                "stock_price":          round(stock_price, 2),
-                                "itm_otm_pct":          round(itm_otm_pct, 2),
-                                "breakeven":            round(breakeven, 2),
-                                "breakeven_move_pct":   round(be_move, 2),
-                                "bid":                  round(bid, 2),
-                                "ask":                  round(ask, 2),
-                                "mid":                  round(mid, 2),
-                                "cost_conservative":    cost_cons,
-                                "cost_per_contract":    cost_real,
-                                "cost_mid":             cost_mid_v,
-                                "max_loss_per_contract": cost_real,
-                                "delta":                round(delta, 4),
-                                "iv_pct":               round(iv * 100, 1),
-                                "theta_daily":          round(theta, 4),
-                                "theta_weekly":         round(theta * 7, 4),
-                                "vega":                 0.0,
-                                "spread_pct":           round(spread_pct, 2),
-                                "open_interest":        oi,
-                                "volume":               vol,
-                                "liquidity_score":      liq,
-                                "stock_quality":        sq,
-                                "xgb_signal":           sig.get("label", "N/A"),
-                                "xgb_prob":             sig.get("prob", None),
-                                "earnings_days_out":    earnings_days,
-                                "iv_rank":              iv_info["rank"],
-                                "iv_yf":                iv_info["iv"],
-                                "rsi14":                tech.get("rsi14"),
-                                "macd_hist":            tech.get("macd_hist"),
-                                "above_sma20":          tech.get("above_sma20"),
-                                "above_sma50":          tech.get("above_sma50"),
-                                "warnings":             warnings,
-                            }
-                            row["score"] = round(
-                                sq * 55
-                                + (1 - abs(delta - 0.60)) * 35
-                                + leap_iv_bonus
-                                + (liq / 100) * 10,
-                                2,
-                            )
-                            rows.append(row)
-                        except Exception:
-                            continue
-                    return rows
+                # ── Fetch live OPRA LEAP calls + institutional signals ──
+                try:
+                    (tds, expiry_ibkr, dte), inst = await asyncio.gather(
+                        _fetch_opra_chain(
+                            ib, ticker, "C", stock_price,
+                            LEAP_MIN_DTE, LEAP_MAX_DTE,
+                            otm_lo_pct=0, otm_hi_pct=20, max_strikes=10,
+                        ),
+                        _institutional_signals(ticker, stock_price),
+                    )
+                except ValueError as e:
+                    log.warning("LEAP [%s]: OPRA unavailable (%s) — skipping", ticker, e)
+                    return []
 
-                loop = asyncio.get_event_loop()
-                rows = await loop.run_in_executor(None, _fetch_yf_calls)
-                log.info(f"LEAP [{ticker}]: {len(rows)} candidates  price=${stock_price:.2f}")
+                T          = dte / 365.0
+                pc_vol_r   = inst.get("pc_vol_ratio", 1.0)
+                pc_oi_r    = inst.get("pc_oi_ratio", 1.0)
+                rows: list = []
+
+                for td in tds:
+                    try:
+                        K   = float(td.contract.strike)
+                        bid = float(td.bid  or 0)
+                        ask = float(td.ask  or 0)
+                        if bid <= 0 or ask <= 0 or math.isnan(bid) or math.isnan(ask):
+                            continue
+
+                        greeks = td.modelGreeks
+                        if not greeks:
+                            continue
+                        iv    = float(greeks.impliedVol  or 0)
+                        delta = float(greeks.delta       or 0)
+                        theta = float(greeks.theta       or 0)
+                        vega  = float(greeks.vega        or 0)
+                        if iv < 0.05 or iv > 3.0 or delta <= 0:
+                            continue
+                        if iv > LEAP_MAX_IV:
+                            continue
+                        if not (LEAP_MIN_DELTA <= delta <= LEAP_MAX_DELTA):
+                            continue
+
+                        mid        = (bid + ask) / 2.0
+                        spread_pct = (ask - bid) / mid * 100
+                        oi  = int(td.openInterest or 0) if (td.openInterest and not math.isnan(float(td.openInterest))) else 0
+                        vol = int(td.volume       or 0) if (td.volume       and not math.isnan(float(td.volume)))       else 0
+
+                        # OPRA order-book pressure on LEAP calls
+                        bid_sz  = int(td.bidSize or 0)
+                        ask_sz  = int(td.askSize or 0)
+                        if   ask_sz > bid_sz * 2: flow_flag = "ASK HEAVY"   # aggressive call buyers
+                        elif bid_sz > ask_sz * 2: flow_flag = "BID HEAVY"
+                        else:                     flow_flag = "BALANCED"
+
+                        vol_oi_ratio = round(vol / max(oi, 1), 2)
+
+                        fill_cons  = ask
+                        fill_real  = ask - (ask - mid) * 0.40
+                        cost_cons  = round(fill_cons * 100, 2)
+                        cost_real  = round(fill_real * 100, 2)
+                        cost_mid_v = round(mid       * 100, 2)
+                        breakeven  = K + fill_real
+                        be_move    = (breakeven - stock_price) / stock_price * 100
+                        liq        = _liquidity_score(oi, vol, spread_pct)
+                        itm_otm_pct= (stock_price - K) / stock_price * 100
+
+                        warnings = _build_warnings(earnings_days, iv_info["rank"], "leap")
+                        if not state["opra_active"]:
+                            warnings.append("OPRA not subscribed — quotes may be delayed")
+                        # Institutional call OI >> put OI = bullish positioning → favourable
+                        if pc_oi_r < 0.6:
+                            pass  # heavy call OI: good for LEAP calls
+                        elif pc_oi_r > 1.5:
+                            warnings.append(f"Heavy put OI (P/C {pc_oi_r:.1f}x) — market bearishly positioned")
+                        if vol_oi_ratio > 2.0 and flow_flag == "ASK HEAVY":
+                            warnings.append(f"Unusual call buying at ${K:.0f} (vol/OI {vol_oi_ratio:.1f}x) — institutional interest")
+
+                        leap_iv_bonus = (1 - iv_info["rank"] / 100) * 15
+                        # OPRA institutional bonus for LEAP calls
+                        inst_bonus = 0.0
+                        if flow_flag == "ASK HEAVY":  inst_bonus += 5   # buyers are aggressive
+                        if vol_oi_ratio > 2.0:        inst_bonus += 8   # unusual call activity
+                        if pc_oi_r < 0.7:             inst_bonus += 5   # call-OI dominant = institutions bullish
+
+                        row = {
+                            "ticker":                ticker,
+                            "expiry":                expiry_ibkr,
+                            "dte":                   dte,
+                            "strike":                K,
+                            "stock_price":           round(stock_price, 2),
+                            "itm_otm_pct":           round(itm_otm_pct, 2),
+                            "breakeven":             round(breakeven, 2),
+                            "breakeven_move_pct":    round(be_move, 2),
+                            "bid":                   round(bid, 2),
+                            "ask":                   round(ask, 2),
+                            "mid":                   round(mid, 2),
+                            "bid_size":              bid_sz,
+                            "ask_size":              ask_sz,
+                            "flow_flag":             flow_flag,
+                            "cost_conservative":     cost_cons,
+                            "cost_per_contract":     cost_real,
+                            "cost_mid":              cost_mid_v,
+                            "max_loss_per_contract": cost_real,
+                            "delta":                 round(delta, 4),
+                            "iv_pct":                round(iv * 100, 1),
+                            "theta_daily":           round(theta, 4),
+                            "theta_weekly":          round(theta * 7, 4),
+                            "vega":                  round(vega, 4),
+                            "spread_pct":            round(spread_pct, 2),
+                            "open_interest":         oi,
+                            "volume":                vol,
+                            "vol_oi_ratio":          vol_oi_ratio,
+                            "liquidity_score":       liq,
+                            "stock_quality":         sq,
+                            "xgb_signal":            sig.get("label", "N/A"),
+                            "xgb_prob":              sig.get("prob", None),
+                            "earnings_days_out":     earnings_days,
+                            "iv_rank":               iv_info["rank"],
+                            "iv_yf":                 iv_info["iv"],
+                            "rsi14":                 tech.get("rsi14"),
+                            "macd_hist":             tech.get("macd_hist"),
+                            "above_sma20":           tech.get("above_sma20"),
+                            "above_sma50":           tech.get("above_sma50"),
+                            "pc_oi_ratio":           pc_oi_r,
+                            "pc_vol_ratio":          pc_vol_r,
+                            "warnings":              warnings,
+                        }
+                        row["score"] = round(
+                            sq * 55
+                            + (1 - abs(delta - 0.60)) * 35
+                            + leap_iv_bonus
+                            + (liq / 100) * 10
+                            + inst_bonus,
+                            2,
+                        )
+                        rows.append(row)
+                    except Exception as exc:
+                        log.debug("LEAP row error %s: %s", ticker, exc)
+                        continue
+
+                log.info("LEAP [%s]: %d OPRA candidates  price=$%.2f  P/C_vol=%.2f",
+                         ticker, len(rows), stock_price, pc_vol_r)
                 return rows
 
             except Exception as e:
