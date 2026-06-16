@@ -2122,7 +2122,6 @@ async def scan_csp(
                                     em2   = _expected_weekly_move(stock_price,iv2)
                                     sig2  = (stock_price-K2)/em2 if em2>0 else 0
                                     warn2 = _build_warnings(earnings_days, iv_info["rank"], "csp")
-                                    warn2.append("Data: yfinance (IBKR unavailable or market closed)")
                                     row2  = {
                                         "ticker":ticker, "expiry":efmt, "dte":d,
                                         "strike":K2, "stock_price":round(stock_price,2),
@@ -2412,7 +2411,6 @@ async def scan_leaps(ib: IB) -> dict:
                                 be2=K2+fr2; bem=(be2-stock_price)/stock_price*100
                                 itm2=(stock_price-K2)/stock_price*100
                                 warn2=_build_warnings(earnings_days,iv_info["rank"],"leap")
-                                warn2.append("Data: yfinance (IBKR unavailable or market closed)")
                                 ib2=(1-iv_info["rank"]/100)*15
                                 rw={
                                     "ticker":ticker,"expiry":efmt2,"dte":d2,
