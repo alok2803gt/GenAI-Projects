@@ -6,7 +6,7 @@
   <title>IBKR Trader — v3</title>
   <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
   <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
-  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.23.5/babel.min.js"></script>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;700;800&display=swap" rel="stylesheet" />
   <style>
@@ -28,7 +28,7 @@
 <body>
 <div id="root"></div>
 
-<script type="text/babel">
+<script type="text/babel" data-presets="react">
 const { useState, useEffect, useRef, useCallback } = React;
 const API = "http://localhost:8000";
 
