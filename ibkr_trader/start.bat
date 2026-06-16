@@ -13,9 +13,12 @@ echo  XGBoost IBKR Day Trading Signal Engine
 echo ============================================================
 echo.
 
-REM ── Stop any existing backend on port 8000 ───────────────────
-echo [CLEAN] Stopping any existing backend on port 8000...
+REM ── Stop any existing processes on ports 8000 and 8001 ──────
+echo [CLEAN] Stopping any existing processes on ports 8000 / 8001...
 FOR /F "tokens=5" %%P IN ('netstat -ano 2^>nul ^| findstr ":8000 "') DO (
+    taskkill /PID %%P /F >nul 2>&1
+)
+FOR /F "tokens=5" %%P IN ('netstat -ano 2^>nul ^| findstr ":8001 "') DO (
     taskkill /PID %%P /F >nul 2>&1
 )
 timeout /t 1 /nobreak >nul
@@ -53,16 +56,20 @@ REM ── Start FastAPI backend ───────────────�
 echo [START] Starting FastAPI backend on http://localhost:8000 ...
 start "IBKR Backend" cmd /k "call %VENV_DIR%\Scripts\activate.bat && cd /d %BACKEND_DIR% && python main.py"
 
+REM ── Start frontend HTTP server on port 8001 ──────────────────
+echo [START] Starting frontend server on http://localhost:8001 ...
+start "IBKR Frontend" cmd /k "call %VENV_DIR%\Scripts\activate.bat && python -m http.server 8001 --directory %~dp0frontend"
+
 REM ── Wait then open dashboard ──────────────────────────────────
 timeout /t 3 /nobreak >nul
 echo [START] Opening dashboard in browser...
-start "" "%~dp0frontend\index.html"
+start "" "http://localhost:8001/index.html"
 
 echo.
 echo ============================================================
-echo  Backend running at  http://localhost:8000
-echo  Dashboard opened in your default browser
-echo  Close the "IBKR Backend" window to stop the server
+echo  Backend  running at  http://localhost:8000
+echo  Frontend running at  http://localhost:8001/index.html
+echo  Close both cmd windows to stop
 echo ============================================================
 echo.
 pause
