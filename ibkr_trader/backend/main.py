@@ -1483,6 +1483,7 @@ async def _autotrader_hedge_coro(ib: IB) -> None:
     opt_contracts = [
         i.contract for i in portfolio
         if getattr(i.contract, "secType", "") in ("OPT", "FOP")
+        and getattr(i.contract, "exchange", "") != "FORECASTX"  # binary prediction contracts — no standard Greeks
     ]
     live_delta: dict = {}   # conId → float
     if opt_contracts:
@@ -3204,6 +3205,7 @@ async def _portfolio_positions(ib: IB) -> dict:
     opt_contracts = [
         i.contract for i in items
         if getattr(i.contract, "secType", "") in ("OPT", "FOP")
+        and getattr(i.contract, "exchange", "") != "FORECASTX"  # binary prediction contracts — no standard Greeks
     ]
     live_delta: dict = {}   # conId → float
     live_iv: dict    = {}   # conId → float (percent, e.g. 28.5)
