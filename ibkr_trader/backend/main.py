@@ -496,7 +496,7 @@ async def _fetch_opra_chain(
     hi = stock_price * (1 - otm_lo_pct / 100) if right == "P" else stock_price * (1 + otm_hi_pct / 100)
     strikes = sorted(
         [s for s in chain.strikes if lo <= s <= hi],
-        reverse=(right == "P"),
+        key=lambda s: abs(s - stock_price) if right == "C" else -s,
     )[:max_strikes]
     if not strikes:
         raise ValueError(f"no strikes in OTM range for {ticker} {right}")
