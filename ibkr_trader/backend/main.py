@@ -1805,15 +1805,19 @@ async def scan_csp(
 
                 # ── Fetch live OPRA data + institutional signals concurrently ──
                 sq = _stock_quality_score(ticker)
+                tds, expiry_ibkr, dte, inst = None, None, 0, {}
+                opra_ok = False
                 try:
                     (tds, expiry_ibkr, dte), inst = await asyncio.gather(
                         _fetch_opra_chain(ib, ticker, "P", stock_price, 5, 35),
                         _institutional_signals(ticker, stock_price),
                     )
+                    opra_ok = True
                 except ValueError as e:
-                    log.warning("CSP [%s]: OPRA unavailable (%s) — skipping", ticker, e)
-                    return []
+                    log.warning("CSP [%s]: OPRA chain unavailable (%s) — will try yfinance", ticker, e)
+                    inst = await _institutional_signals(ticker, stock_price)
 
+                data_src   = ("OPRA-LIVE" if state.get("opra_active") else "OPRA-DELAYED") if opra_ok else "yfinance"
                 T          = dte / 365.0
                 today_d    = date.today()
                 max_pain   = inst.get("max_pain")
@@ -1934,6 +1938,7 @@ async def scan_csp(
                             "above_max_pain":        bool(max_pain and K >= max_pain),
                             "pc_oi_ratio":           pc_oi_r,
                             "pc_vol_ratio":          pc_vol_r,
+                            "data_source":           data_src,
                             "warnings":              warnings,
                         }
                         row["score"] = _score_csp(row)
@@ -1942,9 +1947,97 @@ async def scan_csp(
                         log.debug("CSP row error %s $%s: %s", ticker, td.contract.strike if td.contract else "?", exc)
                         continue
 
-                log.info("CSP [%s]: %d OPRA candidates  price=$%.2f  max_pain=$%s  P/C_vol=%.2f",
-                         ticker, len(rows), stock_price,
+                log.info("CSP [%s]: %d %s candidates  price=$%.2f  max_pain=$%s  P/C_vol=%.2f",
+                         ticker, len(rows), data_src, stock_price,
                          f"{max_pain:.0f}" if max_pain else "n/a", pc_vol_r)
+
+                # ── yfinance fallback: market closed or IBKR returned no bids ──
+                if not rows:
+                    log.info("CSP [%s]: no IBKR bids — falling back to yfinance", ticker)
+                    data_src = "yfinance"
+                    def _yf_puts():
+                        t = yf.Ticker(ticker)
+                        out = []
+                        for exp_str in (t.options or []):
+                            try:
+                                exp_date = datetime.strptime(exp_str, "%Y-%m-%d").date()
+                            except ValueError:
+                                continue
+                            d = (exp_date - today_d).days
+                            if d < 5:   continue
+                            if d > 35:  break
+                            T2 = d / 365.0
+                            efmt = exp_date.strftime("%Y%m%d")
+                            try:
+                                puts = t.option_chain(exp_str).puts
+                            except Exception:
+                                continue
+                            for _, r2 in puts.iterrows():
+                                try:
+                                    K2  = float(r2["strike"])
+                                    b2  = float(r2.get("bid") or 0)
+                                    a2  = float(r2.get("ask") or 0)
+                                    iv2 = float(r2.get("impliedVolatility") or 0)
+                                    oi2 = int(r2.get("openInterest") or 0)
+                                    vl2 = int(r2.get("volume") or 0)
+                                    if b2<=0 or a2<=0 or iv2<0.05 or iv2>3.0: continue
+                                    mid2  = (b2+a2)/2; sp2=(a2-b2)/mid2*100
+                                    otp   = (stock_price-K2)/stock_price*100
+                                    if otp<3 or otp>30: continue
+                                    dlt2  = _bs_delta(stock_price,K2,T2,iv2,is_put=True)
+                                    if math.isnan(dlt2) or dlt2>=0 or abs(dlt2)>max_delta: continue
+                                    if oi2<CSP_MIN_OI or sp2/100>CSP_MAX_SPREAD_PCT: continue
+                                    tht2  = _bs_theta(stock_price,K2,T2,iv2,is_put=True)
+                                    fr2   = b2+(mid2-b2)*0.40
+                                    wret  = fr2/K2*100
+                                    if wret<min_return: continue
+                                    liq2  = _liquidity_score(oi2,vl2,sp2)
+                                    em2   = _expected_weekly_move(stock_price,iv2)
+                                    sig2  = (stock_price-K2)/em2 if em2>0 else 0
+                                    warn2 = _build_warnings(earnings_days, iv_info["rank"], "csp")
+                                    warn2.append("Data: yfinance (IBKR unavailable or market closed)")
+                                    row2  = {
+                                        "ticker":ticker, "expiry":efmt, "dte":d,
+                                        "strike":K2, "stock_price":round(stock_price,2),
+                                        "otm_pct":round(otp,2), "sigma_otm":round(sig2,2),
+                                        "bid":round(b2,2), "ask":round(a2,2), "mid":round(mid2,2),
+                                        "bid_size":0, "ask_size":0, "flow_flag":"N/A",
+                                        "weekly_return_bid":round(b2/K2*100,2),
+                                        "weekly_return_pct":round(wret,2),
+                                        "weekly_return_mid":round(mid2/K2*100,2),
+                                        "annualized_return":round(wret*52,1),
+                                        "max_loss_per_contract":round((K2-fr2)*100,2),
+                                        "return_on_risk_ann":round(fr2/max(K2-fr2,0.01)*52*100,1),
+                                        "breakeven":round(K2-fr2,2),
+                                        "delta":round(dlt2,4), "iv_pct":round(iv2*100,1),
+                                        "theta_daily":round(tht2,4),
+                                        "open_interest":oi2, "volume":vl2,
+                                        "vol_oi_ratio":round(vl2/max(oi2,1),2),
+                                        "spread_pct":round(sp2,2), "liquidity_score":liq2,
+                                        "stock_quality":sq,
+                                        "assignment_risk":_assignment_risk(dlt2,otp),
+                                        "xgb_signal":state["signals"].get(ticker,{}).get("label","N/A"),
+                                        "cash_required":round(K2*100,2),
+                                        "premium_collected":round(fr2*100,2),
+                                        "earnings_days_out":earnings_days,
+                                        "iv_rank":iv_info["rank"], "iv_yf":iv_info["iv"],
+                                        "rsi14":tech.get("rsi14"), "macd_hist":tech.get("macd_hist"),
+                                        "above_sma20":tech.get("above_sma20"),
+                                        "above_sma50":tech.get("above_sma50"),
+                                        "max_pain":max_pain, "gamma_wall":inst.get("gamma_wall"),
+                                        "above_max_pain":bool(max_pain and K2>=max_pain),
+                                        "pc_oi_ratio":inst.get("pc_oi_ratio",1.0),
+                                        "pc_vol_ratio":inst.get("pc_vol_ratio",1.0),
+                                        "data_source":"yfinance",
+                                        "warnings":warn2,
+                                    }
+                                    row2["score"] = _score_csp(row2)
+                                    out.append(row2)
+                                except Exception: continue
+                            if out: break
+                        return out
+                    rows = await asyncio.get_event_loop().run_in_executor(None, _yf_puts)
+                    log.info("CSP [%s]: %d yfinance fallback candidates", ticker, len(rows))
                 return rows
 
             except Exception as e:
@@ -2001,6 +2094,8 @@ async def scan_leaps(ib: IB) -> dict:
                     return []
 
                 # ── Fetch live OPRA LEAP calls + institutional signals ──
+                tds, expiry_ibkr, dte, inst = None, None, 0, {}
+                opra_ok_leap = False
                 try:
                     (tds, expiry_ibkr, dte), inst = await asyncio.gather(
                         _fetch_opra_chain(
@@ -2010,10 +2105,12 @@ async def scan_leaps(ib: IB) -> dict:
                         ),
                         _institutional_signals(ticker, stock_price),
                     )
+                    opra_ok_leap = True
                 except ValueError as e:
-                    log.warning("LEAP [%s]: OPRA unavailable (%s) — skipping", ticker, e)
-                    return []
+                    log.warning("LEAP [%s]: OPRA chain unavailable (%s) — will try yfinance", ticker, e)
+                    inst = await _institutional_signals(ticker, stock_price)
 
+                leap_data_src = ("OPRA-LIVE" if state.get("opra_active") else "OPRA-DELAYED") if opra_ok_leap else "yfinance"
                 T          = dte / 365.0
                 pc_vol_r   = inst.get("pc_vol_ratio", 1.0)
                 pc_oi_r    = inst.get("pc_oi_ratio", 1.0)
@@ -2124,6 +2221,7 @@ async def scan_leaps(ib: IB) -> dict:
                             "above_sma50":           tech.get("above_sma50"),
                             "pc_oi_ratio":           pc_oi_r,
                             "pc_vol_ratio":          pc_vol_r,
+                            "data_source":           leap_data_src,
                             "warnings":              warnings,
                         }
                         row["score"] = round(
@@ -2139,8 +2237,85 @@ async def scan_leaps(ib: IB) -> dict:
                         log.debug("LEAP row error %s: %s", ticker, exc)
                         continue
 
-                log.info("LEAP [%s]: %d OPRA candidates  price=$%.2f  P/C_vol=%.2f",
-                         ticker, len(rows), stock_price, pc_vol_r)
+                log.info("LEAP [%s]: %d %s candidates  price=$%.2f  P/C_vol=%.2f",
+                         ticker, len(rows), leap_data_src, stock_price, pc_vol_r)
+
+                # ── yfinance fallback when IBKR has no bids (market closed) ──
+                if not rows:
+                    log.info("LEAP [%s]: no IBKR bids — falling back to yfinance", ticker)
+                    def _yf_calls():
+                        t2 = yf.Ticker(ticker)
+                        cands = []
+                        for exp_str in (t2.options or []):
+                            try:
+                                exp_date = datetime.strptime(exp_str, "%Y-%m-%d").date()
+                            except ValueError:
+                                continue
+                            d = (exp_date - today).days
+                            if LEAP_MIN_DTE <= d <= LEAP_MAX_DTE:
+                                cands.append((abs(d-365), d, exp_str, exp_date))
+                        if not cands: return []
+                        cands.sort()
+                        _, d2, exp_str2, exp_date2 = cands[0]
+                        T2 = d2 / 365.0
+                        efmt2 = exp_date2.strftime("%Y%m%d")
+                        out = []
+                        try:
+                            calls = t2.option_chain(exp_str2).calls
+                        except Exception:
+                            return []
+                        for _, rc in calls.iterrows():
+                            try:
+                                K2  = float(rc["strike"])
+                                b2  = float(rc.get("bid") or 0)
+                                a2  = float(rc.get("ask") or 0)
+                                iv2 = float(rc.get("impliedVolatility") or 0)
+                                oi2 = int(rc.get("openInterest") or 0)
+                                vl2 = int(rc.get("volume") or 0)
+                                if b2<=0 or a2<=0 or iv2<0.05 or iv2>LEAP_MAX_IV: continue
+                                mid2=(b2+a2)/2; sp2=(a2-b2)/mid2*100
+                                dlt2=_bs_delta(stock_price,K2,T2,iv2,is_put=False)
+                                if math.isnan(dlt2) or not (LEAP_MIN_DELTA<=dlt2<=LEAP_MAX_DELTA): continue
+                                tht2=_bs_theta(stock_price,K2,T2,iv2,is_put=False)
+                                fr2=a2-(a2-mid2)*0.40
+                                liq2=_liquidity_score(oi2,vl2,sp2)
+                                be2=K2+fr2; bem=(be2-stock_price)/stock_price*100
+                                itm2=(stock_price-K2)/stock_price*100
+                                warn2=_build_warnings(earnings_days,iv_info["rank"],"leap")
+                                warn2.append("Data: yfinance (IBKR unavailable or market closed)")
+                                ib2=(1-iv_info["rank"]/100)*15
+                                rw={
+                                    "ticker":ticker,"expiry":efmt2,"dte":d2,
+                                    "strike":K2,"stock_price":round(stock_price,2),
+                                    "itm_otm_pct":round(itm2,2),"breakeven":round(be2,2),
+                                    "breakeven_move_pct":round(bem,2),
+                                    "bid":round(b2,2),"ask":round(a2,2),"mid":round(mid2,2),
+                                    "bid_size":0,"ask_size":0,"flow_flag":"N/A",
+                                    "cost_conservative":round(a2*100,2),
+                                    "cost_per_contract":round(fr2*100,2),
+                                    "cost_mid":round(mid2*100,2),
+                                    "max_loss_per_contract":round(fr2*100,2),
+                                    "delta":round(dlt2,4),"iv_pct":round(iv2*100,1),
+                                    "theta_daily":round(tht2,4),"theta_weekly":round(tht2*7,4),
+                                    "vega":0.0,"spread_pct":round(sp2,2),
+                                    "open_interest":oi2,"volume":vl2,
+                                    "vol_oi_ratio":round(vl2/max(oi2,1),2),
+                                    "liquidity_score":liq2,"stock_quality":sq,
+                                    "xgb_signal":sig.get("label","N/A"),"xgb_prob":sig.get("prob"),
+                                    "earnings_days_out":earnings_days,
+                                    "iv_rank":iv_info["rank"],"iv_yf":iv_info["iv"],
+                                    "rsi14":tech.get("rsi14"),"macd_hist":tech.get("macd_hist"),
+                                    "above_sma20":tech.get("above_sma20"),"above_sma50":tech.get("above_sma50"),
+                                    "pc_oi_ratio":inst.get("pc_oi_ratio",1.0),
+                                    "pc_vol_ratio":inst.get("pc_vol_ratio",1.0),
+                                    "data_source":"yfinance","warnings":warn2,
+                                }
+                                rw["score"]=round(sq*55+(1-abs(dlt2-0.60))*35+ib2+(liq2/100)*10,2)
+                                out.append(rw)
+                            except Exception: continue
+                        return out
+                    rows = await asyncio.get_event_loop().run_in_executor(None, _yf_calls)
+                    log.info("LEAP [%s]: %d yfinance fallback candidates", ticker, len(rows))
                 return rows
 
             except Exception as e:

@@ -788,6 +788,12 @@ function CSPTab({ connected }) {
       <span style={{color:r.above_sma50?C.bull:C.bear}} title="Price above 50-day SMA">{r.above_sma50?"▲":"▼"}</span>
     },
     { key:"open_interest",        label:"OI",          render: r => r.open_interest?.toLocaleString() },
+    { key:"data_source",          label:"Source",      render: r => {
+      const s = r.data_source || "?";
+      const bg = s==="OPRA-LIVE"?"#dcfce7":s==="OPRA-DELAYED"?"#fef9c3":"#ffedd5";
+      const tc = s==="OPRA-LIVE"?"#15803d":s==="OPRA-DELAYED"?"#854d0e":"#c2410c";
+      return <span style={{background:bg,color:tc,padding:"2px 6px",borderRadius:4,fontSize:11,fontWeight:600}}>{s}</span>;
+    }},
     { key:"warnings",             label:"Warnings",    render: r => <WarningBadges warnings={r.warnings} /> },
   ];
 
@@ -1042,6 +1048,12 @@ function LEAPTab({ connected }) {
       r.above_sma50==null ? <span style={{color:C.muted}}>—</span> :
       <span style={{color:r.above_sma50?C.bull:C.bear}} title="Above 50-day SMA">{r.above_sma50?"▲":"▼"}</span>
     },
+    { key:"data_source",       label:"Source",      render:r=>{
+      const s = r.data_source||"?";
+      const bg = s==="OPRA-LIVE"?"#dcfce7":s==="OPRA-DELAYED"?"#fef9c3":"#ffedd5";
+      const tc = s==="OPRA-LIVE"?"#15803d":s==="OPRA-DELAYED"?"#854d0e":"#c2410c";
+      return <span style={{background:bg,color:tc,padding:"2px 6px",borderRadius:4,fontSize:11,fontWeight:600}}>{s}</span>;
+    }},
     { key:"warnings",          label:"Warnings",    render:r=><WarningBadges warnings={r.warnings} /> },
   ];
 
