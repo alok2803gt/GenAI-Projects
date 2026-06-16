@@ -11,18 +11,18 @@
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;700;800&display=swap" rel="stylesheet" />
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-    body { background: #080c18; color: #e2e8f0; font-family: 'Inter', sans-serif; }
+    body { background: #f0f4f8; color: #1e293b; font-family: 'Inter', sans-serif; }
     ::-webkit-scrollbar { width: 4px; height: 4px; }
-    ::-webkit-scrollbar-track { background: #080c18; }
-    ::-webkit-scrollbar-thumb { background: #1e2a3a; border-radius: 2px; }
+    ::-webkit-scrollbar-track { background: #e2e8f0; }
+    ::-webkit-scrollbar-thumb { background: #94a3b8; border-radius: 2px; }
     @keyframes blink    { 0%,100%{opacity:1} 50%{opacity:0.3} }
     @keyframes fadeIn   { from{opacity:0;transform:translateY(6px)} to{opacity:1;transform:translateY(0)} }
     @keyframes spin     { to { transform: rotate(360deg); } }
-    @keyframes pulse-ring { 0%{box-shadow:0 0 0 0 rgba(0,212,255,0.4)} 70%{box-shadow:0 0 0 10px transparent} 100%{box-shadow:0 0 0 0 transparent} }
+    @keyframes pulse-ring { 0%{box-shadow:0 0 0 0 rgba(0,120,212,0.4)} 70%{box-shadow:0 0 0 10px transparent} 100%{box-shadow:0 0 0 0 transparent} }
     .spin { animation: spin 0.9s linear infinite; display:inline-block; }
     table { border-collapse: collapse; width: 100%; }
     th, td { text-align: left; padding: 6px 10px; white-space: nowrap; }
-    tr:hover td { background: rgba(0,212,255,0.04); }
+    tr:hover td { background: rgba(0,120,212,0.05); }
   </style>
 </head>
 <body>
@@ -33,10 +33,10 @@ const { useState, useEffect, useRef, useCallback } = React;
 const API = "http://localhost:8000";
 
 const C = {
-  bg:"#080c18", surface:"#0f1623", card:"#131d2e",
-  border:"#1e2d42", accent:"#00d4ff", bull:"#00e5a0",
-  bear:"#ff4d6a", neutral:"#fbbf24", text:"#e2e8f0",
-  muted:"#4a6080", white:"#f8fafc", dim:"#1a2540", orange:"#f97316",
+  bg:"#f0f4f8", surface:"#ffffff", card:"#ffffff",
+  border:"#e2e8f0", accent:"#0078d4", bull:"#16a34a",
+  bear:"#dc2626", neutral:"#d97706", text:"#1e293b",
+  muted:"#64748b", white:"#1e293b", dim:"#f1f5f9", orange:"#ea580c",
 };
 const mono = { fontFamily:"'JetBrains Mono', monospace" };
 const sans = { fontFamily:"'Inter', sans-serif" };
@@ -83,7 +83,7 @@ function Btn({ onClick, children, color, style: sx }) {
 
 function Card({ children, style: sx }) {
   return (
-    <div style={{ background:C.card, border:`1px solid ${C.border}`, borderRadius:10, padding:"16px 18px", ...sx }}>
+    <div style={{ background:C.card, border:`1px solid ${C.border}`, borderRadius:10, padding:"16px 18px", boxShadow:"0 1px 4px rgba(0,0,0,0.07)", ...sx }}>
       {children}
     </div>
   );
@@ -174,21 +174,42 @@ function StatusPill({ connected, error }) {
   );
 }
 
-function OPRAPill({ opraActive }) {
+function OPRAPill({ opraActive, onRecheck }) {
+  const [checking, setChecking] = React.useState(false);
   if (opraActive === null || opraActive === undefined) return null;
   const col   = opraActive ? C.bull : C.bear;
   const label = opraActive ? "OPRA LIVE" : "OPRA DELAYED";
   const tip   = opraActive
     ? "Real-time options data — Greeks and quotes are live"
-    : "OPRA not subscribed — options quotes are 15-min delayed";
+    : "OPRA not subscribed — options quotes are 15-min delayed. Click ↻ to recheck after subscribing.";
+
+  async function handleRecheck() {
+    setChecking(true);
+    try {
+      const r = await fetch(`${API}/opra/recheck`);
+      const d = await r.json();
+      if (onRecheck) onRecheck(d.opra_active);
+    } catch(e) { /* ignore */ }
+    finally { setChecking(false); }
+  }
+
   return (
-    <div title={tip} style={{
-      display:"inline-flex", alignItems:"center", gap:5,
-      padding:"4px 10px", borderRadius:20, border:`1px solid ${col}33`, background:`${col}0e`,
-      cursor:"default",
-    }}>
-      <span style={{ fontSize:9 }}>{opraActive ? "●" : "○"}</span>
-      <span style={{ ...mono, fontSize:10, color:col, letterSpacing:1 }}>{label}</span>
+    <div style={{ display:"inline-flex", alignItems:"center", gap:4 }}>
+      <div title={tip} style={{
+        display:"inline-flex", alignItems:"center", gap:5,
+        padding:"4px 10px", borderRadius:20, border:`1px solid ${col}33`, background:`${col}0e`,
+        cursor:"default",
+      }}>
+        <span style={{ fontSize:9 }}>{opraActive ? "●" : "○"}</span>
+        <span style={{ ...mono, fontSize:10, color:col, letterSpacing:1 }}>{label}</span>
+      </div>
+      {!opraActive && (
+        <button onClick={handleRecheck} disabled={checking} title="Recheck OPRA subscription" style={{
+          background:"none", border:`1px solid ${C.muted}44`, borderRadius:12,
+          color:C.muted, cursor:"pointer", fontSize:11, padding:"3px 8px",
+          opacity: checking ? 0.5 : 1,
+        }}>{checking ? "…" : "↻ Recheck"}</button>
+      )}
     </div>
   );
 }
@@ -367,16 +388,324 @@ function HistoryTable({ history }) {
   );
 }
 
+// ── Trade modal ───────────────────────────────────────────────────────────
+function TradeModal({ trade, onClose, onSuccess }) {
+  const [qty, setQty]           = React.useState(1);
+  const [lmt, setLmt]           = React.useState(trade.suggested_price || 0);
+  const [loading, setLoading]   = React.useState(false);
+  const [result, setResult]     = React.useState(null);
+  const [error, setError]       = React.useState(null);
+  const isCSP = trade.action === "SELL";
+
+  const submit = async () => {
+    setLoading(true); setError(null);
+    try {
+      const d = await apiFetch("/orders/place", {
+        method: "POST",
+        headers: {"Content-Type":"application/json"},
+        body: JSON.stringify({
+          ticker:      trade.ticker,
+          expiry:      trade.expiry,
+          strike:      trade.strike,
+          right:       trade.right,
+          action:      trade.action,
+          quantity:    qty,
+          limit_price: parseFloat(lmt),
+        }),
+      });
+      setResult(d);
+      if (onSuccess) onSuccess(d);
+    } catch(e) { setError(e.message); }
+    setLoading(false);
+  };
+
+  return (
+    <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.45)", display:"flex",
+      alignItems:"center", justifyContent:"center", zIndex:1000 }}>
+      <Card style={{ width:500, maxWidth:"95vw", animation:"fadeIn 0.2s ease" }}>
+        {/* Header */}
+        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:16 }}>
+          <span style={{ ...mono, fontSize:13, color:C.accent, fontWeight:700, letterSpacing:1 }}>
+            {isCSP ? "SELL PUT — Cash-Secured" : "BUY CALL — LEAP"} · PAPER
+          </span>
+          <button onClick={onClose} style={{ background:"none", border:"none", color:C.muted, fontSize:20, cursor:"pointer", lineHeight:1 }}>×</button>
+        </div>
+
+        {/* Contract summary */}
+        <div style={{ display:"flex", gap:8, flexWrap:"wrap", marginBottom:14 }}>
+          {[
+            ["Ticker",  trade.ticker,                          C.accent],
+            ["Strike",  fmt$(trade.strike),                    null],
+            ["Expiry",  trade.expiry,                          C.muted],
+            ["DTE",     `${trade.dte}d`,                       C.muted],
+            ["Stock $", fmt$(trade.stock_price),               null],
+            ["Delta",   trade.delta != null ? fmtN(trade.delta,3) : "—", null],
+          ].map(([l,v,c]) => <Stat key={l} label={l} value={v} color={c} />)}
+        </div>
+
+        {/* Return / risk preview */}
+        {isCSP ? (
+          <div style={{ display:"flex", gap:8, flexWrap:"wrap", marginBottom:14 }}>
+            {[
+              ["Wkly Return",    fmtP(trade.weekly_return_pct), C.bull],
+              ["Premium × qty",  fmt$(parseFloat(lmt) * 100 * qty), C.bull],
+              ["Cash Required",  fmt$(trade.strike * 100 * qty), C.bear],
+            ].map(([l,v,c]) => <Stat key={l} label={l} value={v} color={c} />)}
+          </div>
+        ) : (
+          <div style={{ display:"flex", gap:8, flexWrap:"wrap", marginBottom:14 }}>
+            {[
+              ["Max Risk",   fmt$(parseFloat(lmt) * 100 * qty), C.bear],
+              ["IV %",       trade.iv_pct ? fmtP(trade.iv_pct) : "—", null],
+            ].map(([l,v,c]) => <Stat key={l} label={l} value={v} color={c} />)}
+          </div>
+        )}
+
+        {/* Controls */}
+        <div style={{ display:"flex", gap:12, marginBottom:14, alignItems:"flex-end" }}>
+          <div>
+            <div style={{ ...sans, fontSize:11, color:C.muted, marginBottom:4 }}>Contracts</div>
+            <input type="number" min="1" max="100" value={qty}
+              onChange={e => setQty(Math.max(1, parseInt(e.target.value)||1))}
+              style={{ ...mono, width:70, padding:"6px 8px", background:C.dim, border:`1px solid ${C.border}`,
+                color:C.white, borderRadius:5, fontSize:14, outline:"none" }} />
+          </div>
+          <div style={{ flex:1 }}>
+            <div style={{ ...sans, fontSize:11, color:C.muted, marginBottom:4 }}>
+              Limit price / share {isCSP ? "(credit)" : "(debit)"}
+            </div>
+            <input type="number" step="0.01" value={lmt}
+              onChange={e => setLmt(e.target.value)}
+              style={{ ...mono, width:"100%", padding:"6px 8px", background:C.dim, border:`1px solid ${C.border}`,
+                color:C.white, borderRadius:5, fontSize:14, outline:"none" }} />
+          </div>
+        </div>
+
+        {isCSP && (
+          <div style={{ ...sans, fontSize:11, color:C.neutral, marginBottom:12,
+            padding:"8px 12px", background:`${C.neutral}11`, borderRadius:6, border:`1px solid ${C.neutral}33` }}>
+            ⚠ Requires <b>${(trade.strike * 100 * qty).toLocaleString()}</b> cash margin per {qty} contract{qty>1?"s":""}.
+          </div>
+        )}
+
+        <div style={{ display:"flex", gap:10, justifyContent:"flex-end" }}>
+          <Btn onClick={onClose} color={C.muted}>Cancel</Btn>
+          <Btn onClick={submit} color={isCSP ? C.bull : C.accent}
+            style={{ padding:"7px 22px", fontSize:12, fontWeight:700, opacity:loading?0.6:1 }}>
+            {loading ? <Spinner /> : `${trade.action} ${qty} Contract${qty>1?"s":""}`}
+          </Btn>
+        </div>
+
+        {result && (
+          <div style={{ marginTop:12, padding:"10px 12px", background:`${C.bull}11`,
+            border:`1px solid ${C.bull}33`, borderRadius:6 }}>
+            <div style={{ ...mono, fontSize:12, color:C.bull }}>
+              ✓ Order #{result.order_id} submitted — {result.status}
+            </div>
+            <div style={{ ...sans, fontSize:11, color:C.muted, marginTop:4 }}>
+              ${lmt} × {qty} contract{qty>1?"s":""} · conId {result.contract_id}
+            </div>
+          </div>
+        )}
+        {error && <div style={{ marginTop:10, ...sans, fontSize:12, color:C.bear }}>⚠ {error}</div>}
+      </Card>
+    </div>
+  );
+}
+
+
+// ── Positions / Portfolio Delta Tab ───────────────────────────────────────
+function PositionsTab() {
+  const [loading, setLoading] = useState(false);
+  const [data, setData]       = useState(null);
+  const [orders, setOrders]   = useState(null);
+  const [error, setError]     = useState(null);
+
+  const loadPositions = async () => {
+    setLoading(true); setError(null);
+    try {
+      const [pos, ord] = await Promise.all([
+        apiFetch("/portfolio/delta"),
+        apiFetch("/orders"),
+      ]);
+      setData(pos); setOrders(ord);
+    } catch(e) { setError(e.message); }
+    setLoading(false);
+  };
+
+  const cancelOrder = async (id) => {
+    try {
+      await apiFetch(`/orders/${id}`, {method:"DELETE"});
+      await loadPositions();
+    } catch(e) { alert("Cancel failed: " + e.message); }
+  };
+
+  const deltaCol = v => v == null ? C.muted : v >= 0 ? C.bull : C.bear;
+
+  return (
+    <div>
+      <Card style={{ marginBottom:14 }}>
+        <SectionTitle>Portfolio — Positions + Net Delta</SectionTitle>
+        <div style={{ display:"flex", gap:12, alignItems:"center", flexWrap:"wrap" }}>
+          <Btn onClick={loadPositions} color={C.accent} style={{ padding:"7px 20px", fontSize:12 }}>
+            {loading ? <Spinner /> : "↻ Refresh"}
+          </Btn>
+          {data && (
+            <span style={{ ...mono, fontSize:16, color:deltaCol(data.total_delta), fontWeight:700 }}>
+              Net Δ {data.total_delta >= 0 ? "+" : ""}{data.total_delta}
+            </span>
+          )}
+          {data && data.total_delta != null && (
+            <span style={{ ...sans, fontSize:11, color:C.muted }}>
+              {Math.abs(data.total_delta) > 300
+                ? "⚠ High directional exposure — consider hedging"
+                : Math.abs(data.total_delta) < 50
+                ? "Roughly delta-neutral"
+                : "Moderate directional exposure"}
+            </span>
+          )}
+        </div>
+        {error && <div style={{ color:C.bear, fontSize:12, marginTop:8 }}>⚠ {error}</div>}
+      </Card>
+
+      {/* Positions table */}
+      {data && (
+        <Card style={{ padding:0, overflow:"hidden", marginBottom:14 }}>
+          <div style={{ padding:"10px 14px", borderBottom:`1px solid ${C.border}` }}>
+            <SectionTitle>Open Positions ({data.count})</SectionTitle>
+          </div>
+          <div style={{ overflowX:"auto" }}>
+            <table style={{ fontSize:12 }}>
+              <thead>
+                <tr style={{ background:C.surface }}>
+                  {["Symbol","Type","Right","Strike","Expiry","DTE","Qty","Avg Cost","Mkt Value","Unreal P&L","δ/contract","Position Δ"].map(h => (
+                    <th key={h} style={{ ...sans, color:C.muted, fontWeight:600, borderBottom:`1px solid ${C.border}`, fontSize:11 }}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {data.positions.map((p,i) => (
+                  <tr key={i} style={{ borderBottom:`1px solid ${C.border}33` }}>
+                    <td style={{ ...mono, color:C.accent, fontWeight:700 }}>{p.symbol}</td>
+                    <td style={{ ...mono, color:C.muted, fontSize:10 }}>{p.sec_type}</td>
+                    <td style={{ ...mono, color: p.right==="C"?C.bull:p.right==="P"?C.bear:C.muted }}>{p.right||"—"}</td>
+                    <td style={{ ...mono }}>{p.strike ? fmt$(p.strike) : "—"}</td>
+                    <td style={{ ...mono, color:C.muted }}>{p.expiry||"—"}</td>
+                    <td style={{ ...mono, color:C.muted }}>{p.dte != null ? `${p.dte}d` : "—"}</td>
+                    <td style={{ ...mono, color:p.position>=0?C.bull:C.bear, fontWeight:700 }}>{p.position}</td>
+                    <td style={{ ...mono }}>{p.avg_cost ? fmt$(p.avg_cost) : "—"}</td>
+                    <td style={{ ...mono }}>{p.market_value != null ? fmt$(p.market_value) : "—"}</td>
+                    <td style={{ ...mono, color:p.unrealized_pnl>=0?C.bull:C.bear, fontWeight:600 }}>
+                      {p.unrealized_pnl != null ? `${p.unrealized_pnl>=0?"+":""}${fmt$(p.unrealized_pnl)}` : "—"}
+                    </td>
+                    <td style={{ ...mono }}>{p.delta != null ? fmtN(p.delta,4) : "—"}</td>
+                    <td style={{ ...mono, color:deltaCol(p.position_delta), fontWeight:700 }}>
+                      {p.position_delta != null ? `${p.position_delta>=0?"+":""}${p.position_delta.toFixed(2)}` : "—"}
+                    </td>
+                  </tr>
+                ))}
+                {data.positions.length === 0 && (
+                  <tr><td colSpan={12} style={{ ...sans, color:C.muted, padding:"24px", textAlign:"center" }}>
+                    No positions — are you on paper trading (port 7497)?
+                  </td></tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+          {data.positions.length > 0 && (
+            <div style={{ padding:"10px 16px", borderTop:`1px solid ${C.border}`, display:"flex", gap:20, alignItems:"center" }}>
+              <span style={{ ...mono, fontSize:15, fontWeight:700, color:deltaCol(data.total_delta) }}>
+                NET Δ: {data.total_delta >= 0 ? "+" : ""}{data.total_delta}
+              </span>
+              <span style={{ ...sans, fontSize:11, color:C.muted }}>as of {new Date(data.timestamp).toLocaleTimeString()}</span>
+            </div>
+          )}
+        </Card>
+      )}
+
+      {/* Open orders table */}
+      {orders && orders.count > 0 && (
+        <Card style={{ padding:0, overflow:"hidden" }}>
+          <div style={{ padding:"10px 14px", borderBottom:`1px solid ${C.border}` }}>
+            <SectionTitle>Open Orders ({orders.count})</SectionTitle>
+          </div>
+          <div style={{ overflowX:"auto" }}>
+            <table style={{ fontSize:12 }}>
+              <thead>
+                <tr style={{ background:C.surface }}>
+                  {["Order ID","Ticker","Action","Qty","Limit","Status","Filled","Avg Fill","Cancel"].map(h => (
+                    <th key={h} style={{ ...sans, color:C.muted, fontWeight:600, borderBottom:`1px solid ${C.border}`, fontSize:11 }}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {orders.orders.map((o,i) => (
+                  <tr key={i} style={{ borderBottom:`1px solid ${C.border}33` }}>
+                    <td style={{ ...mono, color:C.muted }}>{o.order_id}</td>
+                    <td style={{ ...mono, color:C.accent, fontWeight:700 }}>{o.ticker}</td>
+                    <td style={{ ...mono, color:o.action==="BUY"?C.bull:C.bear, fontWeight:700 }}>{o.action}</td>
+                    <td style={{ ...mono }}>{o.quantity}</td>
+                    <td style={{ ...mono }}>{fmt$(o.limit_price)}</td>
+                    <td style={{ ...mono, color:C.neutral }}>{o.status}</td>
+                    <td style={{ ...mono }}>{o.filled}</td>
+                    <td style={{ ...mono }}>{o.avg_fill ? fmt$(o.avg_fill) : "—"}</td>
+                    <td>
+                      <Btn onClick={() => cancelOrder(o.order_id)} color={C.bear} style={{ padding:"2px 8px", fontSize:10 }}>
+                        ✕ Cancel
+                      </Btn>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </Card>
+      )}
+      {orders && orders.count === 0 && data && (
+        <Card style={{ color:C.muted, fontSize:12, textAlign:"center", padding:"16px 0" }}>No open orders</Card>
+      )}
+    </div>
+  );
+}
+
+
+// ── Recommendation filters ────────────────────────────────────────────────
+function filterCSP(candidates) {
+  // Quality gates: clean warnings, liquid, meaningful IV rank, good score,
+  // earnings safely past expiry (>21d away or unknown)
+  const clean = candidates.filter(r =>
+    (r.warnings || []).length === 0 &&
+    r.liquidity_score >= 50 &&
+    r.iv_rank >= 30 &&
+    r.score >= 70 &&
+    (r.earnings_days_out == null || r.earnings_days_out > 21)
+  );
+  // Best 1 per ticker (already sorted by score desc)
+  const seen = new Set();
+  return clean.filter(r => { if (seen.has(r.ticker)) return false; seen.add(r.ticker); return true; });
+}
+
+function filterLEAP(candidates) {
+  const clean = candidates.filter(r =>
+    (r.warnings || []).length === 0 &&
+    r.liquidity_score >= 60
+  );
+  const seen = new Set();
+  return clean.filter(r => { if (seen.has(r.ticker)) return false; seen.add(r.ticker); return true; });
+}
+
 // ── CSP Scan Tab ──────────────────────────────────────────────────────────
 function CSPTab({ connected }) {
-  const [loading, setLoading]     = useState(false);
-  const [result, setResult]       = useState(null);
-  const [error, setError]         = useState(null);
-  const [minReturn, setMinReturn] = useState(4.0);
-  const [maxDelta, setMaxDelta]   = useState(0.20);
-  const [selected, setSelected]   = useState(null);
-  const [quote, setQuote]         = useState(null);
-  const [quoteLoading, setQL]     = useState(false);
+  const [loading, setLoading]       = useState(false);
+  const [result, setResult]         = useState(null);
+  const [error, setError]           = useState(null);
+  const [minReturn, setMinReturn]   = useState(0.75);
+  const [maxDelta, setMaxDelta]     = useState(0.20);
+  const [selected, setSelected]     = useState(null);
+  const [quote, setQuote]           = useState(null);
+  const [quoteLoading, setQL]       = useState(false);
+  const [tradeTarget, setTradeTgt]  = useState(null);
+  const [recommended, setRec]       = useState(true);
 
   const runScan = async (refresh=false) => {
     setLoading(true); setError(null); setSelected(null); setQuote(null);
@@ -441,18 +770,40 @@ function CSPTab({ connected }) {
     }},
     { key:"cash_required",        label:"Cash Req",    render: r => fmt$(r.cash_required) },
     { key:"xgb_signal",           label:"XGB",         render: r => <Pill color={SIG_COLOR[r.xgb_signal]||C.muted}>{r.xgb_signal}</Pill> },
+    { key:"rsi14",                label:"RSI",         render: r => {
+      const v = r.rsi14; if (v==null) return <span style={{color:C.muted}}>—</span>;
+      const c = v<30?C.bull:v>70?C.bear:v>=45&&v<=65?C.accent:C.neutral;
+      return <span style={{color:c,fontWeight:600}} title="RSI(14) — ideal 45-65 for put selling">{v.toFixed(0)}</span>;
+    }},
+    { key:"macd_hist",            label:"MACD↑",       render: r => {
+      const v = r.macd_hist; if (v==null) return <span style={{color:C.muted}}>—</span>;
+      return <span style={{color:v>0?C.bull:C.bear,fontWeight:600}} title="MACD histogram >0 = bullish momentum">{v>0?"▲":"▼"}</span>;
+    }},
+    { key:"above_sma20",          label:"SMA20",       render: r =>
+      r.above_sma20==null ? <span style={{color:C.muted}}>—</span> :
+      <span style={{color:r.above_sma20?C.bull:C.bear}} title="Price above 20-day SMA">{r.above_sma20?"▲":"▼"}</span>
+    },
+    { key:"above_sma50",          label:"SMA50",       render: r =>
+      r.above_sma50==null ? <span style={{color:C.muted}}>—</span> :
+      <span style={{color:r.above_sma50?C.bull:C.bear}} title="Price above 50-day SMA">{r.above_sma50?"▲":"▼"}</span>
+    },
     { key:"open_interest",        label:"OI",          render: r => r.open_interest?.toLocaleString() },
     { key:"warnings",             label:"Warnings",    render: r => <WarningBadges warnings={r.warnings} /> },
   ];
 
   return (
     <div>
+      {tradeTarget && (
+        <TradeModal trade={tradeTarget} onClose={() => setTradeTgt(null)}
+          onSuccess={() => { /* keep modal open to show confirmation */ }} />
+      )}
+
       {/* Market regime banner */}
       {result?.market_regime && <RegimeBanner regime={result.market_regime} />}
 
       {/* Controls */}
       <Card style={{ marginBottom:14 }}>
-        <SectionTitle>CSP Scanner — 4% Weekly Income Strategy</SectionTitle>
+        <SectionTitle>CSP Scanner — Weekly Income Strategy</SectionTitle>
         <div style={{ display:"flex", gap:12, flexWrap:"wrap", alignItems:"flex-end" }}>
           <div>
             <div style={{ ...sans, fontSize:11, color:C.muted, marginBottom:4 }}>Min Weekly Return %</div>
@@ -474,14 +825,30 @@ function CSPTab({ connected }) {
               ↻ Force Refresh
             </Btn>
           )}
+          {result && (
+            <button onClick={() => setRec(r => !r)} style={{
+              ...sans, fontSize:11, padding:"5px 14px", borderRadius:6, cursor:"pointer",
+              background: recommended ? `${C.bull}22` : C.dim,
+              border: `1px solid ${recommended ? C.bull : C.border}`,
+              color: recommended ? C.bull : C.muted,
+              fontWeight: recommended ? 700 : 400,
+            }}>
+              {recommended ? "★ Recommended only" : "☰ Show all"}
+            </button>
+          )}
         </div>
         {error && <div style={{ ...sans, fontSize:12, color:C.bear, marginTop:10 }}>⚠ {error}</div>}
-        {result && !loading && (
-          <div style={{ ...sans, fontSize:11, color:C.muted, marginTop:10 }}>
-            {result.cached ? `Cached result (${result.age_seconds}s ago)` : `Scanned at ${new Date(result.scanned_at).toLocaleTimeString()}`}
-            · {result.count} candidates found
-          </div>
-        )}
+        {result && !loading && (() => {
+          const shown = recommended ? filterCSP(result.candidates) : result.candidates;
+          return (
+            <div style={{ ...sans, fontSize:11, color:C.muted, marginTop:10 }}>
+              {result.cached ? `Cached (${result.age_seconds}s ago)` : `Scanned ${new Date(result.scanned_at).toLocaleTimeString()}`}
+              {recommended
+                ? <> · <b style={{color:C.bull}}>{shown.length} recommended</b> of {result.count} total</>
+                : <> · {result.count} candidates</>}
+            </div>
+          );
+        })()}
       </Card>
 
       {/* Loading state */}
@@ -496,7 +863,9 @@ function CSPTab({ connected }) {
       )}
 
       {/* Results table */}
-      {!loading && result?.candidates?.length > 0 && (
+      {!loading && result?.candidates?.length > 0 && (() => {
+        const rows = recommended ? filterCSP(result.candidates) : result.candidates;
+        return (
         <Card style={{ padding:0, overflow:"hidden" }}>
           <div style={{ overflowX:"auto" }}>
             <table style={{ fontSize:12 }}>
@@ -507,20 +876,37 @@ function CSPTab({ connected }) {
                       {c.label}
                     </th>
                   ))}
-                  <th style={{ ...sans, color:C.muted, fontWeight:600, borderBottom:`1px solid ${C.border}`, fontSize:11 }}>Quote</th>
+                  <th style={{ ...sans, color:C.muted, fontWeight:600, borderBottom:`1px solid ${C.border}`, fontSize:11 }}>Actions</th>
                 </tr>
               </thead>
               <tbody>
-                {result.candidates.map((r,i) => (
+                {rows.length === 0 && (
+                  <tr><td colSpan={cols.length+1} style={{ ...sans, color:C.muted, padding:"24px", textAlign:"center" }}>
+                    No candidates pass the recommendation filters. Click "Show all" to see everything.
+                  </td></tr>
+                )}
+                {rows.map((r,i) => (
                   <tr key={i} style={{
                     borderBottom:`1px solid ${C.border}33`,
                     background: selected?.ticker===r.ticker && selected?.strike===r.strike ? `${C.accent}0a` : "transparent",
                   }}>
                     {cols.map(c => <td key={c.key} style={{ ...mono, fontSize:12 }}>{c.render(r)}</td>)}
                     <td>
-                      <Btn onClick={() => fetchQuote(r)} color={C.accent} style={{ padding:"3px 10px", fontSize:10 }}>
-                        Live Quote
-                      </Btn>
+                      <div style={{ display:"flex", gap:5 }}>
+                        <Btn onClick={() => fetchQuote(r)} color={C.accent} style={{ padding:"3px 8px", fontSize:10 }}>
+                          Quote
+                        </Btn>
+                        <Btn onClick={() => setTradeTgt({
+                          ticker: r.ticker, expiry: r.expiry, strike: r.strike,
+                          right: "P", action: "SELL", dte: r.dte,
+                          stock_price: r.stock_price, delta: r.delta,
+                          weekly_return_pct: r.weekly_return_pct,
+                          iv_pct: r.iv_pct,
+                          suggested_price: r.bid,
+                        })} color={C.bull} style={{ padding:"3px 8px", fontSize:10, fontWeight:700 }}>
+                          Trade
+                        </Btn>
+                      </div>
                     </td>
                   </tr>
                 ))}
@@ -528,7 +914,8 @@ function CSPTab({ connected }) {
             </table>
           </div>
         </Card>
-      )}
+        );
+      })()}
 
       {!loading && result?.candidates?.length === 0 && (
         <Card style={{ textAlign:"center", padding:"30px 0", color:C.muted, fontSize:13 }}>
@@ -570,12 +957,14 @@ function CSPTab({ connected }) {
 
 // ── LEAP Scan Tab ─────────────────────────────────────────────────────────
 function LEAPTab({ connected }) {
-  const [loading, setLoading] = useState(false);
-  const [result, setResult]   = useState(null);
-  const [error, setError]     = useState(null);
-  const [selected, setSelected] = useState(null);
-  const [quote, setQuote]     = useState(null);
-  const [quoteLoading, setQL] = useState(false);
+  const [loading, setLoading]      = useState(false);
+  const [result, setResult]        = useState(null);
+  const [error, setError]          = useState(null);
+  const [selected, setSelected]    = useState(null);
+  const [quote, setQuote]          = useState(null);
+  const [quoteLoading, setQL]      = useState(false);
+  const [tradeTarget, setTradeTgt] = useState(null);
+  const [recommended, setRec]      = useState(true);
 
   const runScan = async (refresh=false) => {
     setLoading(true); setError(null); setSelected(null); setQuote(null);
@@ -640,11 +1029,29 @@ function LEAPTab({ connected }) {
     }},
     { key:"theta_daily",       label:"Θ/day",       render:r=><span style={{color:C.bear}}>{fmtN(r.theta_daily,4)}</span> },
     { key:"theta_weekly",      label:"Θ/wk",        render:r=><span style={{color:C.bear}}>{fmtN(r.theta_weekly,3)}</span> },
+    { key:"rsi14",             label:"RSI",         render:r=>{
+      const v=r.rsi14; if(v==null) return <span style={{color:C.muted}}>—</span>;
+      const c=v<30?C.bull:v>70?C.bear:v>=45&&v<=65?C.accent:C.neutral;
+      return <span style={{color:c,fontWeight:600}} title="RSI(14)">{v.toFixed(0)}</span>;
+    }},
+    { key:"macd_hist",         label:"MACD↑",       render:r=>{
+      const v=r.macd_hist; if(v==null) return <span style={{color:C.muted}}>—</span>;
+      return <span style={{color:v>0?C.bull:C.bear,fontWeight:600}} title="MACD histogram >0 = bullish">{v>0?"▲":"▼"}</span>;
+    }},
+    { key:"above_sma50",       label:"SMA50",       render:r=>
+      r.above_sma50==null ? <span style={{color:C.muted}}>—</span> :
+      <span style={{color:r.above_sma50?C.bull:C.bear}} title="Above 50-day SMA">{r.above_sma50?"▲":"▼"}</span>
+    },
     { key:"warnings",          label:"Warnings",    render:r=><WarningBadges warnings={r.warnings} /> },
   ];
 
   return (
     <div>
+      {tradeTarget && (
+        <TradeModal trade={tradeTarget} onClose={() => setTradeTgt(null)}
+          onSuccess={() => {}} />
+      )}
+
       {/* Market regime banner */}
       {result?.market_regime && <RegimeBanner regime={result.market_regime} />}
 
@@ -655,17 +1062,33 @@ function LEAPTab({ connected }) {
             {loading ? <Spinner /> : "▶ Scan LEAPs"}
           </Btn>
           {result && <Btn onClick={() => runScan(true)} color={C.muted}>↻ Force Refresh</Btn>}
+          {result && (
+            <button onClick={() => setRec(r => !r)} style={{
+              ...sans, fontSize:11, padding:"5px 14px", borderRadius:6, cursor:"pointer",
+              background: recommended ? `${C.bull}22` : C.dim,
+              border: `1px solid ${recommended ? C.bull : C.border}`,
+              color: recommended ? C.bull : C.muted,
+              fontWeight: recommended ? 700 : 400,
+            }}>
+              {recommended ? "★ Recommended only" : "☰ Show all"}
+            </button>
+          )}
           <span style={{ ...sans, fontSize:11, color:C.muted }}>
             6–18 month calls · delta 0.45–0.75 · IV ≤ 70% · BUY/HOLD stocks only
           </span>
         </div>
         {error && <div style={{ ...sans, fontSize:12, color:C.bear, marginTop:10 }}>⚠ {error}</div>}
-        {result && !loading && (
-          <div style={{ ...sans, fontSize:11, color:C.muted, marginTop:10 }}>
-            {result.cached ? `Cached (${result.age_seconds}s ago)` : `Scanned ${new Date(result.scanned_at).toLocaleTimeString()}`}
-            · {result.count} candidates
-          </div>
-        )}
+        {result && !loading && (() => {
+          const shown = recommended ? filterLEAP(result.candidates) : result.candidates;
+          return (
+            <div style={{ ...sans, fontSize:11, color:C.muted, marginTop:10 }}>
+              {result.cached ? `Cached (${result.age_seconds}s ago)` : `Scanned ${new Date(result.scanned_at).toLocaleTimeString()}`}
+              {recommended
+                ? <> · <b style={{color:C.bull}}>{shown.length} recommended</b> of {result.count} total</>
+                : <> · {result.count} candidates</>}
+            </div>
+          );
+        })()}
       </Card>
 
       {loading && (
@@ -678,7 +1101,9 @@ function LEAPTab({ connected }) {
         </Card>
       )}
 
-      {!loading && result?.candidates?.length > 0 && (
+      {!loading && result?.candidates?.length > 0 && (() => {
+        const rows = recommended ? filterLEAP(result.candidates) : result.candidates;
+        return (
         <Card style={{ padding:0, overflow:"hidden" }}>
           <div style={{ overflowX:"auto" }}>
             <table style={{ fontSize:12 }}>
@@ -689,20 +1114,36 @@ function LEAPTab({ connected }) {
                       {c.label}
                     </th>
                   ))}
-                  <th style={{ ...sans, color:C.muted, fontWeight:600, borderBottom:`1px solid ${C.border}`, fontSize:11 }}>Quote</th>
+                  <th style={{ ...sans, color:C.muted, fontWeight:600, borderBottom:`1px solid ${C.border}`, fontSize:11 }}>Actions</th>
                 </tr>
               </thead>
               <tbody>
-                {result.candidates.map((r,i) => (
+                {rows.length === 0 && (
+                  <tr><td colSpan={cols.length+1} style={{ ...sans, color:C.muted, padding:"24px", textAlign:"center" }}>
+                    No candidates pass the recommendation filters. Click "Show all" to see everything.
+                  </td></tr>
+                )}
+                {rows.map((r,i) => (
                   <tr key={i} style={{
                     borderBottom:`1px solid ${C.border}33`,
                     background: selected?.ticker===r.ticker && selected?.strike===r.strike ? `${C.bull}0a` : "transparent",
                   }}>
                     {cols.map(c => <td key={c.key} style={{ ...mono, fontSize:12 }}>{c.render(r)}</td>)}
                     <td>
-                      <Btn onClick={() => fetchQuote(r)} color={C.bull} style={{ padding:"3px 10px", fontSize:10 }}>
-                        Live Quote
-                      </Btn>
+                      <div style={{ display:"flex", gap:5 }}>
+                        <Btn onClick={() => fetchQuote(r)} color={C.bull} style={{ padding:"3px 8px", fontSize:10 }}>
+                          Quote
+                        </Btn>
+                        <Btn onClick={() => setTradeTgt({
+                          ticker: r.ticker, expiry: r.expiry, strike: r.strike,
+                          right: "C", action: "BUY", dte: r.dte,
+                          stock_price: r.stock_price, delta: r.delta,
+                          iv_pct: r.iv_pct,
+                          suggested_price: r.ask,
+                        })} color={C.accent} style={{ padding:"3px 8px", fontSize:10, fontWeight:700 }}>
+                          Trade
+                        </Btn>
+                      </div>
                     </td>
                   </tr>
                 ))}
@@ -710,7 +1151,8 @@ function LEAPTab({ connected }) {
             </table>
           </div>
         </Card>
-      )}
+        );
+      })()}
 
       {!loading && result?.candidates?.length === 0 && (
         <Card style={{ textAlign:"center", padding:"30px 0", color:C.muted, fontSize:13 }}>
@@ -812,7 +1254,7 @@ function SignalsTab({ connected }) {
       <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", flexWrap:"wrap", gap:8, marginBottom:14 }}>
         <div style={{ display:"flex", gap:8, alignItems:"center", flexWrap:"wrap" }}>
           <StatusPill connected={status.connected} error={status.error} />
-          <OPRAPill opraActive={status.opra_active} />
+          <OPRAPill opraActive={status.opra_active} onRecheck={v => setStatus(s => ({...s, opra_active: v}))} />
         </div>
         <div style={{ display:"flex", gap:12, alignItems:"center" }}>
           {status.model_accuracy && (
@@ -895,12 +1337,766 @@ function SignalsTab({ connected }) {
   );
 }
 
+// ── Auto-Trader Tab ───────────────────────────────────────────────────────
+function AutoTraderTab() {
+  const [status,      setStatus]  = useState(null);
+  const [saving,      setSaving]  = useState(false);
+  const [running,     setRunning] = useState(false);
+  const [reconnMode,  setReconn]  = useState(null);
+  const [cfg, setCfg] = useState({
+    max_positions:     5,
+    profit_target_pct: 0.65,
+    stop_loss_mult:    5.0,
+    scan_types:        ["csp"],
+    csp_capital:       20000,
+    leap_capital:      5000,
+    use_kelly:         true,
+    total_capital:     100000,
+    assumed_win_rate:  0.85,
+    trailing_exit:     true,
+    auto_hedge:        false,
+    hedge_threshold:   100,
+  });
+
+  const load = async () => {
+    try {
+      const d = await apiFetch("/autotrader/status");
+      setStatus(d);
+      setCfg(d.config || cfg);
+    } catch(_) {}
+  };
+
+  useEffect(() => { load(); const id = setInterval(load, 8000); return () => clearInterval(id); }, []);
+
+  const saveConfig = async (enabled) => {
+    setSaving(true);
+    try {
+      await apiFetch("/autotrader/config", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...cfg, enabled: enabled ?? status?.enabled ?? false }),
+      });
+      await load();
+    } finally { setSaving(false); }
+  };
+
+  const runNow = async () => {
+    setRunning(true);
+    try {
+      await apiFetch("/autotrader/run-now", { method: "POST" });
+      await load();
+    } catch(e) { alert("Run failed: " + e.message); }
+    finally { setRunning(false); }
+  };
+
+  const enabled = status?.enabled || false;
+  const positions = status?.positions || {};
+  const actLog = [...(status?.log || [])].reverse();
+
+  const inp = (extra={}) => ({
+    style: { width:"100%", padding:"6px 10px", borderRadius:6,
+      background:"#f8fafc", border:"1px solid #cbd5e1", color:"#1e293b", fontSize:13, ...extra.style },
+    ...extra,
+  });
+  const toggleScan = (type, checked) => {
+    const cur = cfg.scan_types || [];
+    setCfg({ ...cfg, scan_types: checked ? [...cur, type] : cur.filter(x => x !== type) });
+  };
+
+  // Kelly fraction display
+  const kellyFrac = (() => {
+    const p = cfg.assumed_win_rate || 0.85;
+    const pt = cfg.profit_target_pct || 0.65;
+    const sl = cfg.stop_loss_mult || 5.0;
+    const b = pt / (sl > 0 ? sl : 5.0);
+    const k = (p * (b + 1) - 1) / b;
+    return Math.max(0.02, k * 0.5);
+  })();
+  const kellyCapital = Math.round((cfg.total_capital || 100000) * kellyFrac);
+
+  const reconnect = async (port) => {
+    setReconn(port);
+    try {
+      const r = await apiFetch("/reconnect", {
+        method:"POST", headers:{"Content-Type":"application/json"},
+        body: JSON.stringify({ port }),
+      });
+      alert(r.message);
+      await load();
+    } catch(e) { alert("Reconnect failed: " + e.message); }
+    finally { setReconn(null); }
+  };
+
+  return (
+    <div style={{ padding:"16px 0" }}>
+
+      {/* Toggle + Run Now + Account Mode */}
+      <div style={{ display:"flex", gap:12, alignItems:"center", flexWrap:"wrap", marginBottom:20 }}>
+        <button onClick={() => saveConfig(!enabled)} disabled={saving} style={{
+          background: enabled ? "#c0392b" : "#27ae60", color:"#fff",
+          border:"none", borderRadius:8, padding:"10px 28px", fontWeight:700,
+          fontSize:15, cursor:"pointer", opacity: saving ? 0.6 : 1,
+        }}>
+          {enabled ? "STOP Auto-Trader" : "START Auto-Trader"}
+        </button>
+        <button onClick={runNow} disabled={running} style={{
+          background:"#2980b9", color:"#fff", border:"none", borderRadius:8,
+          padding:"10px 22px", fontWeight:600, cursor:"pointer", opacity: running ? 0.6 : 1,
+        }}>
+          {running ? "Running…" : "Run Now"}
+        </button>
+        <button onClick={() => reconnect(7497)} disabled={!!reconnMode} style={{
+          background:"#7f8c8d", color:"#fff", border:"none", borderRadius:8,
+          padding:"8px 16px", fontSize:13, cursor:"pointer",
+        }}>Paper (7497)</button>
+        <button onClick={() => reconnect(7496)} disabled={!!reconnMode} style={{
+          background:"#e67e22", color:"#fff", border:"none", borderRadius:8,
+          padding:"8px 16px", fontSize:13, cursor:"pointer", fontWeight:700,
+        }}>LIVE (7496)</button>
+        <span style={{ fontWeight:700, color: enabled ? "#16a34a" : "#94a3b8", fontSize:14 }}>
+          {enabled ? "ACTIVE — scanning every 5 min" : "INACTIVE"}
+        </span>
+        {status?.last_run && <span style={{ color:"#64748b", fontSize:12 }}>last: {status.last_run}</span>}
+      </div>
+
+      {/* Multi-strategy budget */}
+      {(status?.premium_collected > 0 || status?.leap_budget > 0) && (
+        <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:12, marginBottom:20 }}>
+          {[
+            { label:"Premium Collected", value:`$${(status?.premium_collected||0).toFixed(0)}`, col:"#27ae60" },
+            { label:"LEAP Budget (50%)", value:`$${(status?.leap_budget||0).toFixed(0)}`, col:"#3498db" },
+            { label:"Kelly Capital/Trade", value:`$${kellyCapital.toLocaleString()}`, col:"#f1c40f" },
+          ].map(s => (
+            <div key={s.label} style={{ background:"#f1f5f9", borderRadius:8, padding:14, textAlign:"center" }}>
+              <div style={{ color:"#64748b", fontSize:11, marginBottom:6 }}>{s.label}</div>
+              <div style={{ color:s.col, fontWeight:700, fontSize:20 }}>{s.value}</div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Config card */}
+      <Card title="Configuration" style={{ marginBottom:20 }}>
+        <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fill, minmax(190px, 1fr))", gap:14 }}>
+          <label style={{ display:"flex", flexDirection:"column", gap:4, fontSize:13, color:"#475569" }}>
+            Max Positions
+            <input type="number" min={1} max={20} value={cfg.max_positions}
+              onChange={e => setCfg({ ...cfg, max_positions: +e.target.value })} {...inp()} />
+          </label>
+          <label style={{ display:"flex", flexDirection:"column", gap:4, fontSize:13, color:"#475569" }}>
+            Profit Target %
+            <input type="number" min={10} max={90} step={5}
+              value={Math.round((cfg.profit_target_pct || 0.65) * 100)}
+              onChange={e => setCfg({ ...cfg, profit_target_pct: +e.target.value / 100 })} {...inp()} />
+          </label>
+          <label style={{ display:"flex", flexDirection:"column", gap:4, fontSize:13, color:"#475569" }}>
+            Stop Loss (× premium, 0=hold-to-expiry)
+            <input type="number" min={0} max={10} step={0.5} value={cfg.stop_loss_mult}
+              onChange={e => setCfg({ ...cfg, stop_loss_mult: +e.target.value })} {...inp()} />
+          </label>
+          <label style={{ display:"flex", flexDirection:"column", gap:4, fontSize:13, color:"#475569" }}>
+            Total Capital ($)
+            <input type="number" min={10000} step={10000} value={cfg.total_capital}
+              onChange={e => setCfg({ ...cfg, total_capital: +e.target.value })} {...inp()} />
+          </label>
+          <label style={{ display:"flex", flexDirection:"column", gap:4, fontSize:13, color:"#475569" }}>
+            Assumed Win Rate %
+            <input type="number" min={50} max={99} step={1}
+              value={Math.round((cfg.assumed_win_rate||0.85)*100)}
+              onChange={e => setCfg({ ...cfg, assumed_win_rate: +e.target.value/100 })} {...inp()} />
+          </label>
+          <label style={{ display:"flex", flexDirection:"column", gap:4, fontSize:13, color:"#475569" }}>
+            Hedge Threshold (delta)
+            <input type="number" min={25} max={500} step={25} value={cfg.hedge_threshold}
+              onChange={e => setCfg({ ...cfg, hedge_threshold: +e.target.value })} {...inp()} />
+          </label>
+        </div>
+
+        {/* Toggles row */}
+        <div style={{ display:"flex", gap:24, marginTop:16, flexWrap:"wrap" }}>
+          {[
+            { key:"use_kelly",     label:"Kelly Sizing",    sub:`~$${kellyCapital.toLocaleString()}/trade` },
+            { key:"trailing_exit", label:"Trailing Exit",   sub:"lock in profits as they grow" },
+            { key:"auto_hedge",    label:"Auto-Hedge",      sub:"SPY option when delta > threshold" },
+          ].map(t => (
+            <label key={t.key} style={{ display:"flex", flexDirection:"column", gap:3, cursor:"pointer" }}>
+              <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+                <input type="checkbox" checked={!!cfg[t.key]}
+                  onChange={e => setCfg({ ...cfg, [t.key]: e.target.checked })} />
+                <span style={{ color:"#ddd", fontWeight:600, fontSize:13 }}>{t.label}</span>
+              </div>
+              <span style={{ color:"#64748b", fontSize:11, marginLeft:22 }}>{t.sub}</span>
+            </label>
+          ))}
+          <div style={{ display:"flex", flexDirection:"column", gap:4, fontSize:13, color:"#475569" }}>
+            Scan Types
+            <div style={{ display:"flex", gap:16 }}>
+              {["csp","leap"].map(t => (
+                <label key={t} style={{ display:"flex", alignItems:"center", gap:6, color:"#334155", cursor:"pointer" }}>
+                  <input type="checkbox"
+                    checked={(cfg.scan_types||[]).includes(t)}
+                    onChange={e => toggleScan(t, e.target.checked)} />
+                  {t.toUpperCase()}
+                </label>
+              ))}
+            </div>
+          </div>
+        </div>
+
+        <button onClick={() => saveConfig()} disabled={saving} style={{
+          marginTop:14, background:"#0078d4", color:"#fff", border:"none", borderRadius:6,
+          padding:"8px 20px", cursor:"pointer", fontSize:13,
+        }}>
+          {saving ? "Saving…" : "Save Config"}
+        </button>
+
+        {/* Kelly info box */}
+        <div style={{ marginTop:12, padding:"10px 14px", background:"#f1f5f9",
+          borderRadius:6, fontSize:12, color:"#64748b", lineHeight:1.7 }}>
+          <strong style={{color:"#d97706"}}>Half-Kelly sizing:</strong> win rate {Math.round((cfg.assumed_win_rate||0.85)*100)}%,
+          profit/loss ratio {((cfg.profit_target_pct||0.65)/((cfg.stop_loss_mult||5.0)||5.0)).toFixed(3)} →
+          Kelly fraction {(kellyFrac*100).toFixed(1)}% of ${(cfg.total_capital||100000).toLocaleString()}
+          = <strong style={{color:"#1e293b"}}>${kellyCapital.toLocaleString()} per trade</strong>.
+          {" "}Trailing exit locks in 15%→35%→60% floor as profit reaches 25%→50%→75% of max.
+        </div>
+      </Card>
+
+      {/* Managed positions */}
+      {Object.keys(positions).length > 0 && (
+        <Card title={`Managed Positions (${Object.keys(positions).length})`} style={{ marginBottom:20 }}>
+          <div style={{ overflowX:"auto" }}>
+            <table style={{ width:"100%", borderCollapse:"collapse", fontSize:13 }}>
+              <thead>
+                <tr style={{ color:"#64748b", borderBottom:"1px solid #e2e8f0" }}>
+                  {["Ticker","Type","Strike","Expiry","Action","Qty","Entry","Max P/L","Score","Placed"].map(h =>
+                    <th key={h} style={{ padding:"6px 10px", textAlign:"left", fontWeight:600 }}>{h}</th>
+                  )}
+                </tr>
+              </thead>
+              <tbody>
+                {Object.entries(positions).map(([key, p]) => (
+                  <tr key={key} style={{ borderBottom:"1px solid #e2e8f0" }}>
+                    <td style={{ padding:"7px 10px", fontWeight:700, color:"#1e293b" }}>{p.ticker}</td>
+                    <td style={{ padding:"7px 10px", color:"#475569" }}>{p.right==="P"?"CSP":"LEAP"}</td>
+                    <td style={{ padding:"7px 10px" }}>${p.strike}</td>
+                    <td style={{ padding:"7px 10px", color:"#475569" }}>{p.expiry}</td>
+                    <td style={{ padding:"7px 10px", color: p.action==="SELL"?"#e74c3c":"#27ae60", fontWeight:700 }}>{p.action}</td>
+                    <td style={{ padding:"7px 10px" }}>{p.qty}</td>
+                    <td style={{ padding:"7px 10px" }}>${(p.entry_price||0).toFixed(2)}</td>
+                    <td style={{ padding:"7px 10px", color:"#f1c40f" }}>${(p.max_profit||0).toFixed(0)}</td>
+                    <td style={{ padding:"7px 10px" }}>{p.score}</td>
+                    <td style={{ padding:"7px 10px", color:"#64748b", fontSize:11 }}>{p.placed_at}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </Card>
+      )}
+
+      {/* Activity log */}
+      <Card title="Activity Log">
+        {actLog.length === 0 ? (
+          <div style={{ color:"#64748b", fontStyle:"italic" }}>
+            No activity yet. Click "Run Now" or enable the auto-trader.
+          </div>
+        ) : (
+          <div style={{ maxHeight:320, overflowY:"auto", fontFamily:"'Fira Mono', monospace", fontSize:12 }}>
+            {actLog.map((e, i) => {
+              const col = e.action==="ERROR"?"#e74c3c"
+                        : (e.action==="TRADE"||e.action==="CLOSED")?"#27ae60"
+                        : e.action==="CLOSE"?"#f1c40f"
+                        : e.action==="SYSTEM"?"#9b59b6"
+                        : "#ccc";
+              return (
+                <div key={i} style={{ padding:"4px 6px", borderBottom:"1px solid #e2e8f0", color:col }}>
+                  <span style={{ color:"#64748b" }}>[{e.time}]</span>
+                  {" "}<strong>{e.action}</strong>: {e.detail}
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </Card>
+    </div>
+  );
+}
+
+// ── Backtest Tab ──────────────────────────────────────────────────────────
+function BacktestTab({ connected }) {
+  const [tickers, setTickers] = useState("AMD,LLY,AAPL,NVDA,SPY");
+  const [weeks,   setWeeks]   = useState(26);
+  const [ptPct,   setPt]      = useState(65);
+  const [slMult,  setSl]      = useState(5.0);
+  const [result,  setResult]  = useState(null);
+  const [loading, setLoading] = useState(false);
+
+  const run = async () => {
+    if (!connected) return alert("Connect IBKR first.");
+    setLoading(true);
+    try {
+      const d = await apiFetch(
+        `/backtest/csp?tickers=${encodeURIComponent(tickers)}&weeks=${weeks}&profit_target_pct=${ptPct/100}&stop_loss_mult=${slMult}`
+      );
+      setResult(d);
+    } catch(e) { alert("Backtest failed: " + e.message); }
+    finally { setLoading(false); }
+  };
+
+  const pnlCol = v => v > 0 ? "#27ae60" : v < 0 ? "#e74c3c" : "#888";
+  const tdS = { padding:"6px 10px", borderBottom:"1px solid #e2e8f0" };
+
+  return (
+    <div style={{ padding:"16px 0" }}>
+      <Card title="Backtest Settings" style={{ marginBottom:20 }}>
+        <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr 1fr", gap:12, marginBottom:14 }}>
+          <label style={{ display:"flex", flexDirection:"column", gap:4, fontSize:13, color:"#475569" }}>
+            Tickers (comma-sep, max 8)
+            <input value={tickers} onChange={e=>setTickers(e.target.value)}
+              style={{ padding:"7px 10px", background:"#f8fafc", border:"1px solid #cbd5e1", color:"#1e293b", borderRadius:6, fontSize:13 }} />
+          </label>
+          <label style={{ display:"flex", flexDirection:"column", gap:4, fontSize:13, color:"#475569" }}>
+            Lookback Weeks
+            <input type="number" min={4} max={104} value={weeks} onChange={e=>setWeeks(+e.target.value)}
+              style={{ padding:"7px 10px", background:"#f8fafc", border:"1px solid #cbd5e1", color:"#1e293b", borderRadius:6, fontSize:13 }} />
+          </label>
+          <label style={{ display:"flex", flexDirection:"column", gap:4, fontSize:13, color:"#475569" }}>
+            Profit Target %
+            <input type="number" min={10} max={90} step={5} value={ptPct} onChange={e=>setPt(+e.target.value)}
+              style={{ padding:"7px 10px", background:"#f8fafc", border:"1px solid #cbd5e1", color:"#1e293b", borderRadius:6, fontSize:13 }} />
+          </label>
+          <label style={{ display:"flex", flexDirection:"column", gap:4, fontSize:13, color:"#475569" }}>
+            Stop Loss (× premium, 0=hold-to-expiry)
+            <input type="number" min={0} max={10} step={0.5} value={slMult} onChange={e=>setSl(+e.target.value)}
+              style={{ padding:"7px 10px", background:"#f8fafc", border:"1px solid #cbd5e1", color:"#1e293b", borderRadius:6, fontSize:13 }} />
+          </label>
+        </div>
+        <button onClick={run} disabled={loading} style={{
+          background:"#2980b9", color:"#fff", border:"none", borderRadius:8,
+          padding:"10px 28px", fontWeight:700, cursor:"pointer", opacity:loading?0.6:1,
+        }}>
+          {loading ? "Running backtest…" : "Run Backtest"}
+        </button>
+        <div style={{ marginTop:10, fontSize:12, color:"#64748b" }}>
+          Uses 2 yr of daily prices. Simulates weekly 20-delta CSP with BS pricing + realized vol.
+          No survivorship bias — uses actual historical closes.
+        </div>
+      </Card>
+
+      {result && (
+        <>
+          {/* Summary row */}
+          <div style={{ display:"grid", gridTemplateColumns:"repeat(3,1fr)", gap:12, marginBottom:20 }}>
+            {[
+              { label:"Avg Win Rate",  value:`${result.summary.avg_win_rate}%`,  col:"#27ae60" },
+              { label:"Avg Sharpe",    value:result.summary.avg_sharpe,           col:"#f1c40f" },
+              { label:"Total P&L",     value:`$${result.summary.total_pnl}`,      col:pnlCol(result.summary.total_pnl) },
+            ].map(s => (
+              <div key={s.label} style={{ background:"#f1f5f9", borderRadius:8, padding:14, textAlign:"center" }}>
+                <div style={{ color:"#64748b", fontSize:11, marginBottom:6 }}>{s.label}</div>
+                <div style={{ color:s.col, fontWeight:700, fontSize:22 }}>{s.value}</div>
+              </div>
+            ))}
+          </div>
+
+          {/* Per-ticker results */}
+          {result.results.map(r => (
+            <Card key={r.ticker} title={`${r.ticker} — ${r.weeks} weeks`} style={{ marginBottom:16 }}>
+              <div style={{ display:"grid", gridTemplateColumns:"repeat(5,1fr)", gap:10, marginBottom:14, textAlign:"center" }}>
+                {[
+                  { label:"Win Rate",     value:`${r.win_rate}%`,      col:"#27ae60" },
+                  { label:"Total P&L",    value:`$${r.total_pnl}`,     col:pnlCol(r.total_pnl) },
+                  { label:"Avg Win",      value:`$${r.avg_win}`,       col:"#27ae60" },
+                  { label:"Avg Loss",     value:`$${r.avg_loss}`,      col:"#e74c3c" },
+                  { label:"Max Drawdown", value:`$${r.max_drawdown}`,  col:"#e74c3c" },
+                ].map(s => (
+                  <div key={s.label} style={{ background:"#f1f5f9", borderRadius:6, padding:10 }}>
+                    <div style={{ color:"#64748b", fontSize:10 }}>{s.label}</div>
+                    <div style={{ color:s.col, fontWeight:700, fontSize:15 }}>{s.value}</div>
+                  </div>
+                ))}
+              </div>
+              <div style={{ overflowX:"auto" }}>
+                <table style={{ width:"100%", borderCollapse:"collapse", fontSize:12 }}>
+                  <thead>
+                    <tr style={{ color:"#64748b", borderBottom:"1px solid #e2e8f0" }}>
+                      {["Date","Spot","Strike","IV%","Premium","P&L","Result"].map(h =>
+                        <th key={h} style={{ ...tdS, fontWeight:600, textAlign:"left" }}>{h}</th>)}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {r.trades.map((t,i) => (
+                      <tr key={i} style={{ background: t.win ? "#f0fdf4" : "#fef2f2" }}>
+                        <td style={tdS}>{t.date}</td>
+                        <td style={tdS}>${t.spot}</td>
+                        <td style={tdS}>${t.strike}</td>
+                        <td style={tdS}>{t.iv_pct}%</td>
+                        <td style={tdS}>${t.premium}</td>
+                        <td style={{ ...tdS, color:pnlCol(t.exit_pnl), fontWeight:700 }}>${t.exit_pnl}</td>
+                        <td style={{ ...tdS, color:t.win?"#27ae60":"#e74c3c", fontWeight:700 }}>{t.win?"WIN":"LOSS"}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </Card>
+          ))}
+        </>
+      )}
+    </div>
+  );
+}
+
+// ── 0DTE Tab ──────────────────────────────────────────────────────────────
+function ZeroDTETab({ connected }) {
+  const [result,  setResult]  = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [eivRes,  setEivRes]  = useState(null);
+  const [eivLoad, setEivLoad] = useState(false);
+  const [tradeTarget, setTradeTgt] = useState(null);
+
+  const scan0dte = async () => {
+    if (!connected) return alert("Connect IBKR first.");
+    setLoading(true);
+    try { setResult(await apiFetch("/scan/0dte?refresh=true")); }
+    catch(e) { alert("0DTE scan failed: " + e.message); }
+    finally { setLoading(false); }
+  };
+
+  const scanEIV = async () => {
+    if (!connected) return alert("Connect IBKR first.");
+    setEivLoad(true);
+    try { setEivRes(await apiFetch("/scan/earnings-iv?refresh=true")); }
+    catch(e) { alert("Earnings IV scan failed: " + e.message); }
+    finally { setEivLoad(false); }
+  };
+
+  const thS = { padding:"7px 10px", textAlign:"left", fontWeight:600, color:"#64748b", borderBottom:"1px solid #e2e8f0" };
+  const tdS = { padding:"7px 10px", borderBottom:"1px solid #e2e8f0" };
+
+  return (
+    <div style={{ padding:"16px 0" }}>
+
+      {/* 0DTE Section */}
+      <Card title="0–7 DTE Quick Premium (SPY / QQQ / IWM)" style={{ marginBottom:24 }}>
+        <div style={{ marginBottom:14 }}>
+          <button onClick={scan0dte} disabled={loading} style={{
+            background:"#8e44ad", color:"#fff", border:"none", borderRadius:8,
+            padding:"10px 24px", fontWeight:700, cursor:"pointer", opacity:loading?0.6:1,
+          }}>
+            {loading ? "Scanning…" : "Scan 0DTE"}
+          </button>
+          <span style={{ marginLeft:12, fontSize:12, color:"#64748b" }}>
+            Targets 1–2% OTM puts, DTE 0–7. Close at 50% profit same/next day.
+          </span>
+        </div>
+        {result && (result.candidates.length === 0
+          ? <div style={{ color:"#64748b" }}>No 0DTE candidates found for today.</div>
+          : <div style={{ overflowX:"auto" }}>
+              <table style={{ width:"100%", borderCollapse:"collapse", fontSize:13 }}>
+                <thead>
+                  <tr>{["Ticker","Expiry","DTE","Strike","OTM%","Bid","Ask","Mid","IV%","OI","Vol","Daily Ret%","Trade"].map(h =>
+                    <th key={h} style={thS}>{h}</th>)}</tr>
+                </thead>
+                <tbody>
+                  {result.candidates.map((r,i) => (
+                    <tr key={i} style={{ background: i%2===0?"#f8fafc":"transparent" }}>
+                      <td style={{ ...tdS, fontWeight:700 }}>{r.ticker}</td>
+                      <td style={tdS}>{r.expiry_display}</td>
+                      <td style={{ ...tdS, color:r.dte===0?"#e74c3c":"#f1c40f" }}>{r.dte}d</td>
+                      <td style={tdS}>${r.strike}</td>
+                      <td style={tdS}>{r.otm_pct}%</td>
+                      <td style={tdS}>${r.bid}</td>
+                      <td style={tdS}>${r.ask}</td>
+                      <td style={{ ...tdS, fontWeight:700 }}>${r.mid}</td>
+                      <td style={tdS}>{r.iv_pct}%</td>
+                      <td style={tdS}>{r.oi}</td>
+                      <td style={tdS}>{r.volume}</td>
+                      <td style={{ ...tdS, color:"#27ae60", fontWeight:700 }}>{r.daily_return_pct}%</td>
+                      <td style={tdS}>
+                        <button onClick={() => setTradeTgt(r)} style={{
+                          background:"#27ae60", color:"#fff", border:"none", borderRadius:4,
+                          padding:"3px 10px", cursor:"pointer", fontSize:12,
+                        }}>Trade</button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+        )}
+      </Card>
+
+      {/* Earnings IV Section */}
+      <Card title="Earnings IV-Crush Plays (sell after announcement)">
+        <div style={{ marginBottom:14 }}>
+          <button onClick={scanEIV} disabled={eivLoad} style={{
+            background:"#d35400", color:"#fff", border:"none", borderRadius:8,
+            padding:"10px 24px", fontWeight:700, cursor:"pointer", opacity:eivLoad?0.6:1,
+          }}>
+            {eivLoad ? "Scanning…" : "Scan Earnings IV"}
+          </button>
+          <span style={{ marginLeft:12, fontSize:12, color:"#64748b" }}>
+            Finds CSP universe tickers with earnings in 2–7 days and IV rank ≥ 50.
+          </span>
+        </div>
+        {eivRes && (eivRes.candidates.length === 0
+          ? <div style={{ color:"#64748b" }}>No earnings IV plays found right now.</div>
+          : <div style={{ overflowX:"auto" }}>
+              <table style={{ width:"100%", borderCollapse:"collapse", fontSize:13 }}>
+                <thead>
+                  <tr>{["Ticker","Expiry","DTE","Strike","Bid","Mid","Prem%","IV Rank","Earnings In","Note","Trade"].map(h =>
+                    <th key={h} style={thS}>{h}</th>)}</tr>
+                </thead>
+                <tbody>
+                  {eivRes.candidates.map((r,i) => (
+                    <tr key={i} style={{ background: i%2===0?"#f8fafc":"transparent" }}>
+                      <td style={{ ...tdS, fontWeight:700 }}>{r.ticker}</td>
+                      <td style={tdS}>{r.expiry_display}</td>
+                      <td style={tdS}>{r.dte}d</td>
+                      <td style={tdS}>${r.strike}</td>
+                      <td style={tdS}>${r.bid}</td>
+                      <td style={{ ...tdS, fontWeight:700 }}>${r.mid}</td>
+                      <td style={tdS}>{r.premium_pct}%</td>
+                      <td style={{ ...tdS, color:"#f1c40f", fontWeight:700 }}>{r.iv_rank}</td>
+                      <td style={{ ...tdS, color:"#e74c3c" }}>{r.earnings_days}d</td>
+                      <td style={{ ...tdS, color:"#64748b", fontSize:11 }}>{r.note}</td>
+                      <td style={tdS}>
+                        <button onClick={() => setTradeTgt(r)} style={{
+                          background:"#d35400", color:"#fff", border:"none", borderRadius:4,
+                          padding:"3px 10px", cursor:"pointer", fontSize:12,
+                        }}>Trade</button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+        )}
+      </Card>
+
+      {tradeTarget && <TradeModal trade={tradeTarget} onClose={() => setTradeTgt(null)} onSuccess={() => setTradeTgt(null)} />}
+    </div>
+  );
+}
+
+// ── Learning Tab ──────────────────────────────────────────────────────────
+function LearningTab() {
+  const [stats,    setStats]   = useState(null);
+  const [journal,  setJournal] = useState(null);
+  const [training, setTraining]= useState(false);
+
+  const load = async () => {
+    try {
+      const [s, j] = await Promise.all([
+        apiFetch("/journal/stats"),
+        apiFetch("/journal?limit=30"),
+      ]);
+      setStats(s);
+      setJournal(j);
+    } catch(_) {}
+  };
+
+  useEffect(() => { load(); const id = setInterval(load, 15000); return () => clearInterval(id); }, []);
+
+  const retrain = async () => {
+    setTraining(true);
+    try {
+      const r = await apiFetch("/journal/retrain", { method: "POST" });
+      if (r.error) alert(r.error);
+      else alert(`Model v${r.version} trained: ${r.win_rate}% win rate, ${r.cv_accuracy}% CV accuracy`);
+      await load();
+    } catch(e) { alert("Retrain failed: " + e.message); }
+    finally { setTraining(false); }
+  };
+
+  const pnlCol = v => v > 0 ? "#27ae60" : v < 0 ? "#e74c3c" : "#888";
+  const thS = { padding:"7px 10px", textAlign:"left", color:"#64748b", borderBottom:"1px solid #e2e8f0", fontWeight:600 };
+  const tdS = { padding:"7px 10px", borderBottom:"1px solid #e2e8f0", fontSize:12 };
+
+  // Feature importance bar chart
+  const FeatureBar = ({ name, val, max }) => (
+    <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom:6 }}>
+      <div style={{ width:130, fontSize:12, color:"#475569", textAlign:"right" }}>{name}</div>
+      <div style={{ flex:1, background:"#f1f5f9", borderRadius:4, height:16, position:"relative" }}>
+        <div style={{ width:`${(val/max)*100}%`, background:"#3498db", borderRadius:4, height:"100%",
+          minWidth:2, transition:"width 0.3s" }} />
+      </div>
+      <div style={{ width:45, fontSize:11, color:"#3498db", textAlign:"right" }}>{(val*100).toFixed(1)}%</div>
+    </div>
+  );
+
+  const latestModel = stats?.model_log?.[0];
+  const importances = latestModel?.importances
+    ? (typeof latestModel.importances === "string"
+        ? JSON.parse(latestModel.importances) : latestModel.importances)
+    : null;
+  const maxImp = importances ? Math.max(...Object.values(importances)) : 1;
+
+  return (
+    <div style={{ padding:"16px 0" }}>
+
+      {/* KPI strip */}
+      {stats && (
+        <div style={{ display:"grid", gridTemplateColumns:"repeat(5,1fr)", gap:12, marginBottom:20 }}>
+          {[
+            { label:"Total Trades",    value: stats.total_trades,           col:"#eee" },
+            { label:"Win Rate",        value: stats.win_rate != null ? `${stats.win_rate}%` : "—", col:"#27ae60" },
+            { label:"Total P&L",       value: stats.total_pnl != null ? `$${stats.total_pnl}` : "—", col:pnlCol(stats.total_pnl) },
+            { label:"Model Version",   value: `v${stats.model_version}`,   col:"#f1c40f" },
+            { label:"Kelly Win Rate",  value: stats.assumed_win_rate ? `${(stats.assumed_win_rate*100).toFixed(1)}%` : "—", col:"#9b59b6" },
+          ].map(s => (
+            <div key={s.label} style={{ background:"#f1f5f9", borderRadius:8, padding:14, textAlign:"center" }}>
+              <div style={{ color:"#64748b", fontSize:11, marginBottom:6 }}>{s.label}</div>
+              <div style={{ color:s.col, fontWeight:700, fontSize:19 }}>{s.value}</div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:20, marginBottom:20 }}>
+
+        {/* Feature importances */}
+        <Card title={`Feature Importances ${latestModel ? `(model v${latestModel.id})` : "(no model yet)"}`}>
+          {!importances ? (
+            <div style={{ color:"#64748b", fontStyle:"italic" }}>
+              Need {20} completed trades to train first model.
+              <br/>Run the auto-trader and come back after 20 closes.
+            </div>
+          ) : (
+            <>
+              {Object.entries(importances)
+                .sort((a,b) => b[1]-a[1])
+                .map(([name, val]) => (
+                  <FeatureBar key={name} name={name} val={val} max={maxImp} />
+                ))}
+              <button onClick={retrain} disabled={training} style={{
+                marginTop:12, background:"#2980b9", color:"#fff", border:"none",
+                borderRadius:6, padding:"7px 18px", cursor:"pointer", fontSize:13,
+              }}>
+                {training ? "Training…" : "Retrain Now"}
+              </button>
+            </>
+          )}
+        </Card>
+
+        {/* Exit breakdown */}
+        <Card title="Exit Breakdown">
+          {!stats?.exit_breakdown || Object.keys(stats.exit_breakdown).length === 0 ? (
+            <div style={{ color:"#64748b", fontStyle:"italic" }}>No closed trades yet.</div>
+          ) : (
+            <>
+              {Object.entries(stats.exit_breakdown).map(([reason, d]) => {
+                const wr = d.total > 0 ? (d.wins/d.total*100).toFixed(0) : 0;
+                const col = reason.includes("profit") || reason.includes("trailing") ? "#27ae60" : "#e74c3c";
+                return (
+                  <div key={reason} style={{ display:"flex", justifyContent:"space-between",
+                    padding:"8px 0", borderBottom:"1px solid #e2e8f0" }}>
+                    <span style={{ color:"#334155", fontSize:13 }}>{reason}</span>
+                    <span style={{ color:"#64748b", fontSize:12 }}>{d.total} trades</span>
+                    <span style={{ color:col, fontWeight:700, fontSize:13 }}>{wr}% win</span>
+                  </div>
+                );
+              })}
+              <div style={{ marginTop:14, fontSize:12, color:"#64748b" }}>
+                Avg win: ${stats.avg_win_pnl?.toFixed(0) || "—"} &nbsp;|&nbsp;
+                Avg loss: ${stats.avg_loss_pnl?.toFixed(0) || "—"}
+              </div>
+            </>
+          )}
+        </Card>
+      </div>
+
+      {/* Model training log */}
+      {stats?.model_log?.length > 0 && (
+        <Card title="Model Training History" style={{ marginBottom:20 }}>
+          <div style={{ overflowX:"auto" }}>
+            <table style={{ width:"100%", borderCollapse:"collapse", fontSize:12 }}>
+              <thead>
+                <tr>{["Version","Trained","Trades","Win Rate","CV Accuracy","Top Feature"].map(h =>
+                  <th key={h} style={thS}>{h}</th>)}</tr>
+              </thead>
+              <tbody>
+                {stats.model_log.map((m, i) => {
+                  const imp = m.importances ? (typeof m.importances === "string"
+                    ? JSON.parse(m.importances) : m.importances) : {};
+                  const top = Object.entries(imp).sort((a,b)=>b[1]-a[1])[0]?.[0] || "—";
+                  return (
+                    <tr key={i} style={{ background: i===0 ? "#f0fdf4" : "transparent" }}>
+                      <td style={{ ...tdS, color:"#f1c40f", fontWeight:700 }}>{m.notes}</td>
+                      <td style={tdS}>{m.trained_at?.slice(0,19)}</td>
+                      <td style={tdS}>{m.n_trades}</td>
+                      <td style={{ ...tdS, color:"#27ae60" }}>{(m.win_rate*100).toFixed(1)}%</td>
+                      <td style={{ ...tdS, color:"#3498db" }}>{(m.cv_accuracy*100).toFixed(1)}%</td>
+                      <td style={{ ...tdS, color:"#9b59b6" }}>{top}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </Card>
+      )}
+
+      {/* Trade journal */}
+      <Card title={`Trade Journal (last ${journal?.trades?.length || 0})`}>
+        {!journal?.trades?.length ? (
+          <div style={{ color:"#64748b", fontStyle:"italic" }}>
+            No trades recorded yet. Trades placed by the auto-trader appear here.
+          </div>
+        ) : (
+          <div style={{ overflowX:"auto" }}>
+            <table style={{ width:"100%", borderCollapse:"collapse", fontSize:11 }}>
+              <thead>
+                <tr style={{ color:"#64748b", borderBottom:"1px solid #e2e8f0" }}>
+                  {["#","Ticker","Type","Strike","Expiry","Qty","Entry","Exit","P&L","Win","Exit Reason",
+                    "IV Rank","Score","Learned","Opened","Closed"].map(h =>
+                    <th key={h} style={{ padding:"6px 8px", textAlign:"left", fontWeight:600 }}>{h}</th>)}
+                </tr>
+              </thead>
+              <tbody>
+                {journal.trades.map((t, i) => (
+                  <tr key={i} style={{
+                    background: t.win === 1 ? "#f0fdf4" : t.win === 0 ? "#fef2f2" : "transparent",
+                    borderBottom:"1px solid #e2e8f0",
+                  }}>
+                    <td style={{ padding:"5px 8px", color:"#64748b" }}>{t.id}</td>
+                    <td style={{ padding:"5px 8px", fontWeight:700 }}>{t.ticker}</td>
+                    <td style={{ padding:"5px 8px" }}>{t.right === "P" ? "CSP" : "LEAP"}</td>
+                    <td style={{ padding:"5px 8px" }}>${t.strike}</td>
+                    <td style={{ padding:"5px 8px", color:"#64748b" }}>{t.expiry}</td>
+                    <td style={{ padding:"5px 8px" }}>{t.qty}</td>
+                    <td style={{ padding:"5px 8px" }}>${t.entry_price?.toFixed(2) || "—"}</td>
+                    <td style={{ padding:"5px 8px" }}>{t.exit_price ? `$${t.exit_price.toFixed(2)}` : "open"}</td>
+                    <td style={{ padding:"5px 8px", color:pnlCol(t.pnl), fontWeight:700 }}>
+                      {t.pnl != null ? `$${t.pnl.toFixed(0)}` : "—"}
+                    </td>
+                    <td style={{ padding:"5px 8px", color: t.win===1?"#27ae60":t.win===0?"#e74c3c":"#888", fontWeight:700 }}>
+                      {t.win===1?"W":t.win===0?"L":"—"}
+                    </td>
+                    <td style={{ padding:"5px 8px", color:"#64748b" }}>{t.exit_reason || "—"}</td>
+                    <td style={{ padding:"5px 8px" }}>{t.iv_rank?.toFixed(0) || "—"}</td>
+                    <td style={{ padding:"5px 8px" }}>{t.score || "—"}</td>
+                    <td style={{ padding:"5px 8px", color:"#9b59b6" }}>{t.learned_score != null ? t.learned_score : "—"}</td>
+                    <td style={{ padding:"5px 8px", color:"#64748b" }}>{t.opened_at?.slice(0,16) || "—"}</td>
+                    <td style={{ padding:"5px 8px", color:"#64748b" }}>{t.closed_at?.slice(0,16) || "open"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </Card>
+    </div>
+  );
+}
+
 // ── Root App ──────────────────────────────────────────────────────────────
 function App() {
   const [tab, setTab]         = useState("signals");
   const [connected, setConn]  = useState(false);
+  const [netDelta, setDelta]  = useState(null);
 
-  // Poll connection status at top level for header
   useEffect(() => {
     const check = async () => {
       try { const s = await apiFetch("/status"); setConn(s.connected); } catch(_) { setConn(false); }
@@ -910,27 +2106,53 @@ function App() {
     return () => clearInterval(iv);
   }, []);
 
+  // Refresh portfolio delta every 60s when connected
+  useEffect(() => {
+    if (!connected) return;
+    const load = async () => {
+      try { const d = await apiFetch("/portfolio/delta"); setDelta(d.total_delta); } catch(_) {}
+    };
+    load();
+    const iv = setInterval(load, 60000);
+    return () => clearInterval(iv);
+  }, [connected]);
+
   const tabs = [
-    { id:"signals", label:"📊 Signals"  },
-    { id:"csp",     label:"💰 CSP Scan" },
-    { id:"leaps",   label:"🚀 LEAPs"    },
+    { id:"signals",    label:"Signals"     },
+    { id:"csp",        label:"CSP Scan"    },
+    { id:"leaps",      label:"LEAPs"       },
+    { id:"positions",  label:"Positions"   },
+    { id:"autotrader", label:"Auto-Trade"  },
+    { id:"backtest",   label:"Backtest"    },
+    { id:"0dte",       label:"0DTE / EIV"  },
+    { id:"learning",   label:"Learning"    },
   ];
+
+  const deltaCol = netDelta == null ? C.muted : netDelta >= 0 ? C.bull : C.bear;
 
   return (
     <div style={{ minHeight:"100vh", background:C.bg, padding:"20px 16px" }}>
-      <div style={{ maxWidth:1100, margin:"0 auto" }}>
+      <div style={{ maxWidth:1200, margin:"0 auto" }}>
 
         {/* Header */}
         <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", flexWrap:"wrap", gap:10, marginBottom:20 }}>
           <div>
             <div style={{ ...mono, fontSize:10, color:C.accent, letterSpacing:3, textTransform:"uppercase", marginBottom:4 }}>
-              XGBoost · IBKR Live · v3
+              XGBoost · IBKR Algo Trading · v6
             </div>
             <h1 style={{ ...sans, fontSize:20, fontWeight:800, color:C.white, letterSpacing:-0.5 }}>
-              Day Trading + Options Strategy Engine
+              Options Strategy Engine — CSP + LEAP + Delta
             </h1>
           </div>
-          <StatusPill connected={connected} />
+          <div style={{ display:"flex", gap:10, alignItems:"center", flexWrap:"wrap" }}>
+            {netDelta != null && (
+              <div style={{ ...mono, fontSize:13, fontWeight:700, color:deltaCol,
+                padding:"4px 12px", borderRadius:16, background:`${deltaCol}11`, border:`1px solid ${deltaCol}33` }}>
+                Net Δ {netDelta >= 0 ? "+" : ""}{netDelta}
+              </div>
+            )}
+            <StatusPill connected={connected} />
+          </div>
         </div>
 
         {/* Nav tabs */}
@@ -947,14 +2169,18 @@ function App() {
         </div>
 
         {/* Tab content */}
-        {tab === "signals" && <SignalsTab connected={connected} />}
-        {tab === "csp"     && <CSPTab    connected={connected} />}
-        {tab === "leaps"   && <LEAPTab   connected={connected} />}
+        {tab === "signals"    && <SignalsTab     connected={connected} />}
+        {tab === "csp"        && <CSPTab         connected={connected} />}
+        {tab === "leaps"      && <LEAPTab        connected={connected} />}
+        {tab === "positions"  && <PositionsTab />}
+        {tab === "autotrader" && <AutoTraderTab />}
+        {tab === "backtest"   && <BacktestTab    connected={connected} />}
+        {tab === "0dte"       && <ZeroDTETab     connected={connected} />}
+        {tab === "learning"   && <LearningTab />}
 
         <div style={{ marginTop:20, ...sans, fontSize:11, color:C.muted, lineHeight:1.7 }}>
-          ⚠ Research / paper trading only. CSP scan requires market hours for live Greeks.
-          LEAP scanner pre-filters to BUY/HOLD stocks with positive momentum.
-          Auto-refresh every 15s on Signals tab; CSP/LEAP cached for 5 min.
+          Auto-trader: Kelly sizing, trailing stops, auto-hedge. Backtest: 2-yr simulation with BS pricing.
+          0DTE: SPY/QQQ/IWM 0–7 DTE puts. Earnings IV: pre-earnings premium plays. Live account: LIVE (7496) button.
         </div>
       </div>
     </div>

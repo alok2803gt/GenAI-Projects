@@ -11,8 +11,10 @@ New in v3:
 
 import asyncio
 import concurrent.futures
+import json
 import logging
 import math
+import sqlite3
 import threading
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta
@@ -24,7 +26,7 @@ import uvicorn
 import yfinance as yf
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from ib_insync import IB, Option, Stock, util
+from ib_insync import IB, LimitOrder, Option, Stock, util
 from pydantic import BaseModel
 from xgboost import XGBClassifier
 from sklearn.model_selection import TimeSeriesSplit
@@ -42,7 +44,7 @@ log = logging.getLogger("ibkr_trader")
 
 # ── Config — bar streaming ──────────────────────────────────────────────────
 TWS_HOST = "127.0.0.1"
-TWS_PORT = 7496          # 7497=TWS paper | 7496=TWS live | 4002=IB Gateway paper
+TWS_PORT = 7497          # 7497=TWS paper | 7496=TWS live | 4002=IB Gateway paper
 TWS_CLIENT_ID = 10
 MODEL_PATH = "model.joblib"
 BAR_SIZE = "5 mins"
@@ -56,7 +58,7 @@ FEATURE_COLS = [
 ]
 
 # ── Config — CSP scanner ───────────────────────────────────────────────────
-CSP_MIN_RETURN_PCT  = 4.0    # Weekly premium / strike  ≥ 4 %
+CSP_MIN_RETURN_PCT  = 0.75   # Weekly premium / strike  ≥ 0.75 % (realistic for VIX 15-20)
 CSP_MAX_DELTA       = 0.20   # Absolute delta (far-OTM safety)
 CSP_MIN_OI          = 50     # Open interest floor
 CSP_MAX_SPREAD_PCT  = 0.15   # Bid-ask spread as fraction of mid
@@ -69,6 +71,14 @@ IV_RANK_MIN_CSP     = 25     # Flag CSP rows below this IV rank (thin premium en
 EARNINGS_CACHE_TTL  = 21600  # 6 h — earnings dates don't change intraday
 IV_RANK_CACHE_TTL   = 3600   # 1 h
 REGIME_CACHE_TTL    = 300    # 5 min
+
+# ── Config — IV history & technical indicators ─────────────────────────────
+IV_HISTORY_PATH     = "iv_history.json"
+IV_HISTORY_MIN_PTS  = 20    # samples needed before percentile rank is reliable
+JOURNAL_DB_PATH     = "trade_journal.db"
+JOURNAL_MIN_TRADES  = 20    # trades needed before learned model is reliable
+RETRAIN_EVERY       = 5     # retrain model every N new closed trades
+AT_STATE_PATH       = "autotrader_state.json"  # persisted across restarts
 
 # ── Config — LEAP scanner ──────────────────────────────────────────────────
 LEAP_MIN_DTE   = 180   # ≥ 6 months
@@ -106,7 +116,7 @@ state: Dict = {
     # Scanner
     "streaming_loop": None,   # event loop of the streaming thread
     "scan_cache": {
-        "csp": None, "leaps": None, "ts": None,
+        "csp": None, "leaps": None, "0dte": None, "earnings_iv": None, "ts": None,
     },
     # External validation cache (yfinance)
     "ext_cache": {
@@ -116,6 +126,40 @@ state: Dict = {
     },
     # OPRA subscription status — set once at startup, re-checked on reconnect
     "opra_active": None,   # None = not yet checked, True/False thereafter
+    # IV history — persisted daily snapshots for true percentile rank
+    "iv_history": {},      # ticker → [{"date":"YYYY-MM-DD","iv":float}, ...]
+    # Auto-trader state
+    "autotrader": {
+        "enabled": False,
+        "config": {
+            "max_positions":     5,
+            "profit_target_pct": 0.65,
+            "stop_loss_mult":    5.0,
+            "scan_types":        ["csp"],
+            "csp_capital":       20000.0,
+            "leap_capital":      5000.0,
+            # Kelly criterion
+            "use_kelly":         True,
+            "total_capital":     100000.0,
+            "assumed_win_rate":  0.85,
+            # Trailing exit
+            "trailing_exit":     True,
+            # Auto-hedge
+            "auto_hedge":        False,
+            "hedge_threshold":   100.0,
+        },
+        "positions":          {},     # contract_key → entry metadata
+        "log":                [],     # [{time, action, detail}, …] last 200
+        "last_run":           None,
+        "premium_collected":  0.0,    # total realized CSP profit
+        "leap_budget":        0.0,    # 50 % of premium_collected → LEAP fund
+    },
+    # Reconnect request (set by /reconnect endpoint, read by streaming loop)
+    "reconnect_port": None,
+    # Continuous learning
+    "model_learned":   None,   # XGBoost trained on real trade outcomes
+    "model_version":   0,
+    "trades_since_retrain": 0,
 }
 
 TICKERS: List[str] = ["AAPL", "MSFT", "NVDA", "SPY"]
@@ -297,19 +341,34 @@ async def streaming_loop_async() -> None:
 
             ib.errorEvent += _on_ib_error
 
-            await ib.connectAsync(TWS_HOST, TWS_PORT, clientId=TWS_CLIENT_ID, timeout=15)
-            log.info(f"Connected to IBKR  {TWS_HOST}:{TWS_PORT}")
+            port = state.get("reconnect_port") or TWS_PORT
+            state["reconnect_port"] = None          # consume the request
+            await ib.connectAsync(TWS_HOST, port, clientId=TWS_CLIENT_ID, timeout=15)
+            log.info(f"Connected to IBKR  {TWS_HOST}:{port}")
             state["ib"] = ib
             state["connected"] = True
             state["error"] = None
 
             ctx["known"] = await _subscribe_pending(ib, ctx["known"])
 
-            # Check OPRA data subscription once per connection
+            # Wait briefly so the options data farm is fully ready before probing.
+            # Without this, reqTickersAsync races with bar subscriptions and returns nan.
+            await asyncio.sleep(3)
             state["opra_active"] = await _check_opra_subscription(ib)
+            # Retry once — occasionally the first snapshot arrives before OPRA feed is warm
+            if not state["opra_active"]:
+                await asyncio.sleep(3)
+                state["opra_active"] = await _check_opra_subscription(ib)
 
+            # Heartbeat: keep usopt farm alive + re-check OPRA every 4 min.
+            # Without this, the options data farm idles and the first scan
+            # after a quiet period gets NaN on every contract.
+            _heartbeat_tick = 0
             while ib.isConnected():
                 ctx["known"] = await _subscribe_pending(ib, ctx["known"])
+                _heartbeat_tick += 1
+                if _heartbeat_tick % 24 == 0:   # every 24 × 10 s = 4 min
+                    state["opra_active"] = await _check_opra_subscription(ib)
                 await asyncio.sleep(10)
 
             state["connected"] = False
@@ -334,6 +393,33 @@ def streaming_loop() -> None:
 
 
 # ── CSP / LEAP scanner helpers ─────────────────────────────────────────────
+
+# Risk-free rate approximation (US 3-month T-bill)
+_RF_RATE = 0.045
+
+def _norm_cdf(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+def _bs_delta(S: float, K: float, T: float, sigma: float, is_put: bool) -> float:
+    """Black-Scholes delta. T in years."""
+    if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
+        return float("nan")
+    d1 = (math.log(S / K) + (_RF_RATE + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
+    return (_norm_cdf(d1) - 1.0) if is_put else _norm_cdf(d1)
+
+def _bs_theta(S: float, K: float, T: float, sigma: float, is_put: bool) -> float:
+    """Black-Scholes theta per calendar day."""
+    if T <= 0 or sigma <= 0:
+        return 0.0
+    d1 = (math.log(S / K) + (_RF_RATE + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
+    d2 = d1 - sigma * math.sqrt(T)
+    phi = math.exp(-0.5 * d1 ** 2) / math.sqrt(2 * math.pi)
+    if is_put:
+        th = -S * phi * sigma / (2 * math.sqrt(T)) + _RF_RATE * K * math.exp(-_RF_RATE * T) * _norm_cdf(-d2)
+    else:
+        th = -S * phi * sigma / (2 * math.sqrt(T)) - _RF_RATE * K * math.exp(-_RF_RATE * T) * _norm_cdf(d2)
+    return th / 365.0
+
 
 def _next_expiry(weeks_out: int = 0) -> str:
     """Next Friday (or n Fridays out) in YYYYMMDD format."""
@@ -407,6 +493,146 @@ def _score_csp(row: dict) -> float:
     # 5) IV rank — elevated IV = better premium selling environment
     s += (row.get("iv_rank", 50) / 100) * 15
     return round(s, 2)
+
+
+# ── IV history (persistent percentile rank) ───────────────────────────────
+
+def _load_iv_history() -> dict:
+    try:
+        if os.path.exists(IV_HISTORY_PATH):
+            with open(IV_HISTORY_PATH, "r") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+def _save_iv_history() -> None:
+    try:
+        with open(IV_HISTORY_PATH, "w") as f:
+            json.dump(state["iv_history"], f)
+    except Exception as e:
+        log.debug(f"IV history save failed: {e}")
+
+
+# ── Auto-trader state persistence ──────────────────────────────────────────
+
+def _at_save_state() -> None:
+    """Persist auto-trader positions + config to disk so a restart is safe."""
+    at = state["autotrader"]
+    payload = {
+        "enabled":           at["enabled"],
+        "config":            at["config"],
+        "positions":         at["positions"],
+        "premium_collected": at["premium_collected"],
+        "leap_budget":       at["leap_budget"],
+        "model_version":     state.get("model_version", 0),
+    }
+    try:
+        with open(AT_STATE_PATH, "w") as f:
+            json.dump(payload, f, indent=2, default=str)
+    except Exception as e:
+        log.warning(f"Auto-trader state save failed: {e}")
+
+
+def _at_load_state() -> None:
+    """Reload auto-trader state from disk on startup."""
+    if not os.path.exists(AT_STATE_PATH):
+        return
+    try:
+        with open(AT_STATE_PATH, "r") as f:
+            saved = json.load(f)
+        at = state["autotrader"]
+        at["enabled"]           = saved.get("enabled", False)
+        at["premium_collected"] = saved.get("premium_collected", 0.0)
+        at["leap_budget"]       = saved.get("leap_budget", 0.0)
+        # Merge saved config over defaults (preserves any missing keys)
+        at["config"].update(saved.get("config", {}))
+        # Restore positions — the monitor loop will reconcile against live portfolio
+        at["positions"] = saved.get("positions", {})
+        state["model_version"] = saved.get("model_version", 0)
+        log.info(
+            f"Auto-trader state restored: enabled={at['enabled']}, "
+            f"positions={len(at['positions'])}, model_v{state['model_version']}"
+        )
+    except Exception as e:
+        log.warning(f"Auto-trader state load failed (starting fresh): {e}")
+
+def _record_iv(ticker: str, iv_frac: float) -> None:
+    """Store today's IV; keep last 252 trading-day snapshots (≈1 year)."""
+    today_str = date.today().isoformat()
+    hist = state["iv_history"].setdefault(ticker, [])
+    hist[:] = [h for h in hist if h.get("date") != today_str]
+    hist.append({"date": today_str, "iv": round(iv_frac, 4)})
+    state["iv_history"][ticker] = hist[-252:]
+
+def _iv_percentile(ticker: str, current_iv_frac: float) -> Optional[float]:
+    """0-100 percentile rank of current IV within stored history."""
+    hist = state["iv_history"].get(ticker, [])
+    ivs = [h["iv"] for h in hist if h.get("iv") is not None]
+    if len(ivs) < IV_HISTORY_MIN_PTS:
+        return None
+    return round(sum(1 for v in ivs if v <= current_iv_frac) / len(ivs) * 100, 1)
+
+
+# ── Technical indicators (RSI-14 + MACD 12/26/9 + SMA crossovers) ─────────
+
+def _compute_indicators_from_closes(closes: pd.Series) -> dict:
+    empty = {"rsi14": None, "macd": None, "macd_signal": None,
+             "macd_hist": None, "above_sma20": None, "above_sma50": None}
+    if len(closes) < 26:
+        return empty
+    def _safe(s):
+        v = s.iloc[-1]
+        return None if (v is None or (isinstance(v, float) and math.isnan(v))) else float(v)
+
+    delta = closes.diff()
+    gain  = delta.clip(lower=0).rolling(14).mean()
+    loss  = (-delta.clip(upper=0)).rolling(14).mean()
+    rsi   = 100 - 100 / (1 + gain / (loss + 1e-9))
+
+    ema12 = closes.ewm(span=12, adjust=False).mean()
+    ema26 = closes.ewm(span=26, adjust=False).mean()
+    macd  = ema12 - ema26
+    msig  = macd.ewm(span=9, adjust=False).mean()
+    mhist = macd - msig
+
+    sma20 = closes.rolling(20).mean()
+    sma50 = closes.rolling(50).mean() if len(closes) >= 50 else pd.Series([float("nan")] * len(closes), index=closes.index)
+
+    last = float(closes.iloc[-1])
+    s20  = _safe(sma20)
+    s50  = _safe(sma50)
+    return {
+        "rsi14":       round(_safe(rsi)  or 50, 1),
+        "macd":        round(_safe(macd) or 0,  4),
+        "macd_signal": round(_safe(msig) or 0,  4),
+        "macd_hist":   round(_safe(mhist) or 0, 4),
+        "above_sma20": bool(last > s20) if s20 is not None else None,
+        "above_sma50": bool(last > s50) if s50 is not None else None,
+    }
+
+
+async def _tech_indicators(ticker: str) -> dict:
+    """RSI-14 + MACD from streaming bars (live 5-min) or yfinance daily fallback."""
+    empty = {"rsi14": None, "macd": None, "macd_signal": None,
+             "macd_hist": None, "above_sma20": None, "above_sma50": None}
+    bars = state["bars"].get(ticker)
+    if bars and len(bars) >= 30:
+        closes = pd.Series([b["close"] for b in bars], dtype=float)
+        return _compute_indicators_from_closes(closes)
+    loop = asyncio.get_event_loop()
+    try:
+        def _fetch():
+            hist = yf.Ticker(ticker).history(period="3mo")
+            if hist.empty or len(hist) < 26:
+                return None
+            return hist["Close"].astype(float)
+        closes = await loop.run_in_executor(None, _fetch)
+        if closes is not None:
+            return _compute_indicators_from_closes(closes)
+    except Exception as e:
+        log.debug(f"Tech indicators [{ticker}]: {e}")
+    return empty
 
 
 # ── External validation helpers (yfinance) ────────────────────────────────
@@ -519,6 +745,15 @@ async def _iv_rank_for_ticker(ticker: str) -> dict:
     else:
         rank = 50.0
 
+    # Override with true percentile rank once enough history accumulates.
+    # Falls back to the rolling-RV proxy above until IV_HISTORY_MIN_PTS days stored.
+    if current_iv:
+        _record_iv(ticker, current_iv)
+        _save_iv_history()
+        hist_rank = _iv_percentile(ticker, current_iv)
+        if hist_rank is not None:
+            rank = hist_rank
+
     result = {
         "iv":    round(current_iv * 100, 1) if current_iv else None,
         "rank":  rank,
@@ -596,26 +831,48 @@ def _build_warnings(earnings_days: Optional[int], iv_rank: float, mode: str = "c
 async def _check_opra_subscription(ib: IB) -> bool:
     """
     Probe whether real-time OPRA options data is active on this account.
-    Tests a SPY ATM put snapshot — NaN bid/ask means delayed or no subscription.
+    Do NOT call reqMarketDataType(1) — it triggers ARCA equity TOP/ALL requests
+    which require a separate subscription and poison the options snapshot.
     """
     try:
         spy_price = await _get_stock_price(ib, "SPY")
         if spy_price <= 0:
             spy_price = 740.0
         strike = float(round(spy_price / 5) * 5)
-        expiry = _next_expiry(0)
-        contract = Option("SPY", expiry, strike, "P", "SMART")
-        await ib.qualifyContractsAsync(contract)
-        if not contract.conId:
+
+        # Try current-week expiry first; fall back to next week if unqualified
+        contract = None
+        for weeks_out in (0, 1):
+            expiry = _next_expiry(weeks_out)
+            c = Option("SPY", expiry, strike, "P", "SMART")
+            await ib.qualifyContractsAsync(c)
+            if c.conId:
+                contract = c
+                break
+
+        if contract is None:
+            log.warning("OPRA check: could not qualify SPY put contract")
             return False
+
+        log.info(f"OPRA check: SPY {expiry} {strike}P  conId={contract.conId}  spot=${spy_price:.2f}")
+
         [td] = await ib.reqTickersAsync(contract)
-        bid = td.bid if td.bid and not math.isnan(td.bid) else None
-        ask = td.ask if td.ask and not math.isnan(td.ask) else None
-        active = bid is not None and ask is not None and bid > 0 and ask > 0
+
+        raw_bid = td.bid
+        raw_ask = td.ask
+        log.info(
+            f"OPRA check raw: bid={raw_bid}  ask={raw_ask}  "
+            f"last={getattr(td,'last',None)}  close={getattr(td,'close',None)}  greeks={td.modelGreeks}"
+        )
+
+        def _valid(v) -> bool:
+            return v is not None and not math.isnan(v) and v > 0
+
+        active = _valid(raw_bid) and _valid(raw_ask)
         log.info(f"OPRA subscription: {'ACTIVE' if active else 'NOT SUBSCRIBED / DELAYED'}")
         return active
     except Exception as e:
-        log.warning(f"OPRA check failed: {e}")
+        log.warning(f"OPRA check failed: {e}", exc_info=True)
         return False
 
 
@@ -632,26 +889,715 @@ def _liquidity_score(oi: int, vol: int, spread_pct: float) -> float:
     return round(oi_pts + vol_pts + spr_pts, 1)
 
 
+# ── Recommendation filters (mirrors frontend JS) ──────────────────────────
+
+def _filter_csp_recommended(candidates: list) -> list:
+    # above_sma50 must be True or None (None = not enough history, give benefit of doubt)
+    clean = [r for r in candidates
+             if len(r.get("warnings", [])) == 0
+             and r["liquidity_score"] >= 50
+             and r["iv_rank"] >= 30
+             and r["score"] >= 70
+             and r.get("above_sma50") is not False          # reject stocks in downtrend
+             and (r["earnings_days_out"] is None or r["earnings_days_out"] > 21)]
+    # Augment with learned model score if available
+    for r in clean:
+        ls = _learned_score(r)
+        r["learned_score"] = ls
+        r["_sort_key"] = ls if ls is not None else r["score"]
+    seen: set = set()
+    out: list = []
+    for r in sorted(clean, key=lambda x: x["_sort_key"], reverse=True):
+        if r["ticker"] not in seen:
+            seen.add(r["ticker"])
+            out.append(r)
+    return out
+
+
+def _filter_leap_recommended(candidates: list) -> list:
+    clean = [r for r in candidates
+             if len(r.get("warnings", [])) == 0
+             and r["liquidity_score"] >= 60]
+    for r in clean:
+        ls = _learned_score(r)
+        r["learned_score"] = ls
+        r["_sort_key"] = ls if ls is not None else r["score"]
+    seen: set = set()
+    out: list = []
+    for r in sorted(clean, key=lambda x: x["_sort_key"], reverse=True):
+        if r["ticker"] not in seen:
+            seen.add(r["ticker"])
+            out.append(r)
+    return out
+
+
+# ── Auto-trader helpers ────────────────────────────────────────────────────
+
+def _is_market_open() -> bool:
+    """
+    Returns True only during US options market hours.
+    Options trade Mon-Fri 9:30 AM – 4:15 PM Eastern Time.
+    Does not account for holidays — IBKR will simply reject those orders gracefully.
+    """
+    from zoneinfo import ZoneInfo
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+    if now_et.weekday() >= 5:          # Saturday=5, Sunday=6
+        return False
+    market_open  = now_et.replace(hour=9,  minute=30, second=0, microsecond=0)
+    market_close = now_et.replace(hour=16, minute=15, second=0, microsecond=0)
+    return market_open <= now_et <= market_close
+
+
+def _at_log(action: str, detail: str) -> None:
+    entry = {"time": datetime.utcnow().strftime("%H:%M:%S UTC"), "action": action, "detail": detail}
+    at = state["autotrader"]
+    at["log"].append(entry)
+    at["log"] = at["log"][-200:]
+    log.info("[AutoTrader] %s: %s", action, detail)
+
+
+def _at_contract_key(c) -> str:
+    return (f"{c.symbol}_{getattr(c,'right','')}"
+            f"{getattr(c,'strike','')}{getattr(c,'lastTradeDateOrContractMonth','')}")
+
+
+def _kelly_qty(cfg: dict, strike: float, t_type: str, mid_price: float = 0.0,
+               regime: str = "BULL") -> int:
+    """Half-Kelly position sizing, scaled by market regime."""
+    p  = float(cfg.get("assumed_win_rate", 0.85))
+    pt = float(cfg.get("profit_target_pct", 0.65))
+    sl = float(cfg.get("stop_loss_mult", 5.0))
+    b  = pt / sl if sl > 0 else pt / 5.0
+    kelly = (p * (b + 1) - 1) / b if b > 0 else 0.0
+    frac  = max(0.02, kelly * 0.5)             # half-Kelly
+    # Regime penalty: reduce size in uncertain or falling market
+    regime_scale = {"BULL": 1.0, "NEUTRAL": 0.6, "BEAR": 0.35, "UNKNOWN": 0.5}.get(regime, 0.5)
+    total = float(cfg.get("total_capital", 100000.0))
+    capital = total * frac * regime_scale
+    if t_type == "csp":
+        return max(1, int(capital / (strike * 100)))
+    else:
+        m = mid_price if mid_price > 0 else 5.0
+        return max(1, int(capital / (m * 100)))
+
+
+def _bs_put_price(S: float, K: float, T: float, sigma: float) -> float:
+    """Black-Scholes put price (risk-free rate = 0)."""
+    if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
+        return max(K - S, 0.0)
+    d1 = (math.log(S / K) + 0.5 * sigma**2 * T) / (sigma * math.sqrt(T))
+    d2 = d1 - sigma * math.sqrt(T)
+    return K * _norm_cdf(-d2) - S * _norm_cdf(-d1)
+
+
+async def _autotrader_monitor_coro(ib: IB) -> None:
+    at           = state["autotrader"]
+    cfg          = at["config"]
+    use_trailing = cfg.get("trailing_exit", True)
+    if not at["positions"]:
+        return
+    for item in ib.portfolio():
+        key = _at_contract_key(item.contract)
+        if key not in at["positions"]:
+            continue
+        info       = at["positions"][key]
+        upnl       = float(item.unrealizedPNL or 0)
+        max_profit = info.get("max_profit", 0)
+        if max_profit <= 0:
+            continue
+
+        if use_trailing:
+            # Update high-water mark
+            hw = max(info.get("high_water", 0.0), upnl)
+            info["high_water"] = hw
+            hw_pct = hw / max_profit
+            # Tiered trailing floor: lock in more as profit builds
+            if hw_pct >= 0.75:
+                floor = 0.60 * max_profit
+            elif hw_pct >= 0.50:
+                floor = 0.35 * max_profit
+            elif hw_pct >= 0.25:
+                floor = 0.15 * max_profit
+            else:
+                floor = -cfg["stop_loss_mult"] * max_profit
+            if upnl <= floor:
+                reason = (f"trailing stop: floor=${floor:.0f}, uPnL=${upnl:.0f}, "
+                          f"HW={hw_pct*100:.0f}% of max")
+                _at_log("CLOSE", f"{key}: {reason}")
+                info["exit_reason"] = "trailing_stop"
+                await _autotrader_close_coro(ib, item, info, key)
+        else:
+            if upnl >= cfg["profit_target_pct"] * max_profit:
+                _at_log("CLOSE", f"{key}: profit target hit (${upnl:.0f})")
+                info["exit_reason"] = "profit_target"
+                await _autotrader_close_coro(ib, item, info, key)
+            elif upnl <= -cfg["stop_loss_mult"] * max_profit:
+                _at_log("CLOSE", f"{key}: stop-loss hit (${upnl:.0f})")
+                info["exit_reason"] = "stop_loss"
+                await _autotrader_close_coro(ib, item, info, key)
+
+
+async def _autotrader_close_coro(ib: IB, item, info: dict, key: str) -> None:
+    c            = item.contract
+    close_action = "BUY" if info["action"] == "SELL" else "SELL"
+    qty          = max(1, abs(int(item.position)))
+    contract     = Option(
+        symbol=c.symbol,
+        lastTradeDateOrContractMonth=c.lastTradeDateOrContractMonth,
+        strike=float(c.strike),
+        right=c.right,
+        exchange="SMART",
+        currency="USD",
+        multiplier="100",
+    )
+    await ib.qualifyContractsAsync(contract)
+    ticker_q = ib.reqMktData(contract, "", False, False)
+    await asyncio.sleep(2)
+    bid = float(ticker_q.bid or 0)
+    ask = float(ticker_q.ask or 0)
+    ib.cancelMktData(contract)
+    if close_action == "BUY":
+        lmt = round((ask + 0.01) if ask > 0 else (bid * 1.10 if bid > 0 else 0.50), 2)
+    else:
+        lmt = round((bid - 0.01) if bid > 0 else (ask * 0.90 if ask > 0 else 0.10), 2)
+    # Capture live IV at exit for learning
+    live_iv_exit = None
+    try:
+        if ticker_q.modelGreeks:
+            live_iv_exit = round(float(ticker_q.modelGreeks.impliedVol or 0) * 100, 2)
+    except Exception:
+        pass
+
+    trade = ib.placeOrder(contract, LimitOrder(close_action, qty, lmt))
+    await asyncio.sleep(1)
+    state["autotrader"]["positions"].pop(key, None)
+
+    upnl_now = float(item.unrealizedPNL or 0)
+
+    # Record exit in trade journal
+    j_id = info.get("journal_id")
+    if j_id:
+        # Determine exit reason from context (info carries last reason from monitor)
+        exit_reason = info.get("exit_reason", "manual")
+        _journal_record_exit(j_id, lmt, upnl_now, exit_reason, live_iv_exit)
+
+    # Track premium collected for LEAP budget
+    if upnl_now > 0 and info.get("action") == "SELL":
+        at = state["autotrader"]
+        at["premium_collected"] = round(at.get("premium_collected", 0.0) + upnl_now, 2)
+        at["leap_budget"]       = round(at["premium_collected"] * 0.50, 2)
+        _at_log("BUDGET", f"+${upnl_now:.0f} → total=${at['premium_collected']:.0f} | LEAP=${at['leap_budget']:.0f}")
+    _at_log("CLOSED", f"{close_action} {qty}x {c.symbol} @ ${lmt:.2f} "
+                      f"pnl=${upnl_now:+.0f} (order #{trade.order.orderId})")
+    _at_save_state()
+
+
+async def _autotrader_scan_and_trade_coro(ib: IB) -> None:
+    at       = state["autotrader"]
+    cfg      = at["config"]
+
+    # ── Market regime gate ────────────────────────────────────────────────────
+    regime_data = await _market_regime()
+    regime      = regime_data.get("regime", "UNKNOWN")
+    vix         = regime_data.get("vix") or 0.0
+
+    if regime == "BEAR" and "csp" in cfg["scan_types"]:
+        _at_log("REGIME", f"BEAR market (VIX={vix:.1f}) — pausing CSP new entries to protect capital")
+        return
+    if vix >= 35:
+        _at_log("REGIME", f"VIX={vix:.1f} (extreme fear) — pausing all new entries")
+        return
+    if regime == "NEUTRAL":
+        _at_log("REGIME", f"NEUTRAL market (VIX={vix:.1f}) — allowing entries at reduced Kelly (0.6x)")
+
+    # ── Position slot check ───────────────────────────────────────────────────
+    managed  = set(at["positions"])
+    active_t = {item.contract.symbol for item in ib.portfolio()
+                if _at_contract_key(item.contract) in managed}
+    # In NEUTRAL, cap at half of max_positions to stay conservative
+    max_slots = cfg["max_positions"] if regime == "BULL" else max(1, cfg["max_positions"] // 2)
+    slots = max_slots - len(active_t)
+    if slots <= 0:
+        _at_log("SCAN", "Max positions filled — skipping scan")
+        return
+    _at_log("SCAN", f"Scanning for up to {slots} new positions (regime={regime})…")
+
+    candidates: list = []
+    if "csp" in cfg["scan_types"]:
+        try:
+            r = await scan_csp(ib, CSP_MIN_RETURN_PCT, CSP_MAX_DELTA)
+            for c in _filter_csp_recommended(r["candidates"]):
+                c["_type"] = "csp"
+                c["_regime"] = regime
+                candidates.append(c)
+        except Exception as exc:
+            _at_log("ERROR", f"CSP scan failed: {exc}")
+    if "leap" in cfg["scan_types"]:
+        try:
+            r = await scan_leaps(ib)
+            for c in _filter_leap_recommended(r["candidates"]):
+                c["_type"] = "leap"
+                c["_regime"] = regime
+                candidates.append(c)
+        except Exception as exc:
+            _at_log("ERROR", f"LEAP scan failed: {exc}")
+    candidates.sort(key=lambda x: x["score"], reverse=True)
+    candidates = [c for c in candidates if c["ticker"] not in active_t]
+    _at_log("SCAN", f"Found {len(candidates)} qualifying candidates after dedup")
+    placed = 0
+    for row in candidates[:slots]:
+        try:
+            await _autotrader_place_coro(ib, row, cfg, regime=regime)
+            active_t.add(row["ticker"])
+            placed += 1
+        except Exception as exc:
+            _at_log("ERROR", f"Place {row['ticker']}: {exc}")
+    _at_log("SCAN", f"Placed {placed} orders this cycle")
+    # Auto-hedge if delta exposure exceeds threshold
+    if cfg.get("auto_hedge", False):
+        try:
+            await _autotrader_hedge_coro(ib)
+        except Exception as exc:
+            _at_log("ERROR", f"Hedge failed: {exc}")
+
+
+async def _autotrader_place_coro(ib: IB, row: dict, cfg: dict, regime: str = "BULL") -> None:
+    ticker = row["ticker"]
+    expiry = row["expiry"]
+    strike = float(row["strike"])
+    t      = row.get("_type", "csp")
+    right  = "P" if t == "csp" else "C"
+    action = "SELL" if t == "csp" else "BUY"
+    bid = float(row.get("bid", 0) or 0)
+    ask = float(row.get("ask", 0) or 0)
+    mid = (bid + ask) / 2 if ask > 0 else 5.0
+    if cfg.get("use_kelly", True):
+        qty = _kelly_qty(cfg, strike, t, mid, regime=regime)
+    elif t == "csp":
+        qty = max(1, int(float(cfg.get("csp_capital", 20000)) / (strike * 100)))
+    else:
+        qty = max(1, int(float(cfg.get("leap_capital", 5000)) / (mid * 100)))
+    contract = Option(ticker, expiry, strike, right, "SMART")
+    await ib.qualifyContractsAsync(contract)
+    if not contract.conId:
+        raise ValueError(f"Could not qualify {ticker} {expiry} {strike}{right}")
+    exp_str = f"{expiry[:4]}-{expiry[4:6]}-{expiry[6:8]}"
+    def _fetch_mid() -> Optional[float]:
+        t_obj = yf.Ticker(ticker)
+        try:
+            chain = t_obj.option_chain(exp_str)
+            df    = chain.calls if right == "C" else chain.puts
+            df_r  = df[df["strike"] == strike]
+            if df_r.empty:
+                return None
+            b = float(df_r["bid"].iloc[0])
+            a = float(df_r["ask"].iloc[0])
+            m = (b + a) / 2
+            return round((b + (m - b) * 0.40) if action == "SELL" else (a - (a - m) * 0.40), 2)
+        except Exception:
+            return None
+    lmt = await asyncio.get_event_loop().run_in_executor(None, _fetch_mid)
+    if not lmt or lmt <= 0:
+        raise ValueError(f"Could not price {ticker} {expiry} ${strike}{right}")
+    # Request live IV snapshot at entry for journal
+    live_iv_entry = None
+    try:
+        tq = ib.reqMktData(contract, "106,13", False, False)
+        await asyncio.sleep(1.5)
+        if tq.modelGreeks:
+            live_iv_entry = round(float(tq.modelGreeks.impliedVol or 0) * 100, 2)
+        ib.cancelMktData(contract)
+    except Exception:
+        pass
+
+    trade      = ib.placeOrder(contract, LimitOrder(action, qty, lmt))
+    await asyncio.sleep(1)
+    max_profit = lmt * qty * 100
+    key        = _at_contract_key(contract)
+
+    # Record entry in journal
+    exp_d  = datetime.strptime(expiry[:8], "%Y%m%d").date()
+    dte    = (exp_d - date.today()).days
+    entry_info = {
+        "ticker":             ticker,  "expiry":           expiry,
+        "strike":             strike,  "right":            right,
+        "action":             action,  "qty":              qty,
+        "entry_price":        lmt,     "max_profit":       round(max_profit, 2),
+        "iv_rank":            row.get("iv_rank"),
+        "score":              row.get("score", 0),
+        "liquidity_score":    row.get("liquidity_score"),
+        "weekly_return_pct":  row.get("weekly_return_pct"),
+        "rsi14":              row.get("rsi14"),
+        "macd_hist":          row.get("macd_hist"),
+        "earnings_days_out":  row.get("earnings_days_out"),
+        "dte":                dte,
+        "spot_price":         row.get("spot") or row.get("stock_price"),
+        "market_regime":      state["ext_cache"].get("regime", {}).get("regime"),
+        "live_iv":            live_iv_entry,
+        "strategy_type":      row.get("_type", "csp"),
+    }
+    journal_id = _journal_insert_entry(entry_info)
+
+    state["autotrader"]["positions"][key] = {
+        "ticker":      ticker,    "expiry":    expiry,
+        "strike":      strike,    "right":     right,
+        "action":      action,    "qty":       qty,
+        "entry_price": lmt,       "max_profit":round(max_profit, 2),
+        "order_id":    trade.order.orderId,
+        "placed_at":   datetime.utcnow().strftime("%H:%M:%S UTC"),
+        "score":       row.get("score", 0),
+        "journal_id":  journal_id,
+        "live_iv":     live_iv_entry,
+    }
+    _at_log("TRADE", f"{action} {qty}x {ticker} {right}{strike} {expiry} @ ${lmt:.2f} "
+                     f"(order #{trade.order.orderId}, journal #{journal_id})")
+    _at_save_state()
+
+
+async def _autotrader_hedge_coro(ib: IB) -> None:
+    """Buy a SPY protective option when net portfolio delta exceeds threshold."""
+    cfg       = state["autotrader"]["config"]
+    threshold = float(cfg.get("hedge_threshold", 100.0))
+
+    # Compute net portfolio delta (quick BS estimate per position)
+    net_delta = 0.0
+    for item in ib.portfolio():
+        c   = item.contract
+        pos = float(item.position)
+        sec = getattr(c, "secType", "")
+        if sec == "STK":
+            net_delta += pos
+        elif sec in ("OPT", "FOP"):
+            try:
+                tk     = yf.Ticker(c.symbol)
+                hist   = tk.history(period="5d", interval="1d")
+                S      = float(hist["Close"].iloc[-1]) if not hist.empty else 0.0
+                K      = float(c.strike)
+                exp_d  = datetime.strptime(c.lastTradeDateOrContractMonth[:8], "%Y%m%d").date()
+                T      = max((exp_d - date.today()).days / 365, 0.001)
+                iv_inf = state["ext_cache"]["iv_rank"].get(c.symbol, {})
+                sigma  = iv_inf.get("iv") or 0.25
+                is_put = c.right.upper() == "P"
+                d      = _bs_delta(S, K, T, sigma, is_put)
+                net_delta += d * pos * (float(getattr(c, "multiplier", 100) or 100))
+            except Exception:
+                pass
+
+    _at_log("HEDGE", f"Net portfolio delta = {net_delta:+.1f} (threshold ±{threshold:.0f})")
+    if abs(net_delta) < threshold:
+        return
+
+    # Choose hedge: long delta → buy put; short delta → buy call
+    hedge_right  = "P" if net_delta > 0 else "C"
+    hedge_action = "BUY"
+
+    # Nearest weekly SPY expiry
+    spy_tk   = yf.Ticker("SPY")
+    spy_hist = spy_tk.history(period="2d", interval="1d")
+    spy_spot = float(spy_hist["Close"].iloc[-1]) if not spy_hist.empty else 540.0
+    expiries = spy_tk.options
+    target_d = date.today()
+    exp_str  = expiries[0] if expiries else ""
+    for exp in expiries:
+        d_exp = datetime.strptime(exp, "%Y-%m-%d").date()
+        if (d_exp - target_d).days >= 3:
+            exp_str = exp
+            break
+
+    if not exp_str:
+        _at_log("HEDGE", "Could not find SPY expiry")
+        return
+
+    chain     = spy_tk.option_chain(exp_str)
+    df        = chain.puts if hedge_right == "P" else chain.calls
+    # Pick 2 % OTM strike
+    tgt_k     = round(spy_spot * (0.98 if hedge_right == "P" else 1.02), 0)
+    df["diff"]= abs(df["strike"] - tgt_k)
+    row       = df.sort_values("diff").iloc[0]
+    strike    = float(row["strike"])
+    bid       = float(row.get("bid", 0) or 0)
+    ask       = float(row.get("ask", 0) or 0)
+    if ask <= 0:
+        _at_log("HEDGE", "No valid SPY quote for hedge")
+        return
+
+    lmt      = round(ask * 1.01, 2)
+    expiry_k = exp_str.replace("-", "")
+    contract = Option("SPY", expiry_k, strike, hedge_right, "SMART")
+    await ib.qualifyContractsAsync(contract)
+    if not contract.conId:
+        _at_log("HEDGE", "Could not qualify SPY hedge contract")
+        return
+
+    trade = ib.placeOrder(contract, LimitOrder(hedge_action, 1, lmt))
+    await asyncio.sleep(1)
+    _at_log("HEDGE", (f"Placed SPY {hedge_right}{strike} {expiry_k} hedge @ ${lmt:.2f} "
+                      f"(delta={net_delta:+.0f}, order #{trade.order.orderId})"))
+
+
+async def _autotrader_background() -> None:
+    await asyncio.sleep(15)          # let server finish starting
+    while True:
+        await asyncio.sleep(300)     # 5-minute cadence
+        if not state["autotrader"]["enabled"]:
+            continue
+        if not state.get("connected") or not state.get("ib"):
+            _at_log("WARN", "Not connected — skipping cycle")
+            continue
+        ib   = state["ib"]
+        loop = asyncio.get_event_loop()
+        market_open = _is_market_open()
+        try:
+            # Monitor runs always — catches trailing stops / profit targets on any open positions
+            await loop.run_in_executor(
+                None,
+                lambda: _run_in_streaming_loop(_autotrader_monitor_coro(ib), timeout=30),
+            )
+            # New entries only during market hours — prevents queued overnight orders
+            if market_open:
+                await loop.run_in_executor(
+                    None,
+                    lambda: _run_in_streaming_loop(_autotrader_scan_and_trade_coro(ib), timeout=180),
+                )
+            else:
+                from zoneinfo import ZoneInfo
+                now_et = datetime.now(ZoneInfo("America/New_York"))
+                _at_log("MARKET", f"Market closed ({now_et.strftime('%a %H:%M ET')}) — monitoring only, no new entries")
+            state["autotrader"]["last_run"] = datetime.utcnow().isoformat() + "Z"
+        except Exception as exc:
+            _at_log("ERROR", f"Cycle error: {exc}")
+            log.error("AutoTrader cycle error: %s", exc, exc_info=True)
+
+
+# ── Trade Journal (SQLite) ─────────────────────────────────────────────────
+
+_JOURNAL_FEATURE_COLS = [
+    "iv_rank", "score", "liquidity_score", "weekly_return_pct",
+    "rsi14", "macd_hist", "earnings_days", "dte",
+]
+
+
+def _journal_init() -> None:
+    con = sqlite3.connect(JOURNAL_DB_PATH, check_same_thread=False)
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS trade_journal (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            opened_at         TEXT,
+            closed_at         TEXT,
+            ticker            TEXT,
+            expiry            TEXT,
+            strike            REAL,
+            right             TEXT,
+            action            TEXT,
+            qty               INTEGER,
+            entry_price       REAL,
+            exit_price        REAL,
+            iv_rank           REAL,
+            score             INTEGER,
+            liquidity_score   REAL,
+            weekly_return_pct REAL,
+            rsi14             REAL,
+            macd_hist         REAL,
+            earnings_days     INTEGER,
+            dte               INTEGER,
+            spot_price        REAL,
+            market_regime     TEXT,
+            live_iv_entry     REAL,
+            exit_reason       TEXT,
+            pnl               REAL,
+            pnl_pct           REAL,
+            win               INTEGER,
+            max_profit        REAL,
+            strategy_type     TEXT,
+            model_version     INTEGER
+        )
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS model_log (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            trained_at   TEXT,
+            n_trades     INTEGER,
+            win_rate     REAL,
+            cv_accuracy  REAL,
+            importances  TEXT,
+            notes        TEXT
+        )
+    """)
+    con.commit()
+    con.close()
+    log.info("Trade journal initialised at %s", JOURNAL_DB_PATH)
+
+
+def _journal_insert_entry(info: dict) -> int:
+    """Record a new auto-trader entry. Returns the DB row id."""
+    con = sqlite3.connect(JOURNAL_DB_PATH, check_same_thread=False)
+    cur = con.execute("""
+        INSERT INTO trade_journal
+            (opened_at, ticker, expiry, strike, right, action, qty, entry_price,
+             iv_rank, score, liquidity_score, weekly_return_pct, rsi14, macd_hist,
+             earnings_days, dte, spot_price, market_regime, live_iv_entry,
+             max_profit, strategy_type, model_version)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    """, (
+        datetime.utcnow().isoformat(),
+        info.get("ticker"), info.get("expiry"),
+        info.get("strike"), info.get("right"),
+        info.get("action"), info.get("qty"),
+        info.get("entry_price"),
+        info.get("iv_rank"),     info.get("score"),
+        info.get("liquidity_score"), info.get("weekly_return_pct"),
+        info.get("rsi14"),       info.get("macd_hist"),
+        info.get("earnings_days_out"), info.get("dte"),
+        info.get("spot_price"),  info.get("market_regime"),
+        info.get("live_iv"),     info.get("max_profit"),
+        info.get("strategy_type", "csp"), state.get("model_version", 0),
+    ))
+    row_id = cur.lastrowid
+    con.commit()
+    con.close()
+    return row_id
+
+
+def _journal_record_exit(
+    journal_id: int,
+    exit_price: float,
+    pnl: float,
+    exit_reason: str,
+    live_iv_exit: Optional[float] = None,
+) -> None:
+    """Close out a journal row with exit data and trigger learning."""
+    con = sqlite3.connect(JOURNAL_DB_PATH, check_same_thread=False)
+    row = con.execute(
+        "SELECT max_profit FROM trade_journal WHERE id=?", (journal_id,)
+    ).fetchone()
+    max_profit = row[0] if row and row[0] else None
+    pnl_pct    = round(pnl / max_profit * 100, 1) if max_profit else None
+    win        = 1 if pnl > 0 else 0
+    con.execute("""
+        UPDATE trade_journal
+        SET closed_at=?, exit_price=?, pnl=?, pnl_pct=?, win=?, exit_reason=?
+        WHERE id=?
+    """, (datetime.utcnow().isoformat(), exit_price, round(pnl, 2),
+          pnl_pct, win, exit_reason, journal_id))
+    con.commit()
+    con.close()
+
+    # Update Kelly from real fill data
+    _update_kelly_from_journal()
+
+    # Trigger periodic model retraining
+    state["trades_since_retrain"] = state.get("trades_since_retrain", 0) + 1
+    if state["trades_since_retrain"] >= RETRAIN_EVERY:
+        state["trades_since_retrain"] = 0
+        try:
+            _retrain_from_journal()
+        except Exception as exc:
+            log.warning("Auto retrain failed: %s", exc)
+
+
+def _update_kelly_from_journal() -> None:
+    """EMA-blend actual win rate from journal into auto-trader's assumed_win_rate."""
+    con = sqlite3.connect(JOURNAL_DB_PATH, check_same_thread=False)
+    rows = con.execute(
+        "SELECT win FROM trade_journal WHERE closed_at IS NOT NULL AND win IS NOT NULL"
+    ).fetchall()
+    con.close()
+    if len(rows) < 10:
+        return
+    actual_wr = sum(r[0] for r in rows) / len(rows)
+    old       = state["autotrader"]["config"].get("assumed_win_rate", 0.85)
+    new_wr    = round(0.70 * old + 0.30 * actual_wr, 4)  # slow EMA
+    state["autotrader"]["config"]["assumed_win_rate"] = new_wr
+    _at_log("LEARN", f"Kelly win rate {old:.1%} → {new_wr:.1%} (actual {actual_wr:.1%} over {len(rows)} trades)")
+
+
+def _retrain_from_journal() -> dict:
+    """Retrain XGBoost score model from completed journal trades."""
+    con = sqlite3.connect(JOURNAL_DB_PATH, check_same_thread=False)
+    cols_sql = ", ".join(_JOURNAL_FEATURE_COLS) + ", win"
+    rows = con.execute(
+        f"SELECT {cols_sql} FROM trade_journal WHERE closed_at IS NOT NULL AND win IS NOT NULL"
+    ).fetchall()
+    con.close()
+    if len(rows) < JOURNAL_MIN_TRADES:
+        return {"error": f"Need {JOURNAL_MIN_TRADES}+ trades (have {len(rows)})"}
+
+    df  = pd.DataFrame(rows, columns=_JOURNAL_FEATURE_COLS + ["win"])
+    X   = df[_JOURNAL_FEATURE_COLS].fillna(df[_JOURNAL_FEATURE_COLS].median())
+    y   = df["win"].astype(int)
+
+    from sklearn.model_selection import cross_val_score
+    model = XGBClassifier(
+        n_estimators=200, max_depth=3, learning_rate=0.05,
+        subsample=0.8, colsample_bytree=0.8,
+        eval_metric="logloss", random_state=42,
+    )
+    cv = cross_val_score(model, X, y, cv=min(5, max(2, len(df) // 4)),
+                         scoring="accuracy")
+    model.fit(X, y)
+
+    importances = {c: round(float(v), 4)
+                   for c, v in zip(_JOURNAL_FEATURE_COLS, model.feature_importances_)}
+    state["model_learned"]  = model
+    state["model_version"]  = state.get("model_version", 0) + 1
+
+    con = sqlite3.connect(JOURNAL_DB_PATH, check_same_thread=False)
+    con.execute("""
+        INSERT INTO model_log (trained_at, n_trades, win_rate, cv_accuracy, importances, notes)
+        VALUES (?,?,?,?,?,?)
+    """, (
+        datetime.utcnow().isoformat(), len(df),
+        round(float(y.mean()), 4), round(float(cv.mean()), 4),
+        json.dumps(importances),
+        f"auto v{state['model_version']}",
+    ))
+    con.commit()
+    con.close()
+
+    top = max(importances, key=importances.get)
+    _at_log("LEARN", (f"Model v{state['model_version']} trained: {len(df)} trades, "
+                       f"win={y.mean():.1%}, CV={cv.mean():.1%}, top={top}"))
+    return {"version": state["model_version"], "n_trades": len(df),
+            "win_rate": round(float(y.mean()) * 100, 1),
+            "cv_accuracy": round(float(cv.mean()) * 100, 1),
+            "importances": importances}
+
+
+def _learned_score(features: dict) -> Optional[float]:
+    """Score a candidate with the learned model (0–100). None if model not ready."""
+    model = state.get("model_learned")
+    if model is None:
+        return None
+    X = [[features.get(col) or 0.0 for col in _JOURNAL_FEATURE_COLS]]
+    try:
+        prob = float(model.predict_proba(X)[0][1])
+        return round(prob * 100, 1)
+    except Exception:
+        return None
+
+
 async def _get_stock_price(ib: IB, ticker: str) -> float:
     """Live price: prefer streaming bar cache (always fresh), else IBKR snapshot."""
     # Streaming bars are the freshest source — use them if available
     bars = state["bars"].get(ticker)
     if bars:
-        return float(bars[-1].close)
+        return float(bars[-1]["close"])
 
     # Fallback: cached signal close (may be up to one bar old)
     sig = state["signals"].get(ticker)
     if sig:
         return float(sig["close"])
 
-    # Last resort: one-shot snapshot
-    contract = Stock(ticker, "SMART", "USD")
-    await ib.qualifyContractsAsync(contract)
-    [t] = await ib.reqTickersAsync(contract)
-    price = t.marketPrice()
-    if not price or math.isnan(price):
-        price = t.close or 0.0
-    return float(price)
+    # Last resort: yfinance (avoids IBKR equity subscription requirement)
+    try:
+        tk = yf.Ticker(ticker)
+        hist = tk.history(period="1d", interval="1m")
+        if not hist.empty:
+            return float(hist["Close"].iloc[-1])
+    except Exception:
+        pass
+    return 0.0
 
 
 async def _option_quotes(ib: IB, contracts: list) -> list:
@@ -690,162 +1636,133 @@ async def scan_csp(
     # Market regime + ticker scans run concurrently
     async def _scan_ticker(ticker: str) -> List[dict]:
         async with sem:
-            # ── Earnings gate (fastest disqualifier) ──────────────────────
             earnings_days = await _earnings_days_out(ticker)
             if earnings_days is not None and earnings_days <= EARNINGS_BLOCK_DAYS:
                 log.info(f"CSP [{ticker}]: blocked — earnings in {earnings_days}d")
                 return []
 
             try:
-                stock_price = await _get_stock_price(ib, ticker)
-                if stock_price <= 0:
-                    log.debug(f"CSP [{ticker}]: no price — skipping")
-                    return []
-
-                stock = Stock(ticker, "SMART", "USD")
-                await ib.qualifyContractsAsync(stock)
-
-                # Fetch option chain and IV rank in parallel
-                chains, iv_info = await asyncio.gather(
-                    ib.reqSecDefOptParamsAsync(ticker, "", "STK", stock.conId),
+                stock_price, iv_info, tech = await asyncio.gather(
+                    _get_stock_price(ib, ticker),
                     _iv_rank_for_ticker(ticker),
+                    _tech_indicators(ticker),
                 )
-                if not chains:
-                    log.debug(f"CSP [{ticker}]: no option chain — skipping")
+                if stock_price <= 0:
+                    log.debug(f"CSP [{ticker}]: no price")
                     return []
 
-                chain = next((c for c in chains if c.exchange == "SMART"), chains[0])
-                expiry = expiry0 if expiry0 in chain.expirations else (
-                    expiry1 if expiry1 in chain.expirations else None
-                )
-                if not expiry:
-                    log.debug(f"CSP [{ticker}]: no weekly expiry available")
-                    return []
+                today_d = date.today()
 
-                dte = (datetime.strptime(expiry, "%Y%m%d").date() - date.today()).days
+                def _fetch_yf_puts():
+                    t = yf.Ticker(ticker)
+                    exps = t.options or []
+                    rows = []
+                    for exp_str in exps:
+                        try:
+                            exp_date = datetime.strptime(exp_str, "%Y-%m-%d").date()
+                        except ValueError:
+                            continue
+                        dte = (exp_date - today_d).days
+                        if dte < 5:
+                            continue
+                        if dte > 35:
+                            break
+                        T = dte / 365.0
+                        expiry_fmt = exp_date.strftime("%Y%m%d")
+                        try:
+                            puts = t.option_chain(exp_str).puts
+                        except Exception:
+                            continue
+                        for _, r in puts.iterrows():
+                            try:
+                                K   = float(r["strike"])
+                                bid = float(r.get("bid") or 0)
+                                ask = float(r.get("ask") or 0)
+                                iv  = float(r.get("impliedVolatility") or 0)
+                                oi  = int(r.get("openInterest") or 0)
+                                vol = int(r.get("volume") or 0)
+                                if bid <= 0 or ask <= 0 or iv < 0.05 or iv > 3.0:
+                                    continue
+                                mid        = (bid + ask) / 2.0
+                                spread_pct = (ask - bid) / mid * 100
+                                otm_pct    = (stock_price - K) / stock_price * 100
+                                if otm_pct < 3 or otm_pct > 30:
+                                    continue
+                                delta = _bs_delta(stock_price, K, T, iv, is_put=True)
+                                if math.isnan(delta) or delta >= 0:
+                                    continue
+                                if abs(delta) > max_delta:
+                                    continue
+                                if oi < CSP_MIN_OI:
+                                    continue
+                                if spread_pct / 100 > CSP_MAX_SPREAD_PCT:
+                                    continue
+                                theta          = _bs_theta(stock_price, K, T, iv, is_put=True)
+                                fill_cons      = bid
+                                fill_real      = bid + (mid - bid) * 0.40
+                                wk_ret_bid     = fill_cons / K * 100
+                                wk_ret_pct     = fill_real / K * 100
+                                wk_ret_mid     = mid       / K * 100
+                                if wk_ret_pct < min_return:
+                                    continue
+                                ann_ret        = wk_ret_pct * 52
+                                max_loss       = round((K - fill_real) * 100, 2)
+                                ror            = round(fill_real / max(K - fill_real, 0.01) * 52 * 100, 1)
+                                liq            = _liquidity_score(oi, vol, spread_pct)
+                                exp_move       = _expected_weekly_move(stock_price, iv)
+                                sigma_otm      = (stock_price - K) / exp_move if exp_move > 0 else 0
+                                warnings       = _build_warnings(earnings_days, iv_info["rank"], "csp")
+                                sq             = _stock_quality_score(ticker)
+                                row = {
+                                    "ticker":               ticker,
+                                    "expiry":               expiry_fmt,
+                                    "dte":                  dte,
+                                    "strike":               K,
+                                    "stock_price":          round(stock_price, 2),
+                                    "otm_pct":              round(otm_pct, 2),
+                                    "sigma_otm":            round(sigma_otm, 2),
+                                    "bid":                  round(bid, 2),
+                                    "ask":                  round(ask, 2),
+                                    "mid":                  round(mid, 2),
+                                    "weekly_return_bid":    round(wk_ret_bid, 2),
+                                    "weekly_return_pct":    round(wk_ret_pct, 2),
+                                    "weekly_return_mid":    round(wk_ret_mid, 2),
+                                    "annualized_return":    round(ann_ret, 1),
+                                    "max_loss_per_contract": max_loss,
+                                    "return_on_risk_ann":   ror,
+                                    "breakeven":            round(K - fill_real, 2),
+                                    "delta":                round(delta, 4),
+                                    "iv_pct":               round(iv * 100, 1),
+                                    "theta_daily":          round(theta, 4),
+                                    "open_interest":        oi,
+                                    "volume":               vol,
+                                    "spread_pct":           round(spread_pct, 2),
+                                    "liquidity_score":      liq,
+                                    "stock_quality":        sq,
+                                    "assignment_risk":      _assignment_risk(delta, otm_pct),
+                                    "xgb_signal":           state["signals"].get(ticker, {}).get("label", "N/A"),
+                                    "cash_required":        round(K * 100, 2),
+                                    "premium_collected":    round(fill_real * 100, 2),
+                                    "earnings_days_out":    earnings_days,
+                                    "iv_rank":              iv_info["rank"],
+                                    "iv_yf":                iv_info["iv"],
+                                    "rsi14":                tech.get("rsi14"),
+                                    "macd_hist":            tech.get("macd_hist"),
+                                    "above_sma20":          tech.get("above_sma20"),
+                                    "above_sma50":          tech.get("above_sma50"),
+                                    "warnings":             warnings,
+                                }
+                                row["score"] = _score_csp(row)
+                                rows.append(row)
+                            except Exception:
+                                continue
+                        if rows:
+                            break  # got candidates from this expiry
+                    return rows
 
-                put_strikes = sorted([
-                    s for s in chain.strikes
-                    if 0.72 * stock_price <= s <= 0.95 * stock_price
-                ], reverse=True)[:8]
-                if not put_strikes:
-                    return []
-
-                contracts = [Option(ticker, expiry, s, "P", "SMART") for s in put_strikes]
-                tickers_data = await _option_quotes(ib, contracts)
-
-                rows: List[dict] = []
-                for td in tickers_data:
-                    bid = td.bid if (td.bid and td.bid > 0) else 0.0
-                    ask = td.ask if (td.ask and td.ask > 0) else 0.0
-                    if bid <= 0 or ask <= 0:
-                        continue
-
-                    mid = (bid + ask) / 2.0
-                    greeks = td.modelGreeks
-                    if not greeks or greeks.delta is None or greeks.impliedVol is None:
-                        continue
-
-                    delta = greeks.delta
-                    iv    = greeks.impliedVol
-                    theta = greeks.theta or 0.0
-
-                    # ── Greek sanity check (bad OPRA data will fail this) ──
-                    if delta >= 0:          continue   # put delta must be negative
-                    if iv < 0.05 or iv > 3.0: continue  # IV out of sane range
-
-                    strike = td.contract.strike
-                    otm_pct = (stock_price - strike) / stock_price * 100
-                    spread_pct = (ask - bid) / mid * 100
-                    oi  = getattr(td, 'openInterest', None) or 0
-                    vol = getattr(td, 'volume', None) or 0
-
-                    # ── Fill estimates (selling a put: you receive near the BID) ──
-                    # Conservative: bid (worst case — market order)
-                    # Realistic:    bid + 40% of spread (limit order near mid)
-                    fill_conservative = bid
-                    fill_realistic    = bid + (mid - bid) * 0.40
-
-                    weekly_return_bid      = fill_conservative / strike * 100
-                    weekly_return_pct      = fill_realistic    / strike * 100   # primary metric
-                    weekly_return_mid      = mid               / strike * 100   # optimistic
-                    annualized_return      = weekly_return_pct * 52
-
-                    # Max loss = assigned at strike, offset by premium received
-                    max_loss_per_contract  = round((strike - fill_realistic) * 100, 2)
-                    # Return on capital at risk (annualised)
-                    return_on_risk = round(
-                        fill_realistic / max(strike - fill_realistic, 0.01) * 52 * 100, 1
-                    )
-
-                    # ── Liquidity ─────────────────────────────────────────
-                    liq = _liquidity_score(oi, vol, spread_pct)
-
-                    # ── Filter gates ──────────────────────────────────────
-                    if weekly_return_pct < min_return:        continue
-                    if abs(delta) > max_delta:                continue
-                    if oi < CSP_MIN_OI:                       continue
-                    if spread_pct / 100 > CSP_MAX_SPREAD_PCT: continue
-
-                    exp_move  = _expected_weekly_move(stock_price, iv)
-                    sigma_otm = (stock_price - strike) / exp_move if exp_move > 0 else 0
-
-                    # ── IV cross-validation (IBKR OPRA vs yfinance) ───────
-                    warnings = _build_warnings(earnings_days, iv_info["rank"], "csp")
-                    if iv_info["iv"] is not None and iv > 0:
-                        divergence = abs(iv * 100 - iv_info["iv"]) / max(iv_info["iv"], 1)
-                        if divergence > 0.35:
-                            warnings.append(
-                                f"IV mismatch: IBKR {iv*100:.0f}% vs YF {iv_info['iv']:.0f}%"
-                            )
-                    if not state["opra_active"]:
-                        warnings.append("OPRA not subscribed — quotes may be delayed")
-
-                    sq = _stock_quality_score(ticker)
-                    row = {
-                        "ticker":                  ticker,
-                        "expiry":                  expiry,
-                        "dte":                     dte,
-                        "strike":                  strike,
-                        "stock_price":             round(stock_price, 2),
-                        "otm_pct":                 round(otm_pct, 2),
-                        "sigma_otm":               round(sigma_otm, 2),
-                        "bid":                     round(bid, 2),
-                        "ask":                     round(ask, 2),
-                        "mid":                     round(mid, 2),
-                        # Return trio: conservative / realistic / optimistic
-                        "weekly_return_bid":        round(weekly_return_bid, 2),
-                        "weekly_return_pct":        round(weekly_return_pct, 2),
-                        "weekly_return_mid":        round(weekly_return_mid, 2),
-                        "annualized_return":        round(annualized_return, 1),
-                        # Risk metrics
-                        "max_loss_per_contract":   max_loss_per_contract,
-                        "return_on_risk_ann":      return_on_risk,
-                        "breakeven":               round(strike - fill_realistic, 2),
-                        # Greeks
-                        "delta":                   round(delta, 4),
-                        "iv_pct":                  round(iv * 100, 1),
-                        "theta_daily":             round(theta, 4),
-                        # Liquidity
-                        "open_interest":           oi,
-                        "volume":                  vol,
-                        "spread_pct":              round(spread_pct, 2),
-                        "liquidity_score":         liq,
-                        # Quality / classification
-                        "stock_quality":           sq,
-                        "assignment_risk":         _assignment_risk(delta, otm_pct),
-                        "xgb_signal":              state["signals"].get(ticker, {}).get("label", "N/A"),
-                        "cash_required":           round(strike * 100, 2),
-                        "premium_collected":       round(fill_realistic * 100, 2),
-                        # External validation
-                        "earnings_days_out":       earnings_days,
-                        "iv_rank":                 iv_info["rank"],
-                        "iv_yf":                   iv_info["iv"],
-                        "warnings":                warnings,
-                    }
-                    row["score"] = _score_csp(row)
-                    rows.append(row)
-
+                loop = asyncio.get_event_loop()
+                rows = await loop.run_in_executor(None, _fetch_yf_puts)
+                log.info(f"CSP [{ticker}]: {len(rows)} candidates  price=${stock_price:.2f}")
                 return rows
 
             except Exception as e:
@@ -880,10 +1797,9 @@ async def scan_leaps(ib: IB) -> dict:
 
     async def _scan_ticker(ticker: str) -> List[dict]:
         async with sem:
-            # ── Earnings gate — IV inflated before earnings, will crush after ──
             earnings_days = await _earnings_days_out(ticker)
             if earnings_days is not None and earnings_days <= EARNINGS_BLOCK_DAYS:
-                log.info(f"LEAP [{ticker}]: blocked — earnings in {earnings_days}d (IV inflated)")
+                log.info(f"LEAP [{ticker}]: blocked — earnings in {earnings_days}d")
                 return []
 
             try:
@@ -894,164 +1810,121 @@ async def scan_leaps(ib: IB) -> dict:
                 if sq < 0.3:
                     return []
 
-                stock_price = await _get_stock_price(ib, ticker)
+                stock_price, iv_info, tech = await asyncio.gather(
+                    _get_stock_price(ib, ticker),
+                    _iv_rank_for_ticker(ticker),
+                    _tech_indicators(ticker),
+                )
                 if stock_price <= 0:
                     return []
 
-                stock = Stock(ticker, "SMART", "USD")
-                await ib.qualifyContractsAsync(stock)
-
-                # Fetch option chain and IV rank concurrently
-                chains, iv_info = await asyncio.gather(
-                    ib.reqSecDefOptParamsAsync(ticker, "", "STK", stock.conId),
-                    _iv_rank_for_ticker(ticker),
-                )
-                if not chains:
-                    return []
-
-                chain = next((c for c in chains if c.exchange == "SMART"), chains[0])
-
-                leap_expiries = []
-                for exp in chain.expirations:
-                    try:
-                        exp_date = datetime.strptime(exp, "%Y%m%d").date()
+                def _fetch_yf_calls():
+                    t = yf.Ticker(ticker)
+                    exps = t.options or []
+                    rows = []
+                    # Pick the expiry closest to 12 months out within 6-18 month window
+                    candidates_exp = []
+                    for exp_str in exps:
+                        try:
+                            exp_date = datetime.strptime(exp_str, "%Y-%m-%d").date()
+                        except ValueError:
+                            continue
                         dte = (exp_date - today).days
                         if LEAP_MIN_DTE <= dte <= LEAP_MAX_DTE:
-                            leap_expiries.append((dte, exp))
-                    except ValueError:
-                        continue
-
-                if not leap_expiries:
-                    return []
-
-                leap_expiries.sort()
-                mid_idx = len(leap_expiries) // 2
-                dte, chosen_expiry = leap_expiries[mid_idx]
-
-                call_strikes = sorted([
-                    s for s in chain.strikes
-                    if stock_price * 0.88 <= s <= stock_price * 1.12
-                ])[:8]
-                if not call_strikes:
-                    return []
-
-                contracts = [Option(ticker, chosen_expiry, s, "C", "SMART") for s in call_strikes]
-                tickers_data = await _option_quotes(ib, contracts)
-
-                rows: List[dict] = []
-                for td in tickers_data:
-                    bid = td.bid if (td.bid and td.bid > 0) else 0.0
-                    ask = td.ask if (td.ask and td.ask > 0) else 0.0
-                    if bid <= 0 or ask <= 0:
-                        continue
-
-                    mid = (bid + ask) / 2.0
-                    greeks = td.modelGreeks
-                    if not greeks or greeks.delta is None or greeks.impliedVol is None:
-                        continue
-
-                    delta = greeks.delta
-                    iv    = greeks.impliedVol
-                    theta = greeks.theta or 0.0
-                    vega  = greeks.vega  or 0.0
-
-                    # ── Greek sanity check ────────────────────────────────
-                    if delta <= 0:             continue   # call delta must be positive
-                    if iv < 0.05 or iv > 3.0:  continue
-
-                    if not (LEAP_MIN_DELTA <= delta <= LEAP_MAX_DELTA):
-                        continue
-                    if iv > LEAP_MAX_IV:
-                        continue
-
-                    strike = td.contract.strike
-                    itm_otm_pct = (stock_price - strike) / stock_price * 100
-                    spread_pct  = (ask - bid) / mid * 100
-                    oi  = getattr(td, 'openInterest', None) or 0
-                    vol = getattr(td, 'volume', None) or 0
-
-                    # ── Fill estimates (buying a call: you PAY near the ASK) ──
-                    # Conservative: ask (worst case — market order)
-                    # Realistic:    ask - 40% of spread (limit order near mid)
-                    fill_conservative = ask
-                    fill_realistic    = ask - (ask - mid) * 0.40
-
-                    cost_conservative      = round(fill_conservative * 100, 2)
-                    cost_per_contract      = round(fill_realistic    * 100, 2)  # primary
-                    cost_mid               = round(mid               * 100, 2)  # optimistic
-
-                    breakeven              = strike + fill_realistic
-                    breakeven_move_pct     = (breakeven - stock_price) / stock_price * 100
-
-                    # Max loss = total premium paid (realistic fill)
-                    max_loss_per_contract  = cost_per_contract
-                    # Weekly theta decay
-                    theta_weekly           = round(theta * 7, 4)
-
-                    liq = _liquidity_score(oi, vol, spread_pct)
-
-                    # ── IV cross-validation ───────────────────────────────
-                    warnings = _build_warnings(earnings_days, iv_info["rank"], "leap")
-                    if iv_info["iv"] is not None and iv > 0:
-                        divergence = abs(iv * 100 - iv_info["iv"]) / max(iv_info["iv"], 1)
-                        if divergence > 0.35:
-                            warnings.append(
-                                f"IV mismatch: IBKR {iv*100:.0f}% vs YF {iv_info['iv']:.0f}%"
+                            candidates_exp.append((abs(dte - 365), dte, exp_str, exp_date))
+                    if not candidates_exp:
+                        return []
+                    candidates_exp.sort()
+                    _, dte, exp_str, exp_date = candidates_exp[0]
+                    T = dte / 365.0
+                    expiry_fmt = exp_date.strftime("%Y%m%d")
+                    try:
+                        calls = t.option_chain(exp_str).calls
+                    except Exception:
+                        return []
+                    for _, r in calls.iterrows():
+                        try:
+                            K   = float(r["strike"])
+                            bid = float(r.get("bid") or 0)
+                            ask = float(r.get("ask") or 0)
+                            iv  = float(r.get("impliedVolatility") or 0)
+                            oi  = int(r.get("openInterest") or 0)
+                            vol = int(r.get("volume") or 0)
+                            if bid <= 0 or ask <= 0 or iv < 0.05 or iv > 3.0:
+                                continue
+                            if iv > LEAP_MAX_IV:
+                                continue
+                            mid        = (bid + ask) / 2.0
+                            spread_pct = (ask - bid) / mid * 100
+                            delta = _bs_delta(stock_price, K, T, iv, is_put=False)
+                            if math.isnan(delta) or delta <= 0:
+                                continue
+                            if not (LEAP_MIN_DELTA <= delta <= LEAP_MAX_DELTA):
+                                continue
+                            theta      = _bs_theta(stock_price, K, T, iv, is_put=False)
+                            fill_cons  = ask
+                            fill_real  = ask - (ask - mid) * 0.40
+                            cost_cons  = round(fill_cons * 100, 2)
+                            cost_real  = round(fill_real * 100, 2)
+                            cost_mid_v = round(mid       * 100, 2)
+                            breakeven  = K + fill_real
+                            be_move    = (breakeven - stock_price) / stock_price * 100
+                            liq        = _liquidity_score(oi, vol, spread_pct)
+                            warnings   = _build_warnings(earnings_days, iv_info["rank"], "leap")
+                            leap_iv_bonus = (1 - iv_info["rank"] / 100) * 15
+                            itm_otm_pct   = (stock_price - K) / stock_price * 100
+                            row = {
+                                "ticker":               ticker,
+                                "expiry":               expiry_fmt,
+                                "dte":                  dte,
+                                "strike":               K,
+                                "stock_price":          round(stock_price, 2),
+                                "itm_otm_pct":          round(itm_otm_pct, 2),
+                                "breakeven":            round(breakeven, 2),
+                                "breakeven_move_pct":   round(be_move, 2),
+                                "bid":                  round(bid, 2),
+                                "ask":                  round(ask, 2),
+                                "mid":                  round(mid, 2),
+                                "cost_conservative":    cost_cons,
+                                "cost_per_contract":    cost_real,
+                                "cost_mid":             cost_mid_v,
+                                "max_loss_per_contract": cost_real,
+                                "delta":                round(delta, 4),
+                                "iv_pct":               round(iv * 100, 1),
+                                "theta_daily":          round(theta, 4),
+                                "theta_weekly":         round(theta * 7, 4),
+                                "vega":                 0.0,
+                                "spread_pct":           round(spread_pct, 2),
+                                "open_interest":        oi,
+                                "volume":               vol,
+                                "liquidity_score":      liq,
+                                "stock_quality":        sq,
+                                "xgb_signal":           sig.get("label", "N/A"),
+                                "xgb_prob":             sig.get("prob", None),
+                                "earnings_days_out":    earnings_days,
+                                "iv_rank":              iv_info["rank"],
+                                "iv_yf":                iv_info["iv"],
+                                "rsi14":                tech.get("rsi14"),
+                                "macd_hist":            tech.get("macd_hist"),
+                                "above_sma20":          tech.get("above_sma20"),
+                                "above_sma50":          tech.get("above_sma50"),
+                                "warnings":             warnings,
+                            }
+                            row["score"] = round(
+                                sq * 55
+                                + (1 - abs(delta - 0.60)) * 35
+                                + leap_iv_bonus
+                                + (liq / 100) * 10,
+                                2,
                             )
-                    if not state["opra_active"]:
-                        warnings.append("OPRA not subscribed — quotes may be delayed")
+                            rows.append(row)
+                        except Exception:
+                            continue
+                    return rows
 
-                    # Low iv_rank = cheaper for LEAP buyers
-                    leap_iv_bonus = (1 - iv_info["rank"] / 100) * 15
-
-                    row = {
-                        "ticker":              ticker,
-                        "expiry":              chosen_expiry,
-                        "dte":                 dte,
-                        "strike":              strike,
-                        "stock_price":         round(stock_price, 2),
-                        "itm_otm_pct":         round(itm_otm_pct, 2),
-                        "breakeven":           round(breakeven, 2),
-                        "breakeven_move_pct":  round(breakeven_move_pct, 2),
-                        "bid":                 round(bid, 2),
-                        "ask":                 round(ask, 2),
-                        "mid":                 round(mid, 2),
-                        # Cost trio: conservative / realistic / optimistic
-                        "cost_conservative":   cost_conservative,
-                        "cost_per_contract":   cost_per_contract,
-                        "cost_mid":            cost_mid,
-                        # Risk
-                        "max_loss_per_contract": max_loss_per_contract,
-                        # Greeks
-                        "delta":               round(delta, 4),
-                        "iv_pct":              round(iv * 100, 1),
-                        "theta_daily":         round(theta, 4),
-                        "theta_weekly":        theta_weekly,
-                        "vega":                round(vega, 4),
-                        # Liquidity
-                        "spread_pct":          round(spread_pct, 2),
-                        "open_interest":       oi,
-                        "volume":              vol,
-                        "liquidity_score":     liq,
-                        # Quality
-                        "stock_quality":       sq,
-                        "xgb_signal":          sig.get("label", "N/A"),
-                        "xgb_prob":            sig.get("prob", None),
-                        # External validation
-                        "earnings_days_out":   earnings_days,
-                        "iv_rank":             iv_info["rank"],
-                        "iv_yf":               iv_info["iv"],
-                        "warnings":            warnings,
-                    }
-                    row["score"] = round(
-                        sq * 55
-                        + (1 - abs(delta - 0.60)) * 35
-                        + leap_iv_bonus
-                        + (liq / 100) * 10,
-                        2
-                    )
-                    rows.append(row)
-
+                loop = asyncio.get_event_loop()
+                rows = await loop.run_in_executor(None, _fetch_yf_calls)
+                log.info(f"LEAP [{ticker}]: {len(rows)} candidates  price=${stock_price:.2f}")
                 return rows
 
             except Exception as e:
@@ -1067,6 +1940,231 @@ async def scan_leaps(ib: IB) -> dict:
         "candidates": sorted(candidates, key=lambda x: x["score"], reverse=True),
         "regime":     regime,
     }
+
+
+# ── 0DTE / weekly scanner ──────────────────────────────────────────────────
+ZERO_DTE_UNIVERSE = ["SPY", "QQQ", "IWM"]
+
+async def scan_0dte(ib: IB) -> dict:
+    """Scan SPY/QQQ/IWM for 0–7 DTE put premium-collection setups."""
+    today      = date.today()
+    candidates = []
+    for ticker in ZERO_DTE_UNIVERSE:
+        try:
+            spot = await _get_stock_price(ib, ticker)
+            if spot <= 0:
+                continue
+            tk       = yf.Ticker(ticker)
+            expiries = tk.options
+            near     = [(datetime.strptime(e, "%Y-%m-%d").date(), e)
+                        for e in expiries
+                        if 0 <= (datetime.strptime(e, "%Y-%m-%d").date() - today).days <= 7]
+            if not near:
+                continue
+            near.sort()
+            exp_d, exp_str = near[0]
+            dte = (exp_d - today).days
+            chain = tk.option_chain(exp_str)
+            puts  = chain.puts.copy()
+            puts["_diff"] = abs(puts["strike"] - spot * 0.98)
+            puts = puts.sort_values("_diff")
+            for _, r in puts.head(4).iterrows():
+                strike       = float(r["strike"])
+                bid          = float(r.get("bid", 0) or 0)
+                ask          = float(r.get("ask", 0) or 0)
+                oi           = int(r.get("openInterest", 0) or 0)
+                vol          = int(r.get("volume", 0) or 0)
+                iv           = float(r.get("impliedVolatility", 0) or 0)
+                if bid < 0.25 or ask <= 0:
+                    continue
+                mid          = (bid + ask) / 2
+                otm_pct      = (spot - strike) / spot * 100
+                daily_ret    = mid / spot * 100
+                liq          = _liquidity_score(oi, vol, (ask - bid) / mid * 100 if mid > 0 else 100)
+                candidates.append({
+                    "ticker":           ticker,
+                    "expiry":           exp_str.replace("-", ""),
+                    "expiry_display":   exp_str,
+                    "dte":              dte,
+                    "strike":           strike,
+                    "bid":              round(bid, 2),
+                    "ask":              round(ask, 2),
+                    "mid":              round(mid, 2),
+                    "iv_pct":           round(iv * 100, 1),
+                    "oi":               oi,
+                    "volume":           vol,
+                    "spot":             round(spot, 2),
+                    "otm_pct":          round(otm_pct, 1),
+                    "daily_return_pct": round(daily_ret, 3),
+                    "liquidity_score":  liq,
+                })
+                break
+        except Exception as exc:
+            log.warning("0DTE scan %s: %s", ticker, exc)
+    candidates.sort(key=lambda x: x["daily_return_pct"], reverse=True)
+    return {"candidates": candidates, "count": len(candidates), "date": today.isoformat()}
+
+
+# ── Earnings IV-crush scanner ───────────────────────────────────────────────
+
+async def scan_earnings_iv(ib: IB) -> dict:
+    """
+    Find tickers with earnings in 2–7 days and elevated IV rank (≥ 50).
+    Strategy: sell put AFTER earnings date to capture IV crush.
+    """
+    today      = date.today()
+    candidates = []
+    for ticker in CSP_UNIVERSE:
+        try:
+            earnings_days = await _earnings_days_out(ticker)
+            if earnings_days is None or not (2 <= earnings_days <= 7):
+                continue
+            iv_info = await _iv_rank_for_ticker(ticker)
+            iv_rank = iv_info.get("rank", 0)
+            if iv_rank < 50:
+                continue
+            spot = await _get_stock_price(ib, ticker)
+            if spot <= 0:
+                continue
+            tk       = yf.Ticker(ticker)
+            expiries = tk.options
+            # First expiry AFTER earnings
+            target_exp = None
+            for exp in sorted(expiries):
+                d_exp = datetime.strptime(exp, "%Y-%m-%d").date()
+                dte   = (d_exp - today).days
+                if earnings_days + 1 <= dte <= 28:
+                    target_exp = exp
+                    break
+            if not target_exp:
+                continue
+            chain = tk.option_chain(target_exp)
+            puts  = chain.puts.copy()
+            # 8–12 % OTM for earnings buffer
+            tgt_k = spot * 0.90
+            puts["_diff"] = abs(puts["strike"] - tgt_k)
+            r = puts.sort_values("_diff").iloc[0]
+            bid    = float(r.get("bid", 0) or 0)
+            ask    = float(r.get("ask", 0) or 0)
+            if bid < 0.10:
+                continue
+            mid         = (bid + ask) / 2
+            prem_pct    = mid / spot * 100
+            dte_val     = (datetime.strptime(target_exp, "%Y-%m-%d").date() - today).days
+            candidates.append({
+                "ticker":        ticker,
+                "expiry":        target_exp.replace("-", ""),
+                "expiry_display":target_exp,
+                "dte":           dte_val,
+                "strike":        float(r["strike"]),
+                "bid":           round(bid, 2),
+                "ask":           round(ask, 2),
+                "mid":           round(mid, 2),
+                "premium_pct":   round(prem_pct, 2),
+                "iv_rank":       round(iv_rank, 1),
+                "earnings_days": earnings_days,
+                "spot":          round(spot, 2),
+                "note":          f"Earnings in {earnings_days}d — sell after announcement",
+            })
+        except Exception as exc:
+            log.warning("Earnings IV scan %s: %s", ticker, exc)
+    candidates.sort(key=lambda x: x["iv_rank"], reverse=True)
+    return {"candidates": candidates, "count": len(candidates)}
+
+
+# ── Backtesting ─────────────────────────────────────────────────────────────
+
+async def _backtest_csp_ticker(
+    ticker: str, weeks: int = 26,
+    profit_target_pct: float = 0.25,
+    stop_loss_mult: float = 1.5,
+) -> dict:
+    """
+    Simulate weekly 20-delta CSP on a ticker using 2-yr historical prices.
+    Uses BS pricing with realized vol as IV proxy.  Returns stats + last-20 trades.
+    """
+    def _run() -> dict:
+        tk   = yf.Ticker(ticker)
+        hist = tk.history(period="2y", interval="1d")
+        if hist.empty or len(hist) < 30:
+            return {}
+        closes = hist["Close"].values.astype(float)
+        dates  = [str(d.date()) for d in hist.index]
+        trades: list = []
+        i = 20
+        while i < len(closes) - 6 and len(trades) < weeks:
+            rv_window  = closes[i - 20:i]
+            log_rets   = np.log(rv_window[1:] / rv_window[:-1])
+            sigma      = float(np.std(log_rets) * np.sqrt(252))
+            if sigma <= 0:
+                i += 5
+                continue
+            S     = float(closes[i])
+            T     = 5 / 252
+            K     = round(S * np.exp(-0.842 * sigma * math.sqrt(T)), 0)
+            prem  = _bs_put_price(S, K, T, sigma)
+            if prem < 0.05:
+                i += 5
+                continue
+            tgt_buy  = prem * (1 - profit_target_pct)
+            stop_buy = prem * (1 + stop_loss_mult) if stop_loss_mult > 0 else float("inf")
+            exit_pnl = 0.0
+            win      = False
+            for j in range(i + 1, min(i + 6, len(closes))):
+                S_j   = float(closes[j])
+                T_j   = max((min(i + 5, len(closes) - 1) - j) / 252, 0.001)
+                p_j   = _bs_put_price(S_j, K, T_j, sigma)
+                gain  = (prem - p_j) * 100
+                if p_j <= tgt_buy:
+                    exit_pnl, win = gain, True
+                    break
+                if p_j >= stop_buy:
+                    exit_pnl = gain
+                    break
+            else:
+                S_exit   = float(closes[min(i + 5, len(closes) - 1)])
+                exit_pnl = (prem - max(0, K - S_exit)) * 100
+                win      = S_exit >= K
+            trades.append({
+                "date":    dates[i],
+                "spot":    round(float(S), 2),
+                "strike":  round(float(K), 2),
+                "premium": round(float(prem), 2),
+                "iv_pct":  round(float(sigma) * 100, 1),
+                "exit_pnl":round(float(exit_pnl), 2),
+                "win":     bool(win),       # numpy.bool_ → Python bool for JSON
+            })
+            i += 5
+        if not trades:
+            return {}
+        wins     = [t for t in trades if t["win"]]
+        losses   = [t for t in trades if not t["win"]]
+        pnls     = np.array([t["exit_pnl"] for t in trades])
+        cum      = np.cumsum(pnls)
+        dd       = cum - np.maximum.accumulate(cum)
+        avg_pnl  = float(np.mean(pnls))
+        std_pnl  = float(np.std(pnls))
+        sharpe   = round(avg_pnl / std_pnl * math.sqrt(52), 2) if std_pnl > 0 else 0.0
+        return {
+            "ticker":       ticker,
+            "weeks":        len(trades),
+            "win_rate":     round(len(wins) / len(trades) * 100, 1),
+            "total_pnl":    round(float(np.sum(pnls)), 0),
+            "avg_win":      round(float(np.mean([t["exit_pnl"] for t in wins])), 0) if wins else 0,
+            "avg_loss":     round(float(np.mean([t["exit_pnl"] for t in losses])), 0) if losses else 0,
+            "max_drawdown": round(float(np.min(dd)), 0),
+            "sharpe":       sharpe,
+            "trades":       trades[-20:],
+        }
+    loop = asyncio.get_running_loop()
+    try:
+        return await asyncio.wait_for(loop.run_in_executor(None, _run), timeout=30)
+    except asyncio.TimeoutError:
+        log.warning("Backtest timeout for %s", ticker)
+        return {}
+    except Exception as exc:
+        log.warning("Backtest executor error for %s: %s", ticker, exc)
+        return {}
 
 
 # ── Real-time single option quote ──────────────────────────────────────────
@@ -1140,9 +2238,29 @@ async def lifespan(app: FastAPI):
         state["model"] = joblib.load(MODEL_PATH)
         log.info("Loaded cached model from disk")
 
+    state["iv_history"] = _load_iv_history()
+    log.info(f"Loaded IV history for {len(state['iv_history'])} tickers")
+    _journal_init()
+
+    # Restore auto-trader positions + config from last shutdown
+    _at_load_state()
+
+    # Warm up the learned model from journal so ranking works immediately
+    try:
+        result = _retrain_from_journal()
+        if "error" not in result:
+            log.info(f"Learned model warmed up: v{result['version']}, "
+                     f"win={result['win_rate']}%, CV={result['cv_accuracy']}%")
+        else:
+            log.info(f"Learned model not ready yet: {result['error']}")
+    except Exception as _e:
+        log.warning(f"Model warm-up skipped: {_e}")
+
     t = threading.Thread(target=streaming_loop, daemon=True)
     t.start()
     log.info("Live streaming thread started")
+    asyncio.create_task(_autotrader_background())
+    log.info("Auto-trader background task started")
     yield
     if state["ib"] and state["ib"].isConnected():
         state["ib"].disconnect()
@@ -1229,6 +2347,72 @@ def health():
 
 
 # ── CSP endpoints ──────────────────────────────────────────────────────────
+@app.get("/opra/recheck")
+async def opra_recheck():
+    """Re-probe OPRA subscription status without restarting the server."""
+    ib = state.get("ib")
+    if not ib or not state.get("connected"):
+        raise HTTPException(503, "Not connected to TWS")
+    try:
+        result = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: _run_in_streaming_loop(_check_opra_subscription(ib), timeout=15),
+        )
+        state["opra_active"] = result
+        return {"opra_active": result}
+    except Exception as e:
+        raise HTTPException(503, str(e))
+
+
+@app.get("/opra/debug")
+async def opra_debug():
+    """Return raw IBKR ticker values from an SPY options snapshot — for diagnosing OPRA issues."""
+    ib = state.get("ib")
+    if not ib or not state.get("connected"):
+        raise HTTPException(503, "Not connected to TWS")
+
+    async def _probe(ib: IB) -> dict:
+        ib.reqMarketDataType(1)
+        spy_price = await _get_stock_price(ib, "SPY")
+        if spy_price <= 0:
+            spy_price = 740.0
+        strike = float(round(spy_price / 5) * 5)
+        results = []
+        for weeks_out in (0, 1):
+            expiry = _next_expiry(weeks_out)
+            c = Option("SPY", expiry, strike, "P", "SMART")
+            await ib.qualifyContractsAsync(c)
+            if not c.conId:
+                results.append({"expiry": expiry, "strike": strike, "conId": None, "error": "qualify failed"})
+                continue
+            [td] = await ib.reqTickersAsync(c)
+            greeks = td.modelGreeks
+            results.append({
+                "expiry":   expiry,
+                "strike":   strike,
+                "conId":    c.conId,
+                "bid":      td.bid,
+                "ask":      td.ask,
+                "last":     getattr(td, "last", None),
+                "close":    getattr(td, "close", None),
+                "volume":   getattr(td, "volume", None),
+                "open_interest": getattr(td, "openInterest", None),
+                "delta":    greeks.delta if greeks else None,
+                "iv":       greeks.impliedVol if greeks else None,
+                "greeks_present": greeks is not None,
+            })
+        return {"spy_price": spy_price, "contracts": results}
+
+    try:
+        result = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: _run_in_streaming_loop(_probe(ib), timeout=20),
+        )
+        return result
+    except Exception as e:
+        raise HTTPException(503, str(e))
+
+
 @app.get("/market-regime")
 async def market_regime_endpoint():
     """Current market regime: SPY vs 50-day SMA + VIX level."""
@@ -1392,6 +2576,467 @@ async def option_quote(
         raise HTTPException(503, str(e))
 
     return result
+
+
+# ── Portfolio delta ────────────────────────────────────────────────────────
+async def _portfolio_positions(ib: IB) -> dict:
+    """
+    Compute net portfolio delta from all open positions.
+    OPT:  BS delta × position × multiplier (IV from yfinance cache or 25% fallback).
+    FOP:  same, with SPY×10 as proxy for the ES underlying.
+    STK:  delta = 1.0 × shares.
+    """
+    items = ib.portfolio()
+    today_d = date.today()
+    positions = []
+    total_delta = 0.0
+
+    for item in items:
+        c   = item.contract
+        pos = float(item.position)
+        sec = getattr(c, "secType", "")
+
+        entry = {
+            "symbol":          c.symbol,
+            "sec_type":        sec,
+            "position":        pos,
+            "avg_cost":        item.averageCost,
+            "market_value":    round(item.marketValue, 2),
+            "market_price":    item.marketPrice,
+            "unrealized_pnl":  round(item.unrealizedPNL, 2),
+            "realized_pnl":    round(item.realizedPNL, 2),
+            "delta":           None,
+            "position_delta":  None,
+        }
+
+        if sec == "STK":
+            entry["delta"]          = 1.0
+            entry["position_delta"] = round(pos, 2)
+            total_delta += pos
+
+        elif sec in ("OPT", "FOP"):
+            try:
+                expiry_str = getattr(c, "lastTradeDateOrContractMonth", "")[:8]
+                exp_date   = datetime.strptime(expiry_str, "%Y%m%d").date()
+                dte        = max((exp_date - today_d).days, 0)
+                T          = dte / 365.0
+                K          = float(getattr(c, "strike", 0))
+                right      = getattr(c, "right", "C")
+                mult       = float(getattr(c, "multiplier", 100) or 100)
+
+                if sec == "OPT":
+                    S = await _get_stock_price(ib, c.symbol)
+                else:
+                    # FOP (e.g. ES options) — use SPY×10 as SPX proxy
+                    spy_bars = state["bars"].get("SPY")
+                    S = float(spy_bars[-1]["close"]) * 10 if spy_bars else 5500.0
+
+                iv_cache = state["ext_cache"]["iv_rank"].get(c.symbol)
+                sigma    = (iv_cache["iv"] / 100) if iv_cache and iv_cache.get("iv") else 0.25
+
+                delta    = _bs_delta(S, K, T, sigma, is_put=(right == "P"))
+                pd_val   = round(pos * delta * mult, 2) if not math.isnan(delta) else 0.0
+
+                entry.update({
+                    "delta":          round(delta, 4) if not math.isnan(delta) else None,
+                    "position_delta": pd_val,
+                    "strike":         K,
+                    "expiry":         expiry_str,
+                    "right":          right,
+                    "multiplier":     int(mult),
+                    "dte":            dte,
+                })
+                total_delta += pd_val
+            except Exception as e:
+                log.debug(f"Delta calc [{c.symbol} {sec}]: {e}")
+
+        positions.append(entry)
+
+    return {
+        "total_delta":   round(total_delta, 2),
+        "positions":     positions,
+        "count":         len(positions),
+        "timestamp":     datetime.utcnow().isoformat() + "Z",
+    }
+
+
+# ── Pydantic models ────────────────────────────────────────────────────────
+class AutoTraderConfigRequest(BaseModel):
+    enabled:            bool      = False
+    max_positions:      int       = 5
+    profit_target_pct:  float     = 0.65
+    stop_loss_mult:     float     = 5.0
+    scan_types:         List[str] = ["csp"]
+    csp_capital:        float     = 20000.0
+    leap_capital:       float     = 5000.0
+    # Kelly
+    use_kelly:          bool      = True
+    total_capital:      float     = 100000.0
+    assumed_win_rate:   float     = 0.85
+    # Trailing exit
+    trailing_exit:      bool      = True
+    # Auto-hedge
+    auto_hedge:         bool      = False
+    hedge_threshold:    float     = 100.0
+
+
+class ReconnectRequest(BaseModel):
+    port: int   # 7497 = paper, 7496 = live, 4001/4002 = IB Gateway
+
+
+class OrderRequest(BaseModel):
+    ticker:      str
+    expiry:      str            # YYYYMMDD
+    strike:      float
+    right:       str            # "P" or "C"
+    action:      str            # "BUY" or "SELL"
+    quantity:    int   = 1
+    limit_price: Optional[float] = None   # None = derive from yfinance mid
+
+
+# ── Order + portfolio endpoints ────────────────────────────────────────────
+@app.post("/orders/place")
+async def place_order(req: OrderRequest):
+    """
+    Place a limit order for a single option contract.
+    For CSP: action=SELL, right=P.  For LEAP: action=BUY, right=C.
+    If limit_price is omitted the backend fetches the yfinance mid and applies
+    the same 40% spread improvement used by the scanner.
+    """
+    _require_connection()
+    action = req.action.upper()
+    right  = req.right.upper()
+    if action not in ("BUY", "SELL"):
+        raise HTTPException(400, "action must be BUY or SELL")
+    if right not in ("C", "P"):
+        raise HTTPException(400, "right must be C or P")
+
+    limit_price = req.limit_price
+    if limit_price is None:
+        exp_str = f"{req.expiry[:4]}-{req.expiry[4:6]}-{req.expiry[6:8]}"
+        loop = asyncio.get_event_loop()
+        def _get_mid():
+            t  = yf.Ticker(req.ticker.upper())
+            try:
+                chain = t.option_chain(exp_str)
+                df    = chain.calls if right == "C" else chain.puts
+                row   = df[df["strike"] == req.strike]
+                if row.empty:
+                    return None
+                bid = float(row["bid"].iloc[0])
+                ask = float(row["ask"].iloc[0])
+                mid = (bid + ask) / 2.0
+                return round((bid + (mid - bid) * 0.40) if action == "SELL"
+                             else (ask - (ask - mid) * 0.40), 2)
+            except Exception:
+                return None
+        limit_price = await loop.run_in_executor(None, _get_mid)
+        if limit_price is None:
+            raise HTTPException(400, "Could not determine limit price — supply limit_price explicitly")
+
+    async def _do_place(ib: IB):
+        contract = Option(req.ticker.upper(), req.expiry, req.strike, right, "SMART")
+        await ib.qualifyContractsAsync(contract)
+        if not contract.conId:
+            raise ValueError(f"Could not qualify {req.ticker} {req.expiry} {req.strike}{right}")
+        order = LimitOrder(action, req.quantity, limit_price)
+        trade = ib.placeOrder(contract, order)
+        await asyncio.sleep(1)
+        return {
+            "order_id":    trade.order.orderId,
+            "status":      trade.orderStatus.status,
+            "ticker":      req.ticker.upper(),
+            "expiry":      req.expiry,
+            "strike":      req.strike,
+            "right":       right,
+            "action":      action,
+            "quantity":    req.quantity,
+            "limit_price": limit_price,
+            "contract_id": contract.conId,
+        }
+
+    try:
+        result = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: _run_in_streaming_loop(_do_place(state["ib"]), timeout=30),
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except (TimeoutError, RuntimeError) as e:
+        raise HTTPException(503, str(e))
+
+    return result
+
+
+@app.get("/orders")
+def get_orders():
+    """List all currently open orders."""
+    _require_connection()
+    trades = state["ib"].openTrades()
+    return {
+        "orders": [
+            {
+                "order_id":    t.order.orderId,
+                "ticker":      t.contract.symbol,
+                "action":      t.order.action,
+                "quantity":    t.order.totalQuantity,
+                "limit_price": t.order.lmtPrice,
+                "status":      t.orderStatus.status,
+                "filled":      t.orderStatus.filled,
+                "remaining":   t.orderStatus.remaining,
+                "avg_fill":    t.orderStatus.avgFillPrice,
+            }
+            for t in trades
+        ],
+        "count": len(trades),
+    }
+
+
+@app.delete("/orders/{order_id}")
+def cancel_order(order_id: int):
+    """Cancel an open order by its orderId."""
+    _require_connection()
+    ib = state["ib"]
+    trades = ib.openTrades()
+    target = next((t for t in trades if t.order.orderId == order_id), None)
+    if target is None:
+        raise HTTPException(404, f"Order {order_id} not found in open orders")
+    ib.cancelOrder(target.order)
+    return {"ok": True, "order_id": order_id, "message": "Cancel request sent"}
+
+
+@app.get("/portfolio/delta")
+async def portfolio_delta():
+    """Net portfolio delta across all open positions, computed via Black-Scholes."""
+    _require_connection()
+    try:
+        result = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: _run_in_streaming_loop(_portfolio_positions(state["ib"]), timeout=30),
+        )
+    except (TimeoutError, RuntimeError) as e:
+        raise HTTPException(503, str(e))
+    return result
+
+
+# ── Auto-trader endpoints ──────────────────────────────────────────────────
+
+@app.get("/autotrader/status")
+def autotrader_status():
+    """Return current auto-trader state, config, positions, and log."""
+    return state["autotrader"]
+
+
+@app.post("/autotrader/config")
+def update_autotrader_config(req: AutoTraderConfigRequest):
+    """Enable/disable the auto-trader and update its config."""
+    was = state["autotrader"]["enabled"]
+    state["autotrader"]["enabled"] = req.enabled
+    state["autotrader"]["config"].update({
+        "max_positions":     req.max_positions,
+        "profit_target_pct": req.profit_target_pct,
+        "stop_loss_mult":    req.stop_loss_mult,
+        "scan_types":        req.scan_types,
+        "csp_capital":       req.csp_capital,
+        "leap_capital":      req.leap_capital,
+        "use_kelly":         req.use_kelly,
+        "total_capital":     req.total_capital,
+        "assumed_win_rate":  req.assumed_win_rate,
+        "trailing_exit":     req.trailing_exit,
+        "auto_hedge":        req.auto_hedge,
+        "hedge_threshold":   req.hedge_threshold,
+    })
+    if req.enabled and not was:
+        _at_log("SYSTEM", "Auto-trader ENABLED — will scan every 5 min")
+    elif not req.enabled and was:
+        _at_log("SYSTEM", "Auto-trader DISABLED")
+    _at_save_state()
+    return {"ok": True}
+
+
+@app.post("/autotrader/run-now")
+async def autotrader_run_now():
+    """Trigger an immediate monitor + scan cycle regardless of enabled state."""
+    _require_connection()
+    ib   = state["ib"]
+    loop = asyncio.get_event_loop()
+    try:
+        await loop.run_in_executor(
+            None,
+            lambda: _run_in_streaming_loop(_autotrader_monitor_coro(ib), timeout=30),
+        )
+        await loop.run_in_executor(
+            None,
+            lambda: _run_in_streaming_loop(_autotrader_scan_and_trade_coro(ib), timeout=180),
+        )
+        state["autotrader"]["last_run"] = datetime.utcnow().isoformat() + "Z"
+    except (TimeoutError, RuntimeError) as exc:
+        raise HTTPException(503, str(exc))
+    return {"ok": True, "log": state["autotrader"]["log"][-20:]}
+
+
+# ── 0DTE endpoint ──────────────────────────────────────────────────────────
+
+@app.get("/scan/0dte")
+async def scan_0dte_endpoint(
+    refresh: bool = Query(False, description="Bypass 5-min cache")
+):
+    """Scan SPY/QQQ/IWM for 0–7 DTE cash-secured put setups."""
+    _require_connection()
+    cache = state["scan_cache"]
+    if not refresh and cache.get("0dte") is not None and cache.get("ts"):
+        age = (datetime.utcnow() - cache["ts"]).total_seconds()
+        if age < SCAN_CACHE_TTL:
+            return {"cached": True, "age_seconds": int(age), **cache["0dte"]}
+    try:
+        result = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: _run_in_streaming_loop(scan_0dte(state["ib"]), timeout=60),
+        )
+    except (TimeoutError, RuntimeError) as exc:
+        raise HTTPException(503, str(exc))
+    cache["0dte"] = result
+    return {"cached": False, **result}
+
+
+# ── Earnings IV play endpoint ───────────────────────────────────────────────
+
+@app.get("/scan/earnings-iv")
+async def scan_earnings_iv_endpoint(
+    refresh: bool = Query(False)
+):
+    """Find pre-earnings IV elevation plays in the CSP universe."""
+    _require_connection()
+    cache = state["scan_cache"]
+    if not refresh and cache.get("earnings_iv") is not None and cache.get("ts"):
+        age = (datetime.utcnow() - cache["ts"]).total_seconds()
+        if age < SCAN_CACHE_TTL:
+            return {"cached": True, "age_seconds": int(age), **cache["earnings_iv"]}
+    try:
+        result = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: _run_in_streaming_loop(scan_earnings_iv(state["ib"]), timeout=120),
+        )
+    except (TimeoutError, RuntimeError) as exc:
+        raise HTTPException(503, str(exc))
+    cache["earnings_iv"] = result
+    return {"cached": False, **result}
+
+
+# ── Backtest endpoint ───────────────────────────────────────────────────────
+
+@app.get("/backtest/csp")
+async def backtest_csp_endpoint(
+    tickers: str = Query("AMD,LLY,AAPL,NVDA,SPY", description="Comma-separated tickers"),
+    weeks:   int = Query(26, description="Lookback weeks (max 104)"),
+    profit_target_pct: float = Query(0.65),
+    stop_loss_mult:    float = Query(5.0),
+):
+    """Backtest weekly 20-delta CSP on requested tickers using 2-yr historical prices."""
+    ticker_list = [t.strip().upper() for t in tickers.split(",") if t.strip()][:8]
+    weeks = min(max(weeks, 4), 104)
+    results = []
+    for ticker in ticker_list:
+        try:
+            r = await _backtest_csp_ticker(ticker, weeks, profit_target_pct, stop_loss_mult)
+            if r:
+                results.append(r)
+        except BaseException as exc:
+            log.warning("Backtest %s: %s", ticker, exc)
+    summary = {
+        "avg_win_rate":     round(sum(r["win_rate"] for r in results) / len(results), 1) if results else 0,
+        "avg_sharpe":       round(sum(r["sharpe"]   for r in results) / len(results), 2) if results else 0,
+        "total_pnl":        round(sum(r["total_pnl"] for r in results), 0) if results else 0,
+    }
+    return {"results": results, "summary": summary, "tickers": ticker_list, "weeks": weeks}
+
+
+# ── Live account reconnect ──────────────────────────────────────────────────
+
+@app.post("/reconnect")
+async def reconnect_endpoint(req: ReconnectRequest):
+    """
+    Switch TWS port. 7497 = paper, 7496 = live.
+    Disconnects the current session; streaming loop auto-reconnects.
+    """
+    if req.port not in (7496, 7497, 4001, 4002):
+        raise HTTPException(400, "Port must be 7496 (live), 7497 (paper), 4001 or 4002 (gateway)")
+    state["reconnect_port"] = req.port
+    if state.get("ib") and state["ib"].isConnected():
+        state["ib"].disconnect()
+    mode = "LIVE" if req.port == 7496 else ("paper" if req.port == 7497 else "gateway")
+    _at_log("SYSTEM", f"Reconnecting to port {req.port} ({mode})")
+    return {"ok": True, "port": req.port, "mode": mode,
+            "message": f"Reconnecting to {mode} account on port {req.port}…"}
+
+
+# ── Trade Journal endpoints ────────────────────────────────────────────────
+
+@app.get("/journal")
+def get_journal(limit: int = Query(100, description="Most recent N trades")):
+    """Return completed and open trade journal entries."""
+    con = sqlite3.connect(JOURNAL_DB_PATH, check_same_thread=False)
+    rows = con.execute(
+        "SELECT * FROM trade_journal ORDER BY id DESC LIMIT ?", (limit,)
+    ).fetchall()
+    cols = [d[0] for d in con.execute("SELECT * FROM trade_journal LIMIT 0").description or []]
+    con.close()
+    trades = [dict(zip(cols, r)) for r in rows]
+    return {"trades": trades, "count": len(trades)}
+
+
+@app.get("/journal/stats")
+def get_journal_stats():
+    """Win rate, avg P&L, feature importances from completed trades."""
+    con = sqlite3.connect(JOURNAL_DB_PATH, check_same_thread=False)
+    rows = con.execute("""
+        SELECT win, pnl, pnl_pct, exit_reason, strategy_type, iv_rank, score
+        FROM trade_journal WHERE closed_at IS NOT NULL AND win IS NOT NULL
+    """).fetchall()
+    model_rows = con.execute(
+        "SELECT * FROM model_log ORDER BY id DESC LIMIT 10"
+    ).fetchall()
+    model_cols = [d[0] for d in (con.execute("SELECT * FROM model_log LIMIT 0").description or [])]
+    con.close()
+
+    if not rows:
+        return {"total_trades": 0, "win_rate": None, "avg_pnl": None, "model_log": []}
+
+    wins     = [r for r in rows if r[0] == 1]
+    losses   = [r for r in rows if r[0] == 0]
+    pnls     = [r[1] for r in rows if r[1] is not None]
+    by_reason = {}
+    for r in rows:
+        rr = r[3] or "unknown"
+        by_reason.setdefault(rr, {"total": 0, "wins": 0})
+        by_reason[rr]["total"] += 1
+        if r[0] == 1:
+            by_reason[rr]["wins"] += 1
+
+    model_log = [dict(zip(model_cols, r)) for r in model_rows]
+
+    return {
+        "total_trades":    len(rows),
+        "win_rate":        round(len(wins) / len(rows) * 100, 1),
+        "avg_pnl":         round(sum(pnls) / len(pnls), 2) if pnls else 0,
+        "total_pnl":       round(sum(pnls), 2) if pnls else 0,
+        "avg_win_pnl":     round(sum(r[1] for r in wins if r[1]) / len(wins), 2) if wins else 0,
+        "avg_loss_pnl":    round(sum(r[1] for r in losses if r[1]) / len(losses), 2) if losses else 0,
+        "exit_breakdown":  by_reason,
+        "model_version":   state.get("model_version", 0),
+        "model_log":       model_log,
+        "assumed_win_rate":state["autotrader"]["config"].get("assumed_win_rate"),
+    }
+
+
+@app.post("/journal/retrain")
+def trigger_retrain():
+    """Manually trigger model retraining from journal data."""
+    try:
+        result = _retrain_from_journal()
+        return result
+    except Exception as exc:
+        raise HTTPException(500, str(exc))
 
 
 # ── Shared guard ───────────────────────────────────────────────────────────
