@@ -19,12 +19,7 @@ FOR /F "tokens=5" %%P IN ('netstat -ano 2^>nul ^| findstr ":8000 "') DO (
     taskkill /PID %%P /F >nul 2>&1
 )
 timeout /t 1 /nobreak >nul
-
-REM ── Clear runtime cache files (keep trade_journal.db) ────────
-echo [CLEAN] Clearing cache files...
-IF EXIST "%BACKEND_DIR%\iv_history.json"      del /f "%BACKEND_DIR%\iv_history.json"
-IF EXIST "%BACKEND_DIR%\autotrader_state.json" del /f "%BACKEND_DIR%\autotrader_state.json"
-echo [CLEAN] Done.
+echo [CLEAN] Done. (iv_history and autotrader_state preserved)
 echo.
 
 REM ── Check Python ─────────────────────────────────────────────
