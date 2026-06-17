@@ -2117,7 +2117,12 @@ function UniverseTab() {
     try { setData(await apiFetch("/csp/universe")); } catch(_) {}
   };
 
-  useEffect(() => { load(); }, []);
+  // Poll every 15 s so the tab picks up the startup screen once it completes
+  useEffect(() => {
+    load();
+    const id = setInterval(load, 15000);
+    return () => clearInterval(id);
+  }, []);
 
   const runRefresh = async () => {
     setScreening(true);
@@ -2206,7 +2211,10 @@ function UniverseTab() {
                   <th style={{ ...thS, textAlign:"right" }}>Price</th>
                   <th style={{ ...thS, textAlign:"right" }}>RSI-14</th>
                   <th style={{ ...thS, textAlign:"center" }}>SMA50</th>
-                  <th style={{ ...thS, textAlign:"right" }}>IV Rank</th>
+                  <th style={{ ...thS, textAlign:"right" }}
+                      title="IV Rank: % of time current IV is below its 252-day range. Needs 20+ trading days to populate.">
+                    IV Rank
+                  </th>
                   <th style={{ ...thS, textAlign:"right" }}>30d ADV</th>
                   <th style={{ ...thS, textAlign:"center" }}>In Universe</th>
                 </tr>
@@ -2232,10 +2240,10 @@ function UniverseTab() {
                         {row.score}
                       </td>
                       <td style={{ ...tdS, textAlign:"right", color:"#f1f5f9" }}>
-                        ${row.price?.toFixed(2) ?? "—"}
+                        {fmt$(row.price)}
                       </td>
                       <td style={{ ...tdS, textAlign:"right", color: rsiCol }}>
-                        {row.rsi14?.toFixed(1) ?? "—"}
+                        {row.rsi14 != null ? row.rsi14.toFixed(1) : "—"}
                       </td>
                       <td style={{ ...tdS, textAlign:"center" }}>
                         {row.above_sma50 === true ? <span style={{color:"#27ae60"}}>↑ Yes</span>
@@ -2243,8 +2251,12 @@ function UniverseTab() {
                           : <span style={{color:"#64748b"}}>—</span>}
                       </td>
                       <td style={{ ...tdS, textAlign:"right",
-                          color: (row.iv_rank ?? 0) >= 25 ? "#f39c12" : "#64748b" }}>
-                        {row.iv_rank != null ? `${row.iv_rank}%` : "—"}
+                          color: row.iv_rank != null
+                            ? (row.iv_rank >= 25 ? "#f39c12" : "#94a3b8")
+                            : "#334155" }}>
+                        {row.iv_rank != null
+                          ? `${row.iv_rank}%`
+                          : <span title="IV rank needs 20+ days of IV history — auto-populates over time">N/A</span>}
                       </td>
                       <td style={{ ...tdS, textAlign:"right", color:"#94a3b8" }}>
                         {fmtVol(row.avg_vol_30d)}
