@@ -1370,15 +1370,19 @@ function AutoTraderTab() {
     hedge_threshold:   100,
   });
 
-  const load = async () => {
+  const load = async (syncConfig = false) => {
     try {
       const d = await apiFetch("/autotrader/status");
       setStatus(d);
-      setCfg(d.config || cfg);
+      if (syncConfig) setCfg(prev => ({ ...prev, ...(d.config || {}) }));
     } catch(_) {}
   };
 
-  useEffect(() => { load(); const id = setInterval(load, 8000); return () => clearInterval(id); }, []);
+  useEffect(() => {
+    load(true);  // sync config once on mount
+    const id = setInterval(() => load(false), 8000);  // poll status only — never overwrite user edits
+    return () => clearInterval(id);
+  }, []);
 
   const saveConfig = async (enabled) => {
     setSaving(true);
@@ -1388,7 +1392,7 @@ function AutoTraderTab() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ ...cfg, enabled: enabled ?? status?.enabled ?? false }),
       });
-      await load();
+      await load(true);  // sync config from server after save to confirm what was stored
     } finally { setSaving(false); }
   };
 
@@ -2180,15 +2184,15 @@ function App() {
           ))}
         </div>
 
-        {/* Tab content */}
-        {tab === "signals"    && <SignalsTab     connected={connected} />}
-        {tab === "csp"        && <CSPTab         connected={connected} />}
-        {tab === "leaps"      && <LEAPTab        connected={connected} />}
-        {tab === "positions"  && <PositionsTab />}
-        {tab === "autotrader" && <AutoTraderTab />}
-        {tab === "backtest"   && <BacktestTab    connected={connected} />}
-        {tab === "0dte"       && <ZeroDTETab     connected={connected} />}
-        {tab === "learning"   && <LearningTab />}
+        {/* Tab content — always mounted so state (scan results, params) survives tab switches */}
+        <div style={{display: tab==="signals"    ? "" : "none"}}><SignalsTab    connected={connected} /></div>
+        <div style={{display: tab==="csp"        ? "" : "none"}}><CSPTab        connected={connected} /></div>
+        <div style={{display: tab==="leaps"      ? "" : "none"}}><LEAPTab       connected={connected} /></div>
+        <div style={{display: tab==="positions"  ? "" : "none"}}><PositionsTab /></div>
+        <div style={{display: tab==="autotrader" ? "" : "none"}}><AutoTraderTab /></div>
+        <div style={{display: tab==="backtest"   ? "" : "none"}}><BacktestTab   connected={connected} /></div>
+        <div style={{display: tab==="0dte"       ? "" : "none"}}><ZeroDTETab    connected={connected} /></div>
+        <div style={{display: tab==="learning"   ? "" : "none"}}><LearningTab /></div>
 
         <div style={{ marginTop:20, ...sans, fontSize:11, color:C.muted, lineHeight:1.7 }}>
           Auto-trader: Kelly sizing, trailing stops, auto-hedge. Backtest: 2-yr simulation with BS pricing.
