@@ -2107,6 +2107,174 @@ function LearningTab() {
   );
 }
 
+// ── Universe Tab ──────────────────────────────────────────────────────────
+function UniverseTab() {
+  const [data,       setData]      = useState(null);
+  const [screening,  setScreening] = useState(false);
+  const [topN,       setTopN]      = useState(25);
+
+  const load = async () => {
+    try { setData(await apiFetch("/csp/universe")); } catch(_) {}
+  };
+
+  useEffect(() => { load(); }, []);
+
+  const runRefresh = async () => {
+    setScreening(true);
+    try {
+      const r = await apiFetch(`/csp/universe/refresh?top_n=${topN}`, { method: "POST" });
+      if (!r.ok) alert("Screen returned no results — universe unchanged");
+      await load();
+    } catch(e) { alert("Refresh failed: " + e.message); }
+    finally { setScreening(false); }
+  };
+
+  const thS = { padding:"7px 12px", textAlign:"left", color:"#64748b",
+                borderBottom:"1px solid #1e293b", fontWeight:600, fontSize:11, whiteSpace:"nowrap" };
+  const tdS = { padding:"6px 12px", borderBottom:"1px solid #0f172a", fontSize:12 };
+
+  const scores = data?.scores || [];
+  const active = new Set(data?.universe || []);
+
+  const fmtVol = v => {
+    if (!v) return "—";
+    if (v >= 1_000_000) return `${(v/1_000_000).toFixed(1)}M`;
+    return `${(v/1_000).toFixed(0)}K`;
+  };
+
+  return (
+    <div>
+      {/* Header row */}
+      <div style={{ display:"flex", alignItems:"center", gap:16, marginBottom:16, flexWrap:"wrap" }}>
+        <div style={{ ...sans, fontSize:14, fontWeight:700, color:"#f1f5f9" }}>
+          Dynamic Universe Screener
+        </div>
+        <div style={{ ...mono, fontSize:11, color:"#64748b" }}>
+          Pool: {data?.candidate_pool ?? "…"} tickers →
+          Active: {data?.count ?? "…"} tickers
+        </div>
+        {data?.last_screened && (
+          <div style={{ ...mono, fontSize:11, color:"#94a3b8" }}>
+            Last screened: {new Date(data.last_screened).toLocaleString()}
+          </div>
+        )}
+        <div style={{ display:"flex", alignItems:"center", gap:8, marginLeft:"auto" }}>
+          <label style={{ ...sans, fontSize:12, color:"#94a3b8" }}>Top</label>
+          <select value={topN} onChange={e => setTopN(Number(e.target.value))}
+            style={{ background:"#1e293b", color:"#f1f5f9", border:"1px solid #334155",
+                     borderRadius:6, padding:"3px 8px", fontSize:12 }}>
+            {[15,20,25,30].map(n => <option key={n} value={n}>{n}</option>)}
+          </select>
+          <button onClick={runRefresh} disabled={screening} style={{
+            ...sans, fontSize:12, fontWeight:700, padding:"6px 18px", borderRadius:8,
+            cursor: screening ? "default" : "pointer", opacity: screening ? 0.6 : 1,
+            background: screening ? "#334155" : "#3498db", color:"#fff", border:"none",
+          }}>
+            {screening ? "Screening…" : "Refresh Now"}
+          </button>
+        </div>
+      </div>
+
+      {/* Active universe chips */}
+      <Card style={{ marginBottom:16 }}>
+        <div style={{ ...sans, fontSize:11, color:"#64748b", marginBottom:8, fontWeight:600 }}>
+          ACTIVE SCAN UNIVERSE ({(data?.universe || []).length} tickers)
+        </div>
+        <div style={{ display:"flex", flexWrap:"wrap", gap:6 }}>
+          {(data?.universe || []).map(t => (
+            <span key={t} style={{
+              ...mono, fontSize:12, fontWeight:700,
+              padding:"3px 10px", borderRadius:12,
+              background:"#0f4c8133", border:"1px solid #3498db55",
+              color:"#93c5fd",
+            }}>{t}</span>
+          ))}
+          {!data && <span style={{ color:"#475569" }}>Loading…</span>}
+        </div>
+      </Card>
+
+      {/* Scores table */}
+      {scores.length > 0 && (
+        <Card style={{ padding:0, overflow:"hidden" }}>
+          <div style={{ overflowX:"auto" }}>
+            <table style={{ width:"100%", borderCollapse:"collapse" }}>
+              <thead>
+                <tr style={{ background:"#0f172a" }}>
+                  <th style={thS}>#</th>
+                  <th style={thS}>Ticker</th>
+                  <th style={{ ...thS, textAlign:"right" }}>Score</th>
+                  <th style={{ ...thS, textAlign:"right" }}>Price</th>
+                  <th style={{ ...thS, textAlign:"right" }}>RSI-14</th>
+                  <th style={{ ...thS, textAlign:"center" }}>SMA50</th>
+                  <th style={{ ...thS, textAlign:"right" }}>IV Rank</th>
+                  <th style={{ ...thS, textAlign:"right" }}>30d ADV</th>
+                  <th style={{ ...thS, textAlign:"center" }}>In Universe</th>
+                </tr>
+              </thead>
+              <tbody>
+                {scores.map((row, i) => {
+                  const inUniverse = active.has(row.ticker);
+                  const rsiCol = row.rsi14 >= 40 && row.rsi14 <= 65
+                    ? "#27ae60" : row.rsi14 < 30 || row.rsi14 > 80
+                    ? "#e74c3c" : "#f39c12";
+                  const scoreCol = row.score >= 60 ? "#27ae60"
+                    : row.score >= 40 ? "#f39c12" : "#94a3b8";
+                  return (
+                    <tr key={row.ticker} style={{
+                      opacity: inUniverse ? 1 : 0.45,
+                      background: inUniverse && i < 30 ? "#0f4c8108" : "transparent",
+                    }}>
+                      <td style={{ ...tdS, color:"#475569" }}>{i+1}</td>
+                      <td style={{ ...tdS, ...mono, fontWeight:700, color: inUniverse ? "#93c5fd" : "#64748b" }}>
+                        {row.ticker}
+                      </td>
+                      <td style={{ ...tdS, textAlign:"right", fontWeight:700, color: scoreCol }}>
+                        {row.score}
+                      </td>
+                      <td style={{ ...tdS, textAlign:"right", color:"#f1f5f9" }}>
+                        ${row.price?.toFixed(2) ?? "—"}
+                      </td>
+                      <td style={{ ...tdS, textAlign:"right", color: rsiCol }}>
+                        {row.rsi14?.toFixed(1) ?? "—"}
+                      </td>
+                      <td style={{ ...tdS, textAlign:"center" }}>
+                        {row.above_sma50 === true ? <span style={{color:"#27ae60"}}>↑ Yes</span>
+                          : row.above_sma50 === false ? <span style={{color:"#e74c3c"}}>↓ No</span>
+                          : <span style={{color:"#64748b"}}>—</span>}
+                      </td>
+                      <td style={{ ...tdS, textAlign:"right",
+                          color: (row.iv_rank ?? 0) >= 25 ? "#f39c12" : "#64748b" }}>
+                        {row.iv_rank != null ? `${row.iv_rank}%` : "—"}
+                      </td>
+                      <td style={{ ...tdS, textAlign:"right", color:"#94a3b8" }}>
+                        {fmtVol(row.avg_vol_30d)}
+                      </td>
+                      <td style={{ ...tdS, textAlign:"center" }}>
+                        {inUniverse
+                          ? <span style={{color:"#27ae60", fontWeight:700}}>✓</span>
+                          : <span style={{color:"#334155"}}>—</span>}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </Card>
+      )}
+
+      {scores.length === 0 && data && (
+        <Card>
+          <div style={{ ...sans, color:"#64748b", textAlign:"center", padding:"24px 0" }}>
+            No screen data yet — click <strong>Refresh Now</strong> to run the screener.
+            <br/>The screener also runs automatically at 08:30 ET on weekdays.
+          </div>
+        </Card>
+      )}
+    </div>
+  );
+}
+
 // ── Root App ──────────────────────────────────────────────────────────────
 function App() {
   const [tab, setTab]         = useState("signals");
@@ -2142,6 +2310,7 @@ function App() {
     { id:"backtest",   label:"Backtest"    },
     { id:"0dte",       label:"0DTE / EIV"  },
     { id:"learning",   label:"Learning"    },
+    { id:"universe",   label:"Universe"    },
   ];
 
   const deltaCol = netDelta == null ? C.muted : netDelta >= 0 ? C.bull : C.bear;
@@ -2193,6 +2362,7 @@ function App() {
         <div style={{display: tab==="backtest"   ? "" : "none"}}><BacktestTab   connected={connected} /></div>
         <div style={{display: tab==="0dte"       ? "" : "none"}}><ZeroDTETab    connected={connected} /></div>
         <div style={{display: tab==="learning"   ? "" : "none"}}><LearningTab /></div>
+        <div style={{display: tab==="universe"   ? "" : "none"}}><UniverseTab /></div>
 
         <div style={{ marginTop:20, ...sans, fontSize:11, color:C.muted, lineHeight:1.7 }}>
           Auto-trader: Kelly sizing, trailing stops, auto-hedge. Backtest: 2-yr simulation with BS pricing.

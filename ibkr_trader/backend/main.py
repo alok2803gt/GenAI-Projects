@@ -102,6 +102,46 @@ CSP_UNIVERSE: List[str] = [
     "COST", "HD", "LLY", "UNH",
 ]
 
+# Fallback — original hardcoded universe (never mutated)
+_DEFAULT_UNIVERSE: List[str] = list(CSP_UNIVERSE)
+
+# Candidate pool screened nightly → top 20-30 replace CSP_UNIVERSE dynamically
+CANDIDATE_POOL: List[str] = [
+    # ── Mega-cap tech ────────────────────────────────────────────────────
+    "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "ORCL", "IBM", "CSCO",
+    # ── Semiconductors ───────────────────────────────────────────────────
+    "AMD", "INTC", "QCOM", "TXN", "AVGO", "MU", "AMAT", "LRCX", "KLAC",
+    "MRVL", "SMCI", "ON", "MPWR",
+    # ── Software / Cloud / AI ────────────────────────────────────────────
+    "NOW", "CRM", "ADBE", "INTU", "SNOW", "PLTR", "UBER", "ABNB",
+    "NET", "DDOG", "ZS", "CRWD", "PANW",
+    # ── Financials ───────────────────────────────────────────────────────
+    "JPM", "BAC", "WFC", "GS", "MS", "BLK", "C", "AXP", "V", "MA",
+    "SCHW", "COF", "USB", "PNC", "TFC", "SPGI", "MCO",
+    # ── Healthcare ───────────────────────────────────────────────────────
+    "UNH", "JNJ", "PFE", "MRK", "ABBV", "BMY", "AMGN", "GILD",
+    "LLY", "TMO", "DHR", "ELV", "HUM", "CI", "ISRG", "VRTX", "REGN",
+    # ── Energy ───────────────────────────────────────────────────────────
+    "XOM", "CVX", "COP", "SLB", "EOG", "OXY", "PSX", "MPC", "VLO",
+    # ── Consumer Discretionary ───────────────────────────────────────────
+    "WMT", "COST", "TGT", "HD", "LOW", "MCD", "SBUX", "NKE",
+    "BKNG", "LULU", "CMG",
+    # ── Consumer Staples ─────────────────────────────────────────────────
+    "PG", "KO", "PEP", "PM", "MO", "MDLZ", "CL",
+    # ── Industrials / Defense ────────────────────────────────────────────
+    "CAT", "DE", "BA", "HON", "GE", "LMT", "RTX", "NOC", "GD",
+    "UPS", "FDX", "ETN", "EMR",
+    # ── Comm / Media ─────────────────────────────────────────────────────
+    "NFLX", "DIS", "CMCSA", "T", "VZ", "ROKU", "SPOT",
+    # ── Real Estate / Infrastructure ─────────────────────────────────────
+    "AMT", "PLD", "EQIX",
+    # ── ETFs ─────────────────────────────────────────────────────────────
+    "SPY", "QQQ", "IWM", "GLD", "XLE", "XLF", "XLK", "XLV", "ARKK",
+    # ── High-vol / options-active ─────────────────────────────────────────
+    "COIN", "HOOD", "SOFI", "RBLX", "MARA", "RIOT",
+    "SHOP", "SQ", "PYPL", "SNAP", "PINS",
+]
+
 # ── Global state ───────────────────────────────────────────────────────────
 state: Dict = {
     # Bar streaming
@@ -129,6 +169,9 @@ state: Dict = {
     "opra_active": None,   # None = not yet checked, True/False thereafter
     # IV history — persisted daily snapshots for true percentile rank
     "iv_history": {},      # ticker → [{"date":"YYYY-MM-DD","iv":float}, ...]
+    # Dynamic universe screening
+    "universe_scores":        [],   # [{ticker, score, price, avg_vol, rsi14, ...}, ...]
+    "universe_last_screened": None, # ISO timestamp of last screen run
     # Auto-trader state
     "autotrader": {
         "enabled": False,
@@ -1050,6 +1093,174 @@ def _liquidity_score(oi: int, vol: int, spread_pct: float) -> float:
     vol_pts = min(vol / 100,   1.0) * 30
     spr_pts = max(0.0, 1.0 - (spread_pct / 100) / CSP_MAX_SPREAD_PCT) * 30
     return round(oi_pts + vol_pts + spr_pts, 1)
+
+
+# ── Dynamic universe screener ─────────────────────────────────────────────
+
+async def _screen_universe(top_n: int = 25) -> Optional[List[str]]:
+    """
+    Screen CANDIDATE_POOL (~155 tickers) with yfinance bulk download.
+    Criteria: price $20-$800, 30-day ADV >500K shares, above SMA-50,
+              RSI-14 in 40-65 range, IV rank >25% (from iv_history if available).
+    Returns top_n tickers by composite score, or None on failure.
+    """
+    log.info("Universe screen: scoring %d candidates → top %d", len(CANDIDATE_POOL), top_n)
+    try:
+        def _bulk_dl():
+            return yf.download(
+                CANDIDATE_POOL,
+                period="65d",
+                interval="1d",
+                group_by="ticker",
+                auto_adjust=True,
+                progress=False,
+                threads=True,
+            )
+        loop = asyncio.get_event_loop()
+        df = await loop.run_in_executor(None, _bulk_dl)
+
+        scored = []
+        for ticker in CANDIDATE_POOL:
+            try:
+                # Extract close & volume series for this ticker
+                if isinstance(df.columns, pd.MultiIndex):
+                    if ticker not in df.columns.get_level_values(0):
+                        continue
+                    closes = df[ticker]["Close"].dropna()
+                    vol_series = df[ticker].get("Volume", pd.Series(dtype=float)).dropna()
+                else:
+                    closes = df["Close"].dropna()
+                    vol_series = df.get("Volume", pd.Series(dtype=float)).dropna()
+
+                if len(closes) < 21:
+                    continue
+
+                price = float(closes.iloc[-1])
+                if not (20.0 <= price <= 800.0):
+                    continue
+
+                # 30-day average daily volume
+                avg_vol = float(vol_series.tail(30).mean()) if len(vol_series) >= 5 else 0.0
+                if avg_vol < 500_000:
+                    continue
+
+                # SMA-50 (need ≥50 bars; if fewer, treat as unknown)
+                above_sma50: Optional[bool] = None
+                if len(closes) >= 50:
+                    sma50 = float(closes.rolling(50).mean().iloc[-1])
+                    above_sma50 = bool(price > sma50)
+
+                # RSI-14
+                delta = closes.diff()
+                gain = delta.clip(lower=0).rolling(14).mean()
+                loss = (-delta.clip(upper=0)).rolling(14).mean()
+                rs_val = gain.iloc[-1] / (loss.iloc[-1] if loss.iloc[-1] != 0 else float("nan"))
+                rsi = float(100 - 100 / (1 + rs_val)) if not np.isnan(rs_val) else 50.0
+
+                # IV rank from persisted iv_history (free — already computed)
+                iv_rank: Optional[int] = None
+                hist = state.get("iv_history", {}).get(ticker, [])
+                if len(hist) >= 20:
+                    ivs = [h["iv"] for h in hist]
+                    iv_range = max(ivs) - min(ivs)
+                    if iv_range > 0:
+                        iv_rank = int((ivs[-1] - min(ivs)) / iv_range * 100)
+
+                # ── Composite score ──────────────────────────────────────
+                score = 0.0
+
+                # Momentum: being above SMA-50 is the single strongest signal
+                if above_sma50 is True:
+                    score += 25.0
+                elif above_sma50 is None:
+                    score += 8.0  # not enough history; neutral
+
+                # RSI sweet-spot (not over-extended, not oversold dump)
+                if 40.0 <= rsi <= 65.0:
+                    score += 25.0
+                elif 35.0 <= rsi < 40.0 or 65.0 < rsi <= 70.0:
+                    score += 12.0
+                elif rsi < 30.0 or rsi > 80.0:
+                    score -= 10.0  # extreme — skip unless IV compensates
+
+                # IV rank: higher = better premium for CSP sellers
+                if iv_rank is not None:
+                    if iv_rank >= 25:
+                        score += min(iv_rank / 100.0, 0.80) * 25.0
+                else:
+                    score += 8.0  # unknown — neutral
+
+                # Volume quality bonus
+                if avg_vol >= 2_000_000:
+                    score += 15.0
+                elif avg_vol >= 1_000_000:
+                    score += 10.0
+                else:
+                    score += 5.0
+
+                # Continuity bonus — tickers already in the active universe
+                if ticker in CSP_UNIVERSE:
+                    score += 5.0
+
+                scored.append({
+                    "ticker":      ticker,
+                    "score":       round(score, 1),
+                    "price":       round(price, 2),
+                    "avg_vol_30d": int(avg_vol),
+                    "rsi14":       round(rsi, 1),
+                    "above_sma50": above_sma50,
+                    "iv_rank":     iv_rank,
+                })
+            except Exception as _e:
+                log.debug("Screen [%s]: %s", ticker, _e)
+
+        if len(scored) < 5:
+            log.warning("Universe screen: only %d tickers passed filters — keeping default", len(scored))
+            return None
+
+        scored.sort(key=lambda x: x["score"], reverse=True)
+        state["universe_scores"] = scored
+        state["universe_last_screened"] = datetime.now().isoformat()
+
+        tickers = [t["ticker"] for t in scored[:top_n]]
+        log.info("Universe screen complete (%d scored): %s", len(scored), ", ".join(tickers))
+        return tickers
+
+    except Exception as exc:
+        log.error("Universe screen failed (%s) — keeping existing universe", exc)
+        return None
+
+
+async def _universe_scheduler() -> None:
+    """Background task: refresh universe daily at 08:30 ET on weekdays."""
+    from zoneinfo import ZoneInfo
+    ET = ZoneInfo("America/New_York")
+    while True:
+        try:
+            now = datetime.now(ET)
+            # Next 08:30 ET
+            target = now.replace(hour=8, minute=30, second=0, microsecond=0)
+            if now >= target:
+                target += timedelta(days=1)
+            # Skip weekends
+            while target.weekday() >= 5:
+                target += timedelta(days=1)
+            wait = (target - now).total_seconds()
+            log.info("Universe scheduler: next screen in %.0f s (at %s ET)", wait, target.strftime("%Y-%m-%d %H:%M"))
+            await asyncio.sleep(wait)
+
+            tickers = await _screen_universe()
+            if tickers:
+                CSP_UNIVERSE.clear()
+                CSP_UNIVERSE.extend(tickers)
+                state["scan_cache"]["csp"]   = None   # invalidate scan caches
+                state["scan_cache"]["leaps"] = None
+                log.info("Universe refreshed: %d tickers", len(CSP_UNIVERSE))
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            log.error("Universe scheduler error: %s", exc)
+            await asyncio.sleep(3600)  # back off 1 h on unexpected failure
 
 
 # ── Recommendation filters (mirrors frontend JS) ──────────────────────────
@@ -2854,6 +3065,22 @@ async def lifespan(app: FastAPI):
     log.info("Live streaming thread started")
     asyncio.create_task(_autotrader_background())
     log.info("Auto-trader background task started")
+
+    # Run initial universe screen in background (non-blocking)
+    async def _initial_screen():
+        tickers = await _screen_universe()
+        if tickers:
+            CSP_UNIVERSE.clear()
+            CSP_UNIVERSE.extend(tickers)
+            state["scan_cache"]["csp"]   = None
+            state["scan_cache"]["leaps"] = None
+            log.info("Startup universe ready: %d tickers", len(CSP_UNIVERSE))
+        else:
+            log.info("Startup universe screen failed — using default %d tickers", len(CSP_UNIVERSE))
+
+    asyncio.create_task(_initial_screen())
+    asyncio.create_task(_universe_scheduler())
+    log.info("Universe screener + daily scheduler started")
     yield
     if state["ib"] and state["ib"].isConnected():
         state["ib"].disconnect()
@@ -3080,7 +3307,13 @@ async def csp_scan(
 
 @app.get("/csp/universe")
 def get_csp_universe():
-    return {"universe": CSP_UNIVERSE, "count": len(CSP_UNIVERSE)}
+    return {
+        "universe":          CSP_UNIVERSE,
+        "count":             len(CSP_UNIVERSE),
+        "candidate_pool":    len(CANDIDATE_POOL),
+        "last_screened":     state["universe_last_screened"],
+        "scores":            state["universe_scores"],
+    }
 
 
 @app.post("/csp/universe/add")
@@ -3090,6 +3323,24 @@ def add_to_csp_universe(req: AddTickerRequest):
         CSP_UNIVERSE.append(ticker)
         state["scan_cache"]["csp"] = None   # invalidate cache
     return {"ok": True, "universe": CSP_UNIVERSE}
+
+
+@app.post("/csp/universe/refresh")
+async def refresh_csp_universe(top_n: int = Query(25, ge=10, le=50)):
+    """Manually trigger a universe screen. Runs _screen_universe() immediately."""
+    tickers = await _screen_universe(top_n=top_n)
+    if tickers:
+        CSP_UNIVERSE.clear()
+        CSP_UNIVERSE.extend(tickers)
+        state["scan_cache"]["csp"]   = None
+        state["scan_cache"]["leaps"] = None
+        return {
+            "ok":           True,
+            "universe":     CSP_UNIVERSE,
+            "count":        len(CSP_UNIVERSE),
+            "last_screened": state["universe_last_screened"],
+        }
+    return {"ok": False, "universe": CSP_UNIVERSE, "error": "Screen returned no results — universe unchanged"}
 
 
 # ── LEAP endpoints ─────────────────────────────────────────────────────────
