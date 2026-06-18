@@ -1471,52 +1471,124 @@ async def _autotrader_monitor_coro(ib: IB) -> None:
 
 
 async def _autotrader_roll_coro(ib: IB, item, info: dict, key: str) -> None:
-    """Close a CSP at/near 21 DTE then re-sell the same strike 30-45 DTE out."""
+    """
+    Roll a CSP at 21 DTE to the next monthly cycle.
+    Three guards before committing:
+      1. Roll count ≤ 2  — caps repeated rolls on the same losing thesis
+      2. Net credit ≥ $0.10/share — new premium must exceed buyback cost
+      3. Strike selection — roll DOWN if stock within 7% of strike (gamma risk zone)
+    Falls back to a plain close if any guard fails.
+    """
     ticker      = info.get("ticker", item.contract.symbol)
     orig_strike = float(info.get("strike", item.contract.strike))
     right       = info.get("right", "P")
+    roll_count  = info.get("roll_count", 0)
 
-    # Step 1 — close current leg
-    info["exit_reason"] = "roll_close"
-    await _autotrader_close_coro(ib, item, info, key)
+    # ── Guard 1: max 2 rolls per position ────────────────────────────────────
+    if roll_count >= 2:
+        _at_log("ROLL", f"{ticker}: max 2 rolls reached — closing and adding to cooldown")
+        info["exit_reason"] = "roll_max"
+        state["autotrader"].setdefault("stopped_out", {})[ticker] = datetime.utcnow().isoformat()
+        await _autotrader_close_coro(ib, item, info, key)
+        return
 
-    # Step 2 — re-open at 30-45 DTE
+    # ── Step 1: get live buyback price (current ask = what we pay to close) ──
+    c = item.contract
+    contract_cur = Option(
+        symbol=c.symbol,
+        lastTradeDateOrContractMonth=c.lastTradeDateOrContractMonth,
+        strike=float(c.strike), right=c.right,
+        exchange="SMART", currency="USD", multiplier="100",
+    )
+    await ib.qualifyContractsAsync(contract_cur)
+    tq_cur = ib.reqMktData(contract_cur, "", False, False)
+    await asyncio.sleep(2)
+    buyback_ask = _safe_float(tq_cur.ask, 0)
+    ib.cancelMktData(contract_cur)
+
+    if buyback_ask <= 0:
+        _at_log("ROLL", f"{ticker}: no buyback price — closing")
+        info["exit_reason"] = "roll_close"
+        await _autotrader_close_coro(ib, item, info, key)
+        return
+
+    # ── Step 2: fetch next-month chain + pick target strike ──────────────────
     try:
         stock_price = await _get_stock_price(ib, ticker)
         if stock_price <= 0:
-            _at_log("ROLL", f"{ticker}: price unavailable — skipping re-entry")
+            _at_log("ROLL", f"{ticker}: no stock price — closing")
+            info["exit_reason"] = "roll_close"
+            await _autotrader_close_coro(ib, item, info, key)
             return
+
+        # Roll-down: if strike is within 7% OTM, target ~12% OTM for safety
+        otm_pct = (stock_price - orig_strike) / stock_price * 100
+        if otm_pct < 7:
+            target_strike = round(stock_price * 0.88, 0)
+            strike_note   = f"roll-DOWN (was {otm_pct:.1f}% OTM → ~12% OTM)"
+        else:
+            target_strike = orig_strike
+            strike_note   = f"same strike ({otm_pct:.1f}% OTM)"
 
         tds, expiry_new, dte_new = await _fetch_opra_chain(
             ib, ticker, right, stock_price, 30, 45,
             otm_lo_pct=0, otm_hi_pct=40, max_strikes=15,
         )
-        if not tds:
-            _at_log("ROLL", f"{ticker}: no contracts found for roll — skipping")
-            return
-
-        valid = [td for td in tds
+        valid = [td for td in (tds or [])
                  if _safe_float(td.contract.strike) is not None
+                 and float(td.contract.strike) < stock_price   # must be OTM put
                  and _safe_float(td.bid, 0) > 0.20
                  and _safe_float(td.ask, 0) > 0]
         if not valid:
-            _at_log("ROLL", f"{ticker}: no liquid contracts for roll — skipping")
+            _at_log("ROLL", f"{ticker}: no liquid OTM contracts next month — closing")
+            info["exit_reason"] = "roll_close"
+            await _autotrader_close_coro(ib, item, info, key)
             return
 
-        # Pick strike closest to original (same or lower = more conservative)
-        best = min(valid, key=lambda td: abs(float(td.contract.strike) - orig_strike))
+        best        = min(valid, key=lambda td: abs(float(td.contract.strike) - target_strike))
         roll_strike = float(best.contract.strike)
-        bid = _safe_float(best.bid, 0)
-        ask = _safe_float(best.ask, 0)
+        new_bid     = _safe_float(best.bid, 0)
+        new_ask     = _safe_float(best.ask, 0)
+        new_mid     = (new_bid + new_ask) / 2
+        new_fill    = round(new_bid + (new_mid - new_bid) * 0.40, 2)  # our expected fill
+
+        # ── Guard 2: net credit check ─────────────────────────────────────────
+        net_credit = round(new_fill - buyback_ask, 2)
+        if net_credit < 0.10:
+            _at_log("ROLL",
+                    f"{ticker}: net debit roll (${net_credit:.2f}/sh, buyback=${buyback_ask:.2f}, "
+                    f"new=${new_fill:.2f}) — closing and adding to cooldown")
+            info["exit_reason"] = "roll_no_credit"
+            state["autotrader"].setdefault("stopped_out", {})[ticker] = datetime.utcnow().isoformat()
+            await _autotrader_close_coro(ib, item, info, key)
+            return
+
+        # ── All guards passed — execute roll ──────────────────────────────────
+        _at_log("ROLL",
+                f"{ticker}: {strike_note} | "
+                f"buyback=${buyback_ask:.2f} new=${new_fill:.2f} net=+${net_credit:.2f}/sh "
+                f"| roll #{roll_count + 1}/2")
+        info["exit_reason"] = "roll_close"
+        await _autotrader_close_coro(ib, item, info, key)
 
         row = {
-            "ticker": ticker, "expiry": expiry_new, "strike": roll_strike,
-            "_type": "csp", "_regime": "BULL", "bid": bid, "ask": ask, "score": 0,
+            "ticker": ticker,   "expiry": expiry_new, "strike": roll_strike,
+            "_type":  "csp",    "_regime": "BULL",
+            "bid":    new_bid,  "ask":     new_ask,   "score": 0,
+            "roll_count": roll_count + 1,
         }
         await _autotrader_place_coro(ib, row, state["autotrader"]["config"], regime="BULL")
-        _at_log("ROLL", f"{ticker}: rolled → {expiry_new} P{roll_strike} ({dte_new} DTE)")
+        _at_log("ROLL",
+                f"{ticker}: rolled → {expiry_new} P{roll_strike} "
+                f"({dte_new} DTE, net +${net_credit*100:.0f}/contract)")
+
     except Exception as exc:
-        _at_log("ROLL", f"{ticker}: roll re-entry failed — {exc}")
+        _at_log("ROLL", f"{ticker}: roll failed ({exc}) — attempting plain close")
+        try:
+            info["exit_reason"] = "roll_close"
+            await _autotrader_close_coro(ib, item, info, key)
+        except Exception:
+            pass
 
 
 async def _autotrader_close_coro(ib: IB, item, info: dict, key: str) -> None:
@@ -1809,16 +1881,18 @@ async def _autotrader_place_coro(ib: IB, row: dict, cfg: dict, regime: str = "BU
     }
     journal_id = _journal_insert_entry(entry_info)
 
+    from zoneinfo import ZoneInfo
     state["autotrader"]["positions"][key] = {
         "ticker":      ticker,    "expiry":    expiry,
         "strike":      strike,    "right":     right,
         "action":      action,    "qty":       qty,
         "entry_price": lmt,       "max_profit":round(max_profit, 2),
         "order_id":    trade.order.orderId,
-        "placed_at":   datetime.utcnow().strftime("%H:%M:%S UTC"),
+        "placed_at":   datetime.now(ZoneInfo("America/New_York")).strftime("%H:%M:%S ET"),
         "score":       row.get("score", 0),
         "journal_id":  journal_id,
         "live_iv":     live_iv_entry,
+        "roll_count":  row.get("roll_count", 0),
     }
     _at_log("TRADE", f"{action} {qty}x {ticker} {right}{strike} {expiry} @ ${lmt:.2f} "
                      f"[price_src={lmt_src}] (order #{trade.order.orderId}, status={order_status}, journal #{journal_id})")
