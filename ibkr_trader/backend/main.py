@@ -3788,6 +3788,63 @@ async def portfolio_delta():
     return result
 
 
+# ── Account summary endpoint ───────────────────────────────────────────────
+
+@app.get("/account/summary")
+async def account_summary():
+    """
+    Real-time account cash, equity, margin, and account number from IBKR.
+    Uses reqAccountSummaryAsync so it always reflects the current TWS state.
+    """
+    _require_connection()
+    ib = state["ib"]
+
+    # Account number(s) known to this connection
+    accounts = ib.client.accounts if ib.client.accounts else []
+    account_id = accounts[0] if accounts else "unknown"
+
+    # Request live account summary (all tags for the primary account)
+    want = ("TotalCashValue", "AvailableFunds", "NetLiquidation",
+            "InitialMarginReq", "MaintMarginReq", "UnrealizedPnL",
+            "RealizedPnL", "GrossPositionValue", "BuyingPower")
+    try:
+        rows = await ib.reqAccountSummaryAsync(
+            groupName="All", tags=",".join(want)
+        )
+    except Exception as e:
+        raise HTTPException(503, f"Account summary failed: {e}")
+
+    summary: dict = {"account": account_id}
+    for row in rows:
+        if row.tag in want and row.currency == "USD":
+            try:
+                summary[row.tag] = round(float(row.value), 2)
+            except (ValueError, TypeError):
+                summary[row.tag] = row.value
+
+    # Invested = gross position value (sum of abs market value of all positions)
+    invested = summary.get("GrossPositionValue", 0.0)
+    cash     = summary.get("TotalCashValue", 0.0)
+    avail    = summary.get("AvailableFunds", 0.0)
+    net_liq  = summary.get("NetLiquidation", 0.0)
+    init_mgn = summary.get("InitialMarginReq", 0.0)
+    upnl     = summary.get("UnrealizedPnL", 0.0)
+    rpnl     = summary.get("RealizedPnL", 0.0)
+
+    return {
+        "account":            account_id,
+        "net_liquidation":    net_liq,
+        "total_cash":         cash,
+        "available_funds":    avail,
+        "gross_position_value": invested,
+        "initial_margin_req": init_mgn,
+        "unrealized_pnl":     upnl,
+        "realized_pnl":       rpnl,
+        "buying_power":       summary.get("BuyingPower", 0.0),
+        "currency":           "USD",
+    }
+
+
 # ── Auto-trader endpoints ──────────────────────────────────────────────────
 
 @app.get("/autotrader/status")

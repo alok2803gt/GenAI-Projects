@@ -1377,10 +1377,11 @@ function SignalsTab({ connected }) {
 
 // ── Auto-Trader Tab ───────────────────────────────────────────────────────
 function AutoTraderTab() {
-  const [status,      setStatus]  = useState(null);
-  const [saving,      setSaving]  = useState(false);
-  const [running,     setRunning] = useState(false);
-  const [reconnMode,  setReconn]  = useState(null);
+  const [status,      setStatus]     = useState(null);
+  const [saving,      setSaving]     = useState(false);
+  const [running,     setRunning]    = useState(false);
+  const [reconnMode,  setReconn]     = useState(null);
+  const [acctSummary, setAcctSummary] = useState(null);
   const [cfg, setCfg] = useState({
     max_positions:     5,
     profit_target_pct: 0.65,
@@ -1404,10 +1405,19 @@ function AutoTraderTab() {
     } catch(_) {}
   };
 
+  const loadAcct = async () => {
+    try {
+      const d = await apiFetch("/account/summary");
+      setAcctSummary(d);
+    } catch(_) {}
+  };
+
   useEffect(() => {
     load(true);  // sync config once on mount
-    const id = setInterval(() => load(false), 8000);  // poll status only — never overwrite user edits
-    return () => clearInterval(id);
+    loadAcct();  // fetch account summary immediately
+    const id  = setInterval(() => load(false), 8000);   // poll status — never overwrite user edits
+    const id2 = setInterval(() => loadAcct(), 30000);   // refresh account every 30 s
+    return () => { clearInterval(id); clearInterval(id2); };
   }, []);
 
   const saveConfig = async (enabled) => {
@@ -1515,6 +1525,46 @@ function AutoTraderTab() {
         </span>
         {status?.last_run && <span style={{ color:"#64748b", fontSize:12 }}>last: {status.last_run}</span>}
       </div>
+
+      {/* Account Summary Panel */}
+      {acctSummary && (() => {
+        const fmt = (v) => v == null ? "—" : "$" + Number(v).toLocaleString("en-US", { minimumFractionDigits:2, maximumFractionDigits:2 });
+        const pnlColor = (v) => v == null ? "#94a3b8" : v >= 0 ? "#27ae60" : "#e74c3c";
+        const cells = [
+          { label:"Account",        value: acctSummary.account || "—",        color:"#f1c40f", mono:true },
+          { label:"Net Liq",        value: fmt(acctSummary.net_liquidation),   color:"#ecf0f1" },
+          { label:"Total Cash",     value: fmt(acctSummary.total_cash),        color:"#27ae60" },
+          { label:"Avail Funds",    value: fmt(acctSummary.available_funds),   color:"#2ecc71" },
+          { label:"Invested",       value: fmt(acctSummary.gross_position_value), color:"#3498db" },
+          { label:"Unrealized P&L", value: fmt(acctSummary.unrealized_pnl),   color: pnlColor(acctSummary.unrealized_pnl) },
+          { label:"Realized P&L",   value: fmt(acctSummary.realized_pnl),     color: pnlColor(acctSummary.realized_pnl) },
+          { label:"Buying Power",   value: fmt(acctSummary.buying_power),     color:"#9b59b6" },
+        ];
+        return (
+          <div style={{ display:"flex", gap:10, flexWrap:"wrap", marginBottom:20,
+                        background:"#0f172a", border:"1px solid #1e293b", borderRadius:10, padding:"12px 16px" }}>
+            {cells.map(c => (
+              <div key={c.label} style={{ display:"flex", flexDirection:"column", alignItems:"center",
+                                          minWidth:110, flex:"1 1 110px" }}>
+                <span style={{ fontSize:10, color:"#64748b", textTransform:"uppercase", letterSpacing:1, marginBottom:3 }}>
+                  {c.label}
+                </span>
+                <span style={{ fontSize:13, fontWeight:700, color:c.color,
+                               fontFamily: c.mono ? "monospace" : "inherit" }}>
+                  {c.value}
+                </span>
+              </div>
+            ))}
+            <div style={{ display:"flex", alignItems:"flex-end", paddingBottom:2 }}>
+              <button onClick={loadAcct} title="Refresh account data" style={{
+                background:"transparent", border:"1px solid #334155", borderRadius:6,
+                color:"#64748b", fontSize:11, padding:"3px 8px", cursor:"pointer",
+              }}>↻</button>
+            </div>
+          </div>
+        );
+      })()}
+
 
       {/* Multi-strategy budget */}
       {(status?.premium_collected > 0 || status?.leap_budget > 0) && (
