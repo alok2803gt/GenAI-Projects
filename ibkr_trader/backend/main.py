@@ -1897,7 +1897,7 @@ async def _autotrader_background() -> None:
             if market_open:
                 await loop.run_in_executor(
                     None,
-                    lambda: _run_in_streaming_loop(_autotrader_scan_and_trade_coro(ib), timeout=180),
+                    lambda: _run_in_streaming_loop(_autotrader_scan_and_trade_coro(ib), timeout=270),
                 )
             else:
                 from zoneinfo import ZoneInfo
@@ -2432,9 +2432,16 @@ async def scan_csp(
                 log.warning("CSP scan error [%s]: %s\n%s", ticker, e, traceback.format_exc())
                 return []
 
+    async def _scan_ticker_safe_csp(t: str) -> List[dict]:
+        try:
+            return await asyncio.wait_for(_scan_ticker(t), timeout=25)
+        except asyncio.TimeoutError:
+            log.warning("CSP [%s]: per-ticker scan timed out (>25s) — skipping", t)
+            return []
+
     regime, *ticker_results = await asyncio.gather(
         _market_regime(),
-        *[_scan_ticker(t) for t in CSP_UNIVERSE],
+        *[_scan_ticker_safe_csp(t) for t in CSP_UNIVERSE],
     )
     candidates = [row for ticker_rows in ticker_results for row in ticker_rows]
     return {
@@ -2712,9 +2719,16 @@ async def scan_leaps(ib: IB) -> dict:
                 log.warning("LEAP scan error [%s]: %s\n%s", ticker, e, traceback.format_exc())
                 return []
 
+    async def _scan_ticker_safe_leap(t: str) -> List[dict]:
+        try:
+            return await asyncio.wait_for(_scan_ticker(t), timeout=25)
+        except asyncio.TimeoutError:
+            log.warning("LEAP [%s]: per-ticker scan timed out (>25s) — skipping", t)
+            return []
+
     regime, *ticker_results = await asyncio.gather(
         _market_regime(),
-        *[_scan_ticker(t) for t in CSP_UNIVERSE],
+        *[_scan_ticker_safe_leap(t) for t in CSP_UNIVERSE],
     )
     candidates = [row for ticker_rows in ticker_results for row in ticker_rows]
     return {
@@ -3791,58 +3805,43 @@ async def portfolio_delta():
 # ── Account summary endpoint ───────────────────────────────────────────────
 
 @app.get("/account/summary")
-async def account_summary():
+def account_summary():
     """
     Real-time account cash, equity, margin, and account number from IBKR.
-    Uses reqAccountSummaryAsync so it always reflects the current TWS state.
+    ib_insync subscribes account values automatically on connect, so
+    ib.accountValues() is always up to date without an extra async call.
     """
     _require_connection()
     ib = state["ib"]
 
-    # Account number(s) known to this connection
-    accounts = ib.client.accounts if ib.client.accounts else []
+    # managedAccounts() returns list of account strings from the handshake
+    accounts   = ib.managedAccounts()
     account_id = accounts[0] if accounts else "unknown"
 
-    # Request live account summary (all tags for the primary account)
-    want = ("TotalCashValue", "AvailableFunds", "NetLiquidation",
-            "InitialMarginReq", "MaintMarginReq", "UnrealizedPnL",
-            "RealizedPnL", "GrossPositionValue", "BuyingPower")
-    try:
-        rows = await ib.reqAccountSummaryAsync(
-            groupName="All", tags=",".join(want)
-        )
-    except Exception as e:
-        raise HTTPException(503, f"Account summary failed: {e}")
-
-    summary: dict = {"account": account_id}
-    for row in rows:
-        if row.tag in want and row.currency == "USD":
-            try:
-                summary[row.tag] = round(float(row.value), 2)
-            except (ValueError, TypeError):
-                summary[row.tag] = row.value
-
-    # Invested = gross position value (sum of abs market value of all positions)
-    invested = summary.get("GrossPositionValue", 0.0)
-    cash     = summary.get("TotalCashValue", 0.0)
-    avail    = summary.get("AvailableFunds", 0.0)
-    net_liq  = summary.get("NetLiquidation", 0.0)
-    init_mgn = summary.get("InitialMarginReq", 0.0)
-    upnl     = summary.get("UnrealizedPnL", 0.0)
-    rpnl     = summary.get("RealizedPnL", 0.0)
-
-    return {
-        "account":            account_id,
-        "net_liquidation":    net_liq,
-        "total_cash":         cash,
-        "available_funds":    avail,
-        "gross_position_value": invested,
-        "initial_margin_req": init_mgn,
-        "unrealized_pnl":     upnl,
-        "realized_pnl":       rpnl,
-        "buying_power":       summary.get("BuyingPower", 0.0),
-        "currency":           "USD",
+    want_map = {
+        "TotalCashValue":     "total_cash",
+        "AvailableFunds":     "available_funds",
+        "NetLiquidation":     "net_liquidation",
+        "GrossPositionValue": "gross_position_value",
+        "InitialMarginReq":   "initial_margin_req",
+        "UnrealizedPnL":      "unrealized_pnl",
+        "RealizedPnL":        "realized_pnl",
+        "BuyingPower":        "buying_power",
     }
+
+    result: dict = {v: 0.0 for v in want_map.values()}
+    result["account"]  = account_id
+    result["currency"] = "USD"
+
+    for av in ib.accountValues(account_id):
+        key = want_map.get(av.tag)
+        if key and av.currency == "USD":
+            try:
+                result[key] = round(float(av.value), 2)
+            except (ValueError, TypeError):
+                pass
+
+    return result
 
 
 # ── Auto-trader endpoints ──────────────────────────────────────────────────
@@ -3893,7 +3892,7 @@ async def autotrader_run_now():
         )
         await loop.run_in_executor(
             None,
-            lambda: _run_in_streaming_loop(_autotrader_scan_and_trade_coro(ib), timeout=180),
+            lambda: _run_in_streaming_loop(_autotrader_scan_and_trade_coro(ib), timeout=270),
         )
         state["autotrader"]["last_run"] = datetime.utcnow().isoformat() + "Z"
     except (TimeoutError, RuntimeError) as exc:
