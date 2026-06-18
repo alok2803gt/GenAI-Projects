@@ -84,8 +84,8 @@ AT_STATE_PATH       = "autotrader_state.json"  # persisted across restarts
 # ── Config — LEAP scanner ──────────────────────────────────────────────────
 LEAP_MIN_DTE   = 180   # ≥ 6 months
 LEAP_MAX_DTE   = 540   # ≤ 18 months
-LEAP_MIN_DELTA = 0.45  # Near-ATM; enough directional exposure
-LEAP_MAX_DELTA = 0.75  # Not deep ITM (expensive)
+LEAP_MIN_DELTA = 0.65  # Research: deep ITM (0.80+) preferred; 0.65 min to avoid pure speculation
+LEAP_MAX_DELTA = 0.85  # Cap to avoid overpaying for very deep ITM
 LEAP_MAX_IV    = 0.70  # Don't overpay for implied vol
 
 # ── Scan universe (user can extend via API) ────────────────────────────────
@@ -177,8 +177,8 @@ state: Dict = {
         "enabled": False,
         "config": {
             "max_positions":     5,
-            "profit_target_pct": 0.65,
-            "stop_loss_mult":    5.0,
+            "profit_target_pct": 0.50,   # 50% of max — research-optimal (Tastytrade 200k-trade study)
+            "stop_loss_mult":    2.0,    # 2× premium received (industry-standard 200% rule)
             "scan_types":        ["csp"],
             "csp_capital":       20000.0,
             "leap_capital":      5000.0,
@@ -186,13 +186,12 @@ state: Dict = {
             "use_kelly":         True,
             "total_capital":     100000.0,
             "assumed_win_rate":  0.85,
-            # Trailing exit
-            "trailing_exit":     True,
             # Auto-hedge
             "auto_hedge":        False,
             "hedge_threshold":   100.0,
         },
         "positions":          {},     # contract_key → entry metadata
+        "stopped_out":        {},     # ticker → ISO timestamp of last stop-loss (48h cooldown)
         "log":                [],     # [{time, action, detail}, …] last 200
         "last_run":           None,
         "premium_collected":  0.0,    # total realized CSP profit
@@ -1361,7 +1360,9 @@ def _is_market_open() -> bool:
 
 
 def _at_log(action: str, detail: str) -> None:
-    entry = {"time": datetime.utcnow().strftime("%H:%M:%S UTC"), "action": action, "detail": detail}
+    from zoneinfo import ZoneInfo
+    est_now = datetime.now(ZoneInfo("America/New_York"))
+    entry = {"time": est_now.strftime("%H:%M:%S ET"), "action": action, "detail": detail}
     at = state["autotrader"]
     at["log"].append(entry)
     at["log"] = at["log"][-200:]
@@ -1403,11 +1404,15 @@ def _bs_put_price(S: float, K: float, T: float, sigma: float) -> float:
 
 
 async def _autotrader_monitor_coro(ib: IB) -> None:
-    at           = state["autotrader"]
-    cfg          = at["config"]
-    use_trailing = cfg.get("trailing_exit", True)
+    at  = state["autotrader"]
+    cfg = at["config"]
     if not at["positions"]:
         return
+
+    profit_target = float(cfg.get("profit_target_pct", 0.50))   # 50% of max premium
+    stop_mult     = float(cfg.get("stop_loss_mult", 2.0))        # 2× premium for CSP
+    today         = date.today()
+
     for item in ib.portfolio():
         key = _at_contract_key(item.contract)
         if key not in at["positions"]:
@@ -1418,35 +1423,100 @@ async def _autotrader_monitor_coro(ib: IB) -> None:
         if max_profit <= 0:
             continue
 
-        if use_trailing:
-            # Update high-water mark
-            hw = max(info.get("high_water", 0.0), upnl)
-            info["high_water"] = hw
-            hw_pct = hw / max_profit
-            # Tiered trailing floor: lock in more as profit builds
-            if hw_pct >= 0.75:
-                floor = 0.60 * max_profit
-            elif hw_pct >= 0.50:
-                floor = 0.35 * max_profit
-            elif hw_pct >= 0.25:
-                floor = 0.15 * max_profit
+        action = info.get("action", "SELL")   # SELL = CSP short put; BUY = LEAP long call
+
+        # Compute DTE from stored expiry
+        dte = 0
+        expiry_str = info.get("expiry", "")
+        if expiry_str:
+            try:
+                dte = (datetime.strptime(expiry_str, "%Y%m%d").date() - today).days
+            except ValueError:
+                pass
+
+        # ── 1. Profit target: 50% of max premium ─────────────────────────
+        if upnl >= profit_target * max_profit:
+            _at_log("CLOSE", f"{key}: {profit_target*100:.0f}% profit target hit (${upnl:.0f} / max=${max_profit:.0f})")
+            info["exit_reason"] = "profit_target"
+            await _autotrader_close_coro(ib, item, info, key)
+            continue
+
+        # ── 2. Hard stop-loss ─────────────────────────────────────────────
+        # CSP: 2× premium received (200% rule — industry standard)
+        # LEAP: 50% of premium paid (limit to half the initial outlay)
+        stop_threshold = (-stop_mult * max_profit if action == "SELL"
+                          else -0.50 * max_profit)
+        if upnl <= stop_threshold:
+            ticker = info.get("ticker", key.split("_")[0])
+            at.setdefault("stopped_out", {})[ticker] = datetime.utcnow().isoformat()
+            _at_log("CLOSE", f"{key}: stop-loss hit (${upnl:.0f}, threshold=${stop_threshold:.0f})")
+            info["exit_reason"] = "stop_loss"
+            await _autotrader_close_coro(ib, item, info, key)
+            continue
+
+        # ── 3. Roll at 21 DTE for CSPs not yet at profit target ──────────
+        # Research (Tastytrade): gamma risk dominates in final 21 days vs remaining theta.
+        # Roll: close current position, open same strike next month (30-45 DTE).
+        if action == "SELL" and 0 < dte <= 21:
+            if upnl >= 0:
+                # Any profit at 21 DTE — take it, free the slot
+                _at_log("CLOSE", f"{key}: 21 DTE — taking ${upnl:.0f} profit (gamma risk zone)")
+                info["exit_reason"] = "roll_close"
+                await _autotrader_close_coro(ib, item, info, key)
             else:
-                floor = -cfg["stop_loss_mult"] * max_profit
-            if upnl <= floor:
-                reason = (f"trailing stop: floor=${floor:.0f}, uPnL=${upnl:.0f}, "
-                          f"HW={hw_pct*100:.0f}% of max")
-                _at_log("CLOSE", f"{key}: {reason}")
-                info["exit_reason"] = "trailing_stop"
-                await _autotrader_close_coro(ib, item, info, key)
-        else:
-            if upnl >= cfg["profit_target_pct"] * max_profit:
-                _at_log("CLOSE", f"{key}: profit target hit (${upnl:.0f})")
-                info["exit_reason"] = "profit_target"
-                await _autotrader_close_coro(ib, item, info, key)
-            elif upnl <= -cfg["stop_loss_mult"] * max_profit:
-                _at_log("CLOSE", f"{key}: stop-loss hit (${upnl:.0f})")
-                info["exit_reason"] = "stop_loss"
-                await _autotrader_close_coro(ib, item, info, key)
+                # At a loss but not yet at stop — roll to next month
+                _at_log("ROLL", f"{key}: 21 DTE, loss=${upnl:.0f} — rolling to next cycle")
+                await _autotrader_roll_coro(ib, item, info, key)
+            continue
+
+
+async def _autotrader_roll_coro(ib: IB, item, info: dict, key: str) -> None:
+    """Close a CSP at/near 21 DTE then re-sell the same strike 30-45 DTE out."""
+    ticker      = info.get("ticker", item.contract.symbol)
+    orig_strike = float(info.get("strike", item.contract.strike))
+    right       = info.get("right", "P")
+
+    # Step 1 — close current leg
+    info["exit_reason"] = "roll_close"
+    await _autotrader_close_coro(ib, item, info, key)
+
+    # Step 2 — re-open at 30-45 DTE
+    try:
+        stock_price = await _get_stock_price(ib, ticker)
+        if stock_price <= 0:
+            _at_log("ROLL", f"{ticker}: price unavailable — skipping re-entry")
+            return
+
+        tds, expiry_new, dte_new = await _fetch_opra_chain(
+            ib, ticker, right, stock_price, 30, 45,
+            otm_lo_pct=0, otm_hi_pct=40, max_strikes=15,
+        )
+        if not tds:
+            _at_log("ROLL", f"{ticker}: no contracts found for roll — skipping")
+            return
+
+        valid = [td for td in tds
+                 if _safe_float(td.contract.strike) is not None
+                 and _safe_float(td.bid, 0) > 0.20
+                 and _safe_float(td.ask, 0) > 0]
+        if not valid:
+            _at_log("ROLL", f"{ticker}: no liquid contracts for roll — skipping")
+            return
+
+        # Pick strike closest to original (same or lower = more conservative)
+        best = min(valid, key=lambda td: abs(float(td.contract.strike) - orig_strike))
+        roll_strike = float(best.contract.strike)
+        bid = _safe_float(best.bid, 0)
+        ask = _safe_float(best.ask, 0)
+
+        row = {
+            "ticker": ticker, "expiry": expiry_new, "strike": roll_strike,
+            "_type": "csp", "_regime": "BULL", "bid": bid, "ask": ask, "score": 0,
+        }
+        await _autotrader_place_coro(ib, row, state["autotrader"]["config"], regime="BULL")
+        _at_log("ROLL", f"{ticker}: rolled → {expiry_new} P{roll_strike} ({dte_new} DTE)")
+    except Exception as exc:
+        _at_log("ROLL", f"{ticker}: roll re-entry failed — {exc}")
 
 
 async def _autotrader_close_coro(ib: IB, item, info: dict, key: str) -> None:
@@ -1561,8 +1631,25 @@ async def _autotrader_scan_and_trade_coro(ib: IB) -> None:
         except Exception as exc:
             _at_log("ERROR", f"LEAP scan failed: {exc}")
     candidates.sort(key=lambda x: x["score"], reverse=True)
-    candidates = [c for c in candidates if c["ticker"] not in active_t]
-    _at_log("SCAN", f"Found {len(candidates)} qualifying candidates after dedup")
+
+    # 48h stop-loss cooldown — don't re-enter tickers recently stopped out
+    stopped_out = at.get("stopped_out", {})
+    _now_utc    = datetime.utcnow()
+    def _in_cooldown(ticker: str) -> bool:
+        ts = stopped_out.get(ticker)
+        if not ts:
+            return False
+        try:
+            return (_now_utc - datetime.fromisoformat(ts)).total_seconds() < 48 * 3600
+        except ValueError:
+            return False
+
+    cooled = [c["ticker"] for c in candidates if _in_cooldown(c["ticker"])]
+    if cooled:
+        _at_log("SCAN", f"48h cooldown — skipping: {cooled}")
+    candidates = [c for c in candidates
+                  if c["ticker"] not in active_t and not _in_cooldown(c["ticker"])]
+    _at_log("SCAN", f"Found {len(candidates)} qualifying candidates after dedup + cooldown")
     placed = 0
     for row in candidates[:slots]:
         try:
@@ -2197,7 +2284,7 @@ async def scan_csp(
                 opra_ok = False
                 try:
                     (tds, expiry_ibkr, dte), inst = await asyncio.gather(
-                        _fetch_opra_chain(ib, ticker, "P", stock_price, 5, 35),
+                        _fetch_opra_chain(ib, ticker, "P", stock_price, 21, 45),
                         _institutional_signals(ticker, stock_price),
                     )
                     opra_ok = True

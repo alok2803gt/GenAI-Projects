@@ -1384,15 +1384,14 @@ function AutoTraderTab() {
   const [acctSummary, setAcctSummary] = useState(null);
   const [cfg, setCfg] = useState({
     max_positions:     5,
-    profit_target_pct: 0.65,
-    stop_loss_mult:    5.0,
+    profit_target_pct: 0.50,
+    stop_loss_mult:    2.0,
     scan_types:        ["csp"],
     csp_capital:       20000,
     leap_capital:      5000,
     use_kelly:         true,
     total_capital:     100000,
     assumed_win_rate:  0.85,
-    trailing_exit:     true,
     auto_hedge:        false,
     hedge_threshold:   100,
   });
@@ -1467,8 +1466,8 @@ function AutoTraderTab() {
   // Kelly fraction display
   const kellyFrac = (() => {
     const p = cfg.assumed_win_rate || 0.85;
-    const pt = cfg.profit_target_pct || 0.65;
-    const sl = cfg.stop_loss_mult || 5.0;
+    const pt = cfg.profit_target_pct || 0.50;
+    const sl = cfg.stop_loss_mult || 2.0;
     const b = pt / (sl > 0 ? sl : 5.0);
     const k = (p * (b + 1) - 1) / b;
     return Math.max(0.02, k * 0.5);
@@ -1622,9 +1621,8 @@ function AutoTraderTab() {
         {/* Toggles row */}
         <div style={{ display:"flex", gap:24, marginTop:16, flexWrap:"wrap" }}>
           {[
-            { key:"use_kelly",     label:"Kelly Sizing",    sub:`~$${kellyCapital.toLocaleString()}/trade` },
-            { key:"trailing_exit", label:"Trailing Exit",   sub:"lock in profits as they grow" },
-            { key:"auto_hedge",    label:"Auto-Hedge",      sub:"SPY option when delta > threshold" },
+            { key:"use_kelly",  label:"Kelly Sizing", sub:`~$${kellyCapital.toLocaleString()}/trade` },
+            { key:"auto_hedge", label:"Auto-Hedge",   sub:"SPY option when delta > threshold" },
           ].map(t => (
             <label key={t.key} style={{ display:"flex", flexDirection:"column", gap:3, cursor:"pointer" }}>
               <div style={{ display:"flex", alignItems:"center", gap:8 }}>
@@ -1661,10 +1659,10 @@ function AutoTraderTab() {
         <div style={{ marginTop:12, padding:"10px 14px", background:"#f1f5f9",
           borderRadius:6, fontSize:12, color:"#64748b", lineHeight:1.7 }}>
           <strong style={{color:"#d97706"}}>Half-Kelly sizing:</strong> win rate {Math.round((cfg.assumed_win_rate||0.85)*100)}%,
-          profit/loss ratio {((cfg.profit_target_pct||0.65)/((cfg.stop_loss_mult||5.0)||5.0)).toFixed(3)} →
+          profit/loss ratio {((cfg.profit_target_pct||0.50)/((cfg.stop_loss_mult||2.0)||2.0)).toFixed(3)} →
           Kelly fraction {(kellyFrac*100).toFixed(1)}% of ${(cfg.total_capital||100000).toLocaleString()}
           = <strong style={{color:"#1e293b"}}>${kellyCapital.toLocaleString()} per trade</strong>.
-          {" "}Trailing exit locks in 15%→35%→60% floor as profit reaches 25%→50%→75% of max.
+          {" "}Exit rules: 50% profit target | 2× premium stop | roll at 21 DTE | 48h cooldown after stop-out.
         </div>
       </Card>
 
