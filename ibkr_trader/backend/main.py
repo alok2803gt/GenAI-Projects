@@ -1609,8 +1609,9 @@ async def _autotrader_place_coro(ib: IB, row: dict, cfg: dict, regime: str = "BU
     lmt_src       = "none"
     _flow_abort   = None   # set inside try; raised outside so except doesn't swallow it
     try:
-        # 100=option volume, 101=option OI, 106=implied vol, 13=OI (standard)
-        tq = ib.reqMktData(contract, "106,13,100,101", False, False)
+        # 100=option volume, 101=option OI, 106=implied vol
+        # tick 13 (equity OI) is NOT valid for OPT and causes error 321
+        tq = ib.reqMktData(contract, "106,100,101", False, False)
         await asyncio.sleep(2.0)   # allow snapshot to settle
         ibkr_bid = tq.bid if tq.bid and not math.isnan(tq.bid) and tq.bid > 0 else None
         ibkr_ask = tq.ask if tq.ask and not math.isnan(tq.ask) and tq.ask > 0 else None
