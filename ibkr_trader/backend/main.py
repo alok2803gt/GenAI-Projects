@@ -402,18 +402,15 @@ async def streaming_loop_async() -> None:
             state["error"] = None
 
             # Cancel any Inactive orders left over from previous sessions.
-            # Inactive orders are stuck in TWS (not sent to exchange) and can
-            # trigger IBKR's duplicate-order suppression on subsequent placements.
-            await asyncio.sleep(1)   # give TWS a moment to send us existing orders
+            # Use reqGlobalCancel (cancels ALL orders for this account regardless of session/clientId).
+            # Regular cancelOrder only works for orders placed by the current connection,
+            # so cross-session Inactive orders require the global cancel.
+            await asyncio.sleep(2)   # give TWS a moment to deliver existing orders
             stale = [t for t in ib.openTrades() if t.orderStatus.status == "Inactive"]
-            for t in stale:
-                try:
-                    ib.cancelOrder(t.order)
-                except Exception:
-                    pass
             if stale:
-                log.info(f"Cancelled {len(stale)} stale Inactive orders from previous session")
-                _at_log("SYSTEM", f"Cancelled {len(stale)} stale Inactive orders on reconnect")
+                ib.client.reqGlobalCancel()
+                log.info(f"reqGlobalCancel sent — clearing {len(stale)} stale Inactive orders on connect")
+                _at_log("SYSTEM", f"Cleared {len(stale)} stale Inactive orders on reconnect (reqGlobalCancel)")
 
             ctx["known"] = await _subscribe_pending(ib, ctx["known"])
 
@@ -3766,19 +3763,15 @@ def cancel_order(order_id: int):
 
 @app.post("/orders/cancel-inactive")
 def cancel_inactive_orders():
-    """Cancel all Inactive orders (stale from previous sessions)."""
+    """Cancel all Inactive orders using reqGlobalCancel (handles cross-session orders)."""
     _require_connection()
     ib = state["ib"]
-    stale = [t for t in ib.openTrades() if t.orderStatus.status == "Inactive"]
-    cancelled = []
-    for t in stale:
-        try:
-            ib.cancelOrder(t.order)
-            cancelled.append(t.order.orderId)
-        except Exception:
-            pass
-    _at_log("SYSTEM", f"Manually cancelled {len(cancelled)} Inactive orders")
-    return {"ok": True, "cancelled": cancelled, "count": len(cancelled)}
+    stale_ids = [t.order.orderId for t in ib.openTrades() if t.orderStatus.status == "Inactive"]
+    # reqGlobalCancel cancels ALL open orders for this account regardless of session/clientId.
+    # Regular cancelOrder only works for orders placed by the current connection.
+    ib.client.reqGlobalCancel()
+    _at_log("SYSTEM", f"reqGlobalCancel sent — cancelling {len(stale_ids)} Inactive orders: {stale_ids}")
+    return {"ok": True, "cancelled": stale_ids, "count": len(stale_ids), "method": "reqGlobalCancel"}
 
 
 @app.get("/portfolio/delta")
