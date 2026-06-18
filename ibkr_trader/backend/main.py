@@ -4271,6 +4271,105 @@ def get_journal_stats():
     }
 
 
+@app.get("/pnl/dashboard")
+def pnl_dashboard():
+    """Unified P&L dashboard: account metrics, per-position data, chart series."""
+    from collections import defaultdict
+
+    acct: dict = {}
+    try:
+        acct = account_summary()
+    except Exception:
+        pass
+
+    con      = sqlite3.connect(JOURNAL_DB_PATH, check_same_thread=False)
+    all_rows = con.execute("SELECT * FROM trade_journal ORDER BY id").fetchall()
+    desc     = con.execute("SELECT * FROM trade_journal LIMIT 0").description or []
+    cols     = [d[0] for d in desc]
+    con.close()
+
+    trades        = [dict(zip(cols, r)) for r in all_rows]
+    open_trades   = [t for t in trades if t.get("closed_at") is None]
+    closed_trades = sorted(
+        [t for t in trades if t.get("closed_at") is not None],
+        key=lambda t: t["closed_at"], reverse=True,
+    )
+
+    daily: dict = defaultdict(float)
+    for t in closed_trades:
+        day = (t.get("closed_at") or "")[:10]
+        if day and t.get("pnl") is not None:
+            daily[day] += t["pnl"]
+    cum      = 0.0
+    daily_pnl = []
+    for day, pnl in sorted(daily.items()):
+        cum += pnl
+        daily_pnl.append({"date": day, "pnl": round(pnl, 2), "cumulative": round(cum, 2)})
+
+    closed_pnls = [t["pnl"] for t in closed_trades if t.get("pnl") is not None]
+    wins        = [t for t in closed_trades if t.get("win") == 1]
+    losses      = [t for t in closed_trades if t.get("win") == 0]
+    today_str   = date.today().isoformat()
+    today_pnl   = sum(
+        t["pnl"] for t in closed_trades
+        if (t.get("closed_at") or "")[:10] == today_str and t.get("pnl") is not None
+    )
+
+    exit_breakdown: dict = {}
+    for t in closed_trades:
+        reason = t.get("exit_reason") or "unknown"
+        exit_breakdown.setdefault(reason, {"count": 0, "pnl": 0.0})
+        exit_breakdown[reason]["count"] += 1
+        if t.get("pnl") is not None:
+            exit_breakdown[reason]["pnl"] = round(exit_breakdown[reason]["pnl"] + t["pnl"], 2)
+
+    portfolio_items: list = []
+    ib_conn = state.get("ib")
+    if ib_conn and state.get("connected"):
+        try:
+            for item in ib_conn.portfolio():
+                c = item.contract
+                portfolio_items.append({
+                    "ticker":         c.symbol,
+                    "sec_type":       getattr(c, "secType", ""),
+                    "strike":         getattr(c, "strike", None),
+                    "right":          getattr(c, "right", None),
+                    "expiry":         getattr(c, "lastTradeDateOrContractMonth", None),
+                    "position":       item.position,
+                    "avg_cost":       round(float(item.averageCost or 0), 4),
+                    "market_value":   round(float(item.marketValue or 0), 2),
+                    "unrealized_pnl": round(float(item.unrealizedPNL or 0), 2),
+                    "realized_pnl":   round(float(item.realizedPNL or 0), 2),
+                })
+        except Exception:
+            pass
+
+    total_realized   = round(sum(closed_pnls), 2) if closed_pnls else 0.0
+    total_unrealized = round(float(acct.get("unrealized_pnl") or 0), 2)
+
+    return {
+        "account": acct,
+        "stats": {
+            "total_trades":         len(closed_trades),
+            "open_count":           len(open_trades),
+            "win_rate":             round(len(wins) / len(closed_trades) * 100, 1) if closed_trades else None,
+            "total_realized_pnl":   total_realized,
+            "total_unrealized_pnl": total_unrealized,
+            "total_pnl":            round(total_realized + total_unrealized, 2),
+            "today_pnl":            round(today_pnl, 2),
+            "avg_win":              round(sum(t["pnl"] for t in wins   if t.get("pnl")) / len(wins),   2) if wins   else 0,
+            "avg_loss":             round(sum(t["pnl"] for t in losses if t.get("pnl")) / len(losses), 2) if losses else 0,
+            "best_trade":           round(max(closed_pnls), 2) if closed_pnls else 0,
+            "worst_trade":          round(min(closed_pnls), 2) if closed_pnls else 0,
+        },
+        "open_positions": open_trades[-20:],
+        "closed_trades":  closed_trades[:30],
+        "daily_pnl":      daily_pnl,
+        "portfolio":      portfolio_items,
+        "exit_breakdown": exit_breakdown,
+    }
+
+
 @app.post("/journal/retrain")
 def trigger_retrain():
     """Manually trigger model retraining from journal data."""

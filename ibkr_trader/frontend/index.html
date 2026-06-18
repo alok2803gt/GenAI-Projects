@@ -2384,9 +2384,264 @@ function UniverseTab() {
   );
 }
 
+// ── P&L Dashboard Tab ─────────────────────────────────────────────────────
+function PnLTab() {
+  const [data,      setData]      = useState(null);
+  const [loading,   setLoading]   = useState(true);
+  const [err,       setErr]       = useState(null);
+  const [countdown, setCountdown] = useState(15);
+  const INTERVAL = 15;
+
+  const load = useCallback(async () => {
+    try {
+      setErr(null);
+      const d = await apiFetch("/pnl/dashboard");
+      setData(d);
+      setCountdown(INTERVAL);
+    } catch(e) { setErr(e.message); }
+    finally    { setLoading(false); }
+  }, []);
+
+  useEffect(() => { load(); const iv = setInterval(load, INTERVAL * 1000); return () => clearInterval(iv); }, [load]);
+  useEffect(() => { const iv = setInterval(() => setCountdown(c => c <= 1 ? INTERVAL : c - 1), 1000); return () => clearInterval(iv); }, []);
+
+  if (loading && !data) return <div style={{...sans, padding:40, textAlign:"center", color:C.muted}}>Loading P&amp;L data…</div>;
+  if (err) return <div style={{...sans, padding:40, textAlign:"center", color:C.bear}}>Error: {err}</div>;
+  if (!data) return null;
+
+  const { account, stats, open_positions, closed_trades, daily_pnl, portfolio, exit_breakdown } = data;
+
+  const pnlCol  = v => v == null ? C.muted : v > 0 ? C.bull : v < 0 ? C.bear : C.muted;
+  const fmtDol  = (v, sign=false) => {
+    if (v == null) return "—";
+    const abs = Math.abs(v).toLocaleString("en-US", {minimumFractionDigits:2, maximumFractionDigits:2});
+    return `${v < 0 ? "-" : (sign && v > 0 ? "+" : "")}$${abs}`;
+  };
+  const fmtDT = s => {
+    if (!s) return "—";
+    return new Date(s).toLocaleString("en-US", {month:"short", day:"numeric", hour:"2-digit", minute:"2-digit"});
+  };
+  const fmtDTE = expiry => {
+    if (!expiry) return "—";
+    const d = new Date(`${expiry.slice(0,4)}-${expiry.slice(4,6)}-${expiry.slice(6,8)}`);
+    return Math.floor((d - Date.now()) / 86400000);
+  };
+
+  // ── SVG cumulative P&L chart ──────────────────────────────────────────────
+  function PnLChart() {
+    const pts = daily_pnl || [];
+    if (pts.length === 0) return (
+      <div style={{height:160, display:"flex", alignItems:"center", justifyContent:"center", color:C.muted, ...sans, fontSize:13}}>
+        No closed trades yet — chart will appear after the first close
+      </div>
+    );
+    const VW=760, VH=160, PAD={l:65,r:20,t:20,b:32};
+    const pW = VW-PAD.l-PAD.r, pH = VH-PAD.t-PAD.b;
+    const vals = pts.map(p => p.cumulative);
+    const yMin = Math.min(0, ...vals), yMax = Math.max(0, ...vals);
+    const yR   = yMax - yMin || 10;
+    const xS   = i  => PAD.l + (pts.length > 1 ? (i/(pts.length-1))*pW : pW/2);
+    const yS   = v  => PAD.t + pH - ((v - yMin)/yR)*pH;
+    const zY   = yS(0);
+    const lc   = vals[vals.length-1] >= 0 ? "#16a34a" : "#dc2626";
+    const linePts = pts.map((p,i) => `${xS(i).toFixed(1)},${yS(p.cumulative).toFixed(1)}`).join(" ");
+    const fillD   = `M ${xS(0)} ${zY} L ${pts.map((p,i)=>`${xS(i)} ${yS(p.cumulative)}`).join(" L ")} L ${xS(pts.length-1)} ${zY} Z`;
+    const yTicks  = [yMin, yMin+yR*0.25, yMin+yR*0.5, yMin+yR*0.75, yMax];
+    const xIdxs   = pts.length <= 6 ? pts.map((_,i)=>i) :
+      [0,1,2,3,4,5].map(i => Math.round(i*(pts.length-1)/5));
+    return (
+      <svg viewBox={`0 0 ${VW} ${VH}`} style={{width:"100%",height:"auto",overflow:"visible"}}>
+        <defs>
+          <linearGradient id="pg" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor={lc} stopOpacity="0.22"/>
+            <stop offset="100%" stopColor={lc} stopOpacity="0.02"/>
+          </linearGradient>
+        </defs>
+        {yTicks.map((v,i) => (
+          <g key={i}>
+            <line x1={PAD.l} y1={yS(v)} x2={VW-PAD.r} y2={yS(v)} stroke={C.border} strokeWidth="0.5" strokeDasharray="3,3"/>
+            <text x={PAD.l-6} y={yS(v)} textAnchor="end" dominantBaseline="middle" style={{...mono,fontSize:9,fill:C.muted}}>
+              {v<0?"-":""}${Math.abs(v).toFixed(0)}
+            </text>
+          </g>
+        ))}
+        <line x1={PAD.l} y1={zY} x2={VW-PAD.r} y2={zY} stroke={C.muted} strokeWidth="1" strokeOpacity="0.4"/>
+        <path d={fillD} fill="url(#pg)"/>
+        <polyline points={linePts} fill="none" stroke={lc} strokeWidth="2" strokeLinejoin="round"/>
+        <circle cx={xS(pts.length-1)} cy={yS(vals[vals.length-1])} r="4" fill={lc} stroke="white" strokeWidth="1.5"/>
+        {xIdxs.map(i => (
+          <text key={i} x={xS(i)} y={VH-4} textAnchor="middle" style={{...mono,fontSize:9,fill:C.muted}}>
+            {pts[i].date.slice(5)}
+          </text>
+        ))}
+      </svg>
+    );
+  }
+
+  const cards = [
+    { label:"Total P&L",      value:fmtDol(stats.total_pnl,true),            color:pnlCol(stats.total_pnl),            sub:"realized + unrealized" },
+    { label:"Realized P&L",   value:fmtDol(stats.total_realized_pnl,true),   color:pnlCol(stats.total_realized_pnl),   sub:`${stats.total_trades} closed trades` },
+    { label:"Unrealized P&L", value:fmtDol(stats.total_unrealized_pnl,true), color:pnlCol(stats.total_unrealized_pnl), sub:`${stats.open_count} open positions` },
+    { label:"Today's P&L",    value:fmtDol(stats.today_pnl,true),            color:pnlCol(stats.today_pnl),            sub:new Date().toLocaleDateString("en-US",{weekday:"short"}) },
+    { label:"Win Rate",       value:stats.win_rate!=null?`${stats.win_rate}%`:"—", color:stats.win_rate>50?C.bull:stats.win_rate<50?C.bear:C.muted,
+      sub:`avg W ${fmtDol(stats.avg_win)} / L ${fmtDol(stats.avg_loss)}` },
+    { label:"Net Liquidation", value:fmtDol(account.net_liquidation),         color:C.accent,                           sub:account.account||"—" },
+  ];
+
+  return (
+    <div style={{animation:"fadeIn 0.2s ease"}}>
+      {/* Header row */}
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}>
+        <div style={{...sans,fontSize:10,textTransform:"uppercase",letterSpacing:2,color:C.muted}}>P&amp;L Dashboard</div>
+        <div style={{display:"flex",gap:10,alignItems:"center"}}>
+          {loading && <Spinner/>}
+          <span style={{...mono,fontSize:11,color:C.muted}}>refresh in {countdown}s</span>
+          <Btn onClick={load} color={C.accent}>↻ Refresh Now</Btn>
+        </div>
+      </div>
+
+      {/* Summary cards */}
+      <div style={{display:"grid",gridTemplateColumns:"repeat(6,1fr)",gap:10,marginBottom:20}}>
+        {cards.map(c => (
+          <Card key={c.label} style={{textAlign:"center",padding:"12px 8px"}}>
+            <div style={{...sans,fontSize:10,color:C.muted,textTransform:"uppercase",letterSpacing:1,marginBottom:6}}>{c.label}</div>
+            <div style={{...mono,fontSize:16,fontWeight:800,color:c.color,marginBottom:4}}>{c.value}</div>
+            <div style={{...sans,fontSize:10,color:C.muted}}>{c.sub}</div>
+          </Card>
+        ))}
+      </div>
+
+      {/* Chart */}
+      <Card style={{marginBottom:20}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
+          <div style={{...sans,fontSize:10,textTransform:"uppercase",letterSpacing:2,color:C.muted}}>Cumulative Realized P&amp;L</div>
+          {daily_pnl.length > 0 && (
+            <div style={{display:"flex",gap:20}}>
+              <span style={{...mono,fontSize:11,color:C.muted}}>Best day: <span style={{color:C.bull}}>{fmtDol(Math.max(...daily_pnl.map(d=>d.pnl)),true)}</span></span>
+              <span style={{...mono,fontSize:11,color:C.muted}}>Worst day: <span style={{color:C.bear}}>{fmtDol(Math.min(...daily_pnl.map(d=>d.pnl)),true)}</span></span>
+              <span style={{...mono,fontSize:11,color:C.muted}}>Total: <span style={{color:pnlCol(stats.total_realized_pnl)}}>{fmtDol(stats.total_realized_pnl,true)}</span></span>
+            </div>
+          )}
+        </div>
+        <PnLChart/>
+      </Card>
+
+      {/* Open positions + Exit breakdown */}
+      <div style={{display:"grid",gridTemplateColumns:"3fr 2fr",gap:16,marginBottom:20}}>
+        <Card>
+          <div style={{...sans,fontSize:10,textTransform:"uppercase",letterSpacing:2,color:C.muted,marginBottom:12}}>Open Positions ({open_positions.length})</div>
+          {open_positions.length === 0
+            ? <div style={{...sans,fontSize:13,color:C.muted,padding:"20px 0",textAlign:"center"}}>No open positions</div>
+            : <div style={{overflowX:"auto"}}>
+                <table style={{fontSize:12}}>
+                  <thead><tr>{["Ticker","Type","Strike","Expiry","DTE","Qty","Entry","Value","IV","Roll#"].map(h=>(
+                    <th key={h} style={{...mono,fontSize:10,color:C.muted,fontWeight:600,paddingBottom:8}}>{h}</th>
+                  ))}</tr></thead>
+                  <tbody>{open_positions.map(t => {
+                    const dte = fmtDTE(t.expiry);
+                    const val = ((t.entry_price||0)*(t.qty||1)*100).toFixed(0);
+                    return (
+                      <tr key={t.id}>
+                        <td style={{...mono,fontWeight:700,color:C.accent}}>{t.ticker}</td>
+                        <td><Pill color={t.action==="BUY"?C.bull:C.bear}>{(t.strategy_type||t.action||"").toUpperCase()}</Pill></td>
+                        <td style={{...mono}}>${t.strike}</td>
+                        <td style={{...mono,fontSize:11}}>{t.expiry?`${t.expiry.slice(0,4)}-${t.expiry.slice(4,6)}-${t.expiry.slice(6,8)}`:"—"}</td>
+                        <td style={{...mono,color:dte<21?C.bear:dte<30?C.neutral:C.muted}}>{dte}</td>
+                        <td style={{...mono}}>{t.qty}</td>
+                        <td style={{...mono}}>${(t.entry_price||0).toFixed(2)}</td>
+                        <td style={{...mono}}>${val}</td>
+                        <td style={{...mono}}>{t.live_iv_entry?`${Number(t.live_iv_entry).toFixed(0)}%`:"—"}</td>
+                        <td style={{...mono,color:C.muted}}>{t.roll_count||0}</td>
+                      </tr>
+                    );
+                  })}</tbody>
+                </table>
+              </div>
+          }
+        </Card>
+
+        <Card>
+          <div style={{...sans,fontSize:10,textTransform:"uppercase",letterSpacing:2,color:C.muted,marginBottom:12}}>Exit Breakdown</div>
+          {Object.keys(exit_breakdown).length === 0
+            ? <div style={{...sans,fontSize:13,color:C.muted,padding:"20px 0",textAlign:"center"}}>No closed trades yet</div>
+            : <table style={{fontSize:12}}>
+                <thead><tr>{["Reason","Count","Total","Avg"].map(h=>(
+                  <th key={h} style={{...mono,fontSize:10,color:C.muted,fontWeight:600,paddingBottom:8}}>{h}</th>
+                ))}</tr></thead>
+                <tbody>{Object.entries(exit_breakdown).sort((a,b)=>b[1].count-a[1].count).map(([reason,d])=>(
+                  <tr key={reason}>
+                    <td><Pill color={d.pnl>=0?C.bull:C.bear}>{reason}</Pill></td>
+                    <td style={{...mono}}>{d.count}</td>
+                    <td style={{...mono,color:pnlCol(d.pnl)}}>{fmtDol(d.pnl,true)}</td>
+                    <td style={{...mono,color:pnlCol(d.count>0?d.pnl/d.count:0)}}>{fmtDol(d.count>0?d.pnl/d.count:0,true)}</td>
+                  </tr>
+                ))}</tbody>
+              </table>
+          }
+
+          {portfolio && portfolio.length > 0 && <>
+            <div style={{height:1,background:C.border,margin:"16px 0"}}/>
+            <div style={{...sans,fontSize:10,textTransform:"uppercase",letterSpacing:2,color:C.muted,marginBottom:10}}>IBKR Live Portfolio</div>
+            <table style={{fontSize:12}}>
+              <thead><tr>{["Ticker","Type","Strike","Pos","Mkt Val","Unrealized"].map(h=>(
+                <th key={h} style={{...mono,fontSize:10,color:C.muted,fontWeight:600,paddingBottom:8}}>{h}</th>
+              ))}</tr></thead>
+              <tbody>{portfolio.map((p,i)=>(
+                <tr key={i}>
+                  <td style={{...mono,fontWeight:700,color:C.accent}}>{p.ticker}</td>
+                  <td style={{...mono,fontSize:11}}>{p.sec_type}{p.right?` ${p.right}`:""}</td>
+                  <td style={{...mono}}>{p.strike?`$${p.strike}`:"—"}</td>
+                  <td style={{...mono}}>{p.position}</td>
+                  <td style={{...mono}}>{fmtDol(p.market_value)}</td>
+                  <td style={{...mono,fontWeight:700,color:pnlCol(p.unrealized_pnl)}}>{fmtDol(p.unrealized_pnl,true)}</td>
+                </tr>
+              ))}</tbody>
+            </table>
+          </>}
+        </Card>
+      </div>
+
+      {/* Closed trades table */}
+      <Card>
+        <div style={{...sans,fontSize:10,textTransform:"uppercase",letterSpacing:2,color:C.muted,marginBottom:12}}>
+          Recent Closed Trades ({closed_trades.length})
+        </div>
+        {closed_trades.length === 0
+          ? <div style={{...sans,fontSize:13,color:C.muted,padding:"20px 0",textAlign:"center"}}>No closed trades yet</div>
+          : <div style={{overflowX:"auto"}}>
+              <table style={{fontSize:12}}>
+                <thead><tr>{["Ticker","Type","Strike","Opened","Closed","Days","P&L","P&L%","Exit Reason","W/L"].map(h=>(
+                  <th key={h} style={{...mono,fontSize:10,color:C.muted,fontWeight:600,paddingBottom:8}}>{h}</th>
+                ))}</tr></thead>
+                <tbody>{closed_trades.map(t => {
+                  const days = Math.max(0, Math.round((new Date(t.closed_at)-new Date(t.opened_at))/86400000));
+                  const exitCol = (t.exit_reason||"").includes("profit") ? C.bull : (t.exit_reason||"").includes("stop")||( t.exit_reason||"").includes("loss") ? C.bear : C.neutral;
+                  return (
+                    <tr key={t.id}>
+                      <td style={{...mono,fontWeight:700,color:C.accent}}>{t.ticker}</td>
+                      <td><Pill color={t.action==="BUY"?C.bull:C.bear}>{(t.strategy_type||t.action||"").toUpperCase()}</Pill></td>
+                      <td style={{...mono}}>${t.strike}</td>
+                      <td style={{...mono,fontSize:11,color:C.muted}}>{fmtDT(t.opened_at)}</td>
+                      <td style={{...mono,fontSize:11,color:C.muted}}>{fmtDT(t.closed_at)}</td>
+                      <td style={{...mono}}>{days}d</td>
+                      <td style={{...mono,fontWeight:700,color:pnlCol(t.pnl)}}>{fmtDol(t.pnl,true)}</td>
+                      <td style={{...mono,color:pnlCol(t.pnl_pct)}}>{t.pnl_pct!=null?`${Number(t.pnl_pct).toFixed(1)}%`:"—"}</td>
+                      <td><Pill color={exitCol}>{t.exit_reason||"—"}</Pill></td>
+                      <td style={{...mono,fontWeight:700,color:t.win===1?C.bull:t.win===0?C.bear:C.muted}}>{t.win===1?"W":t.win===0?"L":"—"}</td>
+                    </tr>
+                  );
+                })}</tbody>
+              </table>
+            </div>
+        }
+      </Card>
+    </div>
+  );
+}
+
 // ── Root App ──────────────────────────────────────────────────────────────
 function App() {
-  const [tab, setTab]         = useState("signals");
+  const [tab, setTab]         = useState("pnl");
   const [connected, setConn]  = useState(false);
   const [netDelta, setDelta]  = useState(null);
 
@@ -2411,6 +2666,7 @@ function App() {
   }, [connected]);
 
   const tabs = [
+    { id:"pnl",        label:"P&L"         },
     { id:"signals",    label:"Signals"     },
     { id:"csp",        label:"CSP Scan"    },
     { id:"leaps",      label:"LEAPs"       },
@@ -2463,6 +2719,7 @@ function App() {
         </div>
 
         {/* Tab content — always mounted so state (scan results, params) survives tab switches */}
+        <div style={{display: tab==="pnl"        ? "" : "none"}}><PnLTab /></div>
         <div style={{display: tab==="signals"    ? "" : "none"}}><SignalsTab    connected={connected} /></div>
         <div style={{display: tab==="csp"        ? "" : "none"}}><CSPTab        connected={connected} /></div>
         <div style={{display: tab==="leaps"      ? "" : "none"}}><LEAPTab       connected={connected} /></div>
