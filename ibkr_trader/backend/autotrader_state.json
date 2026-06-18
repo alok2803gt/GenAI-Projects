@@ -1,0 +1,84 @@
+{
+  "enabled": false,
+  "config": {
+    "max_positions": 5,
+    "profit_target_pct": 0.5,
+    "stop_loss_mult": 2.0,
+    "scan_types": [
+      "csp"
+    ],
+    "csp_capital": 20000.0,
+    "leap_capital": 5000.0,
+    "use_kelly": true,
+    "total_capital": 100000.0,
+    "assumed_win_rate": 0.85,
+    "auto_hedge": false,
+    "hedge_threshold": 100.0
+  },
+  "positions": {
+    "IWM_C300.020270617": {
+      "ticker": "IWM",
+      "expiry": "20270617",
+      "strike": 300.0,
+      "right": "C",
+      "action": "BUY",
+      "qty": 1,
+      "entry_price": 28.85,
+      "max_profit": 2885.0,
+      "order_id": 9649,
+      "placed_at": "19:16:15 UTC",
+      "score": 83.83,
+      "journal_id": 275,
+      "live_iv": 22.82
+    },
+    "SPY_C745.020270617": {
+      "ticker": "SPY",
+      "expiry": "20270617",
+      "strike": 745.0,
+      "right": "C",
+      "action": "BUY",
+      "qty": 1,
+      "entry_price": 70.65,
+      "max_profit": 7065.0,
+      "order_id": 10517,
+      "placed_at": "19:28:30 UTC",
+      "score": 83.09,
+      "journal_id": 276,
+      "live_iv": 18.32
+    },
+    "NVDA_C220.020270617": {
+      "ticker": "NVDA",
+      "expiry": "20270617",
+      "strike": 220.0,
+      "right": "C",
+      "action": "BUY",
+      "qty": 1,
+      "entry_price": 36.34,
+      "max_profit": 3634.0,
+      "order_id": 11382,
+      "placed_at": "19:35:53 UTC",
+      "score": 84.24,
+      "journal_id": 277,
+      "live_iv": 43.73
+    },
+    "XLK_C200.020270617": {
+      "ticker": "XLK",
+      "expiry": "20270617",
+      "strike": 200.0,
+      "right": "C",
+      "action": "BUY",
+      "qty": 1,
+      "entry_price": 26.28,
+      "max_profit": 2628.0,
+      "order_id": 12260,
+      "placed_at": "19:58:16 UTC",
+      "score": 84.05,
+      "journal_id": 278,
+      "live_iv": 33.3
+    }
+  },
+  "premium_collected": 0.0,
+  "leap_budget": 0.0,
+  "model_version": 0,
+  "stopped_out": {}
+}

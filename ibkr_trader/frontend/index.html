@@ -949,9 +949,11 @@ function CSPTab({ connected }) {
         );
       })()}
 
-      {!loading && result?.candidates?.length === 0 && (
+      {!loading && result && result.candidates?.length === 0 && (
         <Card style={{ textAlign:"center", padding:"30px 0", color:C.muted, fontSize:13 }}>
-          No CSP candidates met the criteria. Try lowering min return or widening delta.
+          {result.count === 0
+            ? "Scanner returned 0 results — market may be closed, all tickers timed out, or no options meet the DTE window (21–45 days)."
+            : "No CSP candidates pass the recommendation filters. Click \"Show all\" to see everything."}
         </Card>
       )}
 
@@ -1192,9 +1194,11 @@ function LEAPTab({ connected }) {
         );
       })()}
 
-      {!loading && result?.candidates?.length === 0 && (
+      {!loading && result && result.candidates?.length === 0 && (
         <Card style={{ textAlign:"center", padding:"30px 0", color:C.muted, fontSize:13 }}>
-          No LEAP candidates found — market may be closed or no tickers pass quality filter.
+          {result.count === 0
+            ? "Scanner returned 0 results — market may be closed, all tickers timed out, or no tickers pass the delta/IV quality filter."
+            : "No LEAP candidates pass the recommendation filters. Click \"Show all\" to see everything."}
         </Card>
       )}
 
@@ -1449,6 +1453,14 @@ function AutoTraderTab() {
     } catch(e) { alert("Clear failed: " + e.message); }
   };
 
+  const cleanupJournal = async () => {
+    if (!window.confirm("Mark all phantom open journal entries (not tracked by auto-trader and older than 24h) as closed with pnl=$0. This is safe and only affects display. Proceed?")) return;
+    try {
+      const r = await apiFetch("/journal/cleanup", { method: "POST" });
+      alert(`Journal cleanup complete.\nOrphaned entries closed: ${r.orphaned}\nActive tracked: ${r.active_tracked}\n\n${r.message}`);
+    } catch(e) { alert("Cleanup failed: " + e.message); }
+  };
+
   const enabled = status?.enabled || false;
   const positions = status?.positions || {};
   const actLog = [...(status?.log || [])].reverse();
@@ -1510,6 +1522,12 @@ function AutoTraderTab() {
           padding:"8px 16px", fontSize:12, cursor:"pointer",
         }} title="Remove Inactive-order positions from tracking dict so fresh orders can be placed">
           Clear Stale Positions
+        </button>
+        <button onClick={cleanupJournal} style={{
+          background:"#475569", color:"#fff", border:"none", borderRadius:8,
+          padding:"8px 16px", fontSize:12, cursor:"pointer",
+        }} title="Mark phantom open journal entries as closed (safe, display only)">
+          Fix Journal
         </button>
         <button onClick={() => reconnect(7497)} disabled={!!reconnMode} style={{
           background:"#7f8c8d", color:"#fff", border:"none", borderRadius:8,
@@ -2731,7 +2749,7 @@ function App() {
         <div style={{display: tab==="universe"   ? "" : "none"}}><UniverseTab /></div>
 
         <div style={{ marginTop:20, ...sans, fontSize:11, color:C.muted, lineHeight:1.7 }}>
-          Auto-trader: Kelly sizing, trailing stops, auto-hedge. Backtest: 2-yr simulation with BS pricing.
+          Auto-trader: Kelly sizing · 50% profit target · IV-adjusted stops · 21 DTE roll · 48h cooldown. Backtest: 2-yr simulation with BS pricing.
           0DTE: SPY/QQQ/IWM 0–7 DTE puts. Earnings IV: pre-earnings premium plays. Live account: LIVE (7496) button.
         </div>
       </div>

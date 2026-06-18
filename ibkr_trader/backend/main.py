@@ -743,10 +743,13 @@ def _save_iv_history() -> None:
 def _at_save_state() -> None:
     """Persist auto-trader positions + config to disk so a restart is safe."""
     at = state["autotrader"]
+    # Strip legacy keys that no longer exist in the codebase
+    clean_config = {k: v for k, v in at["config"].items() if k != "trailing_exit"}
     payload = {
         "enabled":           at["enabled"],
-        "config":            at["config"],
+        "config":            clean_config,
         "positions":         at["positions"],
+        "stopped_out":       at.get("stopped_out", {}),
         "premium_collected": at["premium_collected"],
         "leap_budget":       at["leap_budget"],
         "model_version":     state.get("model_version", 0),
@@ -769,10 +772,12 @@ def _at_load_state() -> None:
         at["enabled"]           = saved.get("enabled", False)
         at["premium_collected"] = saved.get("premium_collected", 0.0)
         at["leap_budget"]       = saved.get("leap_budget", 0.0)
-        # Merge saved config over defaults (preserves any missing keys)
-        at["config"].update(saved.get("config", {}))
-        # Restore positions — the monitor loop will reconcile against live portfolio
-        at["positions"] = saved.get("positions", {})
+        # Merge saved config over defaults; strip removed keys on load
+        merged = {**saved.get("config", {})}
+        merged.pop("trailing_exit", None)   # removed feature
+        at["config"].update(merged)
+        at["positions"]   = saved.get("positions", {})
+        at["stopped_out"] = saved.get("stopped_out", {})  # restore 48h cooldowns
         state["model_version"] = saved.get("model_version", 0)
         log.info(
             f"Auto-trader state restored: enabled={at['enabled']}, "
@@ -2064,7 +2069,7 @@ async def _autotrader_background() -> None:
         loop = asyncio.get_event_loop()
         market_open = _is_market_open()
         try:
-            # Monitor runs always — catches trailing stops / profit targets on any open positions
+            # Monitor runs always — checks profit targets, hard stops, and 21-DTE rolls
             await loop.run_in_executor(
                 None,
                 lambda: _run_in_streaming_loop(_autotrader_monitor_coro(ib), timeout=30),
@@ -3803,18 +3808,14 @@ async def _portfolio_positions(ib: IB) -> dict:
 class AutoTraderConfigRequest(BaseModel):
     enabled:            bool      = False
     max_positions:      int       = 5
-    profit_target_pct:  float     = 0.65
-    stop_loss_mult:     float     = 5.0
+    profit_target_pct:  float     = 0.50
+    stop_loss_mult:     float     = 2.0
     scan_types:         List[str] = ["csp"]
     csp_capital:        float     = 20000.0
     leap_capital:       float     = 5000.0
-    # Kelly
     use_kelly:          bool      = True
     total_capital:      float     = 100000.0
     assumed_win_rate:   float     = 0.85
-    # Trailing exit
-    trailing_exit:      bool      = True
-    # Auto-hedge
     auto_hedge:         bool      = False
     hedge_threshold:    float     = 100.0
 
@@ -3952,15 +3953,22 @@ def cancel_order(order_id: int):
 
 
 @app.post("/orders/cancel-inactive")
-def cancel_inactive_orders():
+async def cancel_inactive_orders():
     """Cancel all Inactive orders using reqGlobalCancel (handles cross-session orders)."""
     _require_connection()
     ib = state["ib"]
-    stale_ids = [t.order.orderId for t in ib.openTrades() if t.orderStatus.status == "Inactive"]
-    # reqGlobalCancel cancels ALL open orders for this account regardless of session/clientId.
-    # Regular cancelOrder only works for orders placed by the current connection.
-    ib.client.reqGlobalCancel()
-    _at_log("SYSTEM", f"reqGlobalCancel sent — cancelling {len(stale_ids)} Inactive orders: {stale_ids}")
+
+    async def _do_cancel(ib: IB):
+        stale_ids = [t.order.orderId for t in ib.openTrades() if t.orderStatus.status == "Inactive"]
+        ib.client.reqGlobalCancel()
+        _at_log("SYSTEM", f"reqGlobalCancel sent — cancelling {len(stale_ids)} Inactive orders: {stale_ids}")
+        return stale_ids
+
+    loop = asyncio.get_event_loop()
+    stale_ids = await loop.run_in_executor(
+        None,
+        lambda: _run_in_streaming_loop(_do_cancel(ib), timeout=10),
+    )
     return {"ok": True, "cancelled": stale_ids, "count": len(stale_ids), "method": "reqGlobalCancel"}
 
 
@@ -4025,7 +4033,20 @@ def account_summary():
 @app.get("/autotrader/status")
 def autotrader_status():
     """Return current auto-trader state, config, positions, and log."""
-    return state["autotrader"]
+    at = state["autotrader"]
+    # Return a snapshot copy so concurrent writes don't race with JSON serialization.
+    # Config is shallow-copied and trailing_exit stripped so it never appears in API.
+    clean_cfg = {k: v for k, v in at["config"].items() if k != "trailing_exit"}
+    return {
+        "enabled":           at["enabled"],
+        "config":            clean_cfg,
+        "positions":         dict(at["positions"]),
+        "stopped_out":       dict(at.get("stopped_out", {})),
+        "log":               list(at["log"]),
+        "last_run":          at.get("last_run"),
+        "premium_collected": at.get("premium_collected", 0.0),
+        "leap_budget":       at.get("leap_budget", 0.0),
+    }
 
 
 @app.post("/autotrader/config")
@@ -4033,7 +4054,9 @@ def update_autotrader_config(req: AutoTraderConfigRequest):
     """Enable/disable the auto-trader and update its config."""
     was = state["autotrader"]["enabled"]
     state["autotrader"]["enabled"] = req.enabled
-    state["autotrader"]["config"].update({
+    cfg = state["autotrader"]["config"]
+    cfg.pop("trailing_exit", None)  # clean any stale key on every save
+    cfg.update({
         "max_positions":     req.max_positions,
         "profit_target_pct": req.profit_target_pct,
         "stop_loss_mult":    req.stop_loss_mult,
@@ -4043,7 +4066,6 @@ def update_autotrader_config(req: AutoTraderConfigRequest):
         "use_kelly":         req.use_kelly,
         "total_capital":     req.total_capital,
         "assumed_win_rate":  req.assumed_win_rate,
-        "trailing_exit":     req.trailing_exit,
         "auto_hedge":        req.auto_hedge,
         "hedge_threshold":   req.hedge_threshold,
     })
@@ -4218,13 +4240,14 @@ async def reconnect_endpoint(req: ReconnectRequest):
 def get_journal(limit: int = Query(100, description="Most recent N trades")):
     """Return completed and open trade journal entries."""
     con = sqlite3.connect(JOURNAL_DB_PATH, check_same_thread=False)
-    rows = con.execute(
+    total = con.execute("SELECT COUNT(*) FROM trade_journal").fetchone()[0]
+    rows  = con.execute(
         "SELECT * FROM trade_journal ORDER BY id DESC LIMIT ?", (limit,)
     ).fetchall()
     cols = [d[0] for d in con.execute("SELECT * FROM trade_journal LIMIT 0").description or []]
     con.close()
     trades = [dict(zip(cols, r)) for r in rows]
-    return {"trades": trades, "count": len(trades)}
+    return {"trades": trades, "count": len(trades), "total": total}
 
 
 @app.get("/journal/stats")
@@ -4347,6 +4370,19 @@ def pnl_dashboard():
     total_realized   = round(sum(closed_pnls), 2) if closed_pnls else 0.0
     total_unrealized = round(float(acct.get("unrealized_pnl") or 0), 2)
 
+    # Only show open positions that are actively tracked or opened in the last 7 days.
+    # This prevents 200+ orphaned journal rows from flooding the UI.
+    tracked_ids     = {
+        info.get("journal_id")
+        for info in state["autotrader"].get("positions", {}).values()
+        if info.get("journal_id") is not None
+    }
+    recent_cutoff  = (datetime.utcnow() - timedelta(days=7)).isoformat()
+    visible_open   = [
+        t for t in open_trades
+        if t["id"] in tracked_ids or (t.get("opened_at") or "") >= recent_cutoff
+    ]
+
     return {
         "account": acct,
         "stats": {
@@ -4362,11 +4398,51 @@ def pnl_dashboard():
             "best_trade":           round(max(closed_pnls), 2) if closed_pnls else 0,
             "worst_trade":          round(min(closed_pnls), 2) if closed_pnls else 0,
         },
-        "open_positions": open_trades[-20:],
+        "open_positions": visible_open[-20:],
         "closed_trades":  closed_trades[:30],
         "daily_pnl":      daily_pnl,
         "portfolio":      portfolio_items,
         "exit_breakdown": exit_breakdown,
+    }
+
+
+@app.post("/journal/cleanup")
+def journal_cleanup():
+    """
+    Mark phantom open journal entries as closed (exit_reason='orphaned').
+
+    An entry is orphaned when closed_at IS NULL but is not tracked in the
+    current autotrader positions dict AND was opened more than 24 hours ago.
+    Entries opened within the last 24 h are left alone — they may still be
+    working orders waiting to fill.
+    """
+    active_journal_ids: set = {
+        info.get("journal_id")
+        for info in state["autotrader"].get("positions", {}).values()
+        if info.get("journal_id") is not None
+    }
+    cutoff = (datetime.utcnow() - timedelta(hours=24)).isoformat()
+    con = sqlite3.connect(JOURNAL_DB_PATH, check_same_thread=False)
+    # Fetch all open entries older than 24 h
+    rows = con.execute(
+        "SELECT id FROM trade_journal WHERE closed_at IS NULL AND opened_at < ?",
+        (cutoff,),
+    ).fetchall()
+    orphan_ids = [r[0] for r in rows if r[0] not in active_journal_ids]
+    if orphan_ids:
+        con.execute(
+            f"UPDATE trade_journal SET closed_at=?, exit_reason='orphaned', win=0, pnl=0, pnl_pct=0 "
+            f"WHERE id IN ({','.join('?' * len(orphan_ids))})",
+            [datetime.utcnow().isoformat()] + orphan_ids,
+        )
+        con.commit()
+    con.close()
+    log.info("Journal cleanup: marked %d orphaned entries as closed", len(orphan_ids))
+    return {
+        "ok": True,
+        "orphaned": len(orphan_ids),
+        "active_tracked": len(active_journal_ids),
+        "message": f"Closed {len(orphan_ids)} phantom open entries (pnl=$0, exit_reason=orphaned)",
     }
 
 
