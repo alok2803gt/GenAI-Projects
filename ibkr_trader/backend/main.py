@@ -1441,15 +1441,29 @@ async def _autotrader_monitor_coro(ib: IB) -> None:
             await _autotrader_close_coro(ib, item, info, key)
             continue
 
-        # ── 2. Hard stop-loss ─────────────────────────────────────────────
-        # CSP: 2× premium received (200% rule — industry standard)
-        # LEAP: 50% of premium paid (limit to half the initial outlay)
-        stop_threshold = (-stop_mult * max_profit if action == "SELL"
-                          else -0.50 * max_profit)
+        # ── 2. Hard stop-loss (IV-adjusted for high-vol underlyings) ────────
+        # CSP: base 2× premium; widened for high-IV options so normal vol
+        #   swings don't fire the stop prematurely (NVDA/QCOM backtest showed
+        #   high-vol names need more room — 5× outperformed 2× in 1-yr test).
+        # LEAP: 50% of cost paid regardless of IV.
+        live_iv = float(info.get("live_iv") or 0)
+        if action == "SELL":
+            if live_iv > 70:
+                eff_stop_mult = 4.0   # high IV (QCOM 108%, ON 80%) — wide stop
+            elif live_iv > 40:
+                eff_stop_mult = 3.0   # medium-high IV (NET 61%) — moderate
+            else:
+                eff_stop_mult = stop_mult  # normal IV — use config value (2×)
+            stop_threshold = -eff_stop_mult * max_profit
+        else:
+            eff_stop_mult  = 0.50
+            stop_threshold = -0.50 * max_profit
+
         if upnl <= stop_threshold:
             ticker = info.get("ticker", key.split("_")[0])
             at.setdefault("stopped_out", {})[ticker] = datetime.utcnow().isoformat()
-            _at_log("CLOSE", f"{key}: stop-loss hit (${upnl:.0f}, threshold=${stop_threshold:.0f})")
+            _at_log("CLOSE",
+                    f"{key}: stop-loss hit (${upnl:.0f}, {eff_stop_mult}× threshold=${stop_threshold:.0f}, IV={live_iv:.0f}%)")
             info["exit_reason"] = "stop_loss"
             await _autotrader_close_coro(ib, item, info, key)
             continue
@@ -1553,11 +1567,12 @@ async def _autotrader_roll_coro(ib: IB, item, info: dict, key: str) -> None:
         new_fill    = round(new_bid + (new_mid - new_bid) * 0.40, 2)  # our expected fill
 
         # ── Guard 2: net credit check ─────────────────────────────────────────
+        # Research minimum: $0.30/share to justify roll complexity + commissions
         net_credit = round(new_fill - buyback_ask, 2)
-        if net_credit < 0.10:
+        if net_credit < 0.30:
             _at_log("ROLL",
-                    f"{ticker}: net debit roll (${net_credit:.2f}/sh, buyback=${buyback_ask:.2f}, "
-                    f"new=${new_fill:.2f}) — closing and adding to cooldown")
+                    f"{ticker}: roll credit ${net_credit:.2f}/sh below $0.30 minimum "
+                    f"(buyback=${buyback_ask:.2f}, new=${new_fill:.2f}) — closing + cooldown")
             info["exit_reason"] = "roll_no_credit"
             state["autotrader"].setdefault("stopped_out", {})[ticker] = datetime.utcnow().isoformat()
             await _autotrader_close_coro(ib, item, info, key)
