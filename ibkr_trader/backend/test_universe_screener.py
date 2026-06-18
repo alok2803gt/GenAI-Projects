@@ -41,7 +41,7 @@ def pytest_configure(config):
 #  Synthetic data helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-_N = 65  # matches download period in _screen_universe
+_N = 65  # mock DataFrame size — 65 bars covers SMA-50, RSI-14, and HV rank computation
 
 
 def _make_df(ticker_data: dict, n: int = _N) -> pd.DataFrame:
@@ -96,6 +96,15 @@ def _rsi_oversold(n=_N, start=120.0) -> list:
     c = [start - i * 0.5 for i in range(n - 14)]
     for _ in range(12): c.append(c[-1] - 2.0)
     for _ in range(2):  c.append(c[-1] + 0.3)
+    return c
+
+
+def _vol_regime_change(n=_N, start=100.0) -> list:
+    """Low vol first half, high vol second half → HV range is non-trivial → hv_proxy iv_rank ≈ 100%."""
+    c = [start]
+    for i in range(n - 1):
+        amp = 0.2 if i < n // 2 else 3.0
+        c.append(c[-1] + amp * (1 if i % 2 == 0 else -1))
     return c
 
 
@@ -294,13 +303,13 @@ class TestScreenUniverseScoring:
 
     def test_rsi_sweet_spot_preferred_over_overbought(self):
         """
-        GOOD: RSI≈50 (+25), SMA borderline (0), 2M vol (+15) = 40
-        BAD:  RSI≈97 (-10), SMA True (+25), 2M vol (+15) = 30
-        FILL: RSI≈50 (+25), SMA borderline (0), 600K (+5) = 30
+        GOOD: RSI≈50 (+25), SMA borderline (0), 2M vol (+15), HV rank≈100% (+20) = 60
+        BAD:  RSI≈97 (-10), SMA True (+25), 2M vol (+15), HV rank≈99% (+20) = 50
+        Both get similar HV rank from their variable-vol price series; RSI gap dominates.
         """
         result = self._top1(
-            {"closes": _rsi_neutral(),    "volumes": [2_000_000] * _N},
-            {"closes": _rsi_overbought(), "volumes": [2_000_000] * _N},
+            {"closes": _vol_regime_change(), "volumes": [2_000_000] * _N},
+            {"closes": _rsi_overbought(),    "volumes": [2_000_000] * _N},
         )
         assert result == ["GOOD"], f"Expected ['GOOD'], got {result}"
 
@@ -337,6 +346,36 @@ class TestScreenUniverseScoring:
         result = _run_screen(data, top_n=1)
         assert result == ["WITHIV"], f"Expected ['WITHIV'], got {result}"
 
+    def test_hv_proxy_populates_iv_rank_without_iv_history(self):
+        """Without iv_history, HV rank from price history fills iv_rank and marks hv_proxy=True."""
+        data = {
+            "HVTICK": {"closes": _vol_regime_change(), "volumes": [2_000_000] * _N},
+            **_FILLER,
+        }
+        _run_screen(data, top_n=5)
+        rows = {r["ticker"]: r for r in state["universe_scores"]}
+        row = rows.get("HVTICK")
+        assert row is not None, "HVTICK should appear in universe_scores"
+        assert row["iv_rank"] is not None, "HV proxy should populate iv_rank from price history"
+        assert row["hv_proxy"] is True, "hv_proxy should be True when using price-based HV"
+
+    def test_iv_history_overrides_hv_proxy(self):
+        """When iv_history has ≥20 entries, real IV rank is used and hv_proxy=False."""
+        state["iv_history"]["REALIV"] = [
+            {"date": f"2026-{m:02d}-01", "iv": 0.25 + 0.01 * i}
+            for i, m in enumerate(range(1, 25))
+        ]
+        data = {
+            "REALIV": {"closes": _vol_regime_change(), "volumes": [2_000_000] * _N},
+            **_FILLER,
+        }
+        _run_screen(data, top_n=5)
+        rows = {r["ticker"]: r for r in state["universe_scores"]}
+        row = rows.get("REALIV")
+        assert row is not None, "REALIV should appear in universe_scores"
+        assert row["iv_rank"] is not None
+        assert row["hv_proxy"] is False, "hv_proxy should be False when real iv_history is used"
+
     def test_continuity_bonus_for_incumbent_ticker(self):
         """Ticker already in CSP_UNIVERSE gets +5 to break ties."""
         main.CSP_UNIVERSE.clear()
@@ -364,7 +403,7 @@ class TestScreenUniverseStateUpdates:
 
     def test_scores_have_expected_fields(self):
         self._run_good()
-        required = {"ticker", "score", "price", "avg_vol_30d", "rsi14", "above_sma50"}
+        required = {"ticker", "score", "price", "avg_vol_30d", "rsi14", "above_sma50", "iv_rank", "hv_proxy"}
         for row in state["universe_scores"]:
             missing = required - set(row.keys())
             assert not missing, f"Score row missing: {missing}"

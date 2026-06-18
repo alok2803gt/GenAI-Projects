@@ -382,6 +382,14 @@ async def streaming_loop_async() -> None:
                     ctx["known"] = set()
                     state["subscriptions"].clear()
                     log.info("IBKR reconnected (1102) — re-subscribing all tickers within 10 s")
+                elif errorCode in (2104, 2106, 2158, 2119):
+                    pass  # benign farm/connectivity notifications
+                elif 100 <= errorCode < 10000:
+                    sym = getattr(contract, "symbol", "") if contract else ""
+                    msg = f"IBKR error {errorCode} reqId={reqId} {sym}: {errorString}"
+                    log.warning(msg)
+                    if errorCode in (201, 202, 203, 321, 10147, 10148):
+                        _at_log("IBKR-ERR", msg)
 
             ib.errorEvent += _on_ib_error
 
@@ -392,6 +400,20 @@ async def streaming_loop_async() -> None:
             state["ib"] = ib
             state["connected"] = True
             state["error"] = None
+
+            # Cancel any Inactive orders left over from previous sessions.
+            # Inactive orders are stuck in TWS (not sent to exchange) and can
+            # trigger IBKR's duplicate-order suppression on subsequent placements.
+            await asyncio.sleep(1)   # give TWS a moment to send us existing orders
+            stale = [t for t in ib.openTrades() if t.orderStatus.status == "Inactive"]
+            for t in stale:
+                try:
+                    ib.cancelOrder(t.order)
+                except Exception:
+                    pass
+            if stale:
+                log.info(f"Cancelled {len(stale)} stale Inactive orders from previous session")
+                _at_log("SYSTEM", f"Cancelled {len(stale)} stale Inactive orders on reconnect")
 
             ctx["known"] = await _subscribe_pending(ib, ctx["known"])
 
@@ -1027,10 +1049,8 @@ def _build_warnings(earnings_days: Optional[int], iv_rank: float, mode: str = "c
     warnings: List[str] = []
     if earnings_days is not None and earnings_days <= EARNINGS_WARN_DAYS:
         warnings.append(f"Earnings in {earnings_days}d")
-    if mode == "csp" and iv_rank < IV_RANK_MIN_CSP:
-        warnings.append(f"Low IV rank ({iv_rank:.0f})")
-    if mode == "leap" and iv_rank > 75:
-        warnings.append(f"High IV rank ({iv_rank:.0f}) — expensive premium")
+    # IV rank thresholds are enforced as direct numeric filters in _filter_csp_recommended
+    # and _filter_leap_recommended — no need to double-block via warnings here.
     return warnings
 
 
@@ -1101,7 +1121,7 @@ async def _screen_universe(top_n: int = 25) -> Optional[List[str]]:
     """
     Screen CANDIDATE_POOL (~155 tickers) with yfinance bulk download.
     Criteria: price $20-$800, 30-day ADV >500K shares, above SMA-50,
-              RSI-14 in 40-65 range, IV rank >25% (from iv_history if available).
+              RSI-14 in 40-65 range, IV rank >25% (real iv_history or HV proxy).
     Returns top_n tickers by composite score, or None on failure.
     """
     log.info("Universe screen: scoring %d candidates → top %d", len(CANDIDATE_POOL), top_n)
@@ -1109,7 +1129,7 @@ async def _screen_universe(top_n: int = 25) -> Optional[List[str]]:
         def _bulk_dl():
             return yf.download(
                 CANDIDATE_POOL,
-                period="65d",
+                period="1y",
                 interval="1d",
                 group_by="ticker",
                 auto_adjust=True,
@@ -1157,14 +1177,33 @@ async def _screen_universe(top_n: int = 25) -> Optional[List[str]]:
                 rs_val = gain.iloc[-1] / (loss.iloc[-1] if loss.iloc[-1] != 0 else float("nan"))
                 rsi = float(100 - 100 / (1 + rs_val)) if not np.isnan(rs_val) else 50.0
 
-                # IV rank from persisted iv_history (free — already computed)
+                # IV rank: prefer persisted iv_history (real IV); fall back to
+                # 30d rolling HV rank computed from the downloaded 1-year series.
+                # HV rank tracks IV rank directionally and is always available
+                # without extra API calls. Upgrades to real IV once 20 daily
+                # iv_history entries accumulate.
                 iv_rank: Optional[int] = None
+                hv_proxy = False
                 hist = state.get("iv_history", {}).get(ticker, [])
                 if len(hist) >= 20:
                     ivs = [h["iv"] for h in hist]
                     iv_range = max(ivs) - min(ivs)
                     if iv_range > 0:
                         iv_rank = int((ivs[-1] - min(ivs)) / iv_range * 100)
+                else:
+                    try:
+                        rets = closes.pct_change().dropna()
+                        hv_series = rets.rolling(30).std().dropna() * math.sqrt(252)
+                        if len(hv_series) >= 20:
+                            hv_cur = float(hv_series.iloc[-1])
+                            hv_lo  = float(hv_series.min())
+                            hv_hi  = float(hv_series.max())
+                            if hv_hi > hv_lo:
+                                iv_rank = int(round(min(max(
+                                    (hv_cur - hv_lo) / (hv_hi - hv_lo) * 100, 0), 100)))
+                                hv_proxy = True
+                    except Exception:
+                        pass
 
                 # ── Composite score ──────────────────────────────────────
                 score = 0.0
@@ -1210,6 +1249,7 @@ async def _screen_universe(top_n: int = 25) -> Optional[List[str]]:
                     "rsi14":       round(rsi, 1),
                     "above_sma50": above_sma50,
                     "iv_rank":     iv_rank,
+                    "hv_proxy":    hv_proxy,
                 })
             except Exception as _e:
                 log.debug("Screen [%s]: %s", ticker, _e)
@@ -1291,7 +1331,8 @@ def _filter_csp_recommended(candidates: list) -> list:
 def _filter_leap_recommended(candidates: list) -> list:
     clean = [r for r in candidates
              if len(r.get("warnings", [])) == 0
-             and r["liquidity_score"] >= 60]
+             and r["liquidity_score"] >= 60
+             and r.get("iv_rank", 50) <= 75]   # avoid buying when IV is too elevated
     for r in clean:
         ls = _learned_score(r)
         r["learned_score"] = ls
@@ -1485,14 +1526,21 @@ async def _autotrader_scan_and_trade_coro(ib: IB) -> None:
         _at_log("REGIME", f"NEUTRAL market (VIX={vix:.1f}) — allowing entries at reduced Kelly (0.6x)")
 
     # ── Position slot check ───────────────────────────────────────────────────
-    managed  = set(at["positions"])
-    active_t = {item.contract.symbol for item in ib.portfolio()
-                if _at_contract_key(item.contract) in managed}
+    # Dedup uses the positions DICT (not live portfolio) so that Inactive orders
+    # (accepted by TWS but not transmitted to exchange) still prevent re-placement.
+    # Using ib.portfolio() alone was the bug: Inactive orders never appear in
+    # the portfolio, so every scan cycle treated all slots as empty and placed
+    # 5 fresh duplicate orders.
+    dict_t   = {k.split("_")[0] for k in at["positions"]}
+    # Also include any portfolio positions not yet in our dict (edge case after manual trades)
+    portf_t  = {item.contract.symbol for item in ib.portfolio()}
+    active_t = dict_t | portf_t
     # In NEUTRAL, cap at half of max_positions to stay conservative
     max_slots = cfg["max_positions"] if regime == "BULL" else max(1, cfg["max_positions"] // 2)
-    slots = max_slots - len(active_t)
+    # Slot count is based on the positions dict length so Inactive orders consume slots
+    slots = max_slots - len(at["positions"])
     if slots <= 0:
-        _at_log("SCAN", "Max positions filled — skipping scan")
+        _at_log("SCAN", f"Max positions reached ({len(at['positions'])}/{cfg['max_positions']}) — skipping scan")
         return
     _at_log("SCAN", f"Scanning for up to {slots} new positions (regime={regime})…")
 
@@ -1558,6 +1606,7 @@ async def _autotrader_place_coro(ib: IB, row: dict, cfg: dict, regime: str = "BU
     # ── Live IBKR/OPRA price for limit order (replaces stale yfinance bid) ──
     live_iv_entry = None
     lmt           = None
+    lmt_src       = "none"
     _flow_abort   = None   # set inside try; raised outside so except doesn't swallow it
     try:
         # 100=option volume, 101=option OI, 106=implied vol, 13=OI (standard)
@@ -1572,6 +1621,7 @@ async def _autotrader_place_coro(ib: IB, row: dict, cfg: dict, regime: str = "BU
                 else (ibkr_ask - (ibkr_ask - ibkr_mid) * 0.40),
                 2,
             )
+            lmt_src = "ibkr"
         if tq.modelGreeks:
             live_iv_entry = round(float(tq.modelGreeks.impliedVol or 0) * 100, 2)
 
@@ -1635,15 +1685,21 @@ async def _autotrader_place_coro(ib: IB, row: dict, cfg: dict, regime: str = "BU
             except Exception:
                 return None
         lmt = await asyncio.get_event_loop().run_in_executor(None, _yf_fallback)
+        lmt_src = "yfinance"
         log.info("Auto-trader: used yfinance fallback price for %s %s $%s%s", ticker, expiry, strike, right)
 
     if not lmt or lmt <= 0:
         raise ValueError(f"Could not price {ticker} {expiry} ${strike}{right}")
 
     trade      = ib.placeOrder(contract, LimitOrder(action, qty, lmt))
-    await asyncio.sleep(1)
+    await asyncio.sleep(2)
+    order_status  = trade.orderStatus.status
+    why_held      = trade.orderStatus.whyHeld or ""
     max_profit = lmt * qty * 100
     key        = _at_contract_key(contract)
+    if order_status == "Inactive":
+        _at_log("WARN", f"Order #{trade.order.orderId} immediately Inactive — whyHeld={why_held!r}. "
+                        "Check TWS permissions or duplicate order suppression.")
 
     # Record entry in journal
     exp_d  = datetime.strptime(expiry[:8], "%Y%m%d").date()
@@ -1680,7 +1736,7 @@ async def _autotrader_place_coro(ib: IB, row: dict, cfg: dict, regime: str = "BU
         "live_iv":     live_iv_entry,
     }
     _at_log("TRADE", f"{action} {qty}x {ticker} {right}{strike} {expiry} @ ${lmt:.2f} "
-                     f"(order #{trade.order.orderId}, journal #{journal_id})")
+                     f"[price_src={lmt_src}] (order #{trade.order.orderId}, status={order_status}, journal #{journal_id})")
     _at_save_state()
 
 
@@ -2218,15 +2274,10 @@ async def scan_csp(
                         exp_move = _expected_weekly_move(stock_price, iv)
                         sigma_otm= (stock_price - K) / exp_move if exp_move > 0 else 0
                         warnings = _build_warnings(earnings_days, iv_info["rank"], "csp")
-                        if not state["opra_active"]:
-                            warnings.append("OPRA not subscribed — quotes may be delayed")
                         if pc_vol_r > 1.5:
                             warnings.append(f"Heavy put flow (P/C vol {pc_vol_r:.1f}x) — bearish sentiment")
                         if vol_oi_ratio > 2.0:
                             warnings.append(f"Unusual put activity at ${K:.0f} (vol/OI {vol_oi_ratio:.1f}x)")
-                        if max_pain and K < max_pain:
-                            warnings.append(f"Strike below max pain ${max_pain:.0f} — assignment risk elevated")
-
                         row = {
                             "ticker":                ticker,
                             "expiry":                expiry_ibkr,
@@ -2261,6 +2312,7 @@ async def scan_csp(
                             "xgb_signal":            state["signals"].get(ticker, {}).get("label", "N/A"),
                             "cash_required":         round(K * 100, 2),
                             "premium_collected":     round(fill_real * 100, 2),
+                            "suggested_price":       round(fill_real, 2),
                             "earnings_days_out":     earnings_days,
                             "iv_rank":               iv_info["rank"],
                             "iv_yf":                 iv_info["iv"],
@@ -2356,6 +2408,7 @@ async def scan_csp(
                                         "xgb_signal":state["signals"].get(ticker,{}).get("label","N/A"),
                                         "cash_required":round(K2*100,2),
                                         "premium_collected":round(fr2*100,2),
+                                        "suggested_price":round(fr2,2),
                                         "earnings_days_out":earnings_days,
                                         "iv_rank":iv_info["rank"], "iv_yf":iv_info["iv"],
                                         "rsi14":tech.get("rsi14"), "macd_hist":tech.get("macd_hist"),
@@ -2502,8 +2555,6 @@ async def scan_leaps(ib: IB) -> dict:
                         itm_otm_pct= (stock_price - K) / stock_price * 100
 
                         warnings = _build_warnings(earnings_days, iv_info["rank"], "leap")
-                        if not state["opra_active"]:
-                            warnings.append("OPRA not subscribed — quotes may be delayed")
                         # Institutional call OI >> put OI = bullish positioning → favourable
                         if pc_oi_r < 0.6:
                             pass  # heavy call OI: good for LEAP calls
@@ -2538,6 +2589,7 @@ async def scan_leaps(ib: IB) -> dict:
                             "cost_per_contract":     cost_real,
                             "cost_mid":              cost_mid_v,
                             "max_loss_per_contract": cost_real,
+                            "suggested_price":       round(fill_real, 2),
                             "delta":                 round(delta, 4),
                             "iv_pct":                round(iv * 100, 1),
                             "theta_daily":           round(theta, 4),
@@ -2634,6 +2686,7 @@ async def scan_leaps(ib: IB) -> dict:
                                     "cost_per_contract":round(fr2*100,2),
                                     "cost_mid":round(mid2*100,2),
                                     "max_loss_per_contract":round(fr2*100,2),
+                                    "suggested_price":round(fr2,2),
                                     "delta":round(dlt2,4),"iv_pct":round(iv2*100,1),
                                     "theta_daily":round(tht2,4),"theta_weekly":round(tht2*7,4),
                                     "vega":0.0,"spread_pct":round(sp2,2),
@@ -3610,6 +3663,8 @@ async def place_order(req: OrderRequest):
         raise HTTPException(400, "right must be C or P")
 
     limit_price = req.limit_price
+    if limit_price is not None and limit_price <= 0:
+        raise HTTPException(400, f"limit_price must be > 0 (got {limit_price})")
     if limit_price is None:
         exp_str = f"{req.expiry[:4]}-{req.expiry[4:6]}-{req.expiry[6:8]}"
         loop = asyncio.get_event_loop()
@@ -3676,10 +3731,15 @@ def get_orders():
             {
                 "order_id":    t.order.orderId,
                 "ticker":      t.contract.symbol,
+                "expiry":      getattr(t.contract, "lastTradeDateOrContractMonth", ""),
+                "strike":      getattr(t.contract, "strike", None),
+                "right":       getattr(t.contract, "right", ""),
                 "action":      t.order.action,
                 "quantity":    t.order.totalQuantity,
                 "limit_price": t.order.lmtPrice,
+                "tif":         t.order.tif,
                 "status":      t.orderStatus.status,
+                "why_held":    t.orderStatus.whyHeld or "",
                 "filled":      t.orderStatus.filled,
                 "remaining":   t.orderStatus.remaining,
                 "avg_fill":    t.orderStatus.avgFillPrice,
@@ -3701,6 +3761,23 @@ def cancel_order(order_id: int):
         raise HTTPException(404, f"Order {order_id} not found in open orders")
     ib.cancelOrder(target.order)
     return {"ok": True, "order_id": order_id, "message": "Cancel request sent"}
+
+
+@app.post("/orders/cancel-inactive")
+def cancel_inactive_orders():
+    """Cancel all Inactive orders (stale from previous sessions)."""
+    _require_connection()
+    ib = state["ib"]
+    stale = [t for t in ib.openTrades() if t.orderStatus.status == "Inactive"]
+    cancelled = []
+    for t in stale:
+        try:
+            ib.cancelOrder(t.order)
+            cancelled.append(t.order.orderId)
+        except Exception:
+            pass
+    _at_log("SYSTEM", f"Manually cancelled {len(cancelled)} Inactive orders")
+    return {"ok": True, "cancelled": cancelled, "count": len(cancelled)}
 
 
 @app.get("/portfolio/delta")
@@ -3771,6 +3848,47 @@ async def autotrader_run_now():
     except (TimeoutError, RuntimeError) as exc:
         raise HTTPException(503, str(exc))
     return {"ok": True, "log": state["autotrader"]["log"][-20:]}
+
+
+@app.post("/autotrader/clear-stale-positions")
+def clear_stale_positions():
+    """
+    Remove positions from the tracking dict whose IBKR orders are Inactive.
+    This resets bloated state from repeated scan cycles where orders never filled.
+    Call this before enabling the auto-trader after fixing an Inactive order issue.
+    """
+    _require_connection()
+    ib = state["ib"]
+    at = state["autotrader"]
+
+    # All currently open order IDs (Inactive, Submitted, PreSubmitted, etc.)
+    open_trades  = ib.openTrades()
+    open_ids     = {t.order.orderId for t in open_trades}
+    inactive_ids = {t.order.orderId for t in open_trades if t.orderStatus.status == "Inactive"}
+    # Portfolio keys for filled positions (these should stay in the dict)
+    portfolio_keys = {_at_contract_key(item.contract) for item in ib.portfolio()}
+
+    removed, kept = [], []
+    for key, info in list(at["positions"].items()):
+        order_id = info.get("order_id")
+        in_open_trades = (order_id is not None and order_id in open_ids)
+        in_portfolio   = key in portfolio_keys
+        is_inactive    = (order_id is not None and order_id in inactive_ids)
+
+        if in_portfolio:
+            # Real filled position — keep it, the monitor manages it
+            kept.append(key)
+        elif is_inactive or not in_open_trades:
+            # Inactive order (stuck) or ghost (order was cancelled/expired, not in portfolio)
+            at["positions"].pop(key)
+            removed.append(key)
+        else:
+            kept.append(key)
+
+    _at_save_state()
+    msg = f"Cleared {len(removed)} stale/ghost positions; {len(kept)} active positions kept"
+    _at_log("SYSTEM", msg)
+    return {"ok": True, "removed": removed, "kept": kept, "message": msg}
 
 
 # ── 0DTE endpoint ──────────────────────────────────────────────────────────

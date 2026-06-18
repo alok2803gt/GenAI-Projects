@@ -391,7 +391,13 @@ function HistoryTable({ history }) {
 // ── Trade modal ───────────────────────────────────────────────────────────
 function TradeModal({ trade, onClose, onSuccess }) {
   const [qty, setQty]           = React.useState(1);
-  const [lmt, setLmt]           = React.useState(trade.suggested_price || 0);
+  const [lmt, setLmt]           = React.useState(
+    trade.suggested_price
+      || (trade.action === "SELL"
+          ? (trade.premium_collected != null ? +(trade.premium_collected / 100).toFixed(2) : trade.bid)
+          : (trade.cost_per_contract  != null ? +(trade.cost_per_contract  / 100).toFixed(2) : trade.ask))
+      || 0
+  );
   const [loading, setLoading]   = React.useState(false);
   const [result, setResult]     = React.useState(null);
   const [error, setError]       = React.useState(null);
@@ -540,6 +546,14 @@ function PositionsTab() {
     } catch(e) { alert("Cancel failed: " + e.message); }
   };
 
+  const cancelInactiveOrders = async () => {
+    try {
+      const r = await apiFetch("/orders/cancel-inactive", {method:"POST"});
+      alert(`Cancelled ${r.count} Inactive order(s): [${r.cancelled.join(", ")}]`);
+      await loadPositions();
+    } catch(e) { alert("Cancel inactive failed: " + e.message); }
+  };
+
   const deltaCol = v => v == null ? C.muted : v >= 0 ? C.bull : C.bear;
 
   return (
@@ -626,27 +640,39 @@ function PositionsTab() {
       {/* Open orders table */}
       {orders && orders.count > 0 && (
         <Card style={{ padding:0, overflow:"hidden" }}>
-          <div style={{ padding:"10px 14px", borderBottom:`1px solid ${C.border}` }}>
+          <div style={{ padding:"10px 14px", borderBottom:`1px solid ${C.border}`, display:"flex", alignItems:"center", justifyContent:"space-between" }}>
             <SectionTitle>Open Orders ({orders.count})</SectionTitle>
+            {orders.orders.some(o => o.status === "Inactive") && (
+              <Btn onClick={cancelInactiveOrders} color="#c0392b" style={{ padding:"4px 12px", fontSize:11 }}
+                   title="Cancel all Inactive orders (stale from previous sessions)">
+                ✕ Cancel All Inactive
+              </Btn>
+            )}
           </div>
           <div style={{ overflowX:"auto" }}>
             <table style={{ fontSize:12 }}>
               <thead>
                 <tr style={{ background:C.surface }}>
-                  {["Order ID","Ticker","Action","Qty","Limit","Status","Filled","Avg Fill","Cancel"].map(h => (
+                  {["Order ID","Ticker","Contract","Action","Qty","Limit","Status / Reason","Filled","Avg Fill","Cancel"].map(h => (
                     <th key={h} style={{ ...sans, color:C.muted, fontWeight:600, borderBottom:`1px solid ${C.border}`, fontSize:11 }}>{h}</th>
                   ))}
                 </tr>
               </thead>
               <tbody>
                 {orders.orders.map((o,i) => (
-                  <tr key={i} style={{ borderBottom:`1px solid ${C.border}33` }}>
+                  <tr key={i} style={{ borderBottom:`1px solid ${C.border}33`, background:o.status==="Inactive"?"#2a1a1a":undefined }}>
                     <td style={{ ...mono, color:C.muted }}>{o.order_id}</td>
                     <td style={{ ...mono, color:C.accent, fontWeight:700 }}>{o.ticker}</td>
+                    <td style={{ ...mono, fontSize:10, color:C.muted }}>
+                      {o.right}{o.strike ? `$${o.strike}` : ""} {o.expiry ? o.expiry.slice(0,8) : ""}
+                    </td>
                     <td style={{ ...mono, color:o.action==="BUY"?C.bull:C.bear, fontWeight:700 }}>{o.action}</td>
                     <td style={{ ...mono }}>{o.quantity}</td>
                     <td style={{ ...mono }}>{fmt$(o.limit_price)}</td>
-                    <td style={{ ...mono, color:C.neutral }}>{o.status}</td>
+                    <td style={{ ...mono, color:o.status==="Inactive"?C.bear:C.neutral }}>
+                      {o.status}
+                      {o.why_held ? <span style={{fontSize:9,color:C.muted,marginLeft:4}}>({o.why_held})</span> : null}
+                    </td>
                     <td style={{ ...mono }}>{o.filled}</td>
                     <td style={{ ...mono }}>{o.avg_fill ? fmt$(o.avg_fill) : "—"}</td>
                     <td>
@@ -1405,6 +1431,15 @@ function AutoTraderTab() {
     finally { setRunning(false); }
   };
 
+  const clearStalePositions = async () => {
+    if (!window.confirm("This will remove all Inactive-order positions from the tracking dict so the auto-trader can place fresh orders. Proceed?")) return;
+    try {
+      const r = await apiFetch("/autotrader/clear-stale-positions", { method: "POST" });
+      alert(`Cleared ${r.removed.length} stale positions.\nKept: ${r.kept.length}\n\n${r.message}`);
+      await load();
+    } catch(e) { alert("Clear failed: " + e.message); }
+  };
+
   const enabled = status?.enabled || false;
   const positions = status?.positions || {};
   const actLog = [...(status?.log || [])].reverse();
@@ -1460,6 +1495,12 @@ function AutoTraderTab() {
           padding:"10px 22px", fontWeight:600, cursor:"pointer", opacity: running ? 0.6 : 1,
         }}>
           {running ? "Running…" : "Run Now"}
+        </button>
+        <button onClick={clearStalePositions} style={{
+          background:"#8e44ad", color:"#fff", border:"none", borderRadius:8,
+          padding:"8px 16px", fontSize:12, cursor:"pointer",
+        }} title="Remove Inactive-order positions from tracking dict so fresh orders can be placed">
+          Clear Stale Positions
         </button>
         <button onClick={() => reconnect(7497)} disabled={!!reconnMode} style={{
           background:"#7f8c8d", color:"#fff", border:"none", borderRadius:8,
@@ -1619,10 +1660,11 @@ function AutoTraderTab() {
         ) : (
           <div style={{ maxHeight:320, overflowY:"auto", fontFamily:"'Fira Mono', monospace", fontSize:12 }}>
             {actLog.map((e, i) => {
-              const col = e.action==="ERROR"?"#e74c3c"
+              const col = (e.action==="ERROR"||e.action==="IBKR-ERR")?"#e74c3c"
                         : (e.action==="TRADE"||e.action==="CLOSED")?"#27ae60"
                         : e.action==="CLOSE"?"#f1c40f"
                         : e.action==="SYSTEM"?"#9b59b6"
+                        : e.action==="WARN"?"#f39c12"
                         : "#ccc";
               return (
                 <div key={i} style={{ padding:"4px 6px", borderBottom:"1px solid #e2e8f0", color:col }}>
@@ -2212,8 +2254,8 @@ function UniverseTab() {
                   <th style={{ ...thS, textAlign:"right" }}>RSI-14</th>
                   <th style={{ ...thS, textAlign:"center" }}>SMA50</th>
                   <th style={{ ...thS, textAlign:"right" }}
-                      title="IV Rank: % of time current IV is below its 252-day range. Needs 20+ trading days to populate.">
-                    IV Rank
+                      title="IV/HV Rank: real IV rank once 20+ daily scans accumulate; until then shows HV Rank (30-day realized vol percentile over 1 year) — tracks IV directionally and is available immediately.">
+                    IV / HV Rank
                   </th>
                   <th style={{ ...thS, textAlign:"right" }}>30d ADV</th>
                   <th style={{ ...thS, textAlign:"center" }}>In Universe</th>
@@ -2255,8 +2297,15 @@ function UniverseTab() {
                             ? (row.iv_rank >= 25 ? "#f39c12" : "#94a3b8")
                             : "#334155" }}>
                         {row.iv_rank != null
-                          ? `${row.iv_rank}%`
-                          : <span title="IV rank needs 20+ days of IV history — auto-populates over time">N/A</span>}
+                          ? <span>
+                              {row.iv_rank}
+                              {row.hv_proxy
+                                ? <span style={{fontSize:9,color:"#64748b",marginLeft:2}}
+                                    title="HV rank proxy — upgrades to real IV rank after 20 daily scans">HV</span>
+                                : <span style={{fontSize:9,color:"#f39c12",marginLeft:2}}>IV</span>}
+                              %
+                            </span>
+                          : <span title="Insufficient price history">—</span>}
                       </td>
                       <td style={{ ...tdS, textAlign:"right", color:"#94a3b8" }}>
                         {fmtVol(row.avg_vol_30d)}
