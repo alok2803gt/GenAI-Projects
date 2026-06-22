@@ -2218,19 +2218,35 @@ def _journal_record_exit(
 
 
 def _update_kelly_from_journal() -> None:
-    """EMA-blend actual win rate from journal into auto-trader's assumed_win_rate."""
+    """EMA-blend actual win rate from real autotrader exits into assumed_win_rate.
+
+    Only counts trades closed by legitimate exit reasons (profit_target, stop_loss,
+    roll_close, roll_max, roll_no_credit, 21dte). Excludes orphaned entries created
+    by cleanup — those aren't real trade outcomes and would collapse Kelly to zero.
+    Requires at least 10 real trades before updating (stay on prior with less data).
+    """
+    real_exits = {
+        "profit_target", "stop_loss", "roll_close", "roll_max",
+        "roll_no_credit", "21dte", "manual",
+    }
     con = sqlite3.connect(JOURNAL_DB_PATH, check_same_thread=False)
     rows = con.execute(
-        "SELECT win FROM trade_journal WHERE closed_at IS NOT NULL AND win IS NOT NULL"
+        "SELECT win FROM trade_journal "
+        "WHERE closed_at IS NOT NULL AND win IS NOT NULL "
+        "  AND exit_reason IN ('profit_target','stop_loss','roll_close',"
+        "                      'roll_max','roll_no_credit','21dte','manual')"
     ).fetchall()
     con.close()
     if len(rows) < 10:
+        # Not enough real data yet — keep the prior unchanged
         return
     actual_wr = sum(r[0] for r in rows) / len(rows)
     old       = state["autotrader"]["config"].get("assumed_win_rate", 0.85)
-    new_wr    = round(0.70 * old + 0.30 * actual_wr, 4)  # slow EMA
+    new_wr    = round(0.70 * old + 0.30 * actual_wr, 4)  # slow EMA blend
     state["autotrader"]["config"]["assumed_win_rate"] = new_wr
-    _at_log("LEARN", f"Kelly win rate {old:.1%} → {new_wr:.1%} (actual {actual_wr:.1%} over {len(rows)} trades)")
+    _at_log("LEARN",
+            f"Kelly win rate {old:.1%} → {new_wr:.1%} "
+            f"(actual {actual_wr:.1%} over {len(rows)} real trades)")
 
 
 def _retrain_from_journal() -> dict:
@@ -4256,7 +4272,9 @@ def get_journal_stats():
     con = sqlite3.connect(JOURNAL_DB_PATH, check_same_thread=False)
     rows = con.execute("""
         SELECT win, pnl, pnl_pct, exit_reason, strategy_type, iv_rank, score
-        FROM trade_journal WHERE closed_at IS NOT NULL AND win IS NOT NULL
+        FROM trade_journal
+        WHERE closed_at IS NOT NULL AND win IS NOT NULL
+          AND exit_reason != 'orphaned'
     """).fetchall()
     model_rows = con.execute(
         "SELECT * FROM model_log ORDER BY id DESC LIMIT 10"
