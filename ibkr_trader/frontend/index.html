@@ -1395,7 +1395,6 @@ function AutoTraderTab() {
     leap_capital:      5000,
     use_kelly:         true,
     total_capital:     100000,
-    assumed_win_rate:  0.85,
     auto_hedge:        false,
     hedge_threshold:   100,
   });
@@ -1477,11 +1476,11 @@ function AutoTraderTab() {
 
   // Kelly fraction display
   const kellyFrac = (() => {
-    const p = cfg.assumed_win_rate || 0.85;
+    const p  = (status?.config?.assumed_win_rate) || 0.85;  // system-managed
     const pt = cfg.profit_target_pct || 0.50;
     const sl = cfg.stop_loss_mult || 2.0;
-    const b = pt / (sl > 0 ? sl : 5.0);
-    const k = (p * (b + 1) - 1) / b;
+    const b  = pt / (sl > 0 ? sl : 5.0);
+    const k  = (p * (b + 1) - 1) / b;
     return Math.max(0.02, k * 0.5);
   })();
   const kellyCapital = Math.round((cfg.total_capital || 100000) * kellyFrac);
@@ -1623,12 +1622,19 @@ function AutoTraderTab() {
             <input type="number" min={10000} step={10000} value={cfg.total_capital}
               onChange={e => setCfg({ ...cfg, total_capital: +e.target.value })} {...inp()} />
           </label>
-          <label style={{ display:"flex", flexDirection:"column", gap:4, fontSize:13, color:"#475569" }}>
-            Assumed Win Rate %
-            <input type="number" min={50} max={99} step={1}
-              value={Math.round((cfg.assumed_win_rate||0.85)*100)}
-              onChange={e => setCfg({ ...cfg, assumed_win_rate: +e.target.value/100 })} {...inp()} />
-          </label>
+          <div style={{ display:"flex", flexDirection:"column", gap:4, fontSize:13, color:"#475569" }}>
+            Kelly Win Rate
+            <div style={{ padding:"6px 10px", borderRadius:6, background:"#f1f5f9",
+              border:"1px solid #e2e8f0", fontSize:13, color:"#334155", display:"flex", alignItems:"center", gap:8 }}>
+              <span style={{ fontWeight:700, color:"#7c3aed" }}>
+                {Math.round(((status?.config?.assumed_win_rate)||0.85)*100)}%
+              </span>
+              <span style={{ fontSize:11, color:"#94a3b8" }}>auto-calibrated · read-only</span>
+            </div>
+            <span style={{ fontSize:11, color:"#94a3b8" }}>
+              Updates from real closed trades (min 10). Prior: 85% (Tastytrade research).
+            </span>
+          </div>
           <label style={{ display:"flex", flexDirection:"column", gap:4, fontSize:13, color:"#475569" }}>
             Hedge Threshold (delta)
             <input type="number" min={25} max={500} step={25} value={cfg.hedge_threshold}
@@ -1676,11 +1682,12 @@ function AutoTraderTab() {
         {/* Kelly info box */}
         <div style={{ marginTop:12, padding:"10px 14px", background:"#f1f5f9",
           borderRadius:6, fontSize:12, color:"#64748b", lineHeight:1.7 }}>
-          <strong style={{color:"#d97706"}}>Half-Kelly sizing:</strong> win rate {Math.round((cfg.assumed_win_rate||0.85)*100)}%,
+          <strong style={{color:"#d97706"}}>Half-Kelly sizing:</strong>{" "}
+          win rate <strong>{Math.round(((status?.config?.assumed_win_rate)||0.85)*100)}%</strong> (auto-calibrated),
           profit/loss ratio {((cfg.profit_target_pct||0.50)/((cfg.stop_loss_mult||2.0)||2.0)).toFixed(3)} →
           Kelly fraction {(kellyFrac*100).toFixed(1)}% of ${(cfg.total_capital||100000).toLocaleString()}
           = <strong style={{color:"#1e293b"}}>${kellyCapital.toLocaleString()} per trade</strong>.
-          {" "}Exit rules: 50% profit target | 2× premium stop | roll at 21 DTE | 48h cooldown after stop-out.
+          {" "}Exit rules: 50% profit target · IV-adjusted stop · roll at 21 DTE · 48h cooldown.
         </div>
       </Card>
 

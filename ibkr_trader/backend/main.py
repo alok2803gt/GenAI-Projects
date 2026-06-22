@@ -3831,7 +3831,8 @@ class AutoTraderConfigRequest(BaseModel):
     leap_capital:       float     = 5000.0
     use_kelly:          bool      = True
     total_capital:      float     = 100000.0
-    assumed_win_rate:   float     = 0.85
+    # assumed_win_rate is intentionally excluded — it is system-managed via
+    # _update_kelly_from_journal and should not be overwritten by the UI.
     auto_hedge:         bool      = False
     hedge_threshold:    float     = 100.0
 
@@ -4081,7 +4082,7 @@ def update_autotrader_config(req: AutoTraderConfigRequest):
         "leap_capital":      req.leap_capital,
         "use_kelly":         req.use_kelly,
         "total_capital":     req.total_capital,
-        "assumed_win_rate":  req.assumed_win_rate,
+        # assumed_win_rate is NOT updated here — managed by _update_kelly_from_journal
         "auto_hedge":        req.auto_hedge,
         "hedge_threshold":   req.hedge_threshold,
     })
