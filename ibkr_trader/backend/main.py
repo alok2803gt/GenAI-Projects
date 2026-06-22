@@ -4347,10 +4347,10 @@ def pnl_dashboard():
             exit_breakdown[reason]["pnl"] = round(exit_breakdown[reason]["pnl"] + t["pnl"], 2)
 
     portfolio_items: list = []
-    ib_conn = state.get("ib")
-    if ib_conn and state.get("connected"):
+    ib_connected = bool(state.get("ib") and state.get("connected"))
+    if ib_connected:
         try:
-            for item in ib_conn.portfolio():
+            for item in state["ib"].portfolio():
                 c = item.contract
                 portfolio_items.append({
                     "ticker":         c.symbol,
@@ -4370,24 +4370,81 @@ def pnl_dashboard():
     total_realized   = round(sum(closed_pnls), 2) if closed_pnls else 0.0
     total_unrealized = round(float(acct.get("unrealized_pnl") or 0), 2)
 
-    # Only show open positions that are actively tracked or opened in the last 7 days.
-    # This prevents 200+ orphaned journal rows from flooding the UI.
-    tracked_ids     = {
-        info.get("journal_id")
-        for info in state["autotrader"].get("positions", {}).values()
-        if info.get("journal_id") is not None
-    }
-    recent_cutoff  = (datetime.utcnow() - timedelta(days=7)).isoformat()
-    visible_open   = [
-        t for t in open_trades
-        if t["id"] in tracked_ids or (t.get("opened_at") or "") >= recent_cutoff
-    ]
+    # ── Build open_positions: IBKR is the source of truth when connected ──────
+    # Enrich each IBKR portfolio item with journal metadata (entry price, IV, etc.)
+    # If not connected, fall back to recent journal entries (last 7 days).
+    # Also auto-close journal entries that have no corresponding IBKR position.
+    if ib_connected:
+        # Build a lookup: (ticker, str(strike), right, expiry[:6]) → journal row
+        def _jkey(ticker, strike, right, expiry):
+            return (ticker, str(strike or ""), right or "", (expiry or "")[:6])
+
+        jlookup = {}
+        for t in open_trades:
+            k = _jkey(t.get("ticker",""), t.get("strike"), t.get("right",""), t.get("expiry",""))
+            jlookup[k] = t
+
+        ibkr_keys = {
+            _jkey(p["ticker"], p.get("strike"), p.get("right"), p.get("expiry"))
+            for p in portfolio_items
+        }
+
+        # Auto-close open journal entries not present in IBKR portfolio
+        orphan_ids = [
+            t["id"] for t in open_trades
+            if _jkey(t.get("ticker",""), t.get("strike"), t.get("right",""), t.get("expiry",""))
+            not in ibkr_keys
+        ]
+        if orphan_ids:
+            try:
+                _con = sqlite3.connect(JOURNAL_DB_PATH, check_same_thread=False)
+                ph   = ",".join("?" * len(orphan_ids))
+                _con.execute(
+                    f"UPDATE trade_journal SET closed_at=?, exit_reason='orphaned', win=0, pnl=0, pnl_pct=0 "
+                    f"WHERE id IN ({ph})",
+                    [datetime.utcnow().isoformat()] + orphan_ids,
+                )
+                _con.commit()
+                _con.close()
+                log.info("pnl_dashboard: auto-closed %d orphaned journal entries", len(orphan_ids))
+            except Exception as e:
+                log.warning("pnl_dashboard orphan cleanup failed: %s", e)
+
+        # Merge IBKR portfolio item with journal enrichment
+        visible_open = []
+        for p in portfolio_items:
+            jrow = jlookup.get(_jkey(p["ticker"], p.get("strike"), p.get("right"), p.get("expiry")), {})
+            visible_open.append({
+                "id":             jrow.get("id"),
+                "ticker":         p["ticker"],
+                "strategy_type":  jrow.get("strategy_type") or p["sec_type"],
+                "action":         jrow.get("action", "BUY" if (p.get("position") or 0) > 0 else "SELL"),
+                "strike":         p.get("strike"),
+                "right":          p.get("right"),
+                "expiry":         p.get("expiry"),
+                "qty":            abs(p.get("position") or 0),
+                "entry_price":    jrow.get("entry_price"),
+                "avg_cost":       p.get("avg_cost"),
+                "market_value":   p.get("market_value"),
+                "unrealized_pnl": p.get("unrealized_pnl"),
+                "live_iv_entry":  jrow.get("live_iv_entry"),
+                "roll_count":     jrow.get("roll_count", 0),
+                "opened_at":      jrow.get("opened_at"),
+                "dte":            jrow.get("dte"),
+            })
+    else:
+        # Disconnected: fall back to recent journal entries (last 7 days)
+        recent_cutoff = (datetime.utcnow() - timedelta(days=7)).isoformat()
+        visible_open  = [
+            t for t in open_trades
+            if (t.get("opened_at") or "") >= recent_cutoff
+        ]
 
     return {
         "account": acct,
         "stats": {
             "total_trades":         len(closed_trades),
-            "open_count":           len(open_trades),
+            "open_count":           len(portfolio_items) if ib_connected else len(open_trades),
             "win_rate":             round(len(wins) / len(closed_trades) * 100, 1) if closed_trades else None,
             "total_realized_pnl":   total_realized,
             "total_unrealized_pnl": total_unrealized,

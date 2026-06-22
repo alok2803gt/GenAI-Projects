@@ -2547,27 +2547,33 @@ function PnLTab() {
       {/* Open positions + Exit breakdown */}
       <div style={{display:"grid",gridTemplateColumns:"3fr 2fr",gap:16,marginBottom:20}}>
         <Card>
-          <div style={{...sans,fontSize:10,textTransform:"uppercase",letterSpacing:2,color:C.muted,marginBottom:12}}>Open Positions ({open_positions.length})</div>
+          <div style={{...sans,fontSize:10,textTransform:"uppercase",letterSpacing:2,color:C.muted,marginBottom:12}}>
+            Open Positions ({open_positions.length}) — IBKR live
+          </div>
           {open_positions.length === 0
-            ? <div style={{...sans,fontSize:13,color:C.muted,padding:"20px 0",textAlign:"center"}}>No open positions</div>
+            ? <div style={{...sans,fontSize:13,color:C.muted,padding:"20px 0",textAlign:"center"}}>
+                No open positions in IBKR portfolio
+              </div>
             : <div style={{overflowX:"auto"}}>
                 <table style={{fontSize:12}}>
-                  <thead><tr>{["Ticker","Type","Strike","Expiry","DTE","Qty","Entry","Value","IV","Roll#"].map(h=>(
+                  <thead><tr>{["Ticker","Type","Strike","Expiry","DTE","Qty","Entry","Mkt Val","Unrealized P&L","IV","Roll#"].map(h=>(
                     <th key={h} style={{...mono,fontSize:10,color:C.muted,fontWeight:600,paddingBottom:8}}>{h}</th>
                   ))}</tr></thead>
-                  <tbody>{open_positions.map(t => {
+                  <tbody>{open_positions.map((t,i) => {
                     const dte = fmtDTE(t.expiry);
-                    const val = ((t.entry_price||0)*(t.qty||1)*100).toFixed(0);
                     return (
-                      <tr key={t.id}>
+                      <tr key={t.id||i}>
                         <td style={{...mono,fontWeight:700,color:C.accent}}>{t.ticker}</td>
                         <td><Pill color={t.action==="BUY"?C.bull:C.bear}>{(t.strategy_type||t.action||"").toUpperCase()}</Pill></td>
-                        <td style={{...mono}}>${t.strike}</td>
+                        <td style={{...mono}}>{t.strike?`$${t.strike}`:"—"}</td>
                         <td style={{...mono,fontSize:11}}>{t.expiry?`${t.expiry.slice(0,4)}-${t.expiry.slice(4,6)}-${t.expiry.slice(6,8)}`:"—"}</td>
                         <td style={{...mono,color:dte<21?C.bear:dte<30?C.neutral:C.muted}}>{dte}</td>
                         <td style={{...mono}}>{t.qty}</td>
-                        <td style={{...mono}}>${(t.entry_price||0).toFixed(2)}</td>
-                        <td style={{...mono}}>${val}</td>
+                        <td style={{...mono}}>{t.entry_price!=null?`$${Number(t.entry_price).toFixed(2)}`:"—"}</td>
+                        <td style={{...mono}}>{t.market_value!=null?`$${Number(t.market_value).toFixed(0)}`:"—"}</td>
+                        <td style={{...mono,fontWeight:700,color:pnlCol(t.unrealized_pnl)}}>
+                          {t.unrealized_pnl!=null?fmtDol(t.unrealized_pnl,true):"—"}
+                        </td>
                         <td style={{...mono}}>{t.live_iv_entry?`${Number(t.live_iv_entry).toFixed(0)}%`:"—"}</td>
                         <td style={{...mono,color:C.muted}}>{t.roll_count||0}</td>
                       </tr>
@@ -2597,25 +2603,7 @@ function PnLTab() {
               </table>
           }
 
-          {portfolio && portfolio.length > 0 && <>
-            <div style={{height:1,background:C.border,margin:"16px 0"}}/>
-            <div style={{...sans,fontSize:10,textTransform:"uppercase",letterSpacing:2,color:C.muted,marginBottom:10}}>IBKR Live Portfolio</div>
-            <table style={{fontSize:12}}>
-              <thead><tr>{["Ticker","Type","Strike","Pos","Mkt Val","Unrealized"].map(h=>(
-                <th key={h} style={{...mono,fontSize:10,color:C.muted,fontWeight:600,paddingBottom:8}}>{h}</th>
-              ))}</tr></thead>
-              <tbody>{portfolio.map((p,i)=>(
-                <tr key={i}>
-                  <td style={{...mono,fontWeight:700,color:C.accent}}>{p.ticker}</td>
-                  <td style={{...mono,fontSize:11}}>{p.sec_type}{p.right?` ${p.right}`:""}</td>
-                  <td style={{...mono}}>{p.strike?`$${p.strike}`:"—"}</td>
-                  <td style={{...mono}}>{p.position}</td>
-                  <td style={{...mono}}>{fmtDol(p.market_value)}</td>
-                  <td style={{...mono,fontWeight:700,color:pnlCol(p.unrealized_pnl)}}>{fmtDol(p.unrealized_pnl,true)}</td>
-                </tr>
-              ))}</tbody>
-            </table>
-          </>}
+          {/* IBKR Live Portfolio data is now shown in the Open Positions table (left card) */}
         </Card>
       </div>
 
