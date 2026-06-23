@@ -59,16 +59,24 @@ FEATURE_COLS = [
 ]
 
 # ── Config — CSP scanner ───────────────────────────────────────────────────
-CSP_MIN_RETURN_PCT  = 0.75   # Weekly premium / strike  ≥ 0.75 % (realistic for VIX 15-20)
+CSP_MIN_RETURN_PCT  = 1.00   # Weekly premium / strike ≥ 1.0% — Tastytrade research: 1%+ weekly
+                              # return is the floor where CSP premium compensates for assignment risk.
+                              # 0.75% was too low — allows entries in flat-IV environments with thin premium.
 CSP_MAX_DELTA       = 0.20   # Absolute delta (far-OTM safety)
 CSP_MIN_OI          = 50     # Open interest floor
 CSP_MAX_SPREAD_PCT  = 0.15   # Bid-ask spread as fraction of mid
 SCAN_CACHE_TTL      = 300    # Seconds before scan cache expires
 
 # ── Config — external validation (yfinance) ────────────────────────────────
-EARNINGS_BLOCK_DAYS = 7      # Skip CSP/LEAP entirely if earnings this close
-EARNINGS_WARN_DAYS  = 14     # Add warning flag if earnings within this window
-IV_RANK_MIN_CSP     = 25     # Flag CSP rows below this IV rank (thin premium env)
+EARNINGS_BLOCK_DAYS = 14     # Skip CSP/LEAP entirely if earnings within 14 days.
+                              # IV inflates 5-10 days before earnings and the spike can blow
+                              # through a 2× stop on a short put regardless of strike selection.
+EARNINGS_WARN_DAYS  = 30     # Warn when earnings are within 30 days — the upcoming event
+                              # compresses theta and skews the risk/reward even if it won't hit.
+IV_RANK_MIN_CSP     = 50     # Only enter when IV is in the top 50th percentile of its range.
+                              # Tastytrade 200k-trade study: outcomes improve materially above 50%.
+                              # Journal losses averaged IV rank 36.8% — premium was too thin to
+                              # compensate for the downside risk at those entry points.
 EARNINGS_CACHE_TTL  = 21600  # 6 h — earnings dates don't change intraday
 IV_RANK_CACHE_TTL   = 3600   # 1 h
 REGIME_CACHE_TTL    = 300    # 5 min
@@ -1317,10 +1325,10 @@ def _filter_csp_recommended(candidates: list) -> list:
     clean = [r for r in candidates
              if len(r.get("warnings", [])) == 0
              and r["liquidity_score"] >= 50
-             and r["iv_rank"] >= 30
+             and r["iv_rank"] >= IV_RANK_MIN_CSP   # 50th percentile — only sell expensive premium
              and r["score"] >= 70
              and r.get("above_sma50") is not False          # reject stocks in downtrend
-             and (r["earnings_days_out"] is None or r["earnings_days_out"] > 21)]
+             and (r["earnings_days_out"] is None or r["earnings_days_out"] > EARNINGS_BLOCK_DAYS * 2)]
     # Augment with learned model score if available
     for r in clean:
         ls = _learned_score(r)
@@ -2612,7 +2620,7 @@ async def scan_csp(
                 opra_ok = False
                 try:
                     (tds, expiry_ibkr, dte), inst = await asyncio.gather(
-                        _fetch_opra_chain(ib, ticker, "P", stock_price, 21, 45),
+                        _fetch_opra_chain(ib, ticker, "P", stock_price, 30, 50),
                         _institutional_signals(ticker, stock_price),
                     )
                     opra_ok = True
