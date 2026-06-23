@@ -49,6 +49,22 @@ async function apiFetch(path, opts) {
 }
 
 function fmt$(n)  { return n == null ? "—" : `$${Number(n).toFixed(2)}`; }
+
+// Derive human strategy label from available fields.
+// Works for IBKR portfolio rows (position qty + right + sec_type)
+// and journal / auto-trader rows (action + right + strategy_type).
+function strategyLabel({ sec_type, right, position, action, strategy_type } = {}) {
+  if (strategy_type) {
+    const m = { csp:"CSP", leap:"LEAP", hedge:"Hedge Put", hedge_put:"Hedge Put", short_call:"Short Call" };
+    return m[strategy_type.toLowerCase()] || strategy_type.toUpperCase();
+  }
+  if (sec_type && sec_type !== "OPT") return sec_type;  // STK, CASH, etc.
+  // Determine short/long from IBKR position qty or action string
+  const isShort = position != null ? position < 0 : action === "SELL";
+  if (right === "P") return isShort ? "CSP"        : "Hedge Put";
+  if (right === "C") return isShort ? "Short Call"  : "LEAP";
+  return "—";
+}
 function fmtP(n)  { return n == null ? "—" : `${Number(n).toFixed(2)}%`; }
 function fmtN(n,d=3) { return n == null ? "—" : Number(n).toFixed(d); }
 
@@ -601,7 +617,9 @@ function PositionsTab() {
                 {data.positions.map((p,i) => (
                   <tr key={i} style={{ borderBottom:`1px solid ${C.border}33` }}>
                     <td style={{ ...mono, color:C.accent, fontWeight:700 }}>{p.symbol}</td>
-                    <td style={{ ...mono, color:C.muted, fontSize:10 }}>{p.sec_type}</td>
+                    <td style={{ ...mono, fontSize:11, color: p.right==="C"?C.bull:p.right==="P"?C.bear:C.muted, fontWeight:600 }}>
+                      {strategyLabel(p)}
+                    </td>
                     <td style={{ ...mono, color: p.right==="C"?C.bull:p.right==="P"?C.bear:C.muted }}>{p.right||"—"}</td>
                     <td style={{ ...mono }}>{p.strike ? fmt$(p.strike) : "—"}</td>
                     <td style={{ ...mono, color:C.muted }}>{p.expiry||"—"}</td>
@@ -1707,7 +1725,10 @@ function AutoTraderTab() {
                 {Object.entries(positions).map(([key, p]) => (
                   <tr key={key} style={{ borderBottom:"1px solid #e2e8f0" }}>
                     <td style={{ padding:"7px 10px", fontWeight:700, color:"#1e293b" }}>{p.ticker}</td>
-                    <td style={{ padding:"7px 10px", color:"#475569" }}>{p.right==="P"?"CSP":"LEAP"}</td>
+                    <td style={{ padding:"7px 10px", fontWeight:600,
+                      color: p.right==="C"?"#27ae60":p.right==="P"?"#e74c3c":"#475569" }}>
+                      {strategyLabel(p)}
+                    </td>
                     <td style={{ padding:"7px 10px" }}>${p.strike}</td>
                     <td style={{ padding:"7px 10px", color:"#475569" }}>{p.expiry}</td>
                     <td style={{ padding:"7px 10px", color: p.action==="SELL"?"#e74c3c":"#27ae60", fontWeight:700 }}>{p.action}</td>
@@ -2193,7 +2214,10 @@ function LearningTab() {
                   }}>
                     <td style={{ padding:"5px 8px", color:"#64748b" }}>{t.id}</td>
                     <td style={{ padding:"5px 8px", fontWeight:700 }}>{t.ticker}</td>
-                    <td style={{ padding:"5px 8px" }}>{t.right === "P" ? "CSP" : "LEAP"}</td>
+                    <td style={{ padding:"5px 8px", fontWeight:600,
+                      color: t.right==="C"?"#27ae60":t.right==="P"?"#e74c3c":"#475569" }}>
+                      {strategyLabel(t)}
+                    </td>
                     <td style={{ padding:"5px 8px" }}>${t.strike}</td>
                     <td style={{ padding:"5px 8px", color:"#64748b" }}>{t.expiry}</td>
                     <td style={{ padding:"5px 8px" }}>{t.qty}</td>
