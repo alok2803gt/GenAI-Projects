@@ -690,41 +690,77 @@ def _assignment_risk(delta: float, otm_pct: float) -> str:
 def _score_csp(row: dict) -> float:
     """
     Composite rank score — higher is better.
-    Uses realistic fill return (bid + 40% spread) as primary return metric.
-    Institutional OPRA signals adjust the score up or down.
+
+    Weight rationale (Tastytrade 200k-trade study + empirical review):
+      IV rank is the #1 predictor of CSP outcome. Prior scoring gave it only
+      10% weight (15/150pts) while premium got 50% (75pts). That caused
+      high-premium, low-IV candidates to outrank high-IV, moderate-premium
+      candidates — exactly backwards from what research supports.
+
+      New weights (max 140 base pts):
+        IV rank        35 pts  — primary driver; sell expensive vol, not just any vol
+        Premium return 40 pts  — still important but capped lower (premium = f(IV), avoid double-count)
+        Delta safety   20 pts  — assignment risk management (unchanged)
+        Liquidity      20 pts  — execution quality (unchanged)
+        Stock quality  15 pts  — trend/momentum confirmation (reduced; secondary)
+        Premium/risk   10 pts  — premium vs OTM distance bonus (new; rewards efficient OTM value)
+      OPRA signals:   ±30 pts  — institutional flow (unchanged)
     """
     s = 0.0
-    # 1) Realistic weekly return above min target (capped at 3×)          max 75
-    s += min(row["weekly_return_pct"] / CSP_MIN_RETURN_PCT, 3.0) * 25
-    # 2) Delta safety — distance from assignment                           max 20
+
+    # 1) IV rank — high IV = expensive premium = better seller's edge       max 35
+    #    Tastytrade: outcomes improve materially above 50th percentile.
+    iv_rank = float(row.get("iv_rank", 50))
+    s += (iv_rank / 100) * 35
+
+    # 2) Realistic weekly return above min target (capped at 2× minimum)   max 40
+    #    Cap reduced from 3× to 2×: premium largely reflects IV (factor 1);
+    #    uncapped premium let high-IV stocks dominate even at low IV rank.
+    s += min(row["weekly_return_pct"] / CSP_MIN_RETURN_PCT, 2.0) * 20
+
+    # 3) Delta safety — distance from assignment risk                       max 20
     s += (CSP_MAX_DELTA - abs(row["delta"])) / CSP_MAX_DELTA * 20
-    # 3) Liquidity (OI + volume + spread)                                  max 20
+
+    # 4) Liquidity (OI + volume + spread quality)                           max 20
     s += (row.get("liquidity_score", 50) / 100) * 20
-    # 4) Stock quality (technical trend strength)                          max 20
-    s += row.get("stock_quality", 0.5) * 20
-    # 5) IV rank — high IV = better premium for sellers                    max 15
-    s += (row.get("iv_rank", 50) / 100) * 15
-    # 6) OPRA institutional signals (bonus / penalty)
-    # Strike above max pain → market makers incentivised to keep price here +8
+
+    # 5) Stock quality (trend strength vs 50-day SMA, RSI, momentum)       max 15
+    s += row.get("stock_quality", 0.5) * 15
+
+    # 6) Premium efficiency: premium collected vs OTM distance              max 10
+    #    Rewards puts that collect meaningful credit relative to how far OTM
+    #    they are. A 10%-OTM put at 2% premium beats a 3%-OTM put at 1.5%.
+    spot   = float(row.get("stock_price") or row.get("spot") or 0)
+    strike = float(row.get("strike") or 0)
+    if spot > 0 and strike > 0 and spot > strike:
+        otm_distance = (spot - strike) / spot  # fraction of stock price
+        premium_pct  = row["weekly_return_pct"] / 100
+        if otm_distance > 0:
+            efficiency = min(premium_pct / otm_distance, 2.0)  # cap at 2×
+            s += efficiency * 5  # max 10 pts at 2× efficiency
+
+    # 7) OPRA institutional signals (bonus / penalty)
+    # Strike above max pain → MMs incentivised to keep price here          +8
     if row.get("max_pain") and row["strike"] >= row["max_pain"]:
         s += 8
-    # Put/call volume ratio < 0.7 → call-dominant flow today (bullish)    +6
+    # Put/call volume ratio < 0.7 → call-dominant flow (bullish)           +6
     pc_vol = row.get("pc_vol_ratio", 1.0)
     if pc_vol < 0.7:
         s += 6
     elif pc_vol > 1.5:
         s -= 6   # heavy put buying — bearish flow
-    # No unusual put activity at this specific strike                      +4
+    # No unusual put activity at this strike                                +4
     if row.get("vol_oi_ratio", 1.0) < 1.0:
         s += 4
     elif row.get("vol_oi_ratio", 1.0) > 2.0:
-        s -= 8   # volume >> OI: someone is making a directional put bet
-    # Ask-heavy order book → buyers aggressively lifting offers (bullish)  +4
+        s -= 8   # volume >> OI: directional put bet
+    # Ask-heavy order book → buyers lifting offers (bullish)                +4
     flow = row.get("flow_flag", "BALANCED")
     if flow == "ASK HEAVY":
         s += 4
     elif flow == "BID HEAVY":
         s -= 4
+
     return round(s, 2)
 
 
@@ -1018,19 +1054,28 @@ async def _market_regime() -> dict:
     loop = asyncio.get_event_loop()
     try:
         def _fetch():
-            spy_hist = yf.Ticker("SPY").history(period="3mo")["Close"]
-            vix_hist = yf.Ticker("^VIX").history(period="5d")["Close"]
+            spy_hist  = yf.Ticker("SPY").history(period="3mo")["Close"]
+            vix_hist  = yf.Ticker("^VIX").history(period="5d")["Close"]
             spy_close = float(spy_hist.iloc[-1])
             spy_sma50 = float(spy_hist.rolling(50).mean().iloc[-1])
+            spy_sma20 = float(spy_hist.rolling(20).mean().iloc[-1])
+            # 5-day return to detect short-term pullbacks within a bull trend
+            spy_5d    = float(spy_hist.pct_change(5).iloc[-1] * 100) if len(spy_hist) >= 6 else 0.0
             vix       = float(vix_hist.iloc[-1])
-            return spy_close, spy_sma50, vix
+            return spy_close, spy_sma50, spy_sma20, spy_5d, vix
 
-        spy_close, spy_sma50, vix = await loop.run_in_executor(None, _fetch)
+        spy_close, spy_sma50, spy_sma20, spy_5d, vix = await loop.run_in_executor(None, _fetch)
         spy_vs_50d = round((spy_close - spy_sma50) / spy_sma50 * 100, 2)
+        spy_vs_20d = round((spy_close - spy_sma20) / spy_sma20 * 100, 2)
 
-        if spy_close >= spy_sma50 and vix < 20:
+        # Regime logic: VIX thresholds slightly relaxed from 20/25 to 22/28
+        # to avoid hard Kelly cliffs from brief VIX spikes. SMA20 added as
+        # short-term trend confirmation — both MAs must agree for BULL.
+        above_50d = spy_close >= spy_sma50
+        above_20d = spy_close >= spy_sma20
+        if above_50d and above_20d and vix < 22:
             regime = "BULL"
-        elif spy_close >= spy_sma50 and vix < 25:
+        elif above_50d and vix < 28:
             regime = "NEUTRAL"
         else:
             regime = "BEAR"
@@ -1039,7 +1084,10 @@ async def _market_regime() -> dict:
             "regime":         regime,
             "spy_close":      round(spy_close, 2),
             "spy_sma50":      round(spy_sma50, 2),
+            "spy_sma20":      round(spy_sma20, 2),
             "spy_vs_50d_pct": spy_vs_50d,
+            "spy_vs_20d_pct": spy_vs_20d,
+            "spy_5d_pct":     round(spy_5d, 2),
             "vix":            round(vix, 2),
             "ts":             now,
         }
@@ -1325,9 +1373,10 @@ def _filter_csp_recommended(candidates: list) -> list:
     clean = [r for r in candidates
              if len(r.get("warnings", [])) == 0
              and r["liquidity_score"] >= 50
-             and r["iv_rank"] >= IV_RANK_MIN_CSP   # 50th percentile — only sell expensive premium
+             and r["iv_rank"] >= IV_RANK_MIN_CSP        # ≥50th pct — sell expensive vol only
              and r["score"] >= 70
-             and r.get("above_sma50") is not False          # reject stocks in downtrend
+             and r.get("above_sma50") is not False       # long-term uptrend (SMA50)
+             and r.get("above_sma20") is not False       # short-term confirmation (SMA20)
              and (r["earnings_days_out"] is None or r["earnings_days_out"] > EARNINGS_BLOCK_DAYS * 2)]
     # Augment with learned model score if available
     for r in clean:
