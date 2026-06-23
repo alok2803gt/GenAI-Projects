@@ -2826,6 +2826,123 @@ function PnLTab() {
   );
 }
 
+// ── Decisions Tab ─────────────────────────────────────────────────────────
+function DecisionsTab() {
+  const [decisions, setDecisions] = useState([]);
+  const [loading,   setLoading]   = useState(true);
+  const [filter,    setFilter]    = useState("ALL");
+
+  const load = async () => {
+    try {
+      const r = await apiFetch("/autotrader/decisions?limit=200");
+      setDecisions(r.decisions || []);
+    } catch(_) {}
+    finally { setLoading(false); }
+  };
+
+  useEffect(() => {
+    load();
+    const id = setInterval(load, 10000);
+    return () => clearInterval(id);
+  }, []);
+
+  const ACTION_META = {
+    ENTER:        { label:"Entry",         color:"#27ae60", bg:"#0d3321" },
+    ROLL:         { label:"Roll",          color:"#3b82f6", bg:"#0c1a3a" },
+    CLOSE_PROFIT: { label:"Profit ✓",      color:"#f1c40f", bg:"#2d2600" },
+    CLOSE_STOP:   { label:"Stop ⚠",        color:"#e74c3c", bg:"#2d0b0b" },
+    CLOSE_21DTE:  { label:"21 DTE",        color:"#f39c12", bg:"#2d1c00" },
+    CLOSE_ROLL:   { label:"Roll-Close",    color:"#64748b", bg:"#1e293b" },
+    CLOSE_ROTATE: { label:"Rotate",        color:"#a855f7", bg:"#1e1033" },
+    CLOSE_MANUAL: { label:"Manual",        color:"#94a3b8", bg:"#1e293b" },
+  };
+  const ALL_FILTERS = ["ALL","ENTER","ROLL","CLOSE_PROFIT","CLOSE_STOP","CLOSE_21DTE","CLOSE_ROTATE"];
+
+  const filtered = filter === "ALL" ? decisions : decisions.filter(d => d.action === filter);
+
+  // Render markdown-lite: **bold** and \n\n as paragraphs
+  const renderBody = body => {
+    if (!body) return null;
+    return body.split("\n\n").map((para, i) => {
+      const parts = para.split(/(\*\*[^*]+\*\*)/g).map((p, j) =>
+        p.startsWith("**") ? <strong key={j}>{p.slice(2,-2)}</strong> : p
+      );
+      return <p key={i} style={{ margin:"4px 0", lineHeight:1.65 }}>{parts}</p>;
+    });
+  };
+
+  return (
+    <div>
+      <div style={{ display:"flex", alignItems:"center", gap:12, marginBottom:16, flexWrap:"wrap" }}>
+        <div style={{ ...sans, fontSize:14, fontWeight:700, color:"#f1f5f9" }}>
+          Trade Decision Log
+        </div>
+        <div style={{ ...mono, fontSize:11, color:"#64748b" }}>
+          {filtered.length} decision{filtered.length !== 1 ? "s" : ""}
+          {filter !== "ALL" ? ` · ${filter}` : ""}
+        </div>
+        <div style={{ display:"flex", gap:6, marginLeft:"auto", flexWrap:"wrap" }}>
+          {ALL_FILTERS.map(f => {
+            const m = ACTION_META[f] || {};
+            return (
+              <button key={f} onClick={() => setFilter(f)} style={{
+                ...sans, fontSize:11, padding:"3px 10px", borderRadius:12,
+                cursor:"pointer", fontWeight: filter===f ? 700 : 400,
+                border: `1px solid ${filter===f ? (m.color||"#3b82f6") : "#334155"}`,
+                background: filter===f ? (m.bg||"#1e293b") : "transparent",
+                color: filter===f ? (m.color||"#93c5fd") : "#64748b",
+              }}>{f==="ALL" ? "All" : (m.label||f)}</button>
+            );
+          })}
+        </div>
+        <button onClick={load} style={{
+          ...sans, fontSize:11, padding:"3px 10px", borderRadius:6,
+          background:"#1e293b", color:"#94a3b8", border:"1px solid #334155", cursor:"pointer",
+        }}>Refresh</button>
+      </div>
+
+      {loading && <div style={{ color:"#64748b", ...mono }}>Loading decisions…</div>}
+      {!loading && filtered.length === 0 && (
+        <Card>
+          <div style={{ color:"#64748b", ...sans, fontSize:13 }}>
+            No decisions recorded yet. The auto-trader logs a plain-English explanation
+            every time it enters, rolls, or exits a trade.
+          </div>
+        </Card>
+      )}
+
+      <div style={{ display:"flex", flexDirection:"column", gap:12 }}>
+        {filtered.map((d, i) => {
+          const m = ACTION_META[d.action] || { label:d.action, color:"#94a3b8", bg:"#1e293b" };
+          return (
+            <Card key={i} style={{ borderLeft:`3px solid ${m.color}`, padding:"14px 18px" }}>
+              <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom:8 }}>
+                <span style={{
+                  ...mono, fontSize:11, fontWeight:700, padding:"2px 8px", borderRadius:8,
+                  background: m.bg, color: m.color, border:`1px solid ${m.color}55`,
+                }}>{m.label}</span>
+                <span style={{ ...mono, fontSize:13, fontWeight:700, color:"#f1f5f9" }}>
+                  {d.ticker}
+                </span>
+                <span style={{ flex:1, ...sans, fontSize:13, color:"#cbd5e1" }}>
+                  {d.headline}
+                </span>
+                <span style={{ ...mono, fontSize:11, color:"#475569", whiteSpace:"nowrap" }}>
+                  {d.time}
+                </span>
+              </div>
+              <div style={{ ...sans, fontSize:12, color:"#94a3b8", paddingLeft:4 }}>
+                {renderBody(d.body)}
+              </div>
+            </Card>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+
 // ── Root App ──────────────────────────────────────────────────────────────
 function App() {
   const [tab, setTab]         = useState("pnl");
@@ -2863,6 +2980,7 @@ function App() {
     { id:"0dte",       label:"0DTE / EIV"  },
     { id:"learning",   label:"Learning"    },
     { id:"universe",   label:"Universe"    },
+    { id:"decisions",  label:"Decisions"   },
   ];
 
   const deltaCol = netDelta == null ? C.muted : netDelta >= 0 ? C.bull : C.bear;
@@ -2916,6 +3034,7 @@ function App() {
         <div style={{display: tab==="0dte"       ? "" : "none"}}><ZeroDTETab    connected={connected} /></div>
         <div style={{display: tab==="learning"   ? "" : "none"}}><LearningTab /></div>
         <div style={{display: tab==="universe"   ? "" : "none"}}><UniverseTab /></div>
+        <div style={{display: tab==="decisions"  ? "" : "none"}}><DecisionsTab /></div>
 
         <div style={{ marginTop:20, ...sans, fontSize:11, color:C.muted, lineHeight:1.7 }}>
           Auto-trader: Kelly sizing · 50% profit target · IV-adjusted stops · 21 DTE roll · 48h cooldown. Backtest: 2-yr simulation with BS pricing.

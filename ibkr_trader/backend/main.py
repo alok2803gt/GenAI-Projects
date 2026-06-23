@@ -201,6 +201,7 @@ state: Dict = {
         "positions":          {},     # contract_key → entry metadata
         "stopped_out":        {},     # ticker → ISO timestamp of last stop-loss (48h cooldown)
         "log":                [],     # [{time, action, detail}, …] last 200
+        "decisions":          [],     # [{ts, action, ticker, headline, body}, …] last 500
         "last_run":           None,
         "premium_collected":  0.0,    # cumulative realized CSP wins
         "leap_pnl":           0.0,    # cumulative realized LEAP P&L (can be negative)
@@ -1437,6 +1438,23 @@ def _at_log(action: str, detail: str) -> None:
     log.info("[AutoTrader] %s: %s", action, detail)
 
 
+def _decision_log(action: str, ticker: str, headline: str, body: str) -> None:
+    """Store a plain-English decision explanation in the decisions list (last 500)."""
+    from zoneinfo import ZoneInfo
+    est_now = datetime.now(ZoneInfo("America/New_York"))
+    entry = {
+        "ts":       est_now.isoformat(),
+        "time":     est_now.strftime("%b %d %H:%M ET"),
+        "action":   action,   # ENTER / CLOSE_PROFIT / CLOSE_STOP / CLOSE_21DTE / ROLL / ROTATE
+        "ticker":   ticker,
+        "headline": headline,
+        "body":     body,
+    }
+    at = state["autotrader"]
+    at.setdefault("decisions", []).append(entry)
+    at["decisions"] = at["decisions"][-500:]
+
+
 def _at_contract_key(c) -> str:
     return (f"{c.symbol}_{getattr(c,'right','')}"
             f"{getattr(c,'strike','')}{getattr(c,'lastTradeDateOrContractMonth','')}")
@@ -1713,6 +1731,28 @@ async def _autotrader_roll_coro(ib: IB, item, info: dict, key: str) -> None:
                 f"{ticker}: rolled → {expiry_new} P{roll_strike} "
                 f"({dte_new} DTE, net +${net_credit*100:.0f}/contract)")
 
+        # ── Plain-English roll rationale ──────────────────────────────────────
+        orig_strike = float(info.get("strike", 0))
+        strike_note_eng = (
+            f"The strike was moved down from ${orig_strike} to ${roll_strike} "
+            f"because the stock declined toward the original strike."
+            if roll_strike < orig_strike else
+            f"The same ${roll_strike} strike was kept since the stock remains safely above it."
+        )
+        _decision_log(
+            "ROLL", ticker,
+            f"{ticker} ${orig_strike} Put rolled → ${roll_strike} Put {expiry_new} (+${net_credit*100:.0f}/contract)",
+            f"**Why we rolled:** The position reached {dte_new + 21} days to expiration (21 DTE "
+            f"is our threshold). Rather than closing for a small loss or a partial profit, rolling "
+            f"extends the trade to a new expiry ({expiry_new}, {dte_new} DTE) and collects an "
+            f"additional net credit of ${net_credit:.2f}/share (${net_credit*100:.0f}/contract). "
+            f"This is roll #{roll_count + 1} of 2 maximum.\n\n"
+            f"**Strike selection:** {strike_note_eng}\n\n"
+            f"**Economics:** We bought back the old put at ${buyback_ask:.2f} and sold the new "
+            f"put at ${new_fill:.2f}, collecting a net ${net_credit:.2f}/share credit. This credit "
+            f"reduces our cost basis and improves the overall trade's break-even point."
+        )
+
     except Exception as exc:
         _at_log("ROLL", f"{ticker}: roll failed ({exc}) — attempting plain close")
         try:
@@ -1780,6 +1820,69 @@ async def _autotrader_close_coro(ib: IB, item, info: dict, key: str) -> None:
                       f"(50%×${at['premium_collected']:.0f} CSP + ${at.get('leap_pnl',0):.0f} LEAP pnl)")
     _at_log("CLOSED", f"{close_action} {qty}x {c.symbol} @ ${lmt:.2f} "
                       f"pnl=${upnl_now:+.0f} (order #{trade.order.orderId})")
+
+    # ── Plain-English close rationale ─────────────────────────────────────────
+    exit_reason = info.get("exit_reason", "manual")
+    ticker_sym  = c.symbol
+    strike_cl   = float(c.strike)
+    expiry_cl   = c.lastTradeDateOrContractMonth
+    mp          = info.get("max_profit", lmt * 100)
+    ep          = info.get("entry_price", lmt)
+    held_days   = ""
+    try:
+        from zoneinfo import ZoneInfo as _ZI
+        import re as _re
+        placed = info.get("placed_at", "")
+        if placed and _re.search(r"\d{4}-\d{2}-\d{2}", placed):
+            from datetime import date as _date
+            d0 = _date.fromisoformat(_re.search(r"\d{4}-\d{2}-\d{2}", placed).group())
+            held_days = f" Held {(datetime.now(_ZI('America/New_York')).date()-d0).days} days."
+    except Exception:
+        pass
+
+    _reason_map = {
+        "profit_target": ("CLOSE_PROFIT", "Profit Target Reached ✓",
+            f"The position gained ${upnl_now:+.0f}, which equals "
+            f"{round(upnl_now/mp*100) if mp else '?'}% of the ${mp:.0f} max profit. "
+            f"Research shows closing at 50% of max profit captures most of the time-decay "
+            f"benefit while freeing capital for fresh opportunities.{held_days}"),
+        "stop_loss": ("CLOSE_STOP", "Stop-Loss Triggered ⚠",
+            f"The position lost ${abs(upnl_now):.0f}, exceeding the stop-loss threshold. "
+            f"{ticker_sym} moved adversely, pushing the option closer to in-the-money. "
+            f"The stop-loss prevents larger losses if the move continues. "
+            f"{ticker_sym} will be on a 48-hour cooldown before re-entry.{held_days}"),
+        "21dte": ("CLOSE_21DTE", "21 Days to Expiration — Theta Risk Rising",
+            f"The position reached 21 days until expiration. At this point, gamma risk "
+            f"(sensitivity to price moves) accelerates sharply. Closing now locks in "
+            f"${upnl_now:+.0f} P&L and avoids the risk of a late adverse move.{held_days}"),
+        "roll_close": ("CLOSE_ROLL", "Closed Before Rolling",
+            f"Position closed as part of a roll sequence or because earnings were within "
+            f"14 days at roll time. Closing first allows re-entry at a better strike/expiry "
+            f"without earnings risk.{held_days}"),
+        "roll_max": ("CLOSE_ROLL", "Max Rolls Reached — Closing",
+            f"This position reached the maximum number of rolls allowed. "
+            f"Closing now with ${upnl_now:+.0f} P&L rather than extending further.{held_days}"),
+        "roll_no_credit": ("CLOSE_ROLL", "No Credit Available at Roll — Closing",
+            f"When attempting to roll, no expiry offered a net credit. "
+            f"Closing with ${upnl_now:+.0f} P&L instead of locking in a debit.{held_days}"),
+        "rotation": ("CLOSE_ROTATE", "Rotated Out — Better Opportunity Found",
+            f"A higher-scoring candidate displaced this position. "
+            f"Closing with ${upnl_now:+.0f} P&L to redeploy capital.{held_days}"),
+        "manual": ("CLOSE_MANUAL", "Manually Closed",
+            f"Position closed by manual request with ${upnl_now:+.0f} P&L.{held_days}"),
+    }
+    _act, _headline_suffix, _body_detail = _reason_map.get(
+        exit_reason,
+        ("CLOSE_MANUAL", exit_reason.replace("_", " ").title(),
+         f"Position closed ({exit_reason}) with ${upnl_now:+.0f} P&L.{held_days}")
+    )
+    _headline = f"{ticker_sym} ${strike_cl} {'Put' if info.get('action')=='SELL' else 'Call'} — {_headline_suffix}"
+    _body = (
+        f"**Contract:** {ticker_sym} ${strike_cl} expiry {expiry_cl}, "
+        f"entered at ${ep:.2f}, closed at ${lmt:.2f}.\n\n"
+        f"**Result:** {_body_detail}"
+    )
+    _decision_log(_act, ticker_sym, _headline, _body)
     _at_save_state()
 
 
@@ -2231,6 +2334,46 @@ async def _autotrader_place_coro(ib: IB, row: dict, cfg: dict, regime: str = "BU
     }
     _at_log("TRADE", f"{action} {qty}x {ticker} {right}{strike} {expiry} @ ${lmt:.2f} "
                      f"[price_src={lmt_src}] (order #{trade.order.orderId}, status={order_status}, journal #{journal_id})")
+
+    # ── Plain-English decision rationale ──────────────────────────────────────
+    iv_rank    = row.get("iv_rank") or 0
+    wkly_ret   = row.get("weekly_return_pct") or 0
+    delta_val  = row.get("delta") or 0
+    earn_days  = row.get("earnings_days_out")
+    spot_px    = row.get("stock_price") or row.get("spot") or 0
+    otm_pct    = round((float(spot_px) - strike) / float(spot_px) * 100, 1) if spot_px and t == "csp" else 0
+    stop_mult  = 4.0 if (live_iv_entry or 0) > 70 else 3.0 if (live_iv_entry or 0) > 40 else float(cfg.get("stop_loss_mult", 2.0))
+    stop_loss  = round(stop_mult * max_profit, 0)
+    earn_note  = f"Earnings are {earn_days} days away — well outside the 14-day block window." if earn_days else "No upcoming earnings detected."
+
+    if t == "csp":
+        headline = f"Sold {qty}× {ticker} ${strike} Put — {dte} DTE, collecting ${round(lmt*100*qty,0):.0f} premium"
+        body = (
+            f"**Why we entered:** {ticker}'s implied volatility (IV) rank is {iv_rank:.0f}% — "
+            f"{'well above' if iv_rank >= 60 else 'above'} the 50% threshold, meaning options are "
+            f"unusually expensive right now, which is ideal for selling. The stock is {otm_pct:.1f}% "
+            f"below the strike price, giving a {round(100*abs(delta_val),0):.0f}% probability the "
+            f"put expires worthless. At ${lmt:.2f}/share premium, this trade earns {wkly_ret:.2f}%/week "
+            f"— above our 1% minimum. Market regime is {regime}.\n\n"
+            f"**The contract:** Sell {qty} × {ticker} ${strike} Put expiring {expiry} ({dte} DTE) "
+            f"at ${lmt:.2f}, collecting ~${round(lmt*100*qty,0):.0f} total premium.\n\n"
+            f"**Risk:** Maximum profit is ${round(max_profit,0):.0f} if {ticker} stays above ${strike} "
+            f"at expiration. Stop-loss fires if the position loses more than ${stop_loss:.0f} "
+            f"({stop_mult:.0f}× the premium collected). {earn_note}"
+        )
+    else:
+        headline = f"Bought {qty}× {ticker} ${strike} Call (LEAP) — {dte} DTE"
+        body = (
+            f"**Why we entered:** Buying a LEAP call gives long-term upside exposure to {ticker} "
+            f"without owning the stock. IV rank is {iv_rank:.0f}% — "
+            f"{'moderate' if iv_rank < 50 else 'elevated'} — paid ${lmt:.2f}/share for this call. "
+            f"Market regime is {regime}, supported by the upward trend signals.\n\n"
+            f"**The contract:** Buy {qty} × {ticker} ${strike} Call expiring {expiry} ({dte} DTE) "
+            f"at ${lmt:.2f}, total cost ~${round(lmt*100*qty,0):.0f}.\n\n"
+            f"**Risk:** Maximum loss is the premium paid (${round(lmt*100*qty,0):.0f}) if {ticker} "
+            f"stays below ${strike}. Stop-loss at {int(stop_mult*100):.0f}% of cost. {earn_note}"
+        )
+    _decision_log("ENTER", ticker, headline, body)
     _at_save_state()
 
 
@@ -4491,6 +4634,13 @@ def clear_stale_positions():
     msg = f"Cleared {len(removed)} stale/ghost positions; {len(kept)} active positions kept"
     _at_log("SYSTEM", msg)
     return {"ok": True, "removed": removed, "kept": kept, "message": msg}
+
+
+@app.get("/autotrader/decisions")
+def get_autotrader_decisions(limit: int = Query(100, ge=1, le=500)):
+    """Return plain-English trade decision log (most recent first)."""
+    decisions = state["autotrader"].get("decisions", [])
+    return {"decisions": list(reversed(decisions[-limit:]))}
 
 
 # ── 0DTE endpoint ──────────────────────────────────────────────────────────
