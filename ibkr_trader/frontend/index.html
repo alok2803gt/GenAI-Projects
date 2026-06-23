@@ -1763,39 +1763,93 @@ function AutoTraderTab() {
           <div style={{ overflowX:"auto" }}>
             <table style={{ width:"100%", borderCollapse:"collapse", fontSize:13 }}>
               <thead>
-                <tr style={{ color:"#64748b", borderBottom:"1px solid #e2e8f0" }}>
-                  {["Ticker","Type","Strike","Expiry","Action","Qty","Entry","Max P/L","Stop Loss","Score","Placed"].map(h =>
-                    <th key={h} style={{ padding:"6px 10px", textAlign:"left", fontWeight:600 }}>{h}</th>
+                <tr style={{ color:"#64748b", borderBottom:"1px solid #1e293b" }}>
+                  {["Ticker","Type","Strike","Expiry","Qty","Entry","Max P/L","Stop","Live P&L","Progress","Placed",""].map(h =>
+                    <th key={h} style={{ padding:"6px 10px", textAlign:"left", fontWeight:600, fontSize:11 }}>{h}</th>
                   )}
                 </tr>
               </thead>
               <tbody>
                 {Object.entries(positions).map(([key, p]) => {
-                  // Compute IV-adjusted stop threshold (mirrors backend monitor logic)
                   const iv = p.live_iv || 0;
                   const stopMult = p.action === "SELL"
                     ? (iv > 70 ? 4.0 : iv > 40 ? 3.0 : (cfg.stop_loss_mult || 2.0))
                     : (iv > 70 ? 0.40 : iv > 40 ? 0.50 : 0.60);
-                  const stopLoss = -(stopMult * (p.max_profit || 0));
+                  const stopLoss      = -(stopMult * (p.max_profit || 0));
+                  const livePnl       = p.live_pnl;
+                  const hasLive       = livePnl != null;
+                  const pnlColor      = !hasLive ? "#64748b"
+                                      : livePnl >= 0 ? "#27ae60" : "#e74c3c";
+                  const profitTarget  = (cfg.profit_target_pct || 0.5) * (p.max_profit || 0);
+                  const progress      = hasLive && profitTarget > 0
+                                      ? Math.min(1, Math.max(0, livePnl / profitTarget))
+                                      : null;
+                  const progressColor = progress == null ? "#334155"
+                                      : progress >= 1   ? "#f1c40f"
+                                      : progress >= 0.5 ? "#27ae60"
+                                      : livePnl < 0     ? "#e74c3c"
+                                      : "#3b82f6";
                   return (
-                  <tr key={key} style={{ borderBottom:"1px solid #e2e8f0" }}>
-                    <td style={{ padding:"7px 10px", fontWeight:700, color:"#1e293b" }}>{p.ticker}</td>
+                  <tr key={key} style={{ borderBottom:"1px solid #0f172a" }}>
+                    <td style={{ padding:"7px 10px", fontWeight:700, color:"#f1f5f9" }}>{p.ticker}</td>
                     <td style={{ padding:"7px 10px", fontWeight:600,
-                      color: p.right==="C"?"#27ae60":p.right==="P"?"#e74c3c":"#475569" }}>
+                      color: p.right==="C"?"#27ae60":p.right==="P"?"#60a5fa":"#94a3b8" }}>
                       {strategyLabel(p)}
                     </td>
-                    <td style={{ padding:"7px 10px" }}>${p.strike}</td>
-                    <td style={{ padding:"7px 10px", color:"#475569" }}>{p.expiry}</td>
-                    <td style={{ padding:"7px 10px", color: p.action==="SELL"?"#e74c3c":"#27ae60", fontWeight:700 }}>{p.action}</td>
-                    <td style={{ padding:"7px 10px" }}>{p.qty}</td>
-                    <td style={{ padding:"7px 10px" }}>${(p.entry_price||0).toFixed(2)}</td>
+                    <td style={{ padding:"7px 10px", color:"#f1f5f9" }}>${p.strike}</td>
+                    <td style={{ padding:"7px 10px", color:"#94a3b8", fontSize:11 }}>{p.expiry}</td>
+                    <td style={{ padding:"7px 10px", color:"#f1f5f9" }}>{p.qty}</td>
+                    <td style={{ padding:"7px 10px", color:"#94a3b8" }}>${(p.entry_price||0).toFixed(2)}</td>
                     <td style={{ padding:"7px 10px", color:"#f1c40f" }}>${(p.max_profit||0).toFixed(0)}</td>
                     <td style={{ padding:"7px 10px" }}>
                       <span style={{ color:"#e74c3c", fontWeight:600 }}>-${Math.abs(stopLoss).toFixed(0)}</span>
-                      <span style={{ color:"#94a3b8", fontSize:10, marginLeft:4 }}>{stopMult}×</span>
+                      <span style={{ color:"#64748b", fontSize:10, marginLeft:3 }}>{stopMult}×</span>
                     </td>
-                    <td style={{ padding:"7px 10px" }}>{p.score}</td>
+                    <td style={{ padding:"7px 10px" }}>
+                      {hasLive
+                        ? <span style={{ fontWeight:700, color:pnlColor }}>{livePnl >= 0 ? "+" : ""}${livePnl.toFixed(0)}</span>
+                        : <span style={{ color:"#475569" }}>—</span>
+                      }
+                    </td>
+                    <td style={{ padding:"7px 10px", minWidth:100 }}>
+                      {progress != null ? (
+                        <div>
+                          <div style={{ fontSize:10, color: progressColor, fontWeight:700, marginBottom:2 }}>
+                            {(progress*100).toFixed(0)}% of target
+                            {progress >= 1 && " ✓"}
+                          </div>
+                          <div style={{ height:5, borderRadius:3, background:"#1e293b", overflow:"hidden" }}>
+                            <div style={{
+                              height:"100%", borderRadius:3,
+                              width:`${Math.min(100,progress*100)}%`,
+                              background: progressColor,
+                              transition:"width 0.5s",
+                            }}/>
+                          </div>
+                        </div>
+                      ) : <span style={{ color:"#475569", fontSize:11 }}>awaiting data</span>}
+                    </td>
                     <td style={{ padding:"7px 10px", color:"#64748b", fontSize:11 }}>{p.placed_at}</td>
+                    <td style={{ padding:"7px 6px" }}>
+                      <button
+                        title="Manually close this position"
+                        onClick={async () => {
+                          if (!window.confirm(`Close ${p.ticker} ${p.strike} ${p.right} manually?`)) return;
+                          try {
+                            await apiFetch("/autotrader/close-position", {
+                              method:"POST",
+                              headers:{"Content-Type":"application/json"},
+                              body: JSON.stringify({ key }),
+                            });
+                          } catch(e) { alert("Close failed: " + e.message); }
+                        }}
+                        style={{
+                          fontSize:11, padding:"3px 8px", borderRadius:5,
+                          background:"#7f1d1d", color:"#fca5a5", border:"1px solid #991b1b",
+                          cursor:"pointer", fontWeight:700,
+                        }}
+                      >Close</button>
+                    </td>
                   </tr>
                   );
                 })}

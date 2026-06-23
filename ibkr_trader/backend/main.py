@@ -4320,6 +4320,10 @@ class ReconnectRequest(BaseModel):
     port: int   # 7497 = paper, 7496 = live, 4001/4002 = IB Gateway
 
 
+class ClosePositionRequest(BaseModel):
+    key: str   # contract key from at["positions"]
+
+
 class OrderRequest(BaseModel):
     ticker:      str
     expiry:      str            # YYYYMMDD
@@ -4530,13 +4534,30 @@ def account_summary():
 def autotrader_status():
     """Return current auto-trader state, config, positions, and log."""
     at = state["autotrader"]
-    # Return a snapshot copy so concurrent writes don't race with JSON serialization.
-    # Config is shallow-copied and trailing_exit stripped so it never appears in API.
     clean_cfg = {k: v for k, v in at["config"].items() if k != "trailing_exit"}
+
+    # Deep-copy positions so we can safely add live P&L without mutating state
+    positions_enriched = {k: dict(v) for k, v in at["positions"].items()}
+
+    # Enrich with live unrealized P&L from IBKR portfolio if connected
+    ib = state.get("ib")
+    if ib and state.get("connected"):
+        try:
+            for item in ib.portfolio():
+                c = item.contract
+                if getattr(c, "secType", "") != "OPT":
+                    continue
+                k = _at_contract_key(c)
+                if k in positions_enriched:
+                    positions_enriched[k]["live_pnl"]   = round(float(item.unrealizedPNL or 0), 2)
+                    positions_enriched[k]["live_price"]  = round(float(item.marketPrice or 0), 4)
+        except Exception:
+            pass
+
     return {
         "enabled":           at["enabled"],
         "config":            clean_cfg,
-        "positions":         dict(at["positions"]),
+        "positions":         positions_enriched,
         "stopped_out":       dict(at.get("stopped_out", {})),
         "log":               list(at["log"]),
         "last_run":          at.get("last_run"),
@@ -4634,6 +4655,37 @@ def clear_stale_positions():
     msg = f"Cleared {len(removed)} stale/ghost positions; {len(kept)} active positions kept"
     _at_log("SYSTEM", msg)
     return {"ok": True, "removed": removed, "kept": kept, "message": msg}
+
+
+@app.post("/autotrader/close-position")
+async def close_position_manual(req: ClosePositionRequest):
+    """Manually close a specific tracked position by contract key."""
+    _require_connection()
+    ib  = state["ib"]
+    at  = state["autotrader"]
+    key = req.key
+    if key not in at["positions"]:
+        raise HTTPException(status_code=404, detail=f"Position '{key}' not tracked")
+
+    info = dict(at["positions"][key])   # copy — close_coro will pop it
+    info["exit_reason"] = "manual"
+
+    # Find matching portfolio item
+    portfolio  = ib.portfolio()
+    matching   = next(
+        (item for item in portfolio if _at_contract_key(item.contract) == key),
+        None,
+    )
+    if not matching:
+        # Ghost position — remove from tracking only
+        at["positions"].pop(key, None)
+        _at_save_state()
+        _at_log("SYSTEM", f"Ghost position {key} removed from tracking (not in portfolio)")
+        return {"ok": True, "note": "Removed ghost position from tracking"}
+
+    _at_log("SYSTEM", f"Manual close requested for {key}")
+    await _autotrader_close_coro(ib, matching, info, key)
+    return {"ok": True}
 
 
 @app.get("/autotrader/decisions")
