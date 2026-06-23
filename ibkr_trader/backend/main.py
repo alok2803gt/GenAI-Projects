@@ -1383,8 +1383,8 @@ def _kelly_qty(cfg: dict, strike: float, t_type: str, mid_price: float = 0.0,
                regime: str = "BULL") -> int:
     """Half-Kelly position sizing, scaled by market regime."""
     p  = float(cfg.get("assumed_win_rate", 0.85))
-    pt = float(cfg.get("profit_target_pct", 0.65))
-    sl = float(cfg.get("stop_loss_mult", 5.0))
+    pt = float(cfg.get("profit_target_pct", 0.50))   # matches AutoTraderConfigRequest default
+    sl = float(cfg.get("stop_loss_mult", 2.0))        # matches AutoTraderConfigRequest default
     b  = pt / sl if sl > 0 else pt / 5.0
     kelly = (p * (b + 1) - 1) / b if b > 0 else 0.0
     frac  = max(0.02, kelly * 0.5)             # half-Kelly
@@ -1400,12 +1400,12 @@ def _kelly_qty(cfg: dict, strike: float, t_type: str, mid_price: float = 0.0,
 
 
 def _bs_put_price(S: float, K: float, T: float, sigma: float) -> float:
-    """Black-Scholes put price (risk-free rate = 0)."""
+    """Black-Scholes put price using the global risk-free rate (_RF_RATE = 4.5%)."""
     if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
         return max(K - S, 0.0)
-    d1 = (math.log(S / K) + 0.5 * sigma**2 * T) / (sigma * math.sqrt(T))
+    d1 = (math.log(S / K) + (_RF_RATE + 0.5 * sigma**2) * T) / (sigma * math.sqrt(T))
     d2 = d1 - sigma * math.sqrt(T)
-    return K * _norm_cdf(-d2) - S * _norm_cdf(-d1)
+    return K * math.exp(-_RF_RATE * T) * _norm_cdf(-d2) - S * _norm_cdf(-d1)
 
 
 async def _autotrader_monitor_coro(ib: IB) -> None:
@@ -1564,7 +1564,16 @@ async def _autotrader_roll_coro(ib: IB, item, info: dict, key: str) -> None:
             await _autotrader_close_coro(ib, item, info, key)
             return
 
-        best        = min(valid, key=lambda td: abs(float(td.contract.strike) - target_strike))
+        # Guard: never roll UP — the new strike must not exceed the original.
+        # Closest-to-target can overshoot above orig_strike if that expiry
+        # only has higher strikes available, which increases assignment risk.
+        safe_valid = [td for td in valid if float(td.contract.strike) <= orig_strike]
+        if not safe_valid:
+            _at_log("ROLL", f"{ticker}: no roll strikes at or below original ${orig_strike} — closing")
+            info["exit_reason"] = "roll_close"
+            await _autotrader_close_coro(ib, item, info, key)
+            return
+        best        = min(safe_valid, key=lambda td: abs(float(td.contract.strike) - target_strike))
         roll_strike = float(best.contract.strike)
         new_bid     = _safe_float(best.bid, 0)
         new_ask     = _safe_float(best.ask, 0)
