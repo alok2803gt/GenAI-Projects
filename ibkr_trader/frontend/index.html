@@ -935,6 +935,31 @@ function CSPTab({ connected }) {
         </Card>
       )}
 
+      {/* Filter diagnostics banner */}
+      {!loading && result?.filter_summary && (() => {
+        const fs = result.filter_summary;
+        const pills = [
+          { label:`${fs.recommended} passed`, color:"#27ae60" },
+          fs.rejected_warn   > 0 && { label:`${fs.rejected_warn} warnings`,  color:"#f39c12" },
+          fs.rejected_liq    > 0 && { label:`${fs.rejected_liq} low-liq`,    color:"#64748b" },
+          fs.rejected_iv     > 0 && { label:`${fs.rejected_iv} low-IV`,      color:"#64748b" },
+          fs.rejected_score  > 0 && { label:`${fs.rejected_score} low-score`,color:"#64748b" },
+          fs.rejected_trend  > 0 && { label:`${fs.rejected_trend} downtrend`,color:"#e74c3c" },
+          fs.rejected_earn   > 0 && { label:`${fs.rejected_earn} earnings`,  color:"#f1c40f" },
+        ].filter(Boolean);
+        return (
+          <div style={{ display:"flex", alignItems:"center", gap:6, marginBottom:10, flexWrap:"wrap" }}>
+            <span style={{ fontSize:11, color:"#64748b" }}>{fs.total_raw} raw →</span>
+            {pills.map((p, i) => (
+              <span key={i} style={{
+                fontSize:11, padding:"2px 8px", borderRadius:10, fontWeight:600,
+                background: p.color + "22", color: p.color, border:`1px solid ${p.color}44`,
+              }}>{p.label}</span>
+            ))}
+          </div>
+        );
+      })()}
+
       {/* Results table */}
       {!loading && result?.candidates?.length > 0 && (() => {
         const rows = recommended ? filterCSP(result.candidates) : result.candidates;

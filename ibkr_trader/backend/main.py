@@ -1369,16 +1369,43 @@ async def _universe_scheduler() -> None:
 
 # ── Recommendation filters (mirrors frontend JS) ──────────────────────────
 
-def _filter_csp_recommended(candidates: list) -> list:
+def _filter_csp_recommended(candidates: list, log_diag: bool = False) -> list:
+    """Filter scan candidates to recommended CSPs. Set log_diag=True to emit AT diagnostics."""
+    n_total     = len(candidates)
+    n_warnings  = sum(1 for r in candidates if len(r.get("warnings", [])) > 0)
+    n_liq       = sum(1 for r in candidates if len(r.get("warnings", [])) == 0 and r["liquidity_score"] < 50)
+    n_iv        = sum(1 for r in candidates if len(r.get("warnings", [])) == 0
+                      and r["liquidity_score"] >= 50 and r["iv_rank"] < IV_RANK_MIN_CSP)
+    n_score     = sum(1 for r in candidates if len(r.get("warnings", [])) == 0
+                      and r["liquidity_score"] >= 50 and r["iv_rank"] >= IV_RANK_MIN_CSP
+                      and r["score"] < 70)
+    n_trend     = sum(1 for r in candidates if len(r.get("warnings", [])) == 0
+                      and r["liquidity_score"] >= 50 and r["iv_rank"] >= IV_RANK_MIN_CSP
+                      and r["score"] >= 70
+                      and (r.get("above_sma50") is False or r.get("above_sma20") is False))
+    n_earnings  = sum(1 for r in candidates if len(r.get("warnings", [])) == 0
+                      and r["liquidity_score"] >= 50 and r["iv_rank"] >= IV_RANK_MIN_CSP
+                      and r["score"] >= 70
+                      and r.get("above_sma50") is not False and r.get("above_sma20") is not False
+                      and r["earnings_days_out"] is not None
+                      and r["earnings_days_out"] <= EARNINGS_BLOCK_DAYS * 2)
+
     # above_sma50 must be True or None (None = not enough history, give benefit of doubt)
     clean = [r for r in candidates
              if len(r.get("warnings", [])) == 0
              and r["liquidity_score"] >= 50
-             and r["iv_rank"] >= IV_RANK_MIN_CSP        # ≥50th pct — sell expensive vol only
+             and r["iv_rank"] >= IV_RANK_MIN_CSP
              and r["score"] >= 70
-             and r.get("above_sma50") is not False       # long-term uptrend (SMA50)
-             and r.get("above_sma20") is not False       # short-term confirmation (SMA20)
+             and r.get("above_sma50") is not False
+             and r.get("above_sma20") is not False
              and (r["earnings_days_out"] is None or r["earnings_days_out"] > EARNINGS_BLOCK_DAYS * 2)]
+
+    if log_diag and n_total > 0:
+        _at_log("SCAN",
+            f"CSP filter: {n_total} raw → {len(clean)} passed "
+            f"[warnings:{n_warnings} liq:{n_liq} iv_rank:{n_iv} "
+            f"score:{n_score} trend:{n_trend} earnings:{n_earnings}]")
+
     # Augment with learned model score if available
     for r in clean:
         ls = _learned_score(r)
@@ -1992,13 +2019,19 @@ def _find_rotation_target(at: dict, portfolio_items: list, candidates: list,
     scored_positions = []
     item_by_key = {_at_contract_key(i.contract): i for i in portfolio_items}
 
+    today = date.today()
     for key, info in at["positions"].items():
         item = item_by_key.get(key)
         if item is None:
             continue
         upnl       = float(item.unrealizedPNL or 0)
         max_profit = float(info.get("max_profit", 0))
-        dte        = int(info.get("dte") or 45)
+        # Recalculate current DTE from expiry (stored DTE is at-entry and stale after days pass)
+        expiry_str = info.get("expiry", "")
+        try:
+            dte = max(0, (datetime.strptime(expiry_str, "%Y%m%d").date() - today).days)
+        except (ValueError, TypeError):
+            dte = int(info.get("dte") or 45)   # fallback only if expiry unparseable
 
         rv_score   = _position_remaining_value(info, upnl, max_profit, dte, profit_target)
         is_closeable = upnl >= 0 or dte <= 21   # only profitable or near-expiry positions
@@ -2084,7 +2117,7 @@ async def _autotrader_scan_and_trade_coro(ib: IB) -> None:
     if "csp" in cfg["scan_types"]:
         try:
             r = await scan_csp(ib, CSP_MIN_RETURN_PCT, CSP_MAX_DELTA)
-            for c in _filter_csp_recommended(r["candidates"]):
+            for c in _filter_csp_recommended(r["candidates"], log_diag=True):
                 c["_type"] = "csp"
                 c["_regime"] = regime
                 candidates.append(c)
@@ -4025,15 +4058,39 @@ async def csp_scan(
     candidates = _json_safe(result["candidates"])
     regime     = _json_safe(result["regime"])
     now = datetime.utcnow()
+
+    # Compute filter diagnostics for the API response
+    recommended = _filter_csp_recommended(candidates)
+    n = len(candidates)
+    filter_summary = {
+        "total_raw":       n,
+        "recommended":     len(recommended),
+        "rejected_warn":   sum(1 for r in candidates if len(r.get("warnings", [])) > 0),
+        "rejected_liq":    sum(1 for r in candidates if not r.get("warnings") and r["liquidity_score"] < 50),
+        "rejected_iv":     sum(1 for r in candidates if not r.get("warnings") and r["liquidity_score"] >= 50
+                               and r["iv_rank"] < IV_RANK_MIN_CSP),
+        "rejected_score":  sum(1 for r in candidates if not r.get("warnings") and r["liquidity_score"] >= 50
+                               and r["iv_rank"] >= IV_RANK_MIN_CSP and r["score"] < 70),
+        "rejected_trend":  sum(1 for r in candidates if not r.get("warnings") and r["liquidity_score"] >= 50
+                               and r["iv_rank"] >= IV_RANK_MIN_CSP and r["score"] >= 70
+                               and (r.get("above_sma50") is False or r.get("above_sma20") is False)),
+        "rejected_earn":   sum(1 for r in candidates if not r.get("warnings") and r["liquidity_score"] >= 50
+                               and r["iv_rank"] >= IV_RANK_MIN_CSP and r["score"] >= 70
+                               and r.get("above_sma50") is not False and r.get("above_sma20") is not False
+                               and r["earnings_days_out"] is not None
+                               and r["earnings_days_out"] <= EARNINGS_BLOCK_DAYS * 2),
+    }
+
     cache["csp"]    = candidates
     cache["regime"] = regime
     cache["ts"]     = now
     return {
-        "cached":        False,
-        "scanned_at":    now.isoformat() + "Z",
-        "count":         len(candidates),
-        "candidates":    candidates,
-        "market_regime": regime,
+        "cached":          False,
+        "scanned_at":      now.isoformat() + "Z",
+        "count":           len(candidates),
+        "candidates":      candidates,
+        "market_regime":   regime,
+        "filter_summary":  filter_summary,
     }
 
 
