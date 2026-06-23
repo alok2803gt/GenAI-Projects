@@ -1914,13 +1914,15 @@ async def _autotrader_scan_and_trade_coro(ib: IB) -> None:
     portf_t  = {item.contract.symbol for item in ib.portfolio()}
     active_t = dict_t | portf_t
 
-    # NEUTRAL regime: cap entries at half of max to stay conservative
-    max_slots = cfg["max_positions"] if regime == "BULL" else max(1, cfg["max_positions"] // 2)
-
     # ── Capital-aware headroom ────────────────────────────────────────────────
-    # Replaces the hard count gate with a dual check:
-    #   1. Count headroom (sanity cap — count-based ceiling)
-    #   2. Capital headroom (main gate — never deploy more than 80% of allocation)
+    # Dual constraint: count headroom (sanity cap) AND capital headroom.
+    # Regime conservatism is handled entirely through Kelly's regime_scale
+    # (BULL=1.0, NEUTRAL=0.6, BEAR=0.35) — which produces smaller positions
+    # that consume less capital, naturally limiting deployment in weak regimes.
+    # A separate count cap on top of Kelly is a double-penalty: NEUTRAL at 60%
+    # Kelly with max_positions=5 would have been capped at 2 positions even with
+    # $40K deployable and 5 quality candidates — defeating capital-aware sizing.
+    max_slots   = cfg["max_positions"]
     cap         = _capital_state(ib, cfg, at)
     count_slots = max_slots - len(at["positions"])
     # Estimate the cheapest likely CSP (use $100 strike as conservative floor)

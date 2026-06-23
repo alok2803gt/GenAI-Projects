@@ -827,7 +827,16 @@ function CSPTab({ connected }) {
       return <span style={{color:c,fontWeight:600}}>{d}d</span>;
     }},
     { key:"cash_required",        label:"Cash Req",    render: r => fmt$(r.cash_required) },
-    { key:"xgb_signal",           label:"XGB",         render: r => <Pill color={SIG_COLOR[r.xgb_signal]||C.muted}>{r.xgb_signal}</Pill> },
+    { key:"xgb_signal", label:"XGB/Model", render: r => (
+      <span style={{display:"flex",alignItems:"center",gap:5}}>
+        <Pill color={SIG_COLOR[r.xgb_signal]||C.muted}>{r.xgb_signal||"—"}</Pill>
+        {r.learned_score != null && (
+          <span style={{color:"#8b5cf6",fontSize:11,fontWeight:700}}>
+            {r.learned_score.toFixed(0)}%
+          </span>
+        )}
+      </span>
+    )},
     { key:"rsi14",                label:"RSI",         render: r => {
       const v = r.rsi14; if (v==null) return <span style={{color:C.muted}}>—</span>;
       const c = v<30?C.bull:v>70?C.bear:v>=45&&v<=65?C.accent:C.neutral;
@@ -1774,12 +1783,17 @@ function AutoTraderTab() {
         ) : (
           <div style={{ maxHeight:320, overflowY:"auto", fontFamily:"'Fira Mono', monospace", fontSize:12 }}>
             {actLog.map((e, i) => {
-              const col = (e.action==="ERROR"||e.action==="IBKR-ERR")?"#e74c3c"
-                        : (e.action==="TRADE"||e.action==="CLOSED")?"#27ae60"
-                        : e.action==="CLOSE"?"#f1c40f"
-                        : e.action==="SYSTEM"?"#9b59b6"
-                        : e.action==="WARN"?"#f39c12"
-                        : "#ccc";
+              const col = (e.action==="ERROR"||e.action==="IBKR-ERR") ? "#e74c3c"
+                        : (e.action==="TRADE"||e.action==="CLOSED")  ? "#27ae60"
+                        : e.action==="CLOSE"                         ? "#f1c40f"
+                        : e.action==="ROLL"                          ? "#3b82f6"
+                        : e.action==="ROTATE"                        ? "#a855f7"
+                        : e.action==="HEDGE"                         ? "#06b6d4"
+                        : e.action==="LEARN"                         ? "#8b5cf6"
+                        : e.action==="SYSTEM"                        ? "#9b59b6"
+                        : e.action==="WARN"                          ? "#f39c12"
+                        : e.action==="SCAN"                          ? "#64748b"
+                        : "#94a3b8";
               return (
                 <div key={i} style={{ padding:"4px 6px", borderBottom:"1px solid #e2e8f0", color:col }}>
                   <span style={{ color:"#64748b" }}>[{e.time}]</span>
