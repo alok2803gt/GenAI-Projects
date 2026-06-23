@@ -1669,6 +1669,13 @@ function AutoTraderTab() {
             Total Capital ($)
             <input type="number" min={10000} step={10000} value={cfg.total_capital}
               onChange={e => setCfg({ ...cfg, total_capital: +e.target.value })} {...inp()} />
+            <span style={{ fontSize:10, color:"#94a3b8" }}>Used by Kelly formula for position sizing</span>
+          </label>
+          <label style={{ display:"flex", flexDirection:"column", gap:4, fontSize:13, color:"#475569" }}>
+            CSP Capital ($)
+            <input type="number" min={5000} step={5000} value={cfg.csp_capital}
+              onChange={e => setCfg({ ...cfg, csp_capital: +e.target.value })} {...inp()} />
+            <span style={{ fontSize:10, color:"#94a3b8" }}>Notional budget deployed in CSP strategy — keep &lt; total capital</span>
           </label>
           <div style={{ display:"flex", flexDirection:"column", gap:4, fontSize:13, color:"#475569" }}>
             Kelly Win Rate

@@ -1789,7 +1789,19 @@ def _capital_state(ib: IB, cfg: dict, at: dict) -> dict:
     """
     CAPITAL_BUFFER_PCT = 0.20   # keep 20% of CSP allocation as dry powder
 
-    allocated  = float(cfg.get("csp_capital", 20000.0))
+    csp_capital   = float(cfg.get("csp_capital", 20000.0))
+    total_capital = float(cfg.get("total_capital", 100000.0))
+    # Guard: if csp_capital is less than 10% of total_capital the user likely
+    # updated total_capital but forgot to also update csp_capital.  Fall back to
+    # 25% of total_capital so the strategy actually deploys at the new scale.
+    if csp_capital < total_capital * 0.10:
+        allocated = total_capital * 0.25
+        _at_log("WARN",
+                f"csp_capital (${csp_capital:,.0f}) < 10% of total_capital (${total_capital:,.0f}). "
+                f"Using 25% of total_capital (${allocated:,.0f}) as CSP allocation. "
+                f"Update csp_capital in config to silence this warning.")
+    else:
+        allocated = csp_capital
     buffer_amt = allocated * CAPITAL_BUFFER_PCT
     max_deploy = allocated - buffer_amt   # 80% of allocation
 
