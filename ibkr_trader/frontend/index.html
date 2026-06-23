@@ -1603,16 +1603,22 @@ function AutoTraderTab() {
       {/* Multi-strategy budget */}
       {(status?.premium_collected > 0 || status?.leap_budget > 0) && (
         <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:12, marginBottom:20 }}>
-          {[
-            { label:"Premium Collected", value:`$${(status?.premium_collected||0).toFixed(0)}`, col:"#27ae60" },
-            { label:"LEAP Budget (50%)", value:`$${(status?.leap_budget||0).toFixed(0)}`, col:"#3498db" },
-            { label:"Kelly Capital/Trade", value:`$${kellyCapital.toLocaleString()}`, col:"#f1c40f" },
-          ].map(s => (
-            <div key={s.label} style={{ background:"#f1f5f9", borderRadius:8, padding:14, textAlign:"center" }}>
-              <div style={{ color:"#64748b", fontSize:11, marginBottom:6 }}>{s.label}</div>
-              <div style={{ color:s.col, fontWeight:700, fontSize:20 }}>{s.value}</div>
-            </div>
-          ))}
+          {(() => {
+            const leapPnl = status?.leap_pnl || 0;
+            const leapPnlCol = leapPnl >= 0 ? "#27ae60" : "#e74c3c";
+            return [
+              { label:"Premium Collected", value:`$${(status?.premium_collected||0).toFixed(0)}`, col:"#27ae60", sub:null },
+              { label:"LEAP Budget (net)", value:`$${(status?.leap_budget||0).toFixed(0)}`, col:"#3498db",
+                sub: leapPnl !== 0 ? { text:`LEAP P&L: ${leapPnl>=0?"+":""}$${leapPnl.toFixed(0)}`, col:leapPnlCol } : null },
+              { label:"Kelly Capital/Trade", value:`$${kellyCapital.toLocaleString()}`, col:"#f1c40f", sub:null },
+            ].map(s => (
+              <div key={s.label} style={{ background:"#f1f5f9", borderRadius:8, padding:14, textAlign:"center" }}>
+                <div style={{ color:"#64748b", fontSize:11, marginBottom:6 }}>{s.label}</div>
+                <div style={{ color:s.col, fontWeight:700, fontSize:20 }}>{s.value}</div>
+                {s.sub && <div style={{ color:s.sub.col, fontSize:11, marginTop:4 }}>{s.sub.text}</div>}
+              </div>
+            ));
+          })()}
         </div>
       )}
 

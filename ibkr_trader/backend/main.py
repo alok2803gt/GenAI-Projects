@@ -194,8 +194,9 @@ state: Dict = {
         "stopped_out":        {},     # ticker → ISO timestamp of last stop-loss (48h cooldown)
         "log":                [],     # [{time, action, detail}, …] last 200
         "last_run":           None,
-        "premium_collected":  0.0,    # total realized CSP profit
-        "leap_budget":        0.0,    # 50 % of premium_collected → LEAP fund
+        "premium_collected":  0.0,    # cumulative realized CSP wins
+        "leap_pnl":           0.0,    # cumulative realized LEAP P&L (can be negative)
+        "leap_budget":        0.0,    # 50% of CSP income + LEAP P&L (net available)
     },
     # Reconnect request (set by /reconnect endpoint, read by streaming loop)
     "reconnect_port": None,
@@ -751,6 +752,7 @@ def _at_save_state() -> None:
         "positions":         at["positions"],
         "stopped_out":       at.get("stopped_out", {}),
         "premium_collected": at["premium_collected"],
+        "leap_pnl":          at.get("leap_pnl", 0.0),
         "leap_budget":       at["leap_budget"],
         "model_version":     state.get("model_version", 0),
     }
@@ -771,6 +773,7 @@ def _at_load_state() -> None:
         at = state["autotrader"]
         at["enabled"]           = saved.get("enabled", False)
         at["premium_collected"] = saved.get("premium_collected", 0.0)
+        at["leap_pnl"]          = saved.get("leap_pnl", 0.0)
         at["leap_budget"]       = saved.get("leap_budget", 0.0)
         # Merge saved config over defaults; strip removed keys on load
         merged = {**saved.get("config", {})}
@@ -1049,7 +1052,10 @@ def _build_warnings(earnings_days: Optional[int], iv_rank: float, mode: str = "c
     """Human-readable warning tags attached to each candidate row."""
     warnings: List[str] = []
     if earnings_days is not None and earnings_days <= EARNINGS_WARN_DAYS:
-        warnings.append(f"Earnings in {earnings_days}d")
+        # Row is filtered from Recommended view when earnings_days <= 21.
+        # Label makes this visible in Show-all mode so user understands why it disappears.
+        suffix = " — excl. recommended" if earnings_days <= 21 else ""
+        warnings.append(f"Earnings in {earnings_days}d{suffix}")
     # IV rank thresholds are enforced as direct numeric filters in _filter_csp_recommended
     # and _filter_leap_recommended — no need to double-block via warnings here.
     return warnings
@@ -1461,8 +1467,16 @@ async def _autotrader_monitor_coro(ib: IB) -> None:
                 eff_stop_mult = stop_mult  # normal IV — use config value (2×)
             stop_threshold = -eff_stop_mult * max_profit
         else:
-            eff_stop_mult  = 0.50
-            stop_threshold = -0.50 * max_profit
+            # LEAP (long call): high IV hurts long options via IV crush.
+            # Tighter stop in high IV to cut before crush compounds; wider
+            # stop in low IV where stock moves are cleaner signals.
+            if live_iv > 70:
+                eff_stop_mult = 0.40   # tight: high IV → crush risk
+            elif live_iv > 40:
+                eff_stop_mult = 0.50   # standard 50% stop
+            else:
+                eff_stop_mult = 0.60   # wider: low IV, let directional thesis develop
+            stop_threshold = -eff_stop_mult * max_profit
 
         if upnl <= stop_threshold:
             ticker = info.get("ticker", key.split("_")[0])
@@ -1601,12 +1615,16 @@ async def _autotrader_roll_coro(ib: IB, item, info: dict, key: str) -> None:
         await _autotrader_close_coro(ib, item, info, key)
 
         row = {
-            "ticker": ticker,   "expiry": expiry_new, "strike": roll_strike,
-            "_type":  "csp",    "_regime": "BULL",
-            "bid":    new_bid,  "ask":     new_ask,   "score": 0,
+            "ticker":     ticker,       "expiry":      expiry_new,
+            "strike":     roll_strike,  "_type":       info.get("strategy_type", "csp"),
+            "_regime":    state["ext_cache"].get("regime", {}).get("regime", "BULL"),
+            "bid":        new_bid,      "ask":         new_ask,
+            "score":      info.get("score", 0),
+            "iv_rank":    info.get("iv_rank"),
+            "live_iv":    live_iv,      # IV at time of roll — critical for learning model
             "roll_count": roll_count + 1,
         }
-        await _autotrader_place_coro(ib, row, state["autotrader"]["config"], regime="BULL")
+        await _autotrader_place_coro(ib, row, state["autotrader"]["config"], regime=row["_regime"])
         _at_log("ROLL",
                 f"{ticker}: rolled → {expiry_new} P{roll_strike} "
                 f"({dte_new} DTE, net +${net_credit*100:.0f}/contract)")
@@ -1664,12 +1682,18 @@ async def _autotrader_close_coro(ib: IB, item, info: dict, key: str) -> None:
         exit_reason = info.get("exit_reason", "manual")
         _journal_record_exit(j_id, lmt, upnl_now, exit_reason, live_iv_exit)
 
-    # Track premium collected for LEAP budget
-    if upnl_now > 0 and info.get("action") == "SELL":
-        at = state["autotrader"]
+    # Track premium collected / LEAP P&L for the LEAP budget fund.
+    # Budget = 50% of cumulative CSP wins PLUS all realised LEAP P&L (wins net losses).
+    at = state["autotrader"]
+    if info.get("action") == "SELL" and upnl_now > 0:
         at["premium_collected"] = round(at.get("premium_collected", 0.0) + upnl_now, 2)
-        at["leap_budget"]       = round(at["premium_collected"] * 0.50, 2)
-        _at_log("BUDGET", f"+${upnl_now:.0f} → total=${at['premium_collected']:.0f} | LEAP=${at['leap_budget']:.0f}")
+        _at_log("BUDGET", f"CSP +${upnl_now:.0f} → premium_collected=${at['premium_collected']:.0f}")
+    elif info.get("action") == "BUY":
+        at["leap_pnl"] = round(at.get("leap_pnl", 0.0) + upnl_now, 2)
+        _at_log("BUDGET", f"LEAP ${upnl_now:+.0f} → cumulative_leap_pnl=${at['leap_pnl']:.0f}")
+    at["leap_budget"] = max(0.0, round(at["premium_collected"] * 0.50 + at.get("leap_pnl", 0.0), 2))
+    _at_log("BUDGET", f"leap_budget=${at['leap_budget']:.0f} "
+                      f"(50%×${at['premium_collected']:.0f} CSP + ${at.get('leap_pnl',0):.0f} LEAP pnl)")
     _at_log("CLOSED", f"{close_action} {qty}x {c.symbol} @ ${lmt:.2f} "
                       f"pnl=${upnl_now:+.0f} (order #{trade.order.orderId})")
     _at_save_state()
@@ -4071,6 +4095,7 @@ def autotrader_status():
         "log":               list(at["log"]),
         "last_run":          at.get("last_run"),
         "premium_collected": at.get("premium_collected", 0.0),
+        "leap_pnl":          at.get("leap_pnl", 0.0),
         "leap_budget":       at.get("leap_budget", 0.0),
     }
 
