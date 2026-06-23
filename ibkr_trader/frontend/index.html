@@ -2595,7 +2595,7 @@ function PnLTab() {
                     return (
                       <tr key={t.id||i}>
                         <td style={{...mono,fontWeight:700,color:C.accent}}>{t.ticker}</td>
-                        <td><Pill color={t.action==="BUY"?C.bull:C.bear}>{(t.strategy_type||t.action||"").toUpperCase()}</Pill></td>
+                        <td><Pill color={t.action==="BUY"?C.bull:C.bear}>{strategyLabel(t)}</Pill></td>
                         <td style={{...mono}}>{t.strike?`$${t.strike}`:"—"}</td>
                         <td style={{...mono,fontSize:11}}>{t.expiry?`${t.expiry.slice(0,4)}-${t.expiry.slice(4,6)}-${t.expiry.slice(6,8)}`:"—"}</td>
                         <td style={{...mono,color:dte<21?C.bear:dte<30?C.neutral:C.muted}}>{dte}</td>
@@ -2656,7 +2656,7 @@ function PnLTab() {
                   return (
                     <tr key={t.id}>
                       <td style={{...mono,fontWeight:700,color:C.accent}}>{t.ticker}</td>
-                      <td><Pill color={t.action==="BUY"?C.bull:C.bear}>{(t.strategy_type||t.action||"").toUpperCase()}</Pill></td>
+                      <td><Pill color={t.action==="BUY"?C.bull:C.bear}>{strategyLabel(t)}</Pill></td>
                       <td style={{...mono}}>${t.strike}</td>
                       <td style={{...mono,fontSize:11,color:C.muted}}>{fmtDT(t.opened_at)}</td>
                       <td style={{...mono,fontSize:11,color:C.muted}}>{fmtDT(t.closed_at)}</td>

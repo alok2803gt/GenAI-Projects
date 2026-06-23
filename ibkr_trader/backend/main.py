@@ -4436,7 +4436,7 @@ def pnl_dashboard():
             visible_open.append({
                 "id":             jrow.get("id"),
                 "ticker":         p["ticker"],
-                "strategy_type":  jrow.get("strategy_type") or p["sec_type"],
+                "strategy_type":  jrow.get("strategy_type") or None,
                 "action":         jrow.get("action", "BUY" if (p.get("position") or 0) > 0 else "SELL"),
                 "strike":         p.get("strike"),
                 "right":          p.get("right"),
