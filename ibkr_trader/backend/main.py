@@ -1791,17 +1791,16 @@ def _capital_state(ib: IB, cfg: dict, at: dict) -> dict:
 
     csp_capital   = float(cfg.get("csp_capital", 20000.0))
     total_capital = float(cfg.get("total_capital", 100000.0))
-    # Guard: if csp_capital is less than 10% of total_capital the user likely
-    # updated total_capital but forgot to also update csp_capital.  Fall back to
-    # 25% of total_capital so the strategy actually deploys at the new scale.
-    if csp_capital < total_capital * 0.10:
-        allocated = total_capital * 0.25
+    # csp_capital is the deliberate control knob — it's what you've decided to
+    # allocate to the CSP strategy regardless of total portfolio size.  Honor it
+    # exactly.  Only warn (never auto-override) when it appears to be a stale
+    # default: less than $25K AND total_capital is at least 5× larger.
+    allocated = csp_capital
+    if csp_capital <= 25000 and total_capital >= csp_capital * 5:
         _at_log("WARN",
-                f"csp_capital (${csp_capital:,.0f}) < 10% of total_capital (${total_capital:,.0f}). "
-                f"Using 25% of total_capital (${allocated:,.0f}) as CSP allocation. "
-                f"Update csp_capital in config to silence this warning.")
-    else:
-        allocated = csp_capital
+                f"csp_capital is ${csp_capital:,.0f} — this controls total CSP deployment, "
+                f"not total_capital (${total_capital:,.0f}). "
+                f"Set csp_capital in Config to your intended CSP budget (e.g. $75K-$150K).")
     buffer_amt = allocated * CAPITAL_BUFFER_PCT
     max_deploy = allocated - buffer_amt   # 80% of allocation
 
