@@ -1525,7 +1525,10 @@ function AutoTraderTab() {
     const k  = (p * (b + 1) - 1) / b;
     return Math.max(0.02, k * 0.5);
   })();
-  const kellyCapital = Math.round((cfg.total_capital || 100000) * kellyFrac);
+  // Kelly base = strategy capital (not total portfolio)
+  const kellyCspCapital  = Math.round((cfg.csp_capital  || 20000)  * kellyFrac);
+  const kellyLeapCapital = Math.round((cfg.leap_capital || 5000)   * kellyFrac);
+  const kellyCapital = kellyCspCapital;  // backward compat for display cards below
 
   const reconnect = async (port) => {
     setReconn(port);
@@ -1634,7 +1637,8 @@ function AutoTraderTab() {
               { label:"Premium Collected", value:`$${(status?.premium_collected||0).toFixed(0)}`, col:"#27ae60", sub:null },
               { label:"LEAP Budget (net)", value:`$${(status?.leap_budget||0).toFixed(0)}`, col:"#3498db",
                 sub: leapPnl !== 0 ? { text:`LEAP P&L: ${leapPnl>=0?"+":""}$${leapPnl.toFixed(0)}`, col:leapPnlCol } : null },
-              { label:"Kelly Capital/Trade", value:`$${kellyCapital.toLocaleString()}`, col:"#f1c40f", sub:null },
+              { label:"Kelly CSP/Trade", value:`$${kellyCspCapital.toLocaleString()}`, col:"#f1c40f",
+                sub:{ text:`LEAP: $${kellyLeapCapital.toLocaleString()}/trade`, col:"#94a3b8" } },
             ].map(s => (
               <div key={s.label} style={{ background:"#f1f5f9", borderRadius:8, padding:14, textAlign:"center" }}>
                 <div style={{ color:"#64748b", fontSize:11, marginBottom:6 }}>{s.label}</div>
@@ -1700,7 +1704,7 @@ function AutoTraderTab() {
         {/* Toggles row */}
         <div style={{ display:"flex", gap:24, marginTop:16, flexWrap:"wrap" }}>
           {[
-            { key:"use_kelly",  label:"Kelly Sizing", sub:`~$${kellyCapital.toLocaleString()}/trade` },
+            { key:"use_kelly",  label:"Kelly Sizing", sub:`CSP ~$${kellyCspCapital.toLocaleString()} · LEAP ~$${kellyLeapCapital.toLocaleString()}` },
             { key:"auto_hedge", label:"Auto-Hedge",   sub:"SPY option when delta > threshold" },
           ].map(t => (
             <label key={t.key} style={{ display:"flex", flexDirection:"column", gap:3, cursor:"pointer" }}>
@@ -1740,8 +1744,9 @@ function AutoTraderTab() {
           <strong style={{color:"#d97706"}}>Half-Kelly sizing:</strong>{" "}
           win rate <strong>{Math.round(((status?.config?.assumed_win_rate)||0.85)*100)}%</strong> (auto-calibrated),
           profit/loss ratio {((cfg.profit_target_pct||0.50)/((cfg.stop_loss_mult||2.0)||2.0)).toFixed(3)} →
-          Kelly fraction {(kellyFrac*100).toFixed(1)}% of ${(cfg.total_capital||100000).toLocaleString()}
-          = <strong style={{color:"#1e293b"}}>${kellyCapital.toLocaleString()} per trade</strong>.
+          Kelly fraction {(kellyFrac*100).toFixed(1)}% of CSP budget ${(cfg.csp_capital||20000).toLocaleString()}
+          = <strong style={{color:"#1e293b"}}>${kellyCspCapital.toLocaleString()} per CSP trade</strong>
+          · LEAP: {(kellyFrac*100).toFixed(1)}% of ${(cfg.leap_capital||5000).toLocaleString()} = ${kellyLeapCapital.toLocaleString()}/trade.
           {" "}Exit rules: 50% profit target · IV-adjusted stop · roll at 21 DTE · 48h cooldown.
         </div>
       </Card>

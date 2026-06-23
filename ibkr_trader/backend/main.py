@@ -1444,21 +1444,32 @@ def _at_contract_key(c) -> str:
 
 def _kelly_qty(cfg: dict, strike: float, t_type: str, mid_price: float = 0.0,
                regime: str = "BULL") -> int:
-    """Half-Kelly position sizing, scaled by market regime."""
+    """Half-Kelly position sizing, scaled by market regime.
+
+    Capital base per strategy:
+      CSP  → csp_capital   (the budget allocated to short-put trades)
+      LEAP → leap_capital  (the budget allocated to long-call trades)
+
+    Kelly is a within-strategy formula — it expresses what fraction of the
+    strategy's own capital to risk per trade, not the whole portfolio.
+    total_capital is a portfolio-level reference used for display only.
+    """
     p  = float(cfg.get("assumed_win_rate", 0.85))
-    pt = float(cfg.get("profit_target_pct", 0.50))   # matches AutoTraderConfigRequest default
-    sl = float(cfg.get("stop_loss_mult", 2.0))        # matches AutoTraderConfigRequest default
+    pt = float(cfg.get("profit_target_pct", 0.50))
+    sl = float(cfg.get("stop_loss_mult", 2.0))
     b  = pt / sl if sl > 0 else pt / 5.0
     kelly = (p * (b + 1) - 1) / b if b > 0 else 0.0
-    frac  = max(0.02, kelly * 0.5)             # half-Kelly
-    # Regime penalty: reduce size in uncertain or falling market
+    frac  = max(0.02, kelly * 0.5)   # half-Kelly
     regime_scale = {"BULL": 1.0, "NEUTRAL": 0.6, "BEAR": 0.35, "UNKNOWN": 0.5}.get(regime, 0.5)
-    total = float(cfg.get("total_capital", 100000.0))
-    capital = total * frac * regime_scale
+
     if t_type == "csp":
+        base = float(cfg.get("csp_capital", 20000.0))
+        capital = base * frac * regime_scale
         return max(1, int(capital / (strike * 100)))
-    else:
+    else:  # leap
+        base = float(cfg.get("leap_capital", 5000.0))
         m = mid_price if mid_price > 0 else 5.0
+        capital = base * frac * regime_scale
         return max(1, int(capital / (m * 100)))
 
 
