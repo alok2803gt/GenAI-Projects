@@ -1679,7 +1679,13 @@ function AutoTraderTab() {
             CSP Capital ($)
             <input type="number" min={5000} step={5000} value={cfg.csp_capital}
               onChange={e => setCfg({ ...cfg, csp_capital: +e.target.value })} {...inp()} />
-            <span style={{ fontSize:10, color:"#94a3b8" }}>Notional budget deployed in CSP strategy — keep &lt; total capital</span>
+            <span style={{ fontSize:10, color:"#94a3b8" }}>CSP deployment budget · Kelly base for short puts</span>
+          </label>
+          <label style={{ display:"flex", flexDirection:"column", gap:4, fontSize:13, color:"#475569" }}>
+            LEAP Capital ($)
+            <input type="number" min={1000} step={1000} value={cfg.leap_capital}
+              onChange={e => setCfg({ ...cfg, leap_capital: +e.target.value })} {...inp()} />
+            <span style={{ fontSize:10, color:"#94a3b8" }}>LEAP deployment budget · Kelly base for long calls</span>
           </label>
           <div style={{ display:"flex", flexDirection:"column", gap:4, fontSize:13, color:"#475569" }}>
             Kelly Win Rate
@@ -1758,13 +1764,20 @@ function AutoTraderTab() {
             <table style={{ width:"100%", borderCollapse:"collapse", fontSize:13 }}>
               <thead>
                 <tr style={{ color:"#64748b", borderBottom:"1px solid #e2e8f0" }}>
-                  {["Ticker","Type","Strike","Expiry","Action","Qty","Entry","Max P/L","Score","Placed"].map(h =>
+                  {["Ticker","Type","Strike","Expiry","Action","Qty","Entry","Max P/L","Stop Loss","Score","Placed"].map(h =>
                     <th key={h} style={{ padding:"6px 10px", textAlign:"left", fontWeight:600 }}>{h}</th>
                   )}
                 </tr>
               </thead>
               <tbody>
-                {Object.entries(positions).map(([key, p]) => (
+                {Object.entries(positions).map(([key, p]) => {
+                  // Compute IV-adjusted stop threshold (mirrors backend monitor logic)
+                  const iv = p.live_iv || 0;
+                  const stopMult = p.action === "SELL"
+                    ? (iv > 70 ? 4.0 : iv > 40 ? 3.0 : (cfg.stop_loss_mult || 2.0))
+                    : (iv > 70 ? 0.40 : iv > 40 ? 0.50 : 0.60);
+                  const stopLoss = -(stopMult * (p.max_profit || 0));
+                  return (
                   <tr key={key} style={{ borderBottom:"1px solid #e2e8f0" }}>
                     <td style={{ padding:"7px 10px", fontWeight:700, color:"#1e293b" }}>{p.ticker}</td>
                     <td style={{ padding:"7px 10px", fontWeight:600,
@@ -1777,10 +1790,15 @@ function AutoTraderTab() {
                     <td style={{ padding:"7px 10px" }}>{p.qty}</td>
                     <td style={{ padding:"7px 10px" }}>${(p.entry_price||0).toFixed(2)}</td>
                     <td style={{ padding:"7px 10px", color:"#f1c40f" }}>${(p.max_profit||0).toFixed(0)}</td>
+                    <td style={{ padding:"7px 10px" }}>
+                      <span style={{ color:"#e74c3c", fontWeight:600 }}>-${Math.abs(stopLoss).toFixed(0)}</span>
+                      <span style={{ color:"#94a3b8", fontSize:10, marginLeft:4 }}>{stopMult}×</span>
+                    </td>
                     <td style={{ padding:"7px 10px" }}>{p.score}</td>
                     <td style={{ padding:"7px 10px", color:"#64748b", fontSize:11 }}>{p.placed_at}</td>
                   </tr>
-                ))}
+                  );
+                })}
               </tbody>
             </table>
           </div>
