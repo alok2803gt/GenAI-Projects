@@ -2524,16 +2524,28 @@ def _update_kelly_from_journal() -> None:
             f"(actual {actual_wr:.1%} over {len(rows)} real trades)")
 
 
+_REAL_EXIT_REASONS = (
+    "'profit_target','stop_loss','roll_close',"
+    "'roll_max','roll_no_credit','21dte','manual','rotation'"
+)
+
 def _retrain_from_journal() -> dict:
-    """Retrain XGBoost score model from completed journal trades."""
+    """Retrain XGBoost score model from completed journal trades.
+
+    Only trains on real managed exits — excludes orphaned/trailing_stop rows
+    (all win=0) that would bias the model toward predicting losses.
+    Same whitelist used by _update_kelly_from_journal().
+    """
     con = sqlite3.connect(JOURNAL_DB_PATH, check_same_thread=False)
     cols_sql = ", ".join(_JOURNAL_FEATURE_COLS) + ", win"
     rows = con.execute(
-        f"SELECT {cols_sql} FROM trade_journal WHERE closed_at IS NOT NULL AND win IS NOT NULL"
+        f"SELECT {cols_sql} FROM trade_journal "
+        f"WHERE closed_at IS NOT NULL AND win IS NOT NULL "
+        f"AND exit_reason IN ({_REAL_EXIT_REASONS})"
     ).fetchall()
     con.close()
     if len(rows) < JOURNAL_MIN_TRADES:
-        return {"error": f"Need {JOURNAL_MIN_TRADES}+ trades (have {len(rows)})"}
+        return {"error": f"Need {JOURNAL_MIN_TRADES}+ real exits (have {len(rows)})"}
 
     df  = pd.DataFrame(rows, columns=_JOURNAL_FEATURE_COLS + ["win"])
     X   = df[_JOURNAL_FEATURE_COLS].fillna(df[_JOURNAL_FEATURE_COLS].median())

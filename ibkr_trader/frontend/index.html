@@ -128,6 +128,11 @@ function RegimeBanner({ regime }) {
   if (!regime) return null;
   const cfg = REGIME_CFG[regime.regime] || REGIME_CFG.UNKNOWN;
   const bearWarn = regime.regime === "BEAR";
+  // VIX color thresholds match backend: BULL<22, NEUTRAL<28, BEAR>=28
+  const vixColor = regime.vix < 22 ? C.bull : regime.vix < 28 ? C.neutral : C.bear;
+  const spy5d = regime.spy_5d_pct;
+  const spy5dColor = spy5d >= 0 ? C.bull : C.bear;
+  const spy5dLabel = spy5d != null ? `${spy5d >= 0 ? "+" : ""}${spy5d.toFixed(1)}% 5d` : null;
   return (
     <div style={{
       display:"flex", alignItems:"center", gap:14, flexWrap:"wrap",
@@ -140,15 +145,24 @@ function RegimeBanner({ regime }) {
       {regime.spy_close != null && (
         <span style={{ ...sans, fontSize:11, color:C.muted }}>
           SPY <b style={{color:C.white}}>{regime.spy_close}</b>
-          {" "}vs 50d SMA <b style={{color:C.white}}>{regime.spy_sma50}</b>
-          {" "}(<b style={{color: regime.spy_vs_50d_pct>=0?C.bull:C.bear}}>
+          {" "}SMA50 <b style={{color: regime.spy_vs_50d_pct>=0?C.bull:C.bear}}>
             {regime.spy_vs_50d_pct>=0?"+":""}{regime.spy_vs_50d_pct}%
-          </b>)
+          </b>
+          {regime.spy_vs_20d_pct != null && (
+            <span>
+              {" "}SMA20 <b style={{color: regime.spy_vs_20d_pct>=0?C.bull:C.bear}}>
+                {regime.spy_vs_20d_pct>=0?"+":""}{regime.spy_vs_20d_pct}%
+              </b>
+            </span>
+          )}
+          {spy5dLabel && (
+            <span> <b style={{color:spy5dColor}}>({spy5dLabel})</b></span>
+          )}
         </span>
       )}
       {regime.vix != null && (
         <span style={{ ...sans, fontSize:11, color:C.muted }}>
-          VIX <b style={{color: regime.vix<20?C.bull:regime.vix<25?C.neutral:C.bear}}>{regime.vix}</b>
+          VIX <b style={{color:vixColor}}>{regime.vix}</b>
         </span>
       )}
       {bearWarn && (
