@@ -3910,7 +3910,16 @@ def add_to_csp_universe(req: AddTickerRequest):
     ticker = req.ticker.upper()
     if ticker not in CSP_UNIVERSE:
         CSP_UNIVERSE.append(ticker)
-        state["scan_cache"]["csp"] = None   # invalidate cache
+        state["scan_cache"]["csp"] = None
+    return {"ok": True, "universe": CSP_UNIVERSE}
+
+
+@app.post("/csp/universe/remove")
+def remove_from_csp_universe(req: AddTickerRequest):
+    ticker = req.ticker.upper()
+    if ticker in CSP_UNIVERSE:
+        CSP_UNIVERSE.remove(ticker)
+        state["scan_cache"]["csp"] = None
     return {"ok": True, "universe": CSP_UNIVERSE}
 
 
