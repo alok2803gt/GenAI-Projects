@@ -1699,6 +1699,138 @@ async def _autotrader_close_coro(ib: IB, item, info: dict, key: str) -> None:
     _at_save_state()
 
 
+def _capital_state(ib: IB, cfg: dict, at: dict) -> dict:
+    """Return capital headroom for new positions.
+
+    Uses three layers:
+      1. IBKR live AvailableFunds — hard floor (never deploy what we don't have)
+      2. csp_capital config — per-strategy allocation ceiling
+      3. CAPITAL_BUFFER_PCT reserve — dry powder for adverse moves + opportunities
+
+    Returns a dict with:
+      allocated      : csp_capital from config
+      consumed       : sum of (strike × qty × 100) for all open CSP positions
+      deployable     : allocated × (1 - buffer) - consumed   (capped at IBKR available)
+      ibkr_available : raw AvailableFunds from IBKR (None if not connected)
+      buffer_held    : dollar amount reserved as buffer
+    """
+    CAPITAL_BUFFER_PCT = 0.20   # keep 20% of CSP allocation as dry powder
+
+    allocated  = float(cfg.get("csp_capital", 20000.0))
+    buffer_amt = allocated * CAPITAL_BUFFER_PCT
+    max_deploy = allocated - buffer_amt   # 80% of allocation
+
+    # Consumed = notional margin tied up in open CSP positions
+    consumed = 0.0
+    for info in at["positions"].values():
+        if info.get("action") == "SELL":   # CSP
+            consumed += float(info.get("strike", 0)) * float(info.get("qty", 1)) * 100
+
+    deployable = max(0.0, max_deploy - consumed)
+
+    # IBKR live floor
+    ibkr_avail = None
+    try:
+        acct_vals = {v.tag: float(v.value) for v in ib.accountValues()
+                     if v.currency == "USD" and v.tag in ("AvailableFunds", "BuyingPower")}
+        ibkr_avail = acct_vals.get("AvailableFunds")
+        if ibkr_avail is not None:
+            deployable = min(deployable, ibkr_avail)
+    except Exception:
+        pass   # not connected or account values unavailable — use config-based limit only
+
+    return {
+        "allocated":      allocated,
+        "consumed":       consumed,
+        "deployable":     deployable,
+        "buffer_held":    buffer_amt,
+        "ibkr_available": ibkr_avail,
+    }
+
+
+def _position_remaining_value(info: dict, upnl: float, max_profit: float,
+                               dte: int, profit_target: float) -> float:
+    """Score an open position on how much value it still has to extract (0–100).
+
+    Lower score = weaker hold = candidate for rotation.
+    Factors: remaining upside to target × DTE time value × original entry quality.
+    """
+    if max_profit <= 0:
+        return 0.0
+    pnl_pct          = upnl / max_profit
+    remaining_upside  = max(0.0, profit_target - pnl_pct)   # fraction of target still uncaptured
+    upside_score      = remaining_upside / profit_target      # 0–1
+
+    if dte <= 0:
+        dte_factor = 0.05
+    elif dte <= 7:
+        dte_factor = 0.25
+    elif dte <= 14:
+        dte_factor = 0.50
+    elif dte <= 21:
+        dte_factor = 0.70
+    else:
+        dte_factor = 1.00
+
+    entry_quality = float(info.get("score", 50)) / 100.0
+    return round(upside_score * dte_factor * entry_quality * 100, 1)
+
+
+def _find_rotation_target(at: dict, portfolio_items: list, candidates: list,
+                           cfg: dict) -> Optional[tuple]:
+    """Find a (new_candidate, key_to_close) rotation pair.
+
+    Rules:
+      - new_candidate.score must be ≥ 1.25× the remaining-value score of the worst position
+      - Only close positions that are profitable OR within 21 DTE (never lock in a loss to rotate)
+      - Never rotate the same ticker (pointless churn)
+
+    Returns (candidate_row, position_key) or None.
+    """
+    profit_target = float(cfg.get("profit_target_pct", 0.50))
+    ROTATION_THRESHOLD = 1.25   # candidate must score 25% better than incumbent
+
+    # Build a score for each open position
+    scored_positions = []
+    item_by_key = {_at_contract_key(i.contract): i for i in portfolio_items}
+
+    for key, info in at["positions"].items():
+        item = item_by_key.get(key)
+        if item is None:
+            continue
+        upnl       = float(item.unrealizedPNL or 0)
+        max_profit = float(info.get("max_profit", 0))
+        dte        = int(info.get("dte") or 45)
+
+        rv_score   = _position_remaining_value(info, upnl, max_profit, dte, profit_target)
+        is_closeable = upnl >= 0 or dte <= 21   # only profitable or near-expiry positions
+
+        scored_positions.append({
+            "key":          key,
+            "ticker":       info.get("ticker", ""),
+            "rv_score":     rv_score,
+            "upnl":         upnl,
+            "dte":          dte,
+            "is_closeable": is_closeable,
+        })
+
+    closeable = [p for p in scored_positions if p["is_closeable"]]
+    if not closeable:
+        return None
+
+    worst = min(closeable, key=lambda p: p["rv_score"])
+    active_tickers = {p["ticker"] for p in scored_positions}
+
+    for candidate in candidates:
+        if candidate["ticker"] in active_tickers:
+            continue   # already hold this ticker
+        candidate_score = float(candidate.get("score", 0))
+        if candidate_score >= worst["rv_score"] * ROTATION_THRESHOLD:
+            return (candidate, worst["key"])
+
+    return None
+
+
 async def _autotrader_scan_and_trade_coro(ib: IB) -> None:
     at       = state["autotrader"]
     cfg      = at["config"]
@@ -1717,24 +1849,36 @@ async def _autotrader_scan_and_trade_coro(ib: IB) -> None:
     if regime == "NEUTRAL":
         _at_log("REGIME", f"NEUTRAL market (VIX={vix:.1f}) — allowing entries at reduced Kelly (0.6x)")
 
-    # ── Position slot check ───────────────────────────────────────────────────
-    # Dedup uses the positions DICT (not live portfolio) so that Inactive orders
-    # (accepted by TWS but not transmitted to exchange) still prevent re-placement.
-    # Using ib.portfolio() alone was the bug: Inactive orders never appear in
-    # the portfolio, so every scan cycle treated all slots as empty and placed
-    # 5 fresh duplicate orders.
+    # ── Active ticker dedup ───────────────────────────────────────────────────
+    # Use the positions DICT (not live portfolio) so Inactive orders still
+    # consume slots — prevents duplicate orders that are accepted by TWS but
+    # not visible in ib.portfolio() until exchange transmission.
     dict_t   = {k.split("_")[0] for k in at["positions"]}
-    # Also include any portfolio positions not yet in our dict (edge case after manual trades)
     portf_t  = {item.contract.symbol for item in ib.portfolio()}
     active_t = dict_t | portf_t
-    # In NEUTRAL, cap at half of max_positions to stay conservative
+
+    # NEUTRAL regime: cap entries at half of max to stay conservative
     max_slots = cfg["max_positions"] if regime == "BULL" else max(1, cfg["max_positions"] // 2)
-    # Slot count is based on the positions dict length so Inactive orders consume slots
-    slots = max_slots - len(at["positions"])
-    if slots <= 0:
-        _at_log("SCAN", f"Max positions reached ({len(at['positions'])}/{cfg['max_positions']}) — skipping scan")
-        return
-    _at_log("SCAN", f"Scanning for up to {slots} new positions (regime={regime})…")
+
+    # ── Capital-aware headroom ────────────────────────────────────────────────
+    # Replaces the hard count gate with a dual check:
+    #   1. Count headroom (sanity cap — count-based ceiling)
+    #   2. Capital headroom (main gate — never deploy more than 80% of allocation)
+    cap         = _capital_state(ib, cfg, at)
+    count_slots = max_slots - len(at["positions"])
+    # Estimate the cheapest likely CSP (use $100 strike as conservative floor)
+    min_csp_cost = 100 * 100   # $10,000 for a $100-strike single-contract CSP
+    capital_slots = int(cap["deployable"] / min_csp_cost) if cap["deployable"] > 0 else 0
+    slots = min(count_slots, capital_slots)
+
+    _at_log("SCAN",
+            f"Capital: ${cap['consumed']:,.0f} deployed / ${cap['allocated']:,.0f} allocated "
+            f"| ${cap['deployable']:,.0f} deployable (20% buffer=${cap['buffer_held']:,.0f})"
+            + (f" | IBKR available=${cap['ibkr_available']:,.0f}" if cap["ibkr_available"] else ""))
+
+    # ── Always scan — needed for rotation decisions even at full capacity ─────
+    _at_log("SCAN", f"Scanning market (count_slots={count_slots}, capital_slots={capital_slots}, "
+                    f"effective_slots={slots}, regime={regime})…")
 
     candidates: list = []
     if "csp" in cfg["scan_types"]:
@@ -1775,14 +1919,55 @@ async def _autotrader_scan_and_trade_coro(ib: IB) -> None:
     candidates = [c for c in candidates
                   if c["ticker"] not in active_t and not _in_cooldown(c["ticker"])]
     _at_log("SCAN", f"Found {len(candidates)} qualifying candidates after dedup + cooldown")
+
     placed = 0
-    for row in candidates[:slots]:
-        try:
-            await _autotrader_place_coro(ib, row, cfg, regime=regime)
-            active_t.add(row["ticker"])
-            placed += 1
-        except Exception as exc:
-            _at_log("ERROR", f"Place {row['ticker']}: {exc}")
+    if slots > 0:
+        # ── Normal entry path ─────────────────────────────────────────────────
+        for row in candidates[:slots]:
+            cost = float(row.get("strike", 0)) * float(row.get("qty", 1)) * 100
+            if cost > cap["deployable"]:
+                _at_log("SCAN", f"Skip {row['ticker']}: position cost ${cost:,.0f} > "
+                                f"deployable ${cap['deployable']:,.0f}")
+                continue
+            try:
+                await _autotrader_place_coro(ib, row, cfg, regime=regime)
+                active_t.add(row["ticker"])
+                cap["deployable"] -= cost   # reduce remaining budget
+                placed += 1
+            except Exception as exc:
+                _at_log("ERROR", f"Place {row['ticker']}: {exc}")
+    elif candidates:
+        # ── At full capacity — check for rotation opportunity ─────────────────
+        rotation = _find_rotation_target(at, list(ib.portfolio()), candidates, cfg)
+        if rotation:
+            new_row, worst_key = rotation
+            worst_info = at["positions"].get(worst_key, {})
+            worst_item = next(
+                (i for i in ib.portfolio() if _at_contract_key(i.contract) == worst_key), None
+            )
+            if worst_item:
+                worst_info["exit_reason"] = "rotation"
+                _at_log("ROTATE",
+                        f"Closing {worst_key} (rv_score low, upnl=${float(worst_item.unrealizedPNL or 0):.0f}) "
+                        f"→ opening {new_row['ticker']} (score={new_row['score']:.0f})")
+                await _autotrader_close_coro(ib, worst_item, worst_info, worst_key)
+                try:
+                    await _autotrader_place_coro(ib, new_row, cfg, regime=regime)
+                    placed += 1
+                except Exception as exc:
+                    _at_log("ERROR", f"Rotation place {new_row['ticker']}: {exc}")
+            else:
+                _at_log("ROTATE", f"Rotation skipped: {worst_key} not found in live portfolio")
+        else:
+            _at_log("SCAN",
+                    f"At capacity ({len(at['positions'])}/{max_slots}, "
+                    f"deployed=${cap['consumed']:,.0f}/${cap['allocated']:,.0f}) "
+                    f"— no rotation opportunity (best candidate not ≥25% better than weakest position)")
+    else:
+        _at_log("SCAN",
+                f"At capacity ({len(at['positions'])}/{max_slots}, "
+                f"deployed=${cap['consumed']:,.0f}/${cap['allocated']:,.0f}) — no new candidates found")
+
     _at_log("SCAN", f"Placed {placed} orders this cycle")
     # Auto-hedge if delta exposure exceeds threshold
     if cfg.get("auto_hedge", False):
