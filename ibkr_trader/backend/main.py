@@ -2452,7 +2452,7 @@ def _update_kelly_from_journal() -> None:
         "SELECT win FROM trade_journal "
         "WHERE closed_at IS NOT NULL AND win IS NOT NULL "
         "  AND exit_reason IN ('profit_target','stop_loss','roll_close',"
-        "                      'roll_max','roll_no_credit','21dte','manual')"
+        "                      'roll_max','roll_no_credit','21dte','manual','rotation')"
     ).fetchall()
     con.close()
     if len(rows) < 10:
