@@ -1582,6 +1582,22 @@ async def _autotrader_roll_coro(ib: IB, item, info: dict, key: str) -> None:
         await _autotrader_close_coro(ib, item, info, key)
         return
 
+    # ── Guard 2: earnings proximity — never roll through an earnings event ────
+    # Rolling into a new expiry that straddles earnings exposes the position to
+    # assignment risk + IV crush on the wrong side. Close now; re-enter after.
+    try:
+        earnings_days = await _earnings_days_out(ticker)
+        if earnings_days is not None and earnings_days <= EARNINGS_BLOCK_DAYS:
+            _at_log("ROLL",
+                    f"{ticker}: earnings in {earnings_days}d — closing instead of rolling "
+                    f"(block={EARNINGS_BLOCK_DAYS}d, cooldown applied)")
+            info["exit_reason"] = "roll_close"
+            state["autotrader"].setdefault("stopped_out", {})[ticker] = datetime.utcnow().isoformat()
+            await _autotrader_close_coro(ib, item, info, key)
+            return
+    except Exception as _earn_exc:
+        _at_log("WARN", f"{ticker}: earnings check failed at roll time ({_earn_exc}) — proceeding")
+
     # ── Step 1: get live buyback price (current ask = what we pay to close) ──
     c = item.contract
     contract_cur = Option(
