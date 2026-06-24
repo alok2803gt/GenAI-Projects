@@ -736,14 +736,19 @@ function PositionsTab() {
 
 // ── Recommendation filters ────────────────────────────────────────────────
 function filterCSP(candidates) {
-  // Quality gates: clean warnings, liquid, meaningful IV rank, good score,
-  // earnings safely past expiry (>21d away or unknown)
+  // Mirrors backend _filter_csp_recommended:
+  //   iv_rank >= 50 (IV_RANK_MIN_CSP), score >= 70, liquidity >= 50,
+  //   all three SMA trend gates (None = benefit of doubt; only False = rejected),
+  //   earnings > 28d (EARNINGS_BLOCK_DAYS * 2 = 14 * 2)
   const clean = candidates.filter(r =>
     (r.warnings || []).length === 0 &&
     r.liquidity_score >= 50 &&
-    r.iv_rank >= 30 &&
+    r.iv_rank >= 50 &&
     r.score >= 70 &&
-    (r.earnings_days_out == null || r.earnings_days_out > 21)
+    r.above_sma20  !== false &&
+    r.above_sma50  !== false &&
+    r.above_sma200 !== false &&
+    (r.earnings_days_out == null || r.earnings_days_out > 28)
   );
   // Best 1 per ticker (already sorted by score desc)
   const seen = new Set();
@@ -751,9 +756,12 @@ function filterCSP(candidates) {
 }
 
 function filterLEAP(candidates) {
+  // Mirrors backend _filter_leap_recommended:
+  //   liquidity >= 60, iv_rank <= 75 (don't overpay for elevated vol on long calls)
   const clean = candidates.filter(r =>
     (r.warnings || []).length === 0 &&
-    r.liquidity_score >= 60
+    r.liquidity_score >= 60 &&
+    (r.iv_rank == null || r.iv_rank <= 75)
   );
   const seen = new Set();
   return clean.filter(r => { if (seen.has(r.ticker)) return false; seen.add(r.ticker); return true; });
