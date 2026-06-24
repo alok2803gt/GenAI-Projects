@@ -3641,9 +3641,14 @@ async def scan_leaps(ib: IB) -> dict:
                             "data_source":           leap_data_src,
                             "warnings":              warnings,
                         }
+                        # Target mid-range delta: (LEAP_MIN_DELTA + LEAP_MAX_DELTA) / 2 = 0.75.
+                        # Old target was 0.60, which is *below* LEAP_MIN_DELTA (0.65) — meaning
+                        # the formula always rewarded the lowest allowed delta.  Deep-ITM LEAP
+                        # strategy prefers higher delta (more intrinsic, less extrinsic decay).
+                        _delta_target = (LEAP_MIN_DELTA + LEAP_MAX_DELTA) / 2  # 0.75
                         row["score"] = round(
                             sq * 55
-                            + (1 - abs(delta - 0.60)) * 35
+                            + (1 - abs(delta - _delta_target)) * 35
                             + leap_iv_bonus
                             + (liq / 100) * 10
                             + inst_bonus,
@@ -3728,7 +3733,7 @@ async def scan_leaps(ib: IB) -> dict:
                                     "pc_vol_ratio":inst.get("pc_vol_ratio",1.0),
                                     "data_source":"yfinance","warnings":warn2,
                                 }
-                                rw["score"]=round(sq*55+(1-abs(dlt2-0.60))*35+ib2+(liq2/100)*10,2)
+                                rw["score"]=round(sq*55+(1-abs(dlt2-(LEAP_MIN_DELTA+LEAP_MAX_DELTA)/2))*35+ib2+(liq2/100)*10,2)
                                 out.append(rw)
                             except Exception: continue
                         return out
