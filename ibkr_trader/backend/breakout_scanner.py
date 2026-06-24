@@ -285,6 +285,8 @@ def scan_universe(tickers: list[str], cfg: dict) -> list[dict]:
     batch_size = cfg.get("batch_size", 50)
     batches    = [tickers[i:i + batch_size] for i in range(0, len(tickers), batch_size)]
     found: list[dict] = []
+    all_inds: list[dict] = []   # all computed indicators (for near-miss reporting)
+    n_skip = 0
 
     for idx, batch in enumerate(batches, 1):
         log.info("  Batch %d/%d (%d tickers)…", idx, len(batches), len(batch))
@@ -292,15 +294,32 @@ def scan_universe(tickers: list[str], cfg: dict) -> list[dict]:
         for tk in batch:
             hist = hist_map.get(tk)
             if hist is None:
+                n_skip += 1
                 continue
             ind = compute_indicators(tk, hist)
             if ind is None:
+                n_skip += 1
                 continue
+            all_inds.append(ind)
             sig = classify_signal(ind, cfg)
             if sig:
                 ind["signal"] = sig
                 found.append(ind)
         time.sleep(1)   # brief pause between batches to avoid rate-limits
+
+    n_computed = len(all_inds)
+    log.info("  Evaluated %d/%d tickers (%d skipped — no data/history)",
+             n_computed, len(tickers), n_skip)
+
+    # Log the top-5 nearest-to-breakout tickers even when nothing triggers,
+    # so you can see the market is being evaluated and how close the leaders are.
+    if all_inds and not found:
+        near = sorted(all_inds, key=lambda x: x["pct_b"], reverse=True)[:5]
+        lines = [f"  {d['ticker']:6s}  %B={d['pct_b']:5.1f}  RSI={d['rsi']:4.1f}"
+                 f"  vol={d['vol_ratio'] or 0:.2f}x (thr={d['vol_90pct']:.2f}x)"
+                 f"  {'▲20/50' if d['above_sma20'] and d['above_sma50'] else '—trend'}"
+                 for d in near]
+        log.info("Top-5 nearest to breakout:\n" + "\n".join(lines))
 
     return found
 
