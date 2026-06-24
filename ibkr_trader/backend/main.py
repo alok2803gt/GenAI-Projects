@@ -5646,13 +5646,16 @@ def pnl_dashboard():
             for p in portfolio_items
         }
 
-        # Auto-close open journal entries not present in IBKR portfolio
+        # Auto-close open journal entries not present in IBKR portfolio.
+        # Guard: only orphan when portfolio_items is non-empty. If the feed is
+        # temporarily empty (post-reconnect, TWS restart), ibkr_keys = {} and
+        # every open entry would be falsely orphaned, corrupting the journal.
         orphan_ids = [
             t["id"] for t in open_trades
             if _jkey(t.get("ticker",""), t.get("strike"), t.get("right",""), t.get("expiry",""))
             not in ibkr_keys
         ]
-        if orphan_ids:
+        if orphan_ids and portfolio_items:
             try:
                 _con = sqlite3.connect(JOURNAL_DB_PATH, check_same_thread=False)
                 ph   = ",".join("?" * len(orphan_ids))
