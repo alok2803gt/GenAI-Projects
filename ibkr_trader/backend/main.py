@@ -2167,7 +2167,11 @@ def _find_rotation_target(at: dict, portfolio_items: list, candidates: list,
             dte = int(info.get("dte") or 45)   # fallback only if expiry unparseable
 
         rv_score   = _position_remaining_value(info, upnl, max_profit, dte, profit_target)
-        is_closeable = upnl >= 0 or dte <= 21   # only profitable or near-expiry positions
+        # LEAP (BUY) positions are long-term strategic holds managed by their own
+        # stop/profit/21-DTE exits.  Never rotate out of a LEAP — the thesis needs
+        # months to develop and short-term score comparisons are meaningless against it.
+        is_leap = info.get("action", "SELL") == "BUY"
+        is_closeable = (not is_leap) and (upnl >= 0 or dte <= 21)
 
         scored_positions.append({
             "key":          key,
