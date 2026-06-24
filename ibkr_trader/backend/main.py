@@ -5712,7 +5712,7 @@ def pnl_dashboard():
             "worst_trade":          round(min(closed_pnls), 2) if closed_pnls else 0,
         },
         "open_positions": visible_open[-20:],
-        "closed_trades":  closed_trades[:30],
+        "closed_trades":  real_closed[:30],
         "daily_pnl":      daily_pnl,
         "portfolio":      portfolio_items,
         "exit_breakdown": exit_breakdown,

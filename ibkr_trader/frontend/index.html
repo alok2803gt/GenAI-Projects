@@ -3176,14 +3176,21 @@ function PnLTab() {
                 <thead><tr>{["Reason","Count","Total","Avg"].map(h=>(
                   <th key={h} style={{...mono,fontSize:10,color:C.muted,fontWeight:600,paddingBottom:8}}>{h}</th>
                 ))}</tr></thead>
-                <tbody>{Object.entries(exit_breakdown).sort((a,b)=>b[1].count-a[1].count).map(([reason,d])=>(
+                <tbody>{Object.entries(exit_breakdown).sort((a,b)=>b[1].count-a[1].count).map(([reason,d])=>{
+                  const isOrphan = reason === "orphaned";
+                  const pillColor = isOrphan ? C.muted : d.pnl >= 0 ? C.bull : C.bear;
+                  return (
                   <tr key={reason}>
-                    <td><Pill color={d.pnl>=0?C.bull:C.bear}>{reason}</Pill></td>
+                    <td><Pill color={pillColor}>{reason}</Pill></td>
                     <td style={{...mono}}>{d.count}</td>
-                    <td style={{...mono,color:pnlCol(d.pnl)}}>{fmtDol(d.pnl,true)}</td>
-                    <td style={{...mono,color:pnlCol(d.count>0?d.pnl/d.count:0)}}>{fmtDol(d.count>0?d.pnl/d.count:0,true)}</td>
+                    <td style={{...mono,color:isOrphan?C.muted:pnlCol(d.pnl)}}>
+                      {isOrphan ? "—" : fmtDol(d.pnl,true)}
+                    </td>
+                    <td style={{...mono,color:isOrphan?C.muted:pnlCol(d.count>0?d.pnl/d.count:0)}}>
+                      {isOrphan ? "—" : fmtDol(d.count>0?d.pnl/d.count:0,true)}
+                    </td>
                   </tr>
-                ))}</tbody>
+                )})}</tbody>
               </table>
           }
 
