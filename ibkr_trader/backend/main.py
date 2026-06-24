@@ -5443,10 +5443,23 @@ def pnl_dashboard():
             except Exception as e:
                 log.warning("pnl_dashboard orphan cleanup failed: %s", e)
 
+        # Build a roll_count lookup from live position tracking (not stored in journal schema)
+        at_positions = state["autotrader"].get("positions", {})
+        rc_lookup: dict = {}  # (ticker, right, str(strike), expiry[:8]) → roll_count
+        for _info in at_positions.values():
+            _key = (
+                _info.get("ticker", ""),
+                _info.get("right", ""),
+                str(_info.get("strike", "")),
+                (_info.get("expiry", "") or "")[:8],
+            )
+            rc_lookup[_key] = _info.get("roll_count", 0)
+
         # Merge IBKR portfolio item with journal enrichment
         visible_open = []
         for p in portfolio_items:
             jrow = jlookup.get(_jkey(p["ticker"], p.get("strike"), p.get("right"), p.get("expiry")), {})
+            rc_key = (p["ticker"], p.get("right") or "", str(p.get("strike") or ""), (p.get("expiry") or "")[:8])
             visible_open.append({
                 "id":             jrow.get("id"),
                 "ticker":         p["ticker"],
@@ -5461,7 +5474,7 @@ def pnl_dashboard():
                 "market_value":   p.get("market_value"),
                 "unrealized_pnl": p.get("unrealized_pnl"),
                 "live_iv_entry":  jrow.get("live_iv_entry"),
-                "roll_count":     jrow.get("roll_count", 0),
+                "roll_count":     rc_lookup.get(rc_key, 0),
                 "opened_at":      jrow.get("opened_at"),
                 "dte":            jrow.get("dte"),
             })
