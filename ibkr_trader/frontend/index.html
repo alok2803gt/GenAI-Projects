@@ -861,6 +861,10 @@ function CSPTab({ connected }) {
       r.above_sma50==null ? <span style={{color:C.muted}}>—</span> :
       <span style={{color:r.above_sma50?C.bull:C.bear}} title="Price above 50-day SMA">{r.above_sma50?"▲":"▼"}</span>
     },
+    { key:"above_sma200",         label:"SMA200",      render: r =>
+      r.above_sma200==null ? <span style={{color:C.muted}}>—</span> :
+      <span style={{color:r.above_sma200?C.bull:C.bear}} title="Price above 200-day SMA (long-term trend)">{r.above_sma200?"▲":"▼"}</span>
+    },
     { key:"open_interest",        label:"OI",          render: r => r.open_interest?.toLocaleString() },
     { key:"data_source",          label:"Source",      render: r => {
       const s = r.data_source || "?";

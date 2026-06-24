@@ -1430,15 +1430,18 @@ def _filter_csp_recommended(candidates: list, log_diag: bool = False) -> list:
     n_trend     = sum(1 for r in candidates if len(r.get("warnings", [])) == 0
                       and r["liquidity_score"] >= 50 and r["iv_rank"] >= IV_RANK_MIN_CSP
                       and r["score"] >= 70
-                      and (r.get("above_sma50") is False or r.get("above_sma20") is False))
+                      and (r.get("above_sma50") is False or r.get("above_sma20") is False
+                           or r.get("above_sma200") is False))
     n_earnings  = sum(1 for r in candidates if len(r.get("warnings", [])) == 0
                       and r["liquidity_score"] >= 50 and r["iv_rank"] >= IV_RANK_MIN_CSP
                       and r["score"] >= 70
                       and r.get("above_sma50") is not False and r.get("above_sma20") is not False
+                      and r.get("above_sma200") is not False
                       and r["earnings_days_out"] is not None
                       and r["earnings_days_out"] <= EARNINGS_BLOCK_DAYS * 2)
 
-    # above_sma50 must be True or None (None = not enough history, give benefit of doubt)
+    # SMA-20/50/200 must be True or None (None = not enough history → benefit of doubt).
+    # above_sma200 is False only when we have 200 bars and the price is below — confirmed downtrend.
     clean = [r for r in candidates
              if len(r.get("warnings", [])) == 0
              and r["liquidity_score"] >= 50
@@ -1446,13 +1449,14 @@ def _filter_csp_recommended(candidates: list, log_diag: bool = False) -> list:
              and r["score"] >= 70
              and r.get("above_sma50") is not False
              and r.get("above_sma20") is not False
+             and r.get("above_sma200") is not False
              and (r["earnings_days_out"] is None or r["earnings_days_out"] > EARNINGS_BLOCK_DAYS * 2)]
 
     if log_diag and n_total > 0:
         _at_log("SCAN",
             f"CSP filter: {n_total} raw → {len(clean)} passed "
             f"[warnings:{n_warnings} liq:{n_liq} iv_rank:{n_iv} "
-            f"score:{n_score} trend:{n_trend} earnings:{n_earnings}]")
+            f"score:{n_score} trend(sma20/50/200):{n_trend} earnings:{n_earnings}]")
 
     # Augment with learned model score if available
     for r in clean:
@@ -3066,6 +3070,8 @@ async def scan_csp(
                             "macd_hist":             tech.get("macd_hist"),
                             "above_sma20":           tech.get("above_sma20"),
                             "above_sma50":           tech.get("above_sma50"),
+                            "above_sma200":          tech.get("above_sma200"),
+                            "pct_b":                 tech.get("pct_b"),
                             # Institutional / OPRA signals
                             "max_pain":              max_pain,
                             "gamma_wall":            gamma_wall,
@@ -4237,10 +4243,12 @@ async def csp_scan(
                                and r["iv_rank"] >= IV_RANK_MIN_CSP and r["score"] < 70),
         "rejected_trend":  sum(1 for r in candidates if not r.get("warnings") and r["liquidity_score"] >= 50
                                and r["iv_rank"] >= IV_RANK_MIN_CSP and r["score"] >= 70
-                               and (r.get("above_sma50") is False or r.get("above_sma20") is False)),
+                               and (r.get("above_sma50") is False or r.get("above_sma20") is False
+                                    or r.get("above_sma200") is False)),
         "rejected_earn":   sum(1 for r in candidates if not r.get("warnings") and r["liquidity_score"] >= 50
                                and r["iv_rank"] >= IV_RANK_MIN_CSP and r["score"] >= 70
                                and r.get("above_sma50") is not False and r.get("above_sma20") is not False
+                               and r.get("above_sma200") is not False
                                and r["earnings_days_out"] is not None
                                and r["earnings_days_out"] <= EARNINGS_BLOCK_DAYS * 2),
     }
