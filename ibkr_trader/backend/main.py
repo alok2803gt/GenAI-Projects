@@ -1675,6 +1675,24 @@ async def _autotrader_monitor_coro(ib: IB) -> None:
                 await _autotrader_roll_coro(ib, item, info, key)
             continue
 
+        # ── 4. Close LEAP at 21 DTE (no roll — long calls don't roll like short puts) ──
+        # At 21 DTE a 12-month LEAP has shed most of its time value.  Holding through
+        # expiry risks exercise mechanics, pin risk, and assignment friction.  Close now
+        # to lock in whatever remains — whether a gain or a managed loss — and free the
+        # slot for a fresh entry.
+        if action == "BUY" and 0 < dte <= 21:
+            if upnl >= 0:
+                _at_log("CLOSE",
+                        f"{key}: LEAP 21 DTE — closing with ${upnl:+.0f} gain "
+                        f"(time value largely exhausted; avoiding exercise risk)")
+            else:
+                _at_log("CLOSE",
+                        f"{key}: LEAP 21 DTE — closing with ${upnl:.0f} loss "
+                        f"(stop not triggered; exiting before expiry to avoid worthless expiry)")
+            info["exit_reason"] = "21dte"
+            await _autotrader_close_coro(ib, item, info, key)
+            continue
+
     # ── Orphaned expired position cleanup ─────────────────────────────────────
     # Options expire and disappear from ib.portfolio() on settlement day.
     # Without cleanup, expired positions stay in at["positions"] forever —
