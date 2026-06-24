@@ -1666,7 +1666,7 @@ async def _autotrader_monitor_coro(ib: IB) -> None:
             if upnl >= 0:
                 # Any profit at 21 DTE — take it, free the slot
                 _at_log("CLOSE", f"{key}: 21 DTE — taking ${upnl:.0f} profit (gamma risk zone)")
-                info["exit_reason"] = "roll_close"
+                info["exit_reason"] = "21dte"
                 await _autotrader_close_coro(ib, item, info, key)
             else:
                 # At a loss but not yet at stop — roll to next month
@@ -2418,7 +2418,7 @@ async def _autotrader_place_coro(ib: IB, row: dict, cfg: dict, regime: str = "BU
         "action":      action,    "qty":       qty,
         "entry_price": lmt,       "max_profit":round(max_profit, 2),
         "order_id":    trade.order.orderId,
-        "placed_at":   datetime.now(ZoneInfo("America/New_York")).strftime("%H:%M:%S ET"),
+        "placed_at":   datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %H:%M ET"),
         "score":       row.get("score", 0),
         "journal_id":  journal_id,
         "live_iv":     live_iv_entry,
