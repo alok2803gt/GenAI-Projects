@@ -1666,8 +1666,10 @@ async def _autotrader_monitor_coro(ib: IB) -> None:
         action = info.get("action", "SELL")   # SELL = CSP short put; BUY = LEAP long call
 
         # Compute DTE from stored expiry
+        # Slice to [:8] because IBKR occasionally stores time-of-day suffix
+        # (e.g. "20261218  20:00:00 EST") which breaks the %Y%m%d parse.
         dte = 0
-        expiry_str = info.get("expiry", "")
+        expiry_str = (info.get("expiry", "") or "")[:8]
         if expiry_str:
             try:
                 dte = (datetime.strptime(expiry_str, "%Y%m%d").date() - today).days
@@ -1762,7 +1764,7 @@ async def _autotrader_monitor_coro(ib: IB) -> None:
     live_keys = {_at_contract_key(item.contract) for item in ib.portfolio()}
     orphans = []
     for key, info in list(at["positions"].items()):
-        expiry_str = info.get("expiry", "")
+        expiry_str = (info.get("expiry", "") or "")[:8]
         try:
             expiry_date = datetime.strptime(expiry_str, "%Y%m%d").date()
         except ValueError:
@@ -2231,7 +2233,7 @@ def _find_rotation_target(at: dict, portfolio_items: list, candidates: list,
         upnl       = float(item.unrealizedPNL or 0)
         max_profit = float(info.get("max_profit", 0))
         # Recalculate current DTE from expiry (stored DTE is at-entry and stale after days pass)
-        expiry_str = info.get("expiry", "")
+        expiry_str = (info.get("expiry", "") or "")[:8]
         try:
             dte = max(0, (datetime.strptime(expiry_str, "%Y%m%d").date() - today).days)
         except (ValueError, TypeError):
