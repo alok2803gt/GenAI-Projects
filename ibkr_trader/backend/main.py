@@ -2579,7 +2579,9 @@ async def _autotrader_place_coro(ib: IB, row: dict, cfg: dict, regime: str = "BU
     key        = _at_contract_key(contract)
     if order_status == "Inactive":
         _at_log("WARN", f"Order #{trade.order.orderId} immediately Inactive — whyHeld={why_held!r}. "
-                        "Check TWS permissions or duplicate order suppression.")
+                        "Order will NOT be tracked to avoid blocking ticker re-entry. "
+                        "Check TWS permissions or margin requirements.")
+        return   # do not track or journal an unfilled Inactive order
 
     # Record entry in journal
     exp_d  = datetime.strptime(expiry[:8], "%Y%m%d").date()
