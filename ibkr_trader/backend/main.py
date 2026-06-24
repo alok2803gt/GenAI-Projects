@@ -5310,13 +5310,15 @@ def get_journal_stats():
 
     model_log = [dict(zip(model_cols, r)) for r in model_rows]
 
+    win_pnls  = [r[1] for r in wins   if r[1] is not None]
+    loss_pnls = [r[1] for r in losses if r[1] is not None]
     return {
         "total_trades":    len(rows),
         "win_rate":        round(len(wins) / len(rows) * 100, 1),
         "avg_pnl":         round(sum(pnls) / len(pnls), 2) if pnls else 0,
         "total_pnl":       round(sum(pnls), 2) if pnls else 0,
-        "avg_win_pnl":     round(sum(r[1] for r in wins if r[1]) / len(wins), 2) if wins else 0,
-        "avg_loss_pnl":    round(sum(r[1] for r in losses if r[1]) / len(losses), 2) if losses else 0,
+        "avg_win_pnl":     round(sum(win_pnls) / len(win_pnls), 2) if win_pnls else 0,
+        "avg_loss_pnl":    round(sum(loss_pnls) / len(loss_pnls), 2) if loss_pnls else 0,
         "exit_breakdown":  by_reason,
         "by_strategy":     by_strategy,
         "model_version":   state.get("model_version", 0),
