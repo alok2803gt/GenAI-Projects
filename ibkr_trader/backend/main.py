@@ -58,6 +58,12 @@ FEATURE_COLS = [
     "vol_ratio", "body_pct", "upper_wick", "lower_wick", "volatility"
 ]
 
+
+class _FlowAbort(Exception):
+    """Raised when the live order-book flow gate intentionally aborts a trade.
+    Distinct from ValueError so callers can log it as SKIP rather than ERROR."""
+
+
 # ── Config — CSP scanner ───────────────────────────────────────────────────
 CSP_MIN_RETURN_PCT  = 1.00   # Weekly premium / strike ≥ 1.0% — Tastytrade research: 1%+ weekly
                               # return is the floor where CSP premium compensates for assignment risk.
@@ -2445,6 +2451,8 @@ async def _autotrader_scan_and_trade_coro(ib: IB) -> None:
                 if row.get("_type") != "leap":
                     cap["deployable"] -= cost   # only deduct CSP capital for CSP trades
                 placed += 1
+            except _FlowAbort:
+                pass   # already logged as SKIP by _autotrader_place_coro
             except Exception as exc:
                 _at_log("ERROR", f"Place {row['ticker']}: {exc}")
     elif candidates:
@@ -2465,6 +2473,8 @@ async def _autotrader_scan_and_trade_coro(ib: IB) -> None:
                 try:
                     await _autotrader_place_coro(ib, new_row, cfg, regime=regime)
                     placed += 1
+                except _FlowAbort:
+                    pass   # already logged as SKIP
                 except Exception as exc:
                     _at_log("ERROR", f"Rotation place {new_row['ticker']}: {exc}")
             else:
@@ -2574,7 +2584,7 @@ async def _autotrader_place_coro(ib: IB, row: dict, cfg: dict, regime: str = "BU
     # Raise flow abort AFTER the try/except so it propagates to the caller
     if _flow_abort:
         _at_log("SKIP", f"Flow gate: {_flow_abort}")
-        raise ValueError(_flow_abort)
+        raise _FlowAbort(_flow_abort)
 
     # Fall back to yfinance if IBKR snapshot gave no data
     if not lmt or lmt <= 0:
