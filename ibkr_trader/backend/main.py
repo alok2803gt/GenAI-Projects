@@ -1963,7 +1963,16 @@ async def _autotrader_close_coro(ib: IB, item, info: dict, key: str) -> None:
     await asyncio.sleep(1)
     state["autotrader"]["positions"].pop(key, None)
 
-    upnl_now = float(item.unrealizedPNL or 0)
+    # Use limit price to compute realized P&L — more accurate than the mark-based
+    # unrealizedPNL which can overstate LEAP profits by ~$100 on wide spreads.
+    entry_px = float(info.get("entry_price", 0) or 0)
+    if entry_px > 0:
+        if close_action == "SELL":   # closing a long (LEAP): sell at lmt
+            upnl_now = round((lmt - entry_px) * qty * 100, 2)
+        else:                        # closing a short (CSP): buy back at lmt
+            upnl_now = round((entry_px - lmt) * qty * 100, 2)
+    else:
+        upnl_now = float(item.unrealizedPNL or 0)
 
     # Record exit in trade journal
     j_id = info.get("journal_id")
