@@ -155,8 +155,10 @@ def fmt_alert(ind: dict, signal: str) -> str:
 def get_sp500_tickers() -> list[str]:
     """Fetch S&P 500 constituents from Wikipedia (BRK.B → BRK-B normalised)."""
     try:
-        url    = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-        tables = pd.read_html(url, flavor="lxml")
+        url     = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+        headers = {"User-Agent": "Mozilla/5.0 (compatible; breakout-scanner/1.0)"}
+        html    = requests.get(url, headers=headers, timeout=15).text
+        tables  = pd.read_html(html, flavor="lxml")
         tickers = tables[0]["Symbol"].tolist()
         tickers = [t.replace(".", "-") for t in tickers]
         log.info("Fetched %d S&P 500 tickers from Wikipedia", len(tickers))
