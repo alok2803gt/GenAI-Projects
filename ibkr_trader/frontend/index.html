@@ -2886,7 +2886,10 @@ function PnLTab() {
   };
   const fmtDTE = expiry => {
     if (!expiry) return "—";
-    const d = new Date(`${expiry.slice(0,4)}-${expiry.slice(4,6)}-${expiry.slice(6,8)}`);
+    // Use T12:00:00 (noon local) so DTE stays ≥0 throughout the expiry trading day,
+    // matching the AutoTrader tab convention. Plain date strings parse as UTC midnight
+    // which produces -1 DTE after 8 PM ET on the eve of expiry.
+    const d = new Date(`${expiry.slice(0,4)}-${expiry.slice(4,6)}-${expiry.slice(6,8)}T12:00:00`);
     return Math.floor((d - Date.now()) / 86400000);
   };
 
