@@ -3500,7 +3500,7 @@ function DecisionsTab() {
     CLOSE_ROTATE: { label:"Rotate",        color:"#a855f7", bg:"#1e1033" },
     CLOSE_MANUAL: { label:"Manual",        color:"#94a3b8", bg:"#1e293b" },
   };
-  const ALL_FILTERS = ["ALL","ENTER","ROLL","CLOSE_PROFIT","CLOSE_STOP","CLOSE_21DTE","CLOSE_ROTATE"];
+  const ALL_FILTERS = ["ALL","ENTER","ROLL","CLOSE_PROFIT","CLOSE_STOP","CLOSE_21DTE","CLOSE_ROLL","CLOSE_ROTATE"];
 
   const filtered = filter === "ALL" ? decisions : decisions.filter(d => d.action === filter);
 

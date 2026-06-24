@@ -2066,7 +2066,7 @@ async def _autotrader_close_coro(ib: IB, item, info: dict, key: str) -> None:
     exit_reason = info.get("exit_reason", "manual")
     ticker_sym  = c.symbol
     strike_cl   = float(c.strike)
-    expiry_cl   = c.lastTradeDateOrContractMonth
+    expiry_cl   = (c.lastTradeDateOrContractMonth or "")[:8]
     mp          = info.get("max_profit", lmt * 100)
     ep          = info.get("entry_price", lmt)
     held_days   = ""
