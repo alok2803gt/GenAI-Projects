@@ -128,7 +128,10 @@ def send_telegram(token: str, chat_id: str, text: str) -> bool:
             json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
             timeout=10,
         )
-        r.raise_for_status()
+        if not r.ok:
+            # Log the actual Telegram error so misconfigured chat_id is visible
+            log.warning("Telegram send failed [HTTP %d] → %s", r.status_code, r.text)
+            return False
         return True
     except Exception as exc:
         log.warning("Telegram send failed: %s", exc)
@@ -412,6 +415,13 @@ def main():
             log.info("Market closed — sleeping %dm until next open", secs // 60)
             time.sleep(min(secs, 300))   # wake every 5 min max to re-check
             continue
+
+        # Reload config each cycle — picks up chat_id / token changes without restart
+        cfg      = load_config()
+        token    = cfg["telegram_token"]
+        chat_id  = cfg["telegram_chat_id"]
+        alert_on = set(cfg["alert_on"])
+        interval = cfg["scan_interval_minutes"] * 60
 
         today = date.today()
         if today != last_scan_day:
