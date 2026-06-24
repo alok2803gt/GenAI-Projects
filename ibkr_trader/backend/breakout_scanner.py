@@ -141,12 +141,14 @@ def fmt_alert(ind: dict, signal: str) -> str:
               ("✓" if (ind["above_sma20"] and ind["above_sma50"]) else "~")
     sma_txt = "All SMAs ✓" if (ind["above_sma20"] and ind["above_sma50"] and ind["above_sma200"]) else \
               ("20/50 SMA ✓" if (ind["above_sma20"] and ind["above_sma50"]) else "partial trend")
-    day_sign = "+" if ind["day_chg_pct"] >= 0 else ""
-    vol_str  = (f"{ind['vol_ratio']:.2f}×" if ind.get("vol_ratio") else "N/A")
+    day_sign  = "+" if ind["day_chg_pct"] >= 0 else ""
+    scale     = ind.get("vol_scale", 1.0)
+    vol_str   = (f"{ind['vol_ratio']:.2f}×" if ind.get("vol_ratio") else "N/A")
+    proj_note = f" (proj {scale:.1f}×)" if scale > 1.05 else ""
     return (
         f"{emoji} <b>{signal}</b> — {ind['ticker']}\n"
         f"💰 Price: ${ind['price']:.2f} ({day_sign}{ind['day_chg_pct']:.1f}%)\n"
-        f"📊 %B: {ind['pct_b']:.1f}  |  Vol: {vol_str} (90th-pct: {ind['vol_90pct']:.2f}×)\n"
+        f"📊 %B: {ind['pct_b']:.1f}  |  Vol: {vol_str}{proj_note} (90th-pct: {ind['vol_90pct']:.2f}×)\n"
         f"📈 RSI: {ind['rsi']:.0f}  |  {sma_txt}"
     )
 
@@ -203,13 +205,27 @@ def compute_indicators(ticker: str, hist: pd.DataFrame) -> dict | None:
         sma50_v  = float(closes.rolling(50).mean().iloc[-1]) if len(closes) >= 50 else 0
         sma200_v = float(closes.rolling(200).mean().iloc[-1]) if len(closes) >= 200 else 0
 
-        # Volume: per-ticker 90th-percentile threshold + today ratio
-        roll_avg  = volumes.rolling(20).mean().shift(1)
+        # Volume: per-ticker 90th-percentile threshold + today ratio.
+        # Today's bar is partial during market hours — project it to a full-day
+        # equivalent so early-session breakouts aren't suppressed by low raw volume.
+        # Formula: projected = raw_today * (390 / minutes_elapsed_since_open).
+        # Capped at 3× raw so pre-open or bad timestamps can't inflate infinitely.
+        roll_avg   = volumes.rolling(20).mean().shift(1)
         all_ratios = (volumes / roll_avg.replace(0, float("nan"))).dropna()
-        recent    = all_ratios.iloc[-252:] if len(all_ratios) >= 252 else all_ratios
-        vol_90pct = float(recent.quantile(0.90)) if len(recent) >= 20 else 1.5
-        avg_vol   = float(volumes.iloc[-21:-1].mean())
-        vol_ratio = round(float(volumes.iloc[-1]) / avg_vol, 2) if avg_vol > 0 else None
+        recent     = all_ratios.iloc[-252:] if len(all_ratios) >= 252 else all_ratios
+        vol_90pct  = float(recent.quantile(0.90)) if len(recent) >= 20 else 1.5
+        avg_vol    = float(volumes.iloc[-21:-1].mean())
+        raw_today  = float(volumes.iloc[-1])
+        # Time-of-day projection
+        now_et = datetime.now(ET)
+        market_open_et = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+        minutes_elapsed = (now_et - market_open_et).total_seconds() / 60
+        if 5 <= minutes_elapsed < 390:
+            scale = min(3.0, 390 / minutes_elapsed)   # cap at 3× to guard bad timestamps
+        else:
+            scale = 1.0   # pre-open, after close, or weekend — use raw volume
+        proj_today = raw_today * scale
+        vol_ratio  = round(proj_today / avg_vol, 2) if avg_vol > 0 else None
 
         return {
             "ticker":       ticker,
@@ -219,6 +235,7 @@ def compute_indicators(ticker: str, hist: pd.DataFrame) -> dict | None:
             "rsi":          round(rsi, 1),
             "vol_ratio":    vol_ratio,
             "vol_90pct":    round(vol_90pct, 2),
+            "vol_scale":    round(scale, 2),   # projection multiplier (1.0 = full day / after hours)
             "above_sma20":  last_close > sma20_v > 0,
             "above_sma50":  last_close > sma50_v > 0,
             "above_sma200": last_close > sma200_v > 0,
@@ -317,6 +334,7 @@ def scan_universe(tickers: list[str], cfg: dict) -> list[dict]:
         near = sorted(all_inds, key=lambda x: x["pct_b"], reverse=True)[:5]
         lines = [f"  {d['ticker']:6s}  %B={d['pct_b']:5.1f}  RSI={d['rsi']:4.1f}"
                  f"  vol={d['vol_ratio'] or 0:.2f}x (thr={d['vol_90pct']:.2f}x)"
+                 f"  scale={d.get('vol_scale',1.0):.1f}x"
                  f"  {'▲20/50' if d['above_sma20'] and d['above_sma50'] else '—trend'}"
                  for d in near]
         log.info("Top-5 nearest to breakout:\n" + "\n".join(lines))
@@ -374,6 +392,8 @@ def main():
     log.info("  Alerts on:       %s", ", ".join(alert_on))
     log.info("  Scan interval:   %d min", cfg["scan_interval_minutes"])
     log.info("  Config:          %s", CONFIG_PATH)
+    log.info("  Volume mode:     intraday projection (scales partial-day volume to full-day "
+             "equivalent so morning breakouts aren't suppressed)")
 
     send_telegram(
         token, chat_id,
