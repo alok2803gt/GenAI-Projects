@@ -1836,6 +1836,16 @@ async def _autotrader_roll_coro(ib: IB, item, info: dict, key: str) -> None:
         info["exit_reason"] = "roll_close"
         await _autotrader_close_coro(ib, item, info, key)
 
+        # Guard: if close_coro returned early (e.g. no market data at close time),
+        # the old position is still in at["positions"].  Opening the new leg would
+        # create two tracking entries for the same ticker — double-counting capital.
+        if key in state["autotrader"]["positions"]:
+            _at_log("ROLL",
+                    f"{ticker}: roll aborted — close_coro did not remove old position "
+                    f"(likely no market data). Old position still tracked; will retry roll "
+                    f"on next monitor cycle when market data is available.")
+            return
+
         row = {
             "ticker":     ticker,       "expiry":      expiry_new,
             "strike":     roll_strike,  "_type":       info.get("strategy_type", "csp"),
