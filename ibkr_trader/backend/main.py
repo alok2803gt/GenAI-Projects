@@ -867,8 +867,9 @@ def _iv_percentile(ticker: str, current_iv_frac: float) -> Optional[float]:
 
 def _compute_indicators_from_closes(closes: pd.Series, volumes: pd.Series | None = None) -> dict:
     empty = {"rsi14": None, "macd": None, "macd_signal": None,
-             "macd_hist": None, "above_sma20": None, "above_sma50": None,
-             "above_sma200": None, "sma200": None,
+             "macd_hist": None,
+             "sma20": None, "sma50": None, "sma200": None,
+             "above_sma20": None, "above_sma50": None, "above_sma200": None,
              "bb_upper": None, "bb_mid": None, "bb_lower": None, "pct_b": None,
              "vol_ratio": None}
     if len(closes) < 26:
@@ -902,7 +903,6 @@ def _compute_indicators_from_closes(closes: pd.Series, volumes: pd.Series | None
     s50  = _safe(sma50)
     s200 = _safe(sma200) if sma200 is not None else None
     b_upper = _safe(bb_upper_s)
-    b_mid   = _safe(sma20)
     b_lower = _safe(bb_lower_s)
     pct_b   = round((last - b_lower) / (b_upper - b_lower) * 100, 1) \
               if (b_upper and b_lower and b_upper != b_lower) else None
@@ -919,12 +919,14 @@ def _compute_indicators_from_closes(closes: pd.Series, volumes: pd.Series | None
         "macd":        round(_safe(macd) or 0,  4),
         "macd_signal": round(_safe(msig) or 0,  4),
         "macd_hist":   round(_safe(mhist) or 0, 4),
+        "sma20":        round(s20,  2) if s20  is not None else None,
+        "sma50":        round(s50,  2) if s50  is not None else None,
+        "sma200":       round(s200, 2) if s200 is not None else None,
         "above_sma20":  bool(last > s20)  if s20  is not None else None,
         "above_sma50":  bool(last > s50)  if s50  is not None else None,
         "above_sma200": bool(last > s200) if s200 is not None else None,
-        "sma200":       round(s200, 2)    if s200 is not None else None,
         "bb_upper":     round(b_upper, 2) if b_upper is not None else None,
-        "bb_mid":       round(b_mid,   2) if b_mid   is not None else None,
+        "bb_mid":       round(s20,   2)   if s20   is not None else None,
         "bb_lower":     round(b_lower, 2) if b_lower is not None else None,
         "pct_b":        pct_b,
         "vol_ratio":    vol_ratio,
@@ -934,8 +936,9 @@ def _compute_indicators_from_closes(closes: pd.Series, volumes: pd.Series | None
 async def _tech_indicators(ticker: str) -> dict:
     """RSI-14 + MACD + BB + SMA-200 from streaming bars or yfinance daily fallback."""
     empty = {"rsi14": None, "macd": None, "macd_signal": None,
-             "macd_hist": None, "above_sma20": None, "above_sma50": None,
-             "above_sma200": None, "sma200": None,
+             "macd_hist": None,
+             "sma20": None, "sma50": None, "sma200": None,
+             "above_sma20": None, "above_sma50": None, "above_sma200": None,
              "bb_upper": None, "bb_mid": None, "bb_lower": None, "pct_b": None,
              "vol_ratio": None}
     bars = state["bars"].get(ticker)
@@ -4033,8 +4036,8 @@ async def get_technicals(ticker: str):
             "macd_signal":  ind.get("macd_signal"),
             "macd_hist":    ind.get("macd_hist"),
             "macd_bias":    macd_bias,
-            "sma20":        ind.get("bb_mid"),
-            "sma50":        None,
+            "sma20":        ind.get("sma20"),
+            "sma50":        ind.get("sma50"),
             "sma200":       ind.get("sma200"),
             "above_sma20":  ind.get("above_sma20"),
             "above_sma50":  ind.get("above_sma50"),
