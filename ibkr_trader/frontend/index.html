@@ -1698,7 +1698,7 @@ function AutoTraderTab() {
           <label style={{ display:"flex", flexDirection:"column", gap:4, fontSize:13, color:"#475569" }}>
             Profit Target %
             <input type="number" min={10} max={90} step={5}
-              value={Math.round((cfg.profit_target_pct || 0.65) * 100)}
+              value={Math.round((cfg.profit_target_pct ?? 0.50) * 100)}
               onChange={e => setCfg({ ...cfg, profit_target_pct: +e.target.value / 100 })} {...inp()} />
           </label>
           <label style={{ display:"flex", flexDirection:"column", gap:4, fontSize:13, color:"#475569" }}>
@@ -1809,10 +1809,11 @@ function AutoTraderTab() {
               <tbody>
                 {Object.entries(positions).map(([key, p]) => {
                   const iv = p.live_iv || 0;
+                  const cfgStop = cfg.stop_loss_mult ?? 2.0;
                   const stopMult = p.action === "SELL"
-                    ? (iv > 70 ? 4.0 : iv > 40 ? 3.0 : (cfg.stop_loss_mult || 2.0))
+                    ? (cfgStop <= 0 ? 0 : iv > 70 ? 4.0 : iv > 40 ? 3.0 : cfgStop)
                     : (iv > 70 ? 0.40 : iv > 40 ? 0.50 : 0.60);
-                  const stopLoss      = -(stopMult * (p.max_profit || 0));
+                  const stopLoss      = stopMult > 0 ? -(stopMult * (p.max_profit || 0)) : null;
                   const livePnl       = p.live_pnl;
                   const hasLive       = livePnl != null;
                   const pnlColor      = !hasLive ? C.muted
@@ -1867,10 +1868,16 @@ function AutoTraderTab() {
                       )}
                     </td>
                     <td style={{ padding:"7px 10px" }}>
-                      <span style={{ color:C.bear, fontWeight:600 }}>-${Math.abs(stopLoss).toFixed(0)}</span>
-                      <span style={{ color:C.muted, fontSize:10, marginLeft:3 }}>
-                        {p.action === "SELL" ? `${stopMult}×` : `${Math.round(stopMult*100)}%`}
-                      </span>
+                      {stopLoss == null ? (
+                        <span style={{ color:C.muted, fontSize:11 }}>hold-to-expiry</span>
+                      ) : (
+                        <>
+                          <span style={{ color:C.bear, fontWeight:600 }}>-${Math.abs(stopLoss).toFixed(0)}</span>
+                          <span style={{ color:C.muted, fontSize:10, marginLeft:3 }}>
+                            {p.action === "SELL" ? `${stopMult}×` : `${Math.round(stopMult*100)}%`}
+                          </span>
+                        </>
+                      )}
                     </td>
                     <td style={{ padding:"7px 10px" }}>
                       {hasLive

@@ -1629,16 +1629,22 @@ async def _autotrader_monitor_coro(ib: IB) -> None:
         # CSP: base 2× premium; widened for high-IV options so normal vol
         #   swings don't fire the stop prematurely (NVDA/QCOM backtest showed
         #   high-vol names need more room — 5× outperformed 2× in 1-yr test).
+        #   stop_loss_mult=0 disables the CSP stop entirely (hold-to-expiry).
         # LEAP: 50% of cost paid regardless of IV.
         live_iv = float(info.get("live_iv") or 0)
         if action == "SELL":
-            if live_iv > 70:
+            if stop_mult <= 0:
+                stop_threshold = -float("inf")   # 0=hold-to-expiry: never stop out
+                eff_stop_mult  = 0.0
+            elif live_iv > 70:
                 eff_stop_mult = 4.0   # high IV (QCOM 108%, ON 80%) — wide stop
+                stop_threshold = -eff_stop_mult * max_profit
             elif live_iv > 40:
                 eff_stop_mult = 3.0   # medium-high IV (NET 61%) — moderate
+                stop_threshold = -eff_stop_mult * max_profit
             else:
                 eff_stop_mult = stop_mult  # normal IV — use config value (2×)
-            stop_threshold = -eff_stop_mult * max_profit
+                stop_threshold = -eff_stop_mult * max_profit
         else:
             # LEAP (long call): high IV hurts long options via IV crush.
             # Tighter stop in high IV to cut before crush compounds; wider
@@ -2547,8 +2553,9 @@ async def _autotrader_place_coro(ib: IB, row: dict, cfg: dict, regime: str = "BU
     earn_days  = row.get("earnings_days_out")
     spot_px    = row.get("stock_price") or row.get("spot") or 0
     otm_pct    = round((float(spot_px) - strike) / float(spot_px) * 100, 1) if spot_px and t == "csp" else 0
-    stop_mult  = 4.0 if (live_iv_entry or 0) > 70 else 3.0 if (live_iv_entry or 0) > 40 else float(cfg.get("stop_loss_mult", 2.0))
-    stop_loss  = round(stop_mult * max_profit, 0)
+    _cfg_stop  = float(cfg.get("stop_loss_mult", 2.0))
+    stop_mult  = 4.0 if (live_iv_entry or 0) > 70 else 3.0 if (live_iv_entry or 0) > 40 else _cfg_stop
+    stop_loss  = round(stop_mult * max_profit, 0) if _cfg_stop > 0 else None
     earn_note  = f"Earnings are {earn_days} days away — well outside the 14-day block window." if earn_days else "No upcoming earnings detected."
 
     if t == "csp":
@@ -2563,8 +2570,9 @@ async def _autotrader_place_coro(ib: IB, row: dict, cfg: dict, regime: str = "BU
             f"**The contract:** Sell {qty} × {ticker} ${strike} Put expiring {expiry} ({dte} DTE) "
             f"at ${lmt:.2f}, collecting ~${round(lmt*100*qty,0):.0f} total premium.\n\n"
             f"**Risk:** Maximum profit is ${round(max_profit,0):.0f} if {ticker} stays above ${strike} "
-            f"at expiration. Stop-loss fires if the position loses more than ${stop_loss:.0f} "
-            f"({stop_mult:.0f}× the premium collected). {earn_note}"
+            f"at expiration. "
+            + (f"Stop-loss fires if the position loses more than ${stop_loss:.0f} ({stop_mult:.0f}× the premium collected). " if stop_loss else "No stop-loss — holding to expiry. ")
+            + earn_note
         )
     else:
         headline = f"Bought {qty}× {ticker} ${strike} Call (LEAP) — {dte} DTE"
