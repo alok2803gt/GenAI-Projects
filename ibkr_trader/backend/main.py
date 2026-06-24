@@ -812,6 +812,7 @@ def _at_save_state() -> None:
         "leap_pnl":          at.get("leap_pnl", 0.0),
         "leap_budget":       at["leap_budget"],
         "model_version":     state.get("model_version", 0),
+        "decisions":         at.get("decisions", [])[-500:],
     }
     try:
         with open(AT_STATE_PATH, "w") as f:
@@ -838,6 +839,7 @@ def _at_load_state() -> None:
         at["config"].update(merged)
         at["positions"]   = saved.get("positions", {})
         at["stopped_out"] = saved.get("stopped_out", {})  # restore 48h cooldowns
+        at["decisions"]   = saved.get("decisions", [])    # restore plain-English trade log
         state["model_version"] = saved.get("model_version", 0)
         log.info(
             f"Auto-trader state restored: enabled={at['enabled']}, "
