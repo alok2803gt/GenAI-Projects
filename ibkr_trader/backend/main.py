@@ -1641,6 +1641,7 @@ async def _autotrader_monitor_coro(ib: IB) -> None:
         _iv_tks = {_k: ib.reqMktData(_c, "106", False, False)
                    for _k, _c in leap_iv_pairs}
         await asyncio.sleep(2)
+        _iv_changed = False
         for _k, _c in leap_iv_pairs:
             _tq = _iv_tks.get(_k)
             if _tq and _tq.modelGreeks and _tq.modelGreeks.impliedVol:
@@ -1648,9 +1649,12 @@ async def _autotrader_monitor_coro(ib: IB) -> None:
                 old_iv  = float(at["positions"][_k].get("live_iv") or 0)
                 at["positions"][_k]["live_iv"] = new_iv
                 if abs(new_iv - old_iv) >= 3:
+                    _iv_changed = True
                     _at_log("SYSTEM",
                             f"{_k}: LEAP IV refreshed {old_iv:.0f}% → {new_iv:.0f}%")
             ib.cancelMktData(_c)
+        if _iv_changed:
+            _at_save_state()
 
     for item in ib.portfolio():
         key = _at_contract_key(item.contract)

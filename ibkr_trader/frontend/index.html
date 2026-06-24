@@ -1556,8 +1556,8 @@ function AutoTraderTab() {
   // Kelly fraction display
   const kellyFrac = (() => {
     const p  = (status?.config?.assumed_win_rate) || 0.85;  // system-managed
-    const pt = cfg.profit_target_pct || 0.50;
-    const sl = cfg.stop_loss_mult || 2.0;
+    const pt = cfg.profit_target_pct ?? 0.50;
+    const sl = cfg.stop_loss_mult ?? 2.0;
     const b  = pt / (sl > 0 ? sl : 5.0);
     const k  = (p * (b + 1) - 1) / b;
     return Math.max(0.02, k * 0.5);
@@ -1818,7 +1818,7 @@ function AutoTraderTab() {
                   const hasLive       = livePnl != null;
                   const pnlColor      = !hasLive ? C.muted
                                       : livePnl >= 0 ? C.bull : C.bear;
-                  const profitTarget  = (cfg.profit_target_pct || 0.5) * (p.max_profit || 0);
+                  const profitTarget  = (cfg.profit_target_pct ?? 0.5) * (p.max_profit || 0);
                   const progress      = hasLive && profitTarget > 0
                                       ? Math.min(1, Math.max(0, livePnl / profitTarget))
                                       : null;
