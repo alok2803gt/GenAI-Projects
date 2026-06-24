@@ -5270,6 +5270,16 @@ def get_journal_stats():
         if r[0] == 1:
             by_reason[rr]["wins"] += 1
 
+    by_strategy: dict = {}
+    for r in rows:
+        st = (r[4] or "csp").lower()
+        by_strategy.setdefault(st, {"total": 0, "wins": 0, "pnl": 0.0})
+        by_strategy[st]["total"] += 1
+        if r[0] == 1:
+            by_strategy[st]["wins"] += 1
+        if r[1] is not None:
+            by_strategy[st]["pnl"] = round(by_strategy[st]["pnl"] + r[1], 2)
+
     model_log = [dict(zip(model_cols, r)) for r in model_rows]
 
     return {
@@ -5280,6 +5290,7 @@ def get_journal_stats():
         "avg_win_pnl":     round(sum(r[1] for r in wins if r[1]) / len(wins), 2) if wins else 0,
         "avg_loss_pnl":    round(sum(r[1] for r in losses if r[1]) / len(losses), 2) if losses else 0,
         "exit_breakdown":  by_reason,
+        "by_strategy":     by_strategy,
         "model_version":   state.get("model_version", 0),
         "model_log":       model_log,
         "assumed_win_rate":state["autotrader"]["config"].get("assumed_win_rate"),

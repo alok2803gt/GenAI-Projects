@@ -2391,6 +2391,38 @@ function LearningTab() {
         </div>
       )}
 
+      {/* Strategy breakdown (CSP vs LEAP) */}
+      {stats?.by_strategy && Object.keys(stats.by_strategy).length > 0 && (
+        <div style={{ display:"flex", gap:12, marginBottom:20, flexWrap:"wrap" }}>
+          {Object.entries(stats.by_strategy).map(([st, d]) => {
+            const wr = d.total > 0 ? (d.wins / d.total * 100).toFixed(1) : "—";
+            const pnlCol = d.pnl >= 0 ? "#27ae60" : "#e74c3c";
+            const stLabel = st === "leap" ? "LEAP Calls" : "CSP Puts";
+            const stColor = st === "leap" ? "#3b82f6" : "#d97706";
+            return (
+              <div key={st} style={{ background:"#f1f5f9", borderRadius:8, padding:"12px 20px",
+                display:"flex", flexDirection:"column", gap:4, minWidth:160 }}>
+                <div style={{ color:stColor, fontWeight:700, fontSize:12 }}>{stLabel}</div>
+                <div style={{ display:"flex", gap:20 }}>
+                  <div>
+                    <div style={{ color:"#64748b", fontSize:10 }}>Trades</div>
+                    <div style={{ fontWeight:700 }}>{d.total}</div>
+                  </div>
+                  <div>
+                    <div style={{ color:"#64748b", fontSize:10 }}>Win %</div>
+                    <div style={{ color:"#27ae60", fontWeight:700 }}>{wr}%</div>
+                  </div>
+                  <div>
+                    <div style={{ color:"#64748b", fontSize:10 }}>Total P&L</div>
+                    <div style={{ color:pnlCol, fontWeight:700 }}>${d.pnl.toFixed(0)}</div>
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
       <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:20, marginBottom:20 }}>
 
         {/* Feature importances */}
