@@ -856,7 +856,7 @@ def _at_load_state() -> None:
 
 def _universe_save(tickers: list) -> None:
     """Persist screened universe to disk so restarts don't revert to hardcoded list."""
-    saved_at = datetime.utcnow().isoformat()
+    saved_at = datetime.utcnow().isoformat() + "Z"   # Z suffix so browsers parse as UTC
     try:
         with open(UNIVERSE_CACHE_PATH, "w") as f:
             json.dump({"tickers": tickers, "saved_at": saved_at}, f)
@@ -872,7 +872,9 @@ def _universe_load() -> None:
     try:
         with open(UNIVERSE_CACHE_PATH, "r") as f:
             data = json.load(f)
-        saved_at = datetime.fromisoformat(data.get("saved_at", "2000-01-01"))
+        saved_at = datetime.fromisoformat(
+            (data.get("saved_at", "2000-01-01") or "2000-01-01").replace("Z", "+00:00")
+        ).replace(tzinfo=None)   # strip tz for naive UTC comparison
         age_days = (datetime.utcnow() - saved_at).days
         if age_days > 7:
             log.info("Universe cache is %d days old — using hardcoded universe", age_days)
