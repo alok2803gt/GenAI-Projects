@@ -1749,9 +1749,16 @@ async def _autotrader_roll_coro(ib: IB, item, info: dict, key: str) -> None:
         exchange="SMART", currency="USD", multiplier="100",
     )
     await ib.qualifyContractsAsync(contract_cur)
-    tq_cur = ib.reqMktData(contract_cur, "", False, False)
+    tq_cur = ib.reqMktData(contract_cur, "106", False, False)  # 106 = implied vol for modelGreeks
     await asyncio.sleep(2)
     buyback_ask = _safe_float(tq_cur.ask, 0)
+    live_iv_roll = None
+    try:
+        if tq_cur.modelGreeks and tq_cur.modelGreeks.impliedVol:
+            live_iv_roll = round(float(tq_cur.modelGreeks.impliedVol) * 100, 2)
+    except Exception:
+        pass
+    live_iv_roll = live_iv_roll or info.get("live_iv")  # fall back to entry IV if snapshot unavailable
     ib.cancelMktData(contract_cur)
 
     if buyback_ask <= 0:
@@ -1836,7 +1843,7 @@ async def _autotrader_roll_coro(ib: IB, item, info: dict, key: str) -> None:
             "bid":        new_bid,      "ask":         new_ask,
             "score":      info.get("score", 0),
             "iv_rank":    info.get("iv_rank"),
-            "live_iv":    live_iv,      # IV at time of roll — critical for learning model
+            "live_iv":    live_iv_roll,  # IV at time of roll — critical for learning model
             "roll_count": roll_count + 1,
         }
         await _autotrader_place_coro(ib, row, state["autotrader"]["config"], regime=row["_regime"])
