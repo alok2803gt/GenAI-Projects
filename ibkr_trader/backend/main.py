@@ -1415,7 +1415,6 @@ async def _screen_universe(top_n: int = 25) -> Optional[List[str]]:
 
         scored.sort(key=lambda x: x["score"], reverse=True)
         state["universe_scores"] = scored
-        state["universe_last_screened"] = datetime.now().isoformat()
 
         tickers = [t["ticker"] for t in scored[:top_n]]
         log.info("Universe screen complete (%d scored): %s", len(scored), ", ".join(tickers))
