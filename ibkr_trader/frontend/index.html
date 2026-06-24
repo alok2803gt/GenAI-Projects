@@ -1801,7 +1801,7 @@ function AutoTraderTab() {
             <table style={{ width:"100%", borderCollapse:"collapse", fontSize:13 }}>
               <thead>
                 <tr style={{ color:C.muted, borderBottom:`1px solid ${C.border}` }}>
-                  {["Ticker","Type","Strike","Expiry / DTE","Qty","Entry","Max P/L","Stop","Live P&L","Progress","Placed",""].map(h =>
+                  {["Ticker","Type","Strike","Expiry / DTE","Qty","Entry","Target / Cost","Stop","Live P&L","Progress","Placed",""].map(h =>
                     <th key={h} style={{ padding:"6px 10px", textAlign:"left", fontWeight:600, fontSize:11 }}>{h}</th>
                   )}
                 </tr>
@@ -1850,10 +1850,27 @@ function AutoTraderTab() {
                     </td>
                     <td style={{ padding:"7px 10px", color:C.text }}>{p.qty}</td>
                     <td style={{ padding:"7px 10px", color:C.muted }}>${(p.entry_price||0).toFixed(2)}</td>
-                    <td style={{ padding:"7px 10px", color:"#d97706", fontWeight:600 }}>${(p.max_profit||0).toFixed(0)}</td>
+                    <td style={{ padding:"7px 10px" }}>
+                      {p.action === "SELL" ? (
+                        // CSP: max_profit = premium collected (true max profit)
+                        <span style={{ color:"#d97706", fontWeight:600 }}>${(p.max_profit||0).toFixed(0)}</span>
+                      ) : (
+                        // LEAP: max_profit = cost paid; target = 50% of cost
+                        <div>
+                          <span style={{ color:"#3b82f6", fontWeight:600 }}>
+                            ${((p.max_profit||0) * (cfg.profit_target_pct||0.5)).toFixed(0)} tgt
+                          </span>
+                          <div style={{ color:C.muted, fontSize:10 }}>
+                            cost ${(p.max_profit||0).toFixed(0)}
+                          </div>
+                        </div>
+                      )}
+                    </td>
                     <td style={{ padding:"7px 10px" }}>
                       <span style={{ color:C.bear, fontWeight:600 }}>-${Math.abs(stopLoss).toFixed(0)}</span>
-                      <span style={{ color:C.muted, fontSize:10, marginLeft:3 }}>{stopMult}×</span>
+                      <span style={{ color:C.muted, fontSize:10, marginLeft:3 }}>
+                        {p.action === "SELL" ? `${stopMult}×` : `${Math.round(stopMult*100)}%`}
+                      </span>
                     </td>
                     <td style={{ padding:"7px 10px" }}>
                       {hasLive
