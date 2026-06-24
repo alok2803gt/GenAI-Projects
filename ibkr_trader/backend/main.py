@@ -5741,8 +5741,8 @@ def journal_cleanup():
     orphan_ids = [r[0] for r in rows if r[0] not in active_journal_ids]
     if orphan_ids:
         con.execute(
-            f"UPDATE trade_journal SET closed_at=?, exit_reason='orphaned', win=0, pnl=0, pnl_pct=0 "
-            f"WHERE id IN ({','.join('?' * len(orphan_ids))})",
+            f"UPDATE trade_journal SET closed_at=?, exit_reason='orphaned' "
+            f"WHERE id IN ({','.join('?' * len(orphan_ids))}) AND closed_at IS NULL",
             [datetime.utcnow().isoformat()] + orphan_ids,
         )
         con.commit()
@@ -5752,7 +5752,7 @@ def journal_cleanup():
         "ok": True,
         "orphaned": len(orphan_ids),
         "active_tracked": len(active_journal_ids),
-        "message": f"Closed {len(orphan_ids)} phantom open entries (pnl=$0, exit_reason=orphaned)",
+        "message": f"Closed {len(orphan_ids)} phantom open entries (exit_reason=orphaned, pnl left null — excluded from stats)",
     }
 
 

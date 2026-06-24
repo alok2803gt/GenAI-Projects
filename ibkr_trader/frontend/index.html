@@ -1530,7 +1530,7 @@ function AutoTraderTab() {
   };
 
   const cleanupJournal = async () => {
-    if (!window.confirm("Mark all phantom open journal entries (not tracked by auto-trader and older than 24h) as closed with pnl=$0. This is safe and only affects display. Proceed?")) return;
+    if (!window.confirm("Mark all phantom open journal entries (not tracked by auto-trader and older than 24h) as orphaned. These entries will be closed with no P&L and excluded from stats. Proceed?")) return;
     try {
       const r = await apiFetch("/journal/cleanup", { method: "POST" });
       alert(`Journal cleanup complete.\nOrphaned entries closed: ${r.orphaned}\nActive tracked: ${r.active_tracked}\n\n${r.message}`);
