@@ -1794,11 +1794,18 @@ async def _autotrader_monitor_coro(ib: IB) -> None:
 
     for key in orphans:
         info = at["positions"].pop(key, {})
+        j_id = info.get("journal_id")
+        if j_id:
+            # Close the journal row so it doesn't show as permanently "open".
+            # Outcome (worthless vs assigned) is unknown here — mark as orphaned
+            # so it is excluded from Kelly and stats but visible in the journal.
+            _journal_record_orphaned(j_id)
         _at_log("WARN",
                 f"{key}: expired position removed from tracking "
                 f"(expiry={info.get('expiry','?')}, "
                 f"ticker={info.get('ticker','?')}, "
                 f"strike={info.get('strike','?')}). "
+                f"Journal entry #{j_id} closed as 'orphaned'. "
                 f"Check TWS for settlement outcome.")
     if orphans:
         _at_save_state()
@@ -1829,6 +1836,7 @@ async def _autotrader_roll_coro(ib: IB, item, info: dict, key: str) -> None:
     # ── Guard 2: earnings proximity — never roll through an earnings event ────
     # Rolling into a new expiry that straddles earnings exposes the position to
     # assignment risk + IV crush on the wrong side. Close now; re-enter after.
+    earnings_days: Optional[int] = None   # captured here so it's available for the roll row below
     try:
         earnings_days = await _earnings_days_out(ticker)
         if earnings_days is not None and earnings_days <= EARNINGS_BLOCK_DAYS:
@@ -1949,14 +1957,16 @@ async def _autotrader_roll_coro(ib: IB, item, info: dict, key: str) -> None:
             return
 
         row = {
-            "ticker":     ticker,       "expiry":      expiry_new,
-            "strike":     roll_strike,  "_type":       info.get("strategy_type", "csp"),
-            "_regime":    state["ext_cache"].get("regime", {}).get("regime", "BULL"),
-            "bid":        new_bid,      "ask":         new_ask,
-            "score":      info.get("score", 0),
-            "iv_rank":    info.get("iv_rank"),
-            "live_iv":    live_iv_roll,  # IV at time of roll — critical for learning model
-            "roll_count": roll_count + 1,
+            "ticker":           ticker,       "expiry":      expiry_new,
+            "strike":           roll_strike,  "_type":       info.get("strategy_type", "csp"),
+            "_regime":          state["ext_cache"].get("regime", {}).get("regime", "BULL"),
+            "bid":              new_bid,      "ask":         new_ask,
+            "score":            info.get("score", 0),
+            "iv_rank":          info.get("iv_rank"),
+            "live_iv":          live_iv_roll,  # IV at time of roll — critical for learning model
+            "roll_count":       roll_count + 1,
+            "spot":             stock_price,    # available from _get_stock_price above
+            "earnings_days_out": earnings_days, # available from _earnings_days_out above
         }
         await _autotrader_place_coro(ib, row, state["autotrader"]["config"], regime=row["_regime"])
         _at_log("ROLL",
@@ -2987,6 +2997,23 @@ def _journal_record_exit(
             _retrain_from_journal()
         except Exception as exc:
             log.warning("Auto retrain failed: %s", exc)
+
+
+def _journal_record_orphaned(journal_id: int) -> None:
+    """Close a journal row for an expired/disappeared position whose outcome is unknown.
+
+    Sets closed_at and exit_reason='orphaned' so the row no longer appears as open,
+    but leaves pnl/win/pnl_pct NULL so it is excluded from Kelly and stats calculations.
+    The 'orphaned' reason is already filtered out of get_journal_stats() and
+    _update_kelly_from_journal() via _REAL_EXIT_REASONS.
+    """
+    con = sqlite3.connect(JOURNAL_DB_PATH, check_same_thread=False)
+    con.execute(
+        "UPDATE trade_journal SET closed_at=?, exit_reason='orphaned' WHERE id=? AND closed_at IS NULL",
+        (datetime.utcnow().isoformat(), journal_id),
+    )
+    con.commit()
+    con.close()
 
 
 _REAL_EXIT_REASONS = (
