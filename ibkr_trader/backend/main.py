@@ -5564,12 +5564,17 @@ def pnl_dashboard():
         cum += pnl
         daily_pnl.append({"date": day, "pnl": round(pnl, 2), "cumulative": round(cum, 2)})
 
-    closed_pnls = [t["pnl"] for t in closed_trades if t.get("pnl") is not None]
-    wins        = [t for t in closed_trades if t.get("win") == 1]
-    losses      = [t for t in closed_trades if t.get("win") == 0]
-    today_str   = date.today().isoformat()
-    today_pnl   = sum(
-        t["pnl"] for t in closed_trades
+    _REAL_EXIT_SET = {
+        "profit_target", "stop_loss", "roll_close",
+        "roll_max", "roll_no_credit", "21dte", "manual", "rotation",
+    }
+    real_closed   = [t for t in closed_trades if t.get("exit_reason") in _REAL_EXIT_SET]
+    closed_pnls   = [t["pnl"] for t in real_closed if t.get("pnl") is not None]
+    wins          = [t for t in real_closed if t.get("win") == 1]
+    losses        = [t for t in real_closed if t.get("win") == 0]
+    today_str     = date.today().isoformat()
+    today_pnl     = sum(
+        t["pnl"] for t in real_closed
         if (t.get("closed_at") or "")[:10] == today_str and t.get("pnl") is not None
     )
 
@@ -5635,8 +5640,8 @@ def pnl_dashboard():
                 _con = sqlite3.connect(JOURNAL_DB_PATH, check_same_thread=False)
                 ph   = ",".join("?" * len(orphan_ids))
                 _con.execute(
-                    f"UPDATE trade_journal SET closed_at=?, exit_reason='orphaned', win=0, pnl=0, pnl_pct=0 "
-                    f"WHERE id IN ({ph})",
+                    f"UPDATE trade_journal SET closed_at=?, exit_reason='orphaned' "
+                    f"WHERE id IN ({ph}) AND closed_at IS NULL",
                     [datetime.utcnow().isoformat()] + orphan_ids,
                 )
                 _con.commit()
@@ -5691,9 +5696,9 @@ def pnl_dashboard():
     return {
         "account": acct,
         "stats": {
-            "total_trades":         len(closed_trades),
+            "total_trades":         len(real_closed),
             "open_count":           len(portfolio_items) if ib_connected else len(open_trades),
-            "win_rate":             round(len(wins) / len(closed_trades) * 100, 1) if closed_trades else None,
+            "win_rate":             round(len(wins) / len(real_closed) * 100, 1) if real_closed else None,
             "total_realized_pnl":   total_realized,
             "total_unrealized_pnl": total_unrealized,
             "total_pnl":            round(total_realized + total_unrealized, 2),
