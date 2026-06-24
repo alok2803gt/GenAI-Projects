@@ -97,9 +97,16 @@ function Btn({ onClick, children, color, style: sx }) {
   );
 }
 
-function Card({ children, style: sx }) {
+function Card({ children, title, style: sx }) {
   return (
     <div style={{ background:C.card, border:`1px solid ${C.border}`, borderRadius:10, padding:"16px 18px", boxShadow:"0 1px 4px rgba(0,0,0,0.07)", ...sx }}>
+      {title && (
+        <div style={{ ...sans, fontSize:12, fontWeight:700, color:C.muted, textTransform:"uppercase",
+                      letterSpacing:"0.08em", marginBottom:12, paddingBottom:8,
+                      borderBottom:`1px solid ${C.border}` }}>
+          {title}
+        </div>
+      )}
       {children}
     </div>
   );
@@ -1663,8 +1670,8 @@ function AutoTraderTab() {
               { label:"Premium Collected", value:`$${(status?.premium_collected||0).toFixed(0)}`, col:"#27ae60", sub:null },
               { label:"LEAP Budget (net)", value:`$${(status?.leap_budget||0).toFixed(0)}`, col:"#3498db",
                 sub: leapPnl !== 0 ? { text:`LEAP P&L: ${leapPnl>=0?"+":""}$${leapPnl.toFixed(0)}`, col:leapPnlCol } : null },
-              { label:"Kelly CSP/Trade", value:`$${kellyCspCapital.toLocaleString()}`, col:"#f1c40f",
-                sub:{ text:`LEAP: $${kellyLeapCapital.toLocaleString()}/trade`, col:"#94a3b8" } },
+              { label:"Kelly CSP/Trade", value:`$${kellyCspCapital.toLocaleString()}`, col:"#d97706",
+                sub:{ text:`LEAP: $${kellyLeapCapital.toLocaleString()}/trade`, col:"#64748b" } },
             ].map(s => (
               <div key={s.label} style={{ background:"#f1f5f9", borderRadius:8, padding:14, textAlign:"center" }}>
                 <div style={{ color:"#64748b", fontSize:11, marginBottom:6 }}>{s.label}</div>
@@ -1939,9 +1946,22 @@ function AutoTraderTab() {
               return (
                 <div key={ticker} style={{
                   padding:"8px 12px", borderRadius:8, border:"1px solid #e74c3c66",
-                  background:"#e74c3c11", minWidth:120,
+                  background:"#e74c3c11", minWidth:130,
                 }}>
-                  <div style={{ fontWeight:700, fontSize:13, color:"#e74c3c" }}>{ticker}</div>
+                  <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", gap:8 }}>
+                    <span style={{ fontWeight:700, fontSize:13, color:"#e74c3c" }}>{ticker}</span>
+                    <span
+                      title="Clear cooldown — allow immediate re-entry"
+                      onClick={async () => {
+                        await apiFetch("/autotrader/clear-cooldown", {
+                          method:"POST", headers:{"Content-Type":"application/json"},
+                          body: JSON.stringify({ ticker }),
+                        });
+                      }}
+                      style={{ cursor:"pointer", color:"#94a3b8", fontSize:14, fontWeight:700,
+                               lineHeight:1, padding:"0 2px" }}
+                    >×</span>
+                  </div>
                   <div style={{ fontSize:11, color:"#64748b", marginTop:2 }}>
                     {remaining > 0
                       ? `${remaining.toFixed(1)}h remaining`

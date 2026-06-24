@@ -4691,6 +4691,18 @@ async def autotrader_run_now():
     return {"ok": True, "log": state["autotrader"]["log"][-20:]}
 
 
+@app.post("/autotrader/clear-cooldown")
+def clear_cooldown(req: AddTickerRequest):
+    """Remove a ticker from the 48h stop-loss cooldown, allowing immediate re-entry."""
+    ticker = req.ticker.upper()
+    at = state["autotrader"]
+    removed = ticker in at.get("stopped_out", {})
+    at.setdefault("stopped_out", {}).pop(ticker, None)
+    _at_save_state()
+    _at_log("SYSTEM", f"Cooldown cleared for {ticker} by user request")
+    return {"ok": True, "removed": removed}
+
+
 @app.post("/autotrader/clear-stale-positions")
 def clear_stale_positions():
     """
