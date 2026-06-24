@@ -856,9 +856,11 @@ def _at_load_state() -> None:
 
 def _universe_save(tickers: list) -> None:
     """Persist screened universe to disk so restarts don't revert to hardcoded list."""
+    saved_at = datetime.utcnow().isoformat()
     try:
         with open(UNIVERSE_CACHE_PATH, "w") as f:
-            json.dump({"tickers": tickers, "saved_at": datetime.utcnow().isoformat()}, f)
+            json.dump({"tickers": tickers, "saved_at": saved_at}, f)
+        state["universe_last_screened"] = saved_at   # keep in-memory state current
     except Exception as e:
         log.warning("Universe cache save failed: %s", e)
 
