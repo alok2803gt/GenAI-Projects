@@ -739,9 +739,11 @@ function filterCSP(candidates) {
   // Mirrors backend _filter_csp_recommended:
   //   iv_rank >= 50 (IV_RANK_MIN_CSP), score >= 70, liquidity >= 50,
   //   all three SMA trend gates (None = benefit of doubt; only False = rejected),
-  //   earnings > 28d (EARNINGS_BLOCK_DAYS * 2 = 14 * 2)
+  //   earnings > 28d (EARNINGS_BLOCK_DAYS * 2 = 14 * 2).
+  //   Informational warnings (e.g. earnings 29-30d) show as badges but do NOT block Recommended.
+  //   Only warnings tagged "excl. recommended" are hard blocks.
   const clean = candidates.filter(r =>
-    (r.warnings || []).length === 0 &&
+    !(r.warnings || []).some(w => w.includes("excl. recommended")) &&
     r.liquidity_score >= 50 &&
     r.iv_rank >= 50 &&
     r.score >= 70 &&
@@ -757,9 +759,10 @@ function filterCSP(candidates) {
 
 function filterLEAP(candidates) {
   // Mirrors backend _filter_leap_recommended:
-  //   liquidity >= 60, iv_rank <= 75 (don't overpay for elevated vol on long calls)
+  //   liquidity >= 60, iv_rank <= 75 (don't overpay for elevated vol on long calls).
+  //   Only "excl. recommended" warnings block; informational warnings show as badges.
   const clean = candidates.filter(r =>
-    (r.warnings || []).length === 0 &&
+    !(r.warnings || []).some(w => w.includes("excl. recommended")) &&
     r.liquidity_score >= 60 &&
     (r.iv_rank == null || r.iv_rank <= 75)
   );

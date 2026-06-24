@@ -1477,20 +1477,24 @@ async def _universe_scheduler() -> None:
 
 def _filter_csp_recommended(candidates: list, log_diag: bool = False) -> list:
     """Filter scan candidates to recommended CSPs. Set log_diag=True to emit AT diagnostics."""
+    # Only block on warnings that explicitly say "excl. recommended".
+    # Informational warnings (e.g. earnings in 29-30d) should show in Recommended with a badge,
+    # not silently exclude the candidate.
+    def _excl(r): return any("excl. recommended" in w for w in r.get("warnings", []))
     n_total     = len(candidates)
-    n_warnings  = sum(1 for r in candidates if len(r.get("warnings", [])) > 0)
-    n_liq       = sum(1 for r in candidates if len(r.get("warnings", [])) == 0 and r["liquidity_score"] < 50)
-    n_iv        = sum(1 for r in candidates if len(r.get("warnings", [])) == 0
+    n_warnings  = sum(1 for r in candidates if _excl(r))
+    n_liq       = sum(1 for r in candidates if not _excl(r) and r["liquidity_score"] < 50)
+    n_iv        = sum(1 for r in candidates if not _excl(r)
                       and r["liquidity_score"] >= 50 and r["iv_rank"] < IV_RANK_MIN_CSP)
-    n_score     = sum(1 for r in candidates if len(r.get("warnings", [])) == 0
+    n_score     = sum(1 for r in candidates if not _excl(r)
                       and r["liquidity_score"] >= 50 and r["iv_rank"] >= IV_RANK_MIN_CSP
                       and r["score"] < 70)
-    n_trend     = sum(1 for r in candidates if len(r.get("warnings", [])) == 0
+    n_trend     = sum(1 for r in candidates if not _excl(r)
                       and r["liquidity_score"] >= 50 and r["iv_rank"] >= IV_RANK_MIN_CSP
                       and r["score"] >= 70
                       and (r.get("above_sma50") is False or r.get("above_sma20") is False
                            or r.get("above_sma200") is False))
-    n_earnings  = sum(1 for r in candidates if len(r.get("warnings", [])) == 0
+    n_earnings  = sum(1 for r in candidates if not _excl(r)
                       and r["liquidity_score"] >= 50 and r["iv_rank"] >= IV_RANK_MIN_CSP
                       and r["score"] >= 70
                       and r.get("above_sma50") is not False and r.get("above_sma20") is not False
@@ -1501,7 +1505,7 @@ def _filter_csp_recommended(candidates: list, log_diag: bool = False) -> list:
     # SMA-20/50/200 must be True or None (None = not enough history → benefit of doubt).
     # above_sma200 is False only when we have 200 bars and the price is below — confirmed downtrend.
     clean = [r for r in candidates
-             if len(r.get("warnings", [])) == 0
+             if not _excl(r)
              and r["liquidity_score"] >= 50
              and r["iv_rank"] >= IV_RANK_MIN_CSP
              and r["score"] >= 70
@@ -1532,7 +1536,7 @@ def _filter_csp_recommended(candidates: list, log_diag: bool = False) -> list:
 
 def _filter_leap_recommended(candidates: list) -> list:
     clean = [r for r in candidates
-             if len(r.get("warnings", [])) == 0
+             if not any("excl. recommended" in w for w in r.get("warnings", []))
              and r["liquidity_score"] >= 60
              and r.get("iv_rank", 50) <= 75]   # avoid buying when IV is too elevated
     for r in clean:
