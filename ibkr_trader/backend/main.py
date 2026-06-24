@@ -2888,9 +2888,15 @@ def _journal_init() -> None:
             win               INTEGER,
             max_profit        REAL,
             strategy_type     TEXT,
-            model_version     INTEGER
+            model_version     INTEGER,
+            live_iv_exit      REAL
         )
     """)
+    # Add live_iv_exit column to existing databases that predate this field
+    try:
+        con.execute("ALTER TABLE trade_journal ADD COLUMN live_iv_exit REAL")
+    except Exception:
+        pass   # Column already exists — ALTER TABLE fails if column is present
     con.execute("""
         CREATE TABLE IF NOT EXISTS model_log (
             id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2954,10 +2960,10 @@ def _journal_record_exit(
     win        = 1 if pnl > 0 else 0
     con.execute("""
         UPDATE trade_journal
-        SET closed_at=?, exit_price=?, pnl=?, pnl_pct=?, win=?, exit_reason=?
+        SET closed_at=?, exit_price=?, pnl=?, pnl_pct=?, win=?, exit_reason=?, live_iv_exit=?
         WHERE id=?
     """, (datetime.utcnow().isoformat(), exit_price, round(pnl, 2),
-          pnl_pct, win, exit_reason, journal_id))
+          pnl_pct, win, exit_reason, live_iv_exit, journal_id))
     con.commit()
     con.close()
 
