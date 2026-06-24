@@ -2272,15 +2272,36 @@ async def _autotrader_scan_and_trade_coro(ib: IB) -> None:
     if slots > 0:
         # ── Normal entry path ─────────────────────────────────────────────────
         for row in candidates[:slots]:
-            cost = float(row.get("strike", 0)) * float(row.get("qty", 1)) * 100
-            if cost > cap["deployable"]:
-                _at_log("SCAN", f"Skip {row['ticker']}: position cost ${cost:,.0f} > "
-                                f"deployable ${cap['deployable']:,.0f}")
-                continue
+            if row.get("_type") == "leap":
+                # LEAP cost = option premium paid (cost_per_contract), NOT strike × 100.
+                # Checked against LEAP-specific budget (leap_capital or self-financed
+                # leap_budget), not the CSP collateral pool.
+                cost = float(row.get("cost_per_contract", 0))
+                leap_deployed = sum(
+                    float(p.get("max_profit", 0))
+                    for p in at["positions"].values()
+                    if p.get("action") == "BUY"
+                )
+                leap_capital = float(cfg.get("leap_capital", 5000.0))
+                leap_budget  = at.get("leap_budget", 0.0)
+                leap_avail   = max(0.0, max(leap_capital, leap_budget) - leap_deployed)
+                if cost > leap_avail:
+                    _at_log("SCAN", f"Skip {row['ticker']} LEAP: cost ${cost:,.0f} > "
+                                    f"LEAP available ${leap_avail:,.0f} "
+                                    f"(deployed=${leap_deployed:,.0f}, "
+                                    f"budget=${leap_budget:,.0f}, capital=${leap_capital:,.0f})")
+                    continue
+            else:
+                cost = float(row.get("strike", 0)) * float(row.get("qty", 1)) * 100
+                if cost > cap["deployable"]:
+                    _at_log("SCAN", f"Skip {row['ticker']}: position cost ${cost:,.0f} > "
+                                    f"deployable ${cap['deployable']:,.0f}")
+                    continue
             try:
                 await _autotrader_place_coro(ib, row, cfg, regime=regime)
                 active_t.add(row["ticker"])
-                cap["deployable"] -= cost   # reduce remaining budget
+                if row.get("_type") != "leap":
+                    cap["deployable"] -= cost   # only deduct CSP capital for CSP trades
                 placed += 1
             except Exception as exc:
                 _at_log("ERROR", f"Place {row['ticker']}: {exc}")
