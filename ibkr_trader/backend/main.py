@@ -1696,8 +1696,11 @@ async def _autotrader_monitor_coro(ib: IB) -> None:
             except ValueError:
                 pass
 
-        # ── 1. Profit target: 50% of max premium ─────────────────────────
-        if upnl >= profit_target * max_profit:
+        # ── 1. Profit target: 50% of max premium (CSPs only) ─────────────────────────
+        # LEAPs (BUY) exit via stop-loss or 21 DTE — not a fixed profit target.
+        # Applying the CSP target to LEAPs would close them at 50% of cost (e.g.
+        # +$500 on a $1000 LEAP), undermining the 6-18 month directional thesis.
+        if action == "SELL" and upnl >= profit_target * max_profit:
             _at_log("CLOSE", f"{key}: {profit_target*100:.0f}% profit target hit (${upnl:.0f} / max=${max_profit:.0f})")
             info["exit_reason"] = "profit_target"
             await _autotrader_close_coro(ib, item, info, key)

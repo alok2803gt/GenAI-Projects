@@ -1823,8 +1823,10 @@ function AutoTraderTab() {
                   const hasLive       = livePnl != null;
                   const pnlColor      = !hasLive ? C.muted
                                       : livePnl >= 0 ? C.bull : C.bear;
-                  const profitTarget  = (cfg.profit_target_pct ?? 0.5) * (p.max_profit || 0);
-                  const progress      = hasLive && profitTarget > 0
+                  // Progress bar only for CSPs (SELL); LEAPs exit via stop-loss / 21 DTE only
+                  const isLeap       = p.action === "BUY";
+                  const profitTarget  = isLeap ? 0 : (cfg.profit_target_pct ?? 0.5) * (p.max_profit || 0);
+                  const progress      = !isLeap && hasLive && profitTarget > 0
                                       ? Math.min(1, Math.max(0, livePnl / profitTarget))
                                       : null;
                   const progressColor = progress == null ? C.border
