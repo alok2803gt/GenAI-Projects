@@ -1675,6 +1675,32 @@ async def _autotrader_monitor_coro(ib: IB) -> None:
                 await _autotrader_roll_coro(ib, item, info, key)
             continue
 
+    # ── Orphaned expired position cleanup ─────────────────────────────────────
+    # Options expire and disappear from ib.portfolio() on settlement day.
+    # Without cleanup, expired positions stay in at["positions"] forever —
+    # blocking re-entry on that ticker and distorting slot/capital accounting.
+    live_keys = {_at_contract_key(item.contract) for item in ib.portfolio()}
+    orphans = []
+    for key, info in list(at["positions"].items()):
+        expiry_str = info.get("expiry", "")
+        try:
+            expiry_date = datetime.strptime(expiry_str, "%Y%m%d").date()
+        except ValueError:
+            continue
+        if expiry_date < today and key not in live_keys:
+            orphans.append(key)
+
+    for key in orphans:
+        info = at["positions"].pop(key, {})
+        _at_log("WARN",
+                f"{key}: expired position removed from tracking "
+                f"(expiry={info.get('expiry','?')}, "
+                f"ticker={info.get('ticker','?')}, "
+                f"strike={info.get('strike','?')}). "
+                f"Check TWS for settlement outcome.")
+    if orphans:
+        _at_save_state()
+
 
 async def _autotrader_roll_coro(ib: IB, item, info: dict, key: str) -> None:
     """
