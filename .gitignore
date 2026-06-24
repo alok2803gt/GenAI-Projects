@@ -16,6 +16,7 @@ env/
 ibkr_trader/backend/autotrader_state.json
 ibkr_trader/backend/iv_history.json
 ibkr_trader/backend/trade_journal.db
+ibkr_trader/backend/universe_cache.json
 
 # Secrets / local config
 .env

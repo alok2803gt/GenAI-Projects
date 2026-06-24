@@ -88,6 +88,7 @@ JOURNAL_DB_PATH     = "trade_journal.db"
 JOURNAL_MIN_TRADES  = 20    # trades needed before learned model is reliable
 RETRAIN_EVERY       = 5     # retrain model every N new closed trades
 AT_STATE_PATH       = "autotrader_state.json"  # persisted across restarts
+UNIVERSE_CACHE_PATH = "universe_cache.json"     # screened universe (refreshed nightly)
 
 # ── Config — LEAP scanner ──────────────────────────────────────────────────
 LEAP_MIN_DTE   = 180   # ≥ 6 months
@@ -853,6 +854,36 @@ def _at_load_state() -> None:
     except Exception as e:
         log.warning(f"Auto-trader state load failed (starting fresh): {e}")
 
+def _universe_save(tickers: list) -> None:
+    """Persist screened universe to disk so restarts don't revert to hardcoded list."""
+    try:
+        with open(UNIVERSE_CACHE_PATH, "w") as f:
+            json.dump({"tickers": tickers, "saved_at": datetime.utcnow().isoformat()}, f)
+    except Exception as e:
+        log.warning("Universe cache save failed: %s", e)
+
+
+def _universe_load() -> None:
+    """Load screened universe from cache on startup (skip if > 7 days old)."""
+    if not os.path.exists(UNIVERSE_CACHE_PATH):
+        return
+    try:
+        with open(UNIVERSE_CACHE_PATH, "r") as f:
+            data = json.load(f)
+        saved_at = datetime.fromisoformat(data.get("saved_at", "2000-01-01"))
+        age_days = (datetime.utcnow() - saved_at).days
+        if age_days > 7:
+            log.info("Universe cache is %d days old — using hardcoded universe", age_days)
+            return
+        tickers = [t for t in data.get("tickers", []) if isinstance(t, str)]
+        if tickers:
+            CSP_UNIVERSE.clear()
+            CSP_UNIVERSE.extend(tickers)
+            log.info("Universe restored from cache (%d tickers, %dd old)", len(tickers), age_days)
+    except Exception as e:
+        log.warning("Universe cache load failed: %s", e)
+
+
 def _record_iv(ticker: str, iv_frac: float) -> None:
     """Store today's IV; keep last 252 trading-day snapshots (≈1 year)."""
     today_str = date.today().isoformat()
@@ -1414,6 +1445,7 @@ async def _universe_scheduler() -> None:
                 CSP_UNIVERSE.extend(tickers)
                 state["scan_cache"]["csp"]   = None   # invalidate scan caches
                 state["scan_cache"]["leaps"] = None
+                _universe_save(tickers)   # persist so restarts don't revert
                 log.info("Universe refreshed: %d tickers", len(CSP_UNIVERSE))
         except asyncio.CancelledError:
             break
@@ -4005,6 +4037,9 @@ async def lifespan(app: FastAPI):
     # Restore auto-trader positions + config from last shutdown
     _at_load_state()
 
+    # Restore screened universe from cache (avoids reverting to hardcoded 19 on restart)
+    _universe_load()
+
     # Warm up the learned model from journal so ranking works immediately
     try:
         result = _retrain_from_journal()
@@ -4030,6 +4065,7 @@ async def lifespan(app: FastAPI):
             CSP_UNIVERSE.extend(tickers)
             state["scan_cache"]["csp"]   = None
             state["scan_cache"]["leaps"] = None
+            _universe_save(tickers)
             log.info("Startup universe ready: %d tickers", len(CSP_UNIVERSE))
         else:
             log.info("Startup universe screen failed — using default %d tickers", len(CSP_UNIVERSE))
@@ -4441,6 +4477,7 @@ async def refresh_csp_universe(top_n: int = Query(25, ge=10, le=50)):
         CSP_UNIVERSE.extend(tickers)
         state["scan_cache"]["csp"]   = None
         state["scan_cache"]["leaps"] = None
+        _universe_save(tickers)
         return {
             "ok":           True,
             "universe":     CSP_UNIVERSE,

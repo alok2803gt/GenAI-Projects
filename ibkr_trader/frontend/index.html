@@ -1786,7 +1786,7 @@ function AutoTraderTab() {
           borderRadius:6, fontSize:12, color:"#64748b", lineHeight:1.7 }}>
           <strong style={{color:"#d97706"}}>Half-Kelly sizing:</strong>{" "}
           win rate <strong>{Math.round(((status?.config?.assumed_win_rate)||0.85)*100)}%</strong> (auto-calibrated),
-          profit/loss ratio {((cfg.profit_target_pct||0.50)/((cfg.stop_loss_mult||2.0)||2.0)).toFixed(3)} →
+          profit/loss ratio {(cfg.stop_loss_mult ?? 2.0) > 0 ? ((cfg.profit_target_pct??0.50)/(cfg.stop_loss_mult??2.0)).toFixed(3) : "∞ (no stop)"} →
           Kelly fraction {(kellyFrac*100).toFixed(1)}% of CSP budget ${(cfg.csp_capital||20000).toLocaleString()}
           = <strong style={{color:"#1e293b"}}>${kellyCspCapital.toLocaleString()} per CSP trade</strong>
           · LEAP: {(kellyFrac*100).toFixed(1)}% of ${(cfg.leap_capital||5000).toLocaleString()} = ${kellyLeapCapital.toLocaleString()}/trade.
