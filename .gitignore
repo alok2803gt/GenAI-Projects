@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+venv/
+.venv/
+env/
+
+# Runtime / auto-generated data files
+ibkr_trader/backend/autotrader_state.json
+ibkr_trader/backend/iv_history.json
+ibkr_trader/backend/trade_journal.db
+
+# Secrets / local config
+.env
+*.env.*
+secrets.json
+
+# IDEs
+.vscode/
+.idea/
+*.suo
+*.user
+
+# OS
+.DS_Store
+Thumbs.db
