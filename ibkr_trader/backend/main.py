@@ -2964,6 +2964,12 @@ def _journal_record_exit(
             log.warning("Auto retrain failed: %s", exc)
 
 
+_REAL_EXIT_REASONS = (
+    "'profit_target','stop_loss','roll_close',"
+    "'roll_max','roll_no_credit','21dte','manual','rotation'"
+)
+
+
 def _update_kelly_from_journal() -> None:
     """EMA-blend actual win rate from real autotrader exits into assumed_win_rate.
 
@@ -2973,10 +2979,9 @@ def _update_kelly_from_journal() -> None:
     """
     con = sqlite3.connect(JOURNAL_DB_PATH, check_same_thread=False)
     rows = con.execute(
-        "SELECT win FROM trade_journal "
-        "WHERE closed_at IS NOT NULL AND win IS NOT NULL "
-        "  AND exit_reason IN ('profit_target','stop_loss','roll_close',"
-        "                      'roll_max','roll_no_credit','21dte','manual','rotation')"
+        f"SELECT win FROM trade_journal "
+        f"WHERE closed_at IS NOT NULL AND win IS NOT NULL "
+        f"  AND exit_reason IN ({_REAL_EXIT_REASONS})"
     ).fetchall()
     con.close()
     if len(rows) < 10:
@@ -2989,12 +2994,6 @@ def _update_kelly_from_journal() -> None:
     _at_log("LEARN",
             f"Kelly win rate {old:.1%} → {new_wr:.1%} "
             f"(actual {actual_wr:.1%} over {len(rows)} real trades)")
-
-
-_REAL_EXIT_REASONS = (
-    "'profit_target','stop_loss','roll_close',"
-    "'roll_max','roll_no_credit','21dte','manual','rotation'"
-)
 
 def _retrain_from_journal() -> dict:
     """Retrain XGBoost score model from completed journal trades.
