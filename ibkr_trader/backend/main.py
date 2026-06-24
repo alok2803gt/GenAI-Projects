@@ -740,7 +740,19 @@ def _score_csp(row: dict) -> float:
             efficiency = min(premium_pct / otm_distance, 2.0)  # cap at 2×
             s += efficiency * 5  # max 10 pts at 2× efficiency
 
-    # 7) OPRA institutional signals (bonus / penalty)
+    # 7) Bollinger Band position — where is price within its own vol envelope  max ±6
+    #    Low pct_b (near lower band) + high IV = stock depressed but vol rich = ideal CSP entry.
+    #    High pct_b (near upper band) = price extended, more assignment risk on reversal.
+    pct_b = row.get("pct_b")
+    if pct_b is not None:
+        if iv_rank >= 45 and pct_b < 30:
+            s += 6   # depressed price + expensive vol: best CSP setup
+        elif pct_b < 20:
+            s += 3   # near lower band even without high IV
+        elif pct_b > 80:
+            s -= 4   # overbought within BB: higher chance of reversion / assignment
+
+    # 8) OPRA institutional signals (bonus / penalty)
     # Strike above max pain → MMs incentivised to keep price here          +8
     if row.get("max_pain") and row["strike"] >= row["max_pain"]:
         s += 8
@@ -853,9 +865,12 @@ def _iv_percentile(ticker: str, current_iv_frac: float) -> Optional[float]:
 
 # ── Technical indicators (RSI-14 + MACD 12/26/9 + SMA crossovers) ─────────
 
-def _compute_indicators_from_closes(closes: pd.Series) -> dict:
+def _compute_indicators_from_closes(closes: pd.Series, volumes: pd.Series | None = None) -> dict:
     empty = {"rsi14": None, "macd": None, "macd_signal": None,
-             "macd_hist": None, "above_sma20": None, "above_sma50": None}
+             "macd_hist": None, "above_sma20": None, "above_sma50": None,
+             "above_sma200": None, "sma200": None,
+             "bb_upper": None, "bb_mid": None, "bb_lower": None, "pct_b": None,
+             "vol_ratio": None}
     if len(closes) < 26:
         return empty
     def _safe(s):
@@ -875,24 +890,54 @@ def _compute_indicators_from_closes(closes: pd.Series) -> dict:
 
     sma20 = closes.rolling(20).mean()
     sma50 = closes.rolling(50).mean() if len(closes) >= 50 else pd.Series([float("nan")] * len(closes), index=closes.index)
+    sma200 = closes.rolling(200).mean() if len(closes) >= 200 else None
+
+    # Bollinger Bands (20, 2)
+    bb_std    = closes.rolling(20).std()
+    bb_upper_s = sma20 + 2 * bb_std
+    bb_lower_s = sma20 - 2 * bb_std
 
     last = float(closes.iloc[-1])
     s20  = _safe(sma20)
     s50  = _safe(sma50)
+    s200 = _safe(sma200) if sma200 is not None else None
+    b_upper = _safe(bb_upper_s)
+    b_mid   = _safe(sma20)
+    b_lower = _safe(bb_lower_s)
+    pct_b   = round((last - b_lower) / (b_upper - b_lower) * 100, 1) \
+              if (b_upper and b_lower and b_upper != b_lower) else None
+
+    # Volume ratio (today vs 20-day avg) — only when volume series provided
+    vol_ratio = None
+    if volumes is not None and len(volumes) >= 21:
+        avg_vol = float(volumes.iloc[-21:-1].mean())
+        today_vol = float(volumes.iloc[-1])
+        vol_ratio = round(today_vol / avg_vol, 2) if avg_vol > 0 else None
+
     return {
         "rsi14":       round(_safe(rsi)  or 50, 1),
         "macd":        round(_safe(macd) or 0,  4),
         "macd_signal": round(_safe(msig) or 0,  4),
         "macd_hist":   round(_safe(mhist) or 0, 4),
-        "above_sma20": bool(last > s20) if s20 is not None else None,
-        "above_sma50": bool(last > s50) if s50 is not None else None,
+        "above_sma20":  bool(last > s20)  if s20  is not None else None,
+        "above_sma50":  bool(last > s50)  if s50  is not None else None,
+        "above_sma200": bool(last > s200) if s200 is not None else None,
+        "sma200":       round(s200, 2)    if s200 is not None else None,
+        "bb_upper":     round(b_upper, 2) if b_upper is not None else None,
+        "bb_mid":       round(b_mid,   2) if b_mid   is not None else None,
+        "bb_lower":     round(b_lower, 2) if b_lower is not None else None,
+        "pct_b":        pct_b,
+        "vol_ratio":    vol_ratio,
     }
 
 
 async def _tech_indicators(ticker: str) -> dict:
-    """RSI-14 + MACD from streaming bars (live 5-min) or yfinance daily fallback."""
+    """RSI-14 + MACD + BB + SMA-200 from streaming bars or yfinance daily fallback."""
     empty = {"rsi14": None, "macd": None, "macd_signal": None,
-             "macd_hist": None, "above_sma20": None, "above_sma50": None}
+             "macd_hist": None, "above_sma20": None, "above_sma50": None,
+             "above_sma200": None, "sma200": None,
+             "bb_upper": None, "bb_mid": None, "bb_lower": None, "pct_b": None,
+             "vol_ratio": None}
     bars = state["bars"].get(ticker)
     if bars and len(bars) >= 30:
         closes = pd.Series([b["close"] for b in bars], dtype=float)
@@ -900,13 +945,13 @@ async def _tech_indicators(ticker: str) -> dict:
     loop = asyncio.get_event_loop()
     try:
         def _fetch():
-            hist = yf.Ticker(ticker).history(period="3mo")
+            hist = yf.Ticker(ticker).history(period="1y")
             if hist.empty or len(hist) < 26:
-                return None
-            return hist["Close"].astype(float)
-        closes = await loop.run_in_executor(None, _fetch)
+                return None, None
+            return hist["Close"].astype(float), hist["Volume"].astype(float)
+        closes, volumes = await loop.run_in_executor(None, _fetch)
         if closes is not None:
-            return _compute_indicators_from_closes(closes)
+            return _compute_indicators_from_closes(closes, volumes)
     except Exception as e:
         log.debug(f"Tech indicators [{ticker}]: {e}")
     return empty
@@ -3898,6 +3943,122 @@ def get_bars(ticker: str, limit: int = 80):
     if ticker not in state["bars"]:
         raise HTTPException(404, f"No bars for {ticker}")
     return state["bars"][ticker][-limit:]
+
+
+@app.get("/technicals/{ticker}")
+async def get_technicals(ticker: str):
+    """
+    Comprehensive technical analysis using 1Y daily OHLCV from IBKR.
+    Returns RSI-14, MACD, Bollinger Bands, SMA-20/50/200, volume breakout,
+    and an overall composite signal.  Requires active IBKR connection.
+    """
+    _require_connection()
+    ticker = ticker.upper().strip()
+    ib = state["ib"]
+    try:
+        contract = Stock(ticker, "SMART", "USD")
+        await ib.qualifyContractsAsync(contract)
+        bars = await ib.reqHistoricalDataAsync(
+            contract,
+            endDateTime="",
+            durationStr="1 Y",
+            barSizeSetting="1 day",
+            whatToShow="TRADES",
+            useRTH=True,
+            formatDate=1,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"IBKR data error: {e}")
+
+    if len(bars) < 60:
+        raise HTTPException(status_code=404, detail=f"Not enough history for {ticker} ({len(bars)} bars)")
+
+    df      = util.df(bars)
+    closes  = df["close"].astype(float)
+    volumes = df["volume"].astype(float)
+
+    ind = _compute_indicators_from_closes(closes, volumes)
+
+    price   = round(float(closes.iloc[-1]), 2)
+    prev    = round(float(closes.iloc[-2]), 2)
+    chg_pct = round((price - prev) / prev * 100, 2) if prev else 0.0
+
+    # Trend classification from MA stack
+    s20  = ind.get("above_sma20")
+    s50  = ind.get("above_sma50")
+    s200 = ind.get("above_sma200")
+    if s20 and s50 and s200:
+        trend = "bullish"
+    elif not s20 and not s50 and (s200 is False):
+        trend = "bearish"
+    else:
+        trend = "mixed"
+
+    rsi14    = ind.get("rsi14") or 50
+    rsi_zone = "overbought" if rsi14 > 70 else "oversold" if rsi14 < 30 else "neutral"
+    macd_bias = "bullish" if (ind.get("macd_hist") or 0) > 0 else "bearish"
+
+    # Volume breakout
+    vol_ratio = ind.get("vol_ratio") or 1.0
+    pct_b_val = ind.get("pct_b")
+    price_breakout = bool(pct_b_val is not None and pct_b_val > 95)
+    confirmed = price_breakout and vol_ratio >= 1.5
+    breakout_signal = "BREAKOUT" if confirmed else ("WATCH" if price_breakout else "NORMAL")
+
+    # Composite overall score (ported from ibkr_technicals._overall)
+    score = 0
+    if trend == "bullish": score += 2
+    elif trend == "bearish": score -= 2
+    if macd_bias == "bullish": score += 1
+    else: score -= 1
+    if rsi_zone == "oversold": score += 1
+    elif rsi_zone == "overbought": score -= 1
+    if confirmed: score += 2
+    if score >= 3: overall = "strong_buy"
+    elif score >= 1: overall = "buy"
+    elif score <= -3: overall = "strong_sell"
+    elif score <= -1: overall = "sell"
+    else: overall = "neutral"
+
+    return {
+        "ticker":     ticker,
+        "price":      price,
+        "change_pct": chg_pct,
+        "trend":      trend,
+        "bars_used":  len(bars),
+        "indicators": {
+            "rsi14":        ind.get("rsi14"),
+            "rsi_zone":     rsi_zone,
+            "macd":         ind.get("macd"),
+            "macd_signal":  ind.get("macd_signal"),
+            "macd_hist":    ind.get("macd_hist"),
+            "macd_bias":    macd_bias,
+            "sma20":        ind.get("bb_mid"),
+            "sma50":        None,
+            "sma200":       ind.get("sma200"),
+            "above_sma20":  ind.get("above_sma20"),
+            "above_sma50":  ind.get("above_sma50"),
+            "above_sma200": ind.get("above_sma200"),
+            "bb_upper":     ind.get("bb_upper"),
+            "bb_mid":       ind.get("bb_mid"),
+            "bb_lower":     ind.get("bb_lower"),
+            "pct_b":        ind.get("pct_b"),
+            "vol_ratio":    vol_ratio,
+        },
+        "breakout": {
+            "signal":        breakout_signal,
+            "vol_ratio":     round(vol_ratio, 2),
+            "price_breakout": price_breakout,
+            "confirmed":     confirmed,
+        },
+        "summary": {
+            "trend":           trend,
+            "rsi_zone":        rsi_zone,
+            "macd_bias":       macd_bias,
+            "breakout_signal": breakout_signal,
+            "overall":         overall,
+        },
+    }
 
 
 @app.post("/add_ticker")

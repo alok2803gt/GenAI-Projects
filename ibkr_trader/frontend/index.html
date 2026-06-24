@@ -3115,6 +3115,270 @@ function PnLTab() {
   );
 }
 
+// ── Technicals Tab ────────────────────────────────────────────────────────
+function TechnicalsTab() {
+  const [ticker,  setTicker]  = useState("");
+  const [loading, setLoading] = useState(false);
+  const [result,  setResult]  = useState(null);
+  const [error,   setError]   = useState(null);
+
+  async function analyze() {
+    const t = ticker.trim().toUpperCase();
+    if (!t) return;
+    setLoading(true); setError(null); setResult(null);
+    try {
+      const r = await apiFetch(`/technicals/${t}`);
+      setResult(r);
+    } catch(e) {
+      setError(e?.detail || e?.message || String(e));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  const overallColors = {
+    strong_buy:  { bg:"#16a34a22", col:"#16a34a", label:"STRONG BUY" },
+    buy:         { bg:"#22c55e22", col:"#22c55e", label:"BUY" },
+    neutral:     { bg:"#94a3b822", col:"#64748b", label:"NEUTRAL" },
+    sell:        { bg:"#f9731622", col:"#f97316", label:"SELL" },
+    strong_sell: { bg:"#dc262622", col:"#dc2626", label:"STRONG SELL" },
+  };
+
+  const trendColors = { bullish:"#16a34a", bearish:"#dc2626", mixed:"#f97316" };
+
+  function Pill({ label, color, bg }) {
+    return (
+      <span style={{ fontSize:11, fontWeight:700, padding:"2px 10px", borderRadius:10,
+                     background: bg || color+"22", color, border:`1px solid ${color}44` }}>
+        {label}
+      </span>
+    );
+  }
+
+  function GaugeBar({ value, min=0, max=100, thresholds, label }) {
+    // thresholds: [{at, color}] defining color zones
+    const pct = Math.max(0, Math.min(100, ((value - min) / (max - min)) * 100));
+    const color = thresholds?.slice().reverse().find(t => value >= t.at)?.color || C.accent;
+    return (
+      <div>
+        <div style={{ display:"flex", justifyContent:"space-between", fontSize:11, color:C.muted, marginBottom:3 }}>
+          <span>{label}</span><span style={{ color, fontWeight:700 }}>{value?.toFixed(1)}</span>
+        </div>
+        <div style={{ height:8, borderRadius:4, background:C.border }}>
+          <div style={{ height:"100%", borderRadius:4, width:`${pct}%`, background:color, transition:"width 0.3s" }}/>
+        </div>
+      </div>
+    );
+  }
+
+  const ind = result?.indicators || {};
+  const sum = result?.summary || {};
+  const brk = result?.breakout || {};
+  const oc  = overallColors[sum.overall] || overallColors.neutral;
+
+  return (
+    <div>
+      <Card title="Technical Analysis — IBKR Live Data">
+        <div style={{ display:"flex", gap:10, marginBottom:16, alignItems:"center" }}>
+          <input
+            value={ticker}
+            onChange={e => setTicker(e.target.value.toUpperCase())}
+            onKeyDown={e => e.key === "Enter" && analyze()}
+            placeholder="Ticker symbol (e.g. AAPL)"
+            style={{ ...sans, flex:1, padding:"8px 12px", borderRadius:8, border:`1px solid ${C.border}`,
+                     fontSize:13, color:C.text, background:"#f8fafc", outline:"none" }}
+          />
+          <button
+            onClick={analyze}
+            disabled={loading || !ticker.trim()}
+            style={{ ...sans, padding:"8px 20px", borderRadius:8, border:"none", cursor:"pointer",
+                     background:C.accent, color:"#fff", fontWeight:700, fontSize:13,
+                     opacity: (loading || !ticker.trim()) ? 0.6 : 1 }}
+          >{loading ? "Analyzing…" : "Analyze"}</button>
+        </div>
+        <div style={{ fontSize:12, color:C.muted }}>
+          Pulls 1 year of daily OHLCV from IBKR. Computes RSI-14, MACD (12/26/9),
+          Bollinger Bands (20,2), SMA-20/50/200, and volume breakout. Requires active connection.
+        </div>
+      </Card>
+
+      {error && (
+        <Card style={{ borderColor:"#dc2626", marginTop:12 }}>
+          <div style={{ color:"#dc2626", fontWeight:600 }}>{error}</div>
+        </Card>
+      )}
+
+      {result && (
+        <>
+          {/* Header row */}
+          <div style={{ display:"flex", alignItems:"center", gap:12, marginTop:12, marginBottom:12, flexWrap:"wrap" }}>
+            <span style={{ ...sans, fontSize:22, fontWeight:800, color:C.text }}>{result.ticker}</span>
+            <span style={{ ...sans, fontSize:20, fontWeight:700, color:C.text }}>${result.price?.toFixed(2)}</span>
+            <span style={{ ...sans, fontSize:14, fontWeight:600,
+                           color: result.change_pct >= 0 ? C.bull : C.bear }}>
+              {result.change_pct >= 0 ? "+" : ""}{result.change_pct?.toFixed(2)}%
+            </span>
+            <Pill label={oc.label} color={oc.col} bg={oc.bg} />
+            <Pill label={(sum.trend || "").toUpperCase()} color={trendColors[sum.trend] || C.muted} />
+            {brk.signal !== "NORMAL" && (
+              <Pill label={brk.signal} color={brk.confirmed ? "#7c3aed" : "#f97316"} />
+            )}
+            <span style={{ ...sans, fontSize:11, color:C.muted, marginLeft:"auto" }}>
+              {result.bars_used} bars
+            </span>
+          </div>
+
+          <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:12 }}>
+            {/* RSI + MACD */}
+            <Card title="Momentum">
+              <div style={{ display:"flex", flexDirection:"column", gap:12 }}>
+                <GaugeBar
+                  label="RSI-14"
+                  value={ind.rsi14 || 50}
+                  thresholds={[
+                    { at:0,  color:"#dc2626" },
+                    { at:30, color:"#64748b" },
+                    { at:70, color:"#f97316" },
+                  ]}
+                />
+                <div style={{ fontSize:11, color:C.muted, marginTop:-6 }}>
+                  Zone: <span style={{ fontWeight:700, color:
+                    ind.rsi_zone==="overbought" ? "#f97316" :
+                    ind.rsi_zone==="oversold"   ? "#dc2626" : C.muted }}>
+                    {sum.rsi_zone?.toUpperCase()}
+                  </span>
+                </div>
+                <div style={{ borderTop:`1px solid ${C.border}`, paddingTop:10 }}>
+                  <div style={{ fontSize:12, fontWeight:700, color:C.muted, marginBottom:6 }}>MACD (12/26/9)</div>
+                  <div style={{ display:"flex", gap:16, fontSize:12 }}>
+                    <div><span style={{ color:C.muted }}>Line </span>
+                      <span style={{ fontWeight:700, color:C.text }}>{ind.macd?.toFixed(4)}</span></div>
+                    <div><span style={{ color:C.muted }}>Signal </span>
+                      <span style={{ fontWeight:700, color:C.text }}>{ind.macd_signal?.toFixed(4)}</span></div>
+                    <div><span style={{ color:C.muted }}>Hist </span>
+                      <span style={{ fontWeight:700, color: (ind.macd_hist||0)>0 ? C.bull : C.bear }}>
+                        {ind.macd_hist?.toFixed(4)}
+                      </span></div>
+                  </div>
+                  <div style={{ marginTop:6 }}>
+                    <Pill label={(sum.macd_bias || "").toUpperCase()} color={(sum.macd_bias==="bullish") ? C.bull : C.bear} />
+                  </div>
+                </div>
+              </div>
+            </Card>
+
+            {/* Bollinger Bands */}
+            <Card title="Bollinger Bands (20, 2)">
+              {ind.bb_upper != null ? (
+                <div style={{ display:"flex", flexDirection:"column", gap:8 }}>
+                  <div style={{ display:"flex", justifyContent:"space-between", fontSize:12 }}>
+                    <span style={{ color:C.muted }}>Upper</span>
+                    <span style={{ fontWeight:700, color:C.bear }}>${ind.bb_upper?.toFixed(2)}</span>
+                  </div>
+                  <div style={{ display:"flex", justifyContent:"space-between", fontSize:12 }}>
+                    <span style={{ color:C.muted }}>Mid (SMA-20)</span>
+                    <span style={{ fontWeight:700, color:C.accent }}>${ind.bb_mid?.toFixed(2)}</span>
+                  </div>
+                  <div style={{ display:"flex", justifyContent:"space-between", fontSize:12 }}>
+                    <span style={{ color:C.muted }}>Lower</span>
+                    <span style={{ fontWeight:700, color:C.bull }}>${ind.bb_lower?.toFixed(2)}</span>
+                  </div>
+                  <div style={{ marginTop:4 }}>
+                    <GaugeBar
+                      label="%B (price position in band)"
+                      value={ind.pct_b || 50}
+                      thresholds={[
+                        { at:0,  color:"#16a34a" },
+                        { at:40, color:"#64748b" },
+                        { at:75, color:"#f97316" },
+                        { at:90, color:"#dc2626" },
+                      ]}
+                    />
+                    <div style={{ display:"flex", justifyContent:"space-between", fontSize:10, color:C.muted, marginTop:2 }}>
+                      <span>lower band</span><span>mid</span><span>upper band</span>
+                    </div>
+                  </div>
+                </div>
+              ) : <div style={{ color:C.muted, fontSize:12 }}>Insufficient data</div>}
+            </Card>
+
+            {/* Moving Averages */}
+            <Card title="Moving Averages">
+              {[
+                { label:"SMA-20",  value:ind.bb_mid,  above:ind.above_sma20  },
+                { label:"SMA-50",  value:ind.sma50,   above:ind.above_sma50  },
+                { label:"SMA-200", value:ind.sma200,  above:ind.above_sma200 },
+              ].map(({ label, value, above }) => (
+                <div key={label} style={{ display:"flex", justifyContent:"space-between", alignItems:"center",
+                                          fontSize:12, padding:"5px 0", borderBottom:`1px solid ${C.border}` }}>
+                  <span style={{ color:C.muted, fontWeight:600 }}>{label}</span>
+                  <div style={{ display:"flex", gap:10, alignItems:"center" }}>
+                    <span style={{ fontWeight:700, color:C.text }}>
+                      {value != null ? `$${value.toFixed(2)}` : "—"}
+                    </span>
+                    {above != null && (
+                      <span style={{ fontSize:10, fontWeight:700, padding:"1px 7px", borderRadius:8,
+                                     background: above ? "#16a34a22" : "#dc262622",
+                                     color: above ? C.bull : C.bear }}>
+                        {above ? "ABOVE" : "BELOW"}
+                      </span>
+                    )}
+                  </div>
+                </div>
+              ))}
+              <div style={{ marginTop:8, fontSize:11, color:C.muted }}>
+                {ind.above_sma20 && ind.above_sma50 && ind.above_sma200
+                  ? "Full bullish MA stack — strong uptrend"
+                  : !ind.above_sma20 && !ind.above_sma50 && ind.above_sma200 === false
+                  ? "Full bearish MA stack — strong downtrend"
+                  : "Mixed MA alignment — choppy or transitioning"}
+              </div>
+            </Card>
+
+            {/* Volume & Breakout */}
+            <Card title="Volume & Breakout">
+              <div style={{ display:"flex", flexDirection:"column", gap:10 }}>
+                <div style={{ display:"flex", justifyContent:"space-between", fontSize:12 }}>
+                  <span style={{ color:C.muted }}>Volume ratio (vs 20d avg)</span>
+                  <span style={{ fontWeight:700, color: (ind.vol_ratio||1) >= 1.5 ? "#7c3aed" : C.text }}>
+                    {ind.vol_ratio?.toFixed(2)}×
+                  </span>
+                </div>
+                <div style={{ display:"flex", gap:8, alignItems:"center" }}>
+                  <Pill
+                    label={brk.signal}
+                    color={ brk.signal==="BREAKOUT" ? "#7c3aed" : brk.signal==="WATCH" ? "#f97316" : C.muted }
+                  />
+                  <span style={{ fontSize:11, color:C.muted }}>
+                    {brk.signal==="BREAKOUT" && "Volume-confirmed upside breakout"}
+                    {brk.signal==="WATCH"    && "Price at 20-day high, volume not confirmed"}
+                    {brk.signal==="NORMAL"   && "No breakout pattern"}
+                  </span>
+                </div>
+                <div style={{ borderTop:`1px solid ${C.border}`, paddingTop:10 }}>
+                  <div style={{ fontSize:12, fontWeight:700, color:C.muted, marginBottom:6 }}>
+                    CSP Implication
+                  </div>
+                  <div style={{ fontSize:12, color:C.text, lineHeight:1.5 }}>
+                    {ind.pct_b != null && ind.pct_b < 30 && (ind.rsi14||50) < 45
+                      ? "Price near lower Bollinger Band + RSI oversold → elevated vol likely → good CSP entry if IV rank is high."
+                      : ind.pct_b != null && ind.pct_b > 80
+                      ? "Price near upper Bollinger Band → extended move. CSP assignment risk elevated on reversal."
+                      : brk.signal === "BREAKOUT"
+                      ? "Breakout with volume confirms underlying strength → CSP on pullback to upper BB."
+                      : "Normal range. Standard CSP criteria apply."}
+                  </div>
+                </div>
+              </div>
+            </Card>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+
 // ── Decisions Tab ─────────────────────────────────────────────────────────
 function DecisionsTab() {
   const [decisions, setDecisions] = useState([]);
@@ -3269,6 +3533,7 @@ function App() {
     { id:"learning",   label:"Learning"    },
     { id:"universe",   label:"Universe"    },
     { id:"decisions",  label:"Decisions"   },
+    { id:"technicals", label:"Technicals"  },
   ];
 
   const deltaCol = netDelta == null ? C.muted : netDelta >= 0 ? C.bull : C.bear;
@@ -3322,6 +3587,7 @@ function App() {
         <div style={{display: tab==="learning"   ? "" : "none"}}><LearningTab /></div>
         <div style={{display: tab==="universe"   ? "" : "none"}}><UniverseTab /></div>
         <div style={{display: tab==="decisions"  ? "" : "none"}}><DecisionsTab /></div>
+        <div style={{display: tab==="technicals" ? "" : "none"}}><TechnicalsTab /></div>
 
         <div style={{ marginTop:20, ...sans, fontSize:11, color:C.muted, lineHeight:1.7 }}>
           Auto-trader: Kelly sizing · 50% profit target · IV-adjusted stops · 21 DTE roll · 48h cooldown. Backtest: 2-yr simulation with BS pricing.
