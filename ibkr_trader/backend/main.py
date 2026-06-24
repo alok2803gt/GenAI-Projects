@@ -1209,9 +1209,9 @@ def _build_warnings(earnings_days: Optional[int], iv_rank: float, mode: str = "c
     """Human-readable warning tags attached to each candidate row."""
     warnings: List[str] = []
     if earnings_days is not None and earnings_days <= EARNINGS_WARN_DAYS:
-        # Row is filtered from Recommended view when earnings_days <= 21.
+        # Row is filtered from Recommended view when earnings_days <= EARNINGS_BLOCK_DAYS * 2.
         # Label makes this visible in Show-all mode so user understands why it disappears.
-        suffix = " — excl. recommended" if earnings_days <= 21 else ""
+        suffix = " — excl. recommended" if earnings_days <= EARNINGS_BLOCK_DAYS * 2 else ""
         warnings.append(f"Earnings in {earnings_days}d{suffix}")
     # IV rank thresholds are enforced as direct numeric filters in _filter_csp_recommended
     # and _filter_leap_recommended — no need to double-block via warnings here.
@@ -3463,7 +3463,7 @@ async def scan_leaps(ib: IB) -> dict:
     For every ticker in CSP_UNIVERSE find LEAP calls:
       • Earnings gate — block if earnings within EARNINGS_BLOCK_DAYS (IV inflated pre-earnings)
       • Expiry 6–18 months out (mid-window ≈ 12 months)
-      • Delta 0.45–0.75 (near-ATM to 10 % OTM)
+      • Delta 0.65–0.85 (deep ITM — matches LEAP_MIN/MAX_DELTA constants)
       • IV ≤ 70 % (don't overpay)
       • Only on tickers with BUY/HOLD XGB signal and positive momentum
       • Low IV rank is favourable for LEAP buyers (cheaper premium)

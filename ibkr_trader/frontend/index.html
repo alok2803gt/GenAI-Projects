@@ -838,8 +838,10 @@ function CSPTab({ connected }) {
     { key:"earnings_days_out",    label:"Earnings",    render: r => {
       const d = r.earnings_days_out;
       if (d==null) return <span style={{color:C.muted}}>—</span>;
-      const c = d<=7?C.bear:d<=14?C.neutral:C.bull;
-      return <span style={{color:c,fontWeight:600}}>{d}d</span>;
+      // ≤14d: hard-blocked by autotrader  |  ≤28d: excluded from Recommended  |  >28d: ok
+      const c = d<=14?C.bear:d<=28?"#f39c12":C.muted;
+      const tag = d<=28 ? " ⊘" : "";
+      return <span style={{color:c,fontWeight:600}}>{d}d{tag}</span>;
     }},
     { key:"cash_required",        label:"Cash Req",    render: r => fmt$(r.cash_required) },
     { key:"xgb_signal", label:"XGB/Model", render: r => (
@@ -1128,8 +1130,9 @@ function LEAPTab({ connected }) {
     { key:"earnings_days_out", label:"Earnings",    render:r=>{
       const d = r.earnings_days_out;
       if (d==null) return <span style={{color:C.muted}}>—</span>;
-      const c = d<=7?C.bear:d<=14?C.neutral:C.bull;
-      return <span style={{color:c,fontWeight:600}}>{d}d</span>;
+      const c = d<=14?C.bear:d<=28?"#f39c12":C.muted;
+      const tag = d<=28 ? " ⊘" : "";
+      return <span style={{color:c,fontWeight:600}}>{d}d{tag}</span>;
     }},
     // Cost trio — realistic is primary; conservative (ask) shown as safety reference
     { key:"cost_per_contract", label:"Cost (real)", render:r=>(
