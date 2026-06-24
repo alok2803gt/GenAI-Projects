@@ -2188,6 +2188,107 @@ function BacktestTab({ connected }) {
           ))}
         </>
       )}
+
+      {/* ── Breakout Backtest ─────────────────────────────────────────── */}
+      <BreakoutBacktest />
+    </div>
+  );
+}
+
+// ── Breakout Backtest (embedded in BacktestTab) ────────────────────────────
+function BreakoutBacktest() {
+  const [result,  setResult]  = useState(null);
+  const [loading, setLoading] = useState(false);
+
+  const run = async () => {
+    setLoading(true);
+    try { setResult(await apiFetch("/backtest/breakout")); }
+    catch(e) { alert("Breakout backtest failed: " + e.message); }
+    finally { setLoading(false); }
+  };
+
+  const wrCol  = v => v == null ? C.muted : v >= 60 ? "#16a34a" : v >= 50 ? "#f97316" : "#dc2626";
+  const retCol = v => v == null ? C.muted : v > 0 ? "#16a34a" : v < 0 ? "#dc2626" : C.muted;
+  const fmt    = v => v == null ? "—" : v.toFixed(1) + "%";
+  const fmtR   = v => v == null ? "—" : (v > 0 ? "+" : "") + v.toFixed(2) + "%";
+
+  const s = result?.summary || {};
+
+  return (
+    <div style={{ marginTop: 28 }}>
+      <Card title="Breakout Backtest — Universe Tickers (Walk-Forward, 2Y)">
+        <div style={{ fontSize:12, color:C.muted, marginBottom:14 }}>
+          Signal: price at/above upper Bollinger Band <b>AND</b> volume ratio ≥ per-ticker 90th-percentile threshold
+          (rolling 252-day window, no look-ahead bias). Measures forward returns at 5d / 10d / 20d.
+          Uses yfinance — no IBKR connection required.
+        </div>
+        <button onClick={run} disabled={loading} style={{
+          background:"#7c3aed", color:"#fff", border:"none", borderRadius:8,
+          padding:"10px 28px", fontWeight:700, cursor:"pointer", opacity:loading?0.6:1, marginBottom:14,
+        }}>
+          {loading ? "Running…" : "Run Breakout Backtest on Universe"}
+        </button>
+
+        {result && (
+          <>
+            {/* Summary */}
+            <div style={{ display:"grid", gridTemplateColumns:"repeat(7,1fr)", gap:10, marginBottom:20 }}>
+              {[
+                { label:"Signals",      value: s.total_signals,          col: C.text    },
+                { label:"Tickers",      value: s.tickers_tested,         col: C.text    },
+                { label:"Win Rate 5d",  value: fmt(s.win_rate_5d),       col: wrCol(s.win_rate_5d)  },
+                { label:"Win Rate 10d", value: fmt(s.win_rate_10d),      col: wrCol(s.win_rate_10d) },
+                { label:"Win Rate 20d", value: fmt(s.win_rate_20d),      col: wrCol(s.win_rate_20d) },
+                { label:"Avg Ret 10d",  value: fmtR(s.avg_ret_10d),     col: retCol(s.avg_ret_10d) },
+                { label:"Avg Ret 20d",  value: fmtR(s.avg_ret_20d),     col: retCol(s.avg_ret_20d) },
+              ].map(stat => (
+                <div key={stat.label} style={{ background:"#f1f5f9", borderRadius:8, padding:"10px 8px", textAlign:"center" }}>
+                  <div style={{ color:C.muted, fontSize:10, marginBottom:4 }}>{stat.label}</div>
+                  <div style={{ color:stat.col, fontWeight:700, fontSize:16 }}>{stat.value ?? "—"}</div>
+                </div>
+              ))}
+            </div>
+
+            {/* Per-ticker table */}
+            <div style={{ overflowX:"auto" }}>
+              <table style={{ width:"100%", borderCollapse:"collapse", fontSize:12 }}>
+                <thead>
+                  <tr style={{ background:"#f8fafc" }}>
+                    {["Ticker","Signals","Vol 90pct","WR 5d","WR 10d","WR 20d","Avg Ret 5d","Avg Ret 10d","Avg Ret 20d","Recent Signals"].map(h => (
+                      <th key={h} style={{ padding:"7px 10px", textAlign:"left", fontWeight:600, color:C.muted,
+                                           borderBottom:`1px solid ${C.border}`, whiteSpace:"nowrap" }}>{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {result.results.sort((a,b) => (b.signals||0) - (a.signals||0)).map(r => (
+                    <tr key={r.ticker} style={{ borderBottom:`1px solid ${C.border}` }}>
+                      <td style={{ padding:"7px 10px", fontWeight:700, color:C.text }}>{r.ticker}</td>
+                      <td style={{ padding:"7px 10px", color: r.signals > 0 ? "#7c3aed" : C.muted, fontWeight:700 }}>{r.signals}</td>
+                      <td style={{ padding:"7px 10px", color:C.muted }}>{r.avg_vol_90pct != null ? r.avg_vol_90pct.toFixed(2)+"×" : "—"}</td>
+                      <td style={{ padding:"7px 10px", color:wrCol(r.win_rate_5d),  fontWeight:600 }}>{fmt(r.win_rate_5d)}</td>
+                      <td style={{ padding:"7px 10px", color:wrCol(r.win_rate_10d), fontWeight:600 }}>{fmt(r.win_rate_10d)}</td>
+                      <td style={{ padding:"7px 10px", color:wrCol(r.win_rate_20d), fontWeight:600 }}>{fmt(r.win_rate_20d)}</td>
+                      <td style={{ padding:"7px 10px", color:retCol(r.avg_ret_5d)  }}>{fmtR(r.avg_ret_5d)}</td>
+                      <td style={{ padding:"7px 10px", color:retCol(r.avg_ret_10d) }}>{fmtR(r.avg_ret_10d)}</td>
+                      <td style={{ padding:"7px 10px", color:retCol(r.avg_ret_20d) }}>{fmtR(r.avg_ret_20d)}</td>
+                      <td style={{ padding:"7px 10px", color:C.muted, fontSize:11 }}>
+                        {(r.recent_signals || []).join(", ") || "—"}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            <div style={{ marginTop:12, fontSize:11, color:C.muted }}>
+              Win rate = % of signals where forward close was higher than entry close.
+              Sorted by signal count descending. Tickers with 0 signals had no days where price broke
+              above the upper Bollinger Band with volume exceeding the 90th-percentile threshold.
+            </div>
+          </>
+        )}
+      </Card>
     </div>
   );
 }
@@ -3435,9 +3536,13 @@ function TechnicalsTab() {
               <div style={{ display:"flex", flexDirection:"column", gap:10 }}>
                 <div style={{ display:"flex", justifyContent:"space-between", fontSize:12 }}>
                   <span style={{ color:C.muted }}>Volume ratio (vs 20d avg)</span>
-                  <span style={{ fontWeight:700, color: (ind.vol_ratio||1) >= 1.5 ? "#7c3aed" : C.text }}>
+                  <span style={{ fontWeight:700, color: (ind.vol_ratio||1) >= (ind.vol_90pct||1.5) ? "#7c3aed" : C.text }}>
                     {ind.vol_ratio?.toFixed(2)}×
                   </span>
+                </div>
+                <div style={{ display:"flex", justifyContent:"space-between", fontSize:11, color:C.muted }}>
+                  <span>Breakout threshold (90th-pct, trailing 252d)</span>
+                  <span style={{ fontWeight:600, color:"#7c3aed" }}>{ind.vol_90pct?.toFixed(2)}×</span>
                 </div>
                 <div style={{ display:"flex", gap:8, alignItems:"center" }}>
                   <Pill
@@ -3445,8 +3550,8 @@ function TechnicalsTab() {
                     color={ brk.signal==="BREAKOUT" ? "#7c3aed" : brk.signal==="WATCH" ? "#f97316" : C.muted }
                   />
                   <span style={{ fontSize:11, color:C.muted }}>
-                    {brk.signal==="BREAKOUT" && "Volume-confirmed upside breakout"}
-                    {brk.signal==="WATCH"    && "Price at 20-day high, volume not confirmed"}
+                    {brk.signal==="BREAKOUT" && `Vol ${ind.vol_ratio?.toFixed(2)}× ≥ ${ind.vol_90pct?.toFixed(2)}× threshold + upper BB`}
+                    {brk.signal==="WATCH"    && "Price at upper BB, volume not above 90th-pct threshold"}
                     {brk.signal==="NORMAL"   && "No breakout pattern"}
                   </span>
                 </div>

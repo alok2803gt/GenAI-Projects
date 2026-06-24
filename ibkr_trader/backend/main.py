@@ -950,10 +950,18 @@ def _compute_indicators_from_closes(closes: pd.Series, volumes: pd.Series | None
     pct_b   = round((last - b_lower) / (b_upper - b_lower) * 100, 1) \
               if (b_upper and b_lower and b_upper != b_lower) else None
 
-    # Volume ratio (today vs 20-day avg) — only when volume series provided
+    # Volume ratio (today vs 20-day avg) + per-ticker 90th-pct threshold
     vol_ratio = None
+    vol_90pct = None
     if volumes is not None and len(volumes) >= 21:
-        avg_vol = float(volumes.iloc[-21:-1].mean())
+        # Rolling 20-day avg shifted by 1 so each day uses only prior data (no look-ahead)
+        roll_avg   = volumes.rolling(20).mean().shift(1)
+        all_ratios = (volumes / roll_avg.replace(0, float("nan"))).dropna()
+        # 90th-percentile of trailing 252 days → dynamic, per-ticker breakout threshold
+        recent = all_ratios.iloc[-252:] if len(all_ratios) >= 252 else all_ratios
+        vol_90pct = round(float(recent.quantile(0.90)), 2) if len(recent) >= 20 else None
+
+        avg_vol   = float(volumes.iloc[-21:-1].mean())
         today_vol = float(volumes.iloc[-1])
         vol_ratio = round(today_vol / avg_vol, 2) if avg_vol > 0 else None
 
@@ -973,6 +981,7 @@ def _compute_indicators_from_closes(closes: pd.Series, volumes: pd.Series | None
         "bb_lower":     round(b_lower, 2) if b_lower is not None else None,
         "pct_b":        pct_b,
         "vol_ratio":    vol_ratio,
+        "vol_90pct":    vol_90pct,
     }
 
 
@@ -4225,11 +4234,12 @@ async def get_technicals(ticker: str):
     rsi_zone = "overbought" if rsi14 > 70 else "oversold" if rsi14 < 30 else "neutral"
     macd_bias = "bullish" if (ind.get("macd_hist") or 0) > 0 else "bearish"
 
-    # Volume breakout
+    # Volume breakout — use per-ticker 90th-pct threshold; fall back to 1.5× if not enough history
     vol_ratio = ind.get("vol_ratio") or 1.0
+    vol_90pct = ind.get("vol_90pct") or 1.5
     pct_b_val = ind.get("pct_b")
     price_breakout = bool(pct_b_val is not None and pct_b_val > 95)
-    confirmed = price_breakout and vol_ratio >= 1.5
+    confirmed = price_breakout and vol_ratio >= vol_90pct
     breakout_signal = "BREAKOUT" if confirmed else ("WATCH" if price_breakout else "NORMAL")
 
     # Composite overall score (ported from ibkr_technicals._overall)
@@ -4277,10 +4287,12 @@ async def get_technicals(ticker: str):
             "bb_lower":     ind.get("bb_lower"),
             "pct_b":        ind.get("pct_b"),
             "vol_ratio":    vol_ratio,
+            "vol_90pct":    round(vol_90pct, 2),
         },
         "breakout": {
             "signal":        breakout_signal,
             "vol_ratio":     round(vol_ratio, 2),
+            "vol_90pct":     round(vol_90pct, 2),
             "price_breakout": price_breakout,
             "confirmed":     confirmed,
         },
@@ -5254,6 +5266,146 @@ async def backtest_csp_endpoint(
         "total_pnl":        round(sum(r["total_pnl"] for r in results), 0) if results else 0,
     }
     return {"results": results, "summary": summary, "tickers": ticker_list, "weeks": weeks}
+
+
+# ── Breakout backtest ───────────────────────────────────────────────────────
+
+def _backtest_breakout_one(ticker: str) -> Optional[dict]:
+    """Walk-forward breakout backtest for one ticker using yfinance 2-yr daily OHLCV.
+
+    Signal: pct_b > 95 (price at/above upper BB) AND vol_ratio >= rolling vol_90pct.
+    vol_90pct is recomputed each day from trailing 252 days of vol ratios → no look-ahead.
+    Measures 5d / 10d / 20d forward returns from each signal day.
+    """
+    try:
+        df = yf.Ticker(ticker).history(period="2y")
+    except Exception as e:
+        log.debug("Breakout backtest yf fetch %s: %s", ticker, e)
+        return None
+    if len(df) < 252:
+        return None
+
+    closes  = df["Close"].astype(float)
+    volumes = df["Volume"].astype(float)
+
+    # Bollinger Bands (20, 2) — %B position
+    sma20    = closes.rolling(20).mean()
+    bb_std   = closes.rolling(20).std()
+    bb_upper = sma20 + 2 * bb_std
+    bb_lower = sma20 - 2 * bb_std
+    pct_b    = ((closes - bb_lower) / (bb_upper - bb_lower).replace(0, float("nan"))) * 100
+
+    # Volume ratio: today vs prior 20-day avg (shift=1 — no look-ahead)
+    roll_avg  = volumes.rolling(20).mean().shift(1)
+    vol_ratio = volumes / roll_avg.replace(0, float("nan"))
+
+    # Walk-forward 90th-pct threshold: rolling 252-day quantile of vol_ratio history
+    vol_90pct_series = vol_ratio.rolling(252, min_periods=60).quantile(0.90)
+
+    # Signal mask — require both vol_ratio and vol_90pct to be valid
+    signal_mask = (
+        (pct_b > 95)
+        & (vol_ratio >= vol_90pct_series)
+        & vol_ratio.notna()
+        & vol_90pct_series.notna()
+    )
+
+    signal_indices = [i for i, v in enumerate(signal_mask) if v]
+    n_signals = len(signal_indices)
+
+    avg_threshold = round(float(vol_90pct_series.dropna().mean()), 2) \
+        if not vol_90pct_series.dropna().empty else None
+
+    if n_signals == 0:
+        return {
+            "ticker": ticker, "signals": 0,
+            "avg_vol_90pct": avg_threshold,
+            "wins_5d": 0, "wins_10d": 0, "wins_20d": 0,
+            "win_rate_5d": None, "win_rate_10d": None, "win_rate_20d": None,
+            "avg_ret_5d": None, "avg_ret_10d": None, "avg_ret_20d": None,
+            "recent_signals": [],
+        }
+
+    rets_5d, rets_10d, rets_20d = [], [], []
+    n = len(closes)
+    for i in signal_indices:
+        p0 = closes.iloc[i]
+        if p0 <= 0:
+            continue
+        if i + 5  < n: rets_5d.append( (closes.iloc[i+5]  / p0 - 1) * 100)
+        if i + 10 < n: rets_10d.append((closes.iloc[i+10] / p0 - 1) * 100)
+        if i + 20 < n: rets_20d.append((closes.iloc[i+20] / p0 - 1) * 100)
+
+    def _wr(rets):  return round(sum(1 for r in rets if r > 0) / len(rets) * 100, 1) if rets else None
+    def _avg(rets): return round(sum(rets) / len(rets), 2) if rets else None
+
+    # Last 5 signal dates for display
+    recent = []
+    for i in signal_indices[-5:]:
+        d = df.index[i]
+        recent.append(str(d.date()) if hasattr(d, "date") else str(d)[:10])
+
+    return {
+        "ticker":         ticker,
+        "signals":        n_signals,
+        "avg_vol_90pct":  avg_threshold,
+        "wins_5d":        sum(1 for r in rets_5d  if r > 0),
+        "wins_10d":       sum(1 for r in rets_10d if r > 0),
+        "wins_20d":       sum(1 for r in rets_20d if r > 0),
+        "win_rate_5d":    _wr(rets_5d),
+        "win_rate_10d":   _wr(rets_10d),
+        "win_rate_20d":   _wr(rets_20d),
+        "avg_ret_5d":     _avg(rets_5d),
+        "avg_ret_10d":    _avg(rets_10d),
+        "avg_ret_20d":    _avg(rets_20d),
+        "recent_signals": recent,
+    }
+
+
+def _run_breakout_backtest() -> dict:
+    tickers = list(CSP_UNIVERSE)
+    rows = []
+    for ticker in tickers:
+        try:
+            r = _backtest_breakout_one(ticker)
+            if r:
+                rows.append(r)
+        except Exception as exc:
+            log.warning("Breakout backtest %s: %s", ticker, exc)
+
+    with_signals = [r for r in rows if r["signals"] > 0]
+    total_signals = sum(r["signals"] for r in rows)
+    total_wins_5d  = sum(r["wins_5d"]  for r in rows)
+    total_wins_10d = sum(r["wins_10d"] for r in rows)
+    total_wins_20d = sum(r["wins_20d"] for r in rows)
+
+    def _safe_avg(vals):
+        v = [x for x in vals if x is not None]
+        return round(sum(v) / len(v), 2) if v else None
+
+    summary = {
+        "total_signals":  total_signals,
+        "win_rate_5d":    round(total_wins_5d  / total_signals * 100, 1) if total_signals else None,
+        "win_rate_10d":   round(total_wins_10d / total_signals * 100, 1) if total_signals else None,
+        "win_rate_20d":   round(total_wins_20d / total_signals * 100, 1) if total_signals else None,
+        "avg_ret_5d":     _safe_avg([r["avg_ret_5d"]  for r in with_signals]),
+        "avg_ret_10d":    _safe_avg([r["avg_ret_10d"] for r in with_signals]),
+        "avg_ret_20d":    _safe_avg([r["avg_ret_20d"] for r in with_signals]),
+        "tickers_tested": len(rows),
+    }
+    return {"tickers": tickers, "results": rows, "summary": summary}
+
+
+@app.get("/backtest/breakout")
+async def backtest_breakout_endpoint():
+    """Walk-forward breakout backtest on all current universe tickers.
+
+    Uses yfinance 2-yr daily OHLCV — no IBKR connection required.
+    Per-ticker vol_90pct threshold computed from rolling 252-day history (no look-ahead).
+    """
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(None, _run_breakout_backtest)
+    return result
 
 
 # ── Live account reconnect ──────────────────────────────────────────────────
