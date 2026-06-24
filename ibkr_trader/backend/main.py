@@ -1662,8 +1662,22 @@ async def _autotrader_monitor_coro(ib: IB) -> None:
         if _k in at["positions"]:
             iv_refresh_pairs.append((_k, _item.contract))
     if iv_refresh_pairs:
-        _iv_tks = {_k: ib.reqMktData(_c, "106", False, False)
-                   for _k, _c in iv_refresh_pairs}
+        # Build fresh Option contracts with exchange="SMART" to avoid error 321
+        # ("Please enter exchange") on portfolio contracts that come back with
+        # exchange="" after a reconnect.  Preserve conId for unambiguous resolution.
+        def _fresh_contract(c):
+            fc = Option(
+                c.symbol,
+                c.lastTradeDateOrContractMonth,
+                float(c.strike), c.right,
+                "SMART", "USD", "100",
+            )
+            if c.conId:
+                fc.conId = c.conId
+            return fc
+        _iv_fresh = {_k: _fresh_contract(_c) for _k, _c in iv_refresh_pairs}
+        _iv_tks   = {_k: ib.reqMktData(fc, "106", False, False)
+                     for _k, fc in _iv_fresh.items()}
         await asyncio.sleep(2)
         _iv_changed = False
         for _k, _c in iv_refresh_pairs:
@@ -1678,7 +1692,7 @@ async def _autotrader_monitor_coro(ib: IB) -> None:
                     _label  = "LEAP" if _action == "BUY" else "CSP"
                     _at_log("SYSTEM",
                             f"{_k}: {_label} IV refreshed {old_iv:.0f}% → {new_iv:.0f}%")
-            ib.cancelMktData(_c)
+            ib.cancelMktData(_iv_fresh[_k])
         if _iv_changed:
             _at_save_state()
 
