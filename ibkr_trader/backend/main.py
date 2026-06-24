@@ -740,17 +740,22 @@ def _score_csp(row: dict) -> float:
             efficiency = min(premium_pct / otm_distance, 2.0)  # cap at 2×
             s += efficiency * 5  # max 10 pts at 2× efficiency
 
-    # 7) Bollinger Band position — where is price within its own vol envelope  max ±6
-    #    Low pct_b (near lower band) + high IV = stock depressed but vol rich = ideal CSP entry.
-    #    High pct_b (near upper band) = price extended, more assignment risk on reversal.
+    # 7) RSI timing bonus: oversold pullback within uptrend = ideal CSP entry  max +5 / min −3
+    #    pct_b<30 is unreachable when above_sma20=True (pct_b>=50 at/above midline by math),
+    #    so RSI is the correct proxy for "temporarily depressed within an uptrend."
+    rsi14 = row.get("rsi14")
+    if rsi14 is not None:
+        if iv_rank >= 45 and 35 <= rsi14 <= 48:
+            s += 5   # oversold pullback + expensive vol: ideal CSP entry timing
+        elif 35 <= rsi14 <= 52:
+            s += 2   # mild pullback within trend
+        elif rsi14 < 35:
+            s -= 3   # too oversold: momentum risk, potential gap through strike
+
+    # BB extension penalty: pct_b > 80 = price in upper band = reversion risk to strike
     pct_b = row.get("pct_b")
-    if pct_b is not None:
-        if iv_rank >= 45 and pct_b < 30:
-            s += 6   # depressed price + expensive vol: best CSP setup
-        elif pct_b < 20:
-            s += 3   # near lower band even without high IV
-        elif pct_b > 80:
-            s -= 4   # overbought within BB: higher chance of reversion / assignment
+    if pct_b is not None and pct_b > 80:
+        s -= 4   # price extended above midline: higher assignment risk on pullback
 
     # 8) OPRA institutional signals (bonus / penalty)
     # Strike above max pain → MMs incentivised to keep price here          +8

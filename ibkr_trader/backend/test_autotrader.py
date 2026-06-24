@@ -87,15 +87,20 @@ def _score_csp(row: dict) -> float:
             efficiency = min(premium_pct / otm_distance, 2.0)
             s += efficiency * 5
 
-    # 7. Bollinger Band position (±6 pts)
+    # 7. RSI timing bonus: oversold pullback within uptrend (max +5 / min -3)
+    rsi14 = row.get("rsi14")
+    if rsi14 is not None:
+        if iv_rank >= 45 and 35 <= rsi14 <= 48:
+            s += 5   # oversold pullback + expensive vol
+        elif 35 <= rsi14 <= 52:
+            s += 2   # mild pullback within trend
+        elif rsi14 < 35:
+            s -= 3   # too oversold: momentum risk
+
+    # BB extension penalty: pct_b > 80 = price in upper band = reversion risk
     pct_b = row.get("pct_b")
-    if pct_b is not None:
-        if iv_rank >= 45 and pct_b < 30:
-            s += 6
-        elif pct_b < 20:
-            s += 3
-        elif pct_b > 80:
-            s -= 4
+    if pct_b is not None and pct_b > 80:
+        s -= 4
 
     return round(s, 2)
 
@@ -258,22 +263,32 @@ def run_unit_tests() -> bool:
     wide_delta  = _score_csp({**base_row, "delta": -0.30})
     t.ok("tighter delta → higher score", tight_delta > wide_delta)
 
-    # -- BB bonus (6 pts at pct_b<30 + iv_rank>=45) -----------------------
-    row_bb_on  = {**base_row, "pct_b": 25, "iv_rank": 55}
-    row_bb_off = {**base_row, "pct_b": 55, "iv_rank": 55}
-    diff = _score_csp(row_bb_on) - _score_csp(row_bb_off)
-    t.near("BB bonus = +6 pts (pct_b<30, ivr≥45)", diff, 6.0)
+    # -- RSI timing bonus (replaces unreachable pct_b<30 bonus) -----------
+    # RSI 35-48 + iv_rank>=45 => +5 pts; achievable above SMA-20 (pct_b>=50 there)
+    row_rsi_on  = {**base_row, "rsi14": 42, "iv_rank": 55}
+    row_rsi_off = {**base_row, "rsi14": 60, "iv_rank": 55}
+    rsi_diff = _score_csp(row_rsi_on) - _score_csp(row_rsi_off)
+    t.near("RSI bonus = +5 pts (rsi 35-48 + ivr>=45)", rsi_diff, 5.0)
 
-    # No BB bonus when IV rank < 45 (even if pct_b < 30)
-    row_no_bonus = {**base_row, "pct_b": 25, "iv_rank": 40}
-    row_neutral  = {**base_row, "pct_b": 55, "iv_rank": 40}
-    t.near("no BB bonus when ivr<45", _score_csp(row_no_bonus) - _score_csp(row_neutral), 0.0, tol=1.0)
+    # Mild pullback (RSI 35-52, any IV rank) => +2 pts
+    row_mild = {**base_row, "rsi14": 50, "iv_rank": 30}
+    row_none = {**base_row, "rsi14": 60, "iv_rank": 30}
+    t.near("RSI mild bonus = +2 pts (rsi 35-52)", _score_csp(row_mild) - _score_csp(row_none), 2.0)
 
-    # BB penalty (−4 pts at pct_b>80)
+    # Too oversold => -3 pts
+    row_bear = {**base_row, "rsi14": 30, "iv_rank": 55}
+    row_neut = {**base_row, "rsi14": 60, "iv_rank": 55}
+    t.near("RSI oversold penalty = -3 pts (rsi<35)", _score_csp(row_neut) - _score_csp(row_bear), 3.0)
+
+    # High IV amplifies RSI bonus (ivr>=45 gets +5; ivr<45 gets +2 = 3 pt difference)
+    row_hiv = {**base_row, "rsi14": 42, "iv_rank": 55}
+    row_lov = {**base_row, "rsi14": 42, "iv_rank": 30}
+    t.ok("ivr>=45 scores higher than ivr<45 when rsi in pullback range", _score_csp(row_hiv) > _score_csp(row_lov))
+    # BB extension penalty (-4 pts at pct_b>80)
     row_extended = {**base_row, "pct_b": 85, "iv_rank": 55}
-    diff_pen = _score_csp(row_bb_off) - _score_csp(row_extended)
-    t.near("BB penalty = −4 pts (pct_b>80)", diff_pen, 4.0)
-
+    row_mid      = {**base_row, "pct_b": 65, "iv_rank": 55}
+    diff_pen = _score_csp(row_mid) - _score_csp(row_extended)
+    t.near("BB penalty = -4 pts (pct_b>80)", diff_pen, 4.0)
     # -- Filter logic ------------------------------------------------------
     pass_base = {
         "warnings": [], "liquidity_score": 70, "iv_rank": 50,
@@ -493,8 +508,9 @@ def backtest_ticker(
             exit_reason = "expiry"
             exit_day = 5
 
-        bb_bonus_active = (
-            (ind.get("pct_b") or 100) < 30 and ivr >= 45
+        rsi_bonus_active = (
+            ivr >= 45 and ind.get("rsi14") is not None
+            and 35 <= ind.get("rsi14", 99) <= 48
         )
         trade = {
             "date":           str(dates[i].date()),
@@ -506,7 +522,7 @@ def backtest_ticker(
             "iv_rank":        round(ivr, 1),
             "score":          round(best_score, 1),
             "pct_b":          ind.get("pct_b"),
-            "bb_bonus":       bb_bonus_active,
+            "rsi_bonus":      rsi_bonus_active,
             "above_sma200":   ind.get("above_sma200"),
             "stop_mult":      eff_stop,
             "exit_pnl":       round(exit_pnl, 2),
@@ -517,7 +533,7 @@ def backtest_ticker(
         trades.append(trade)
 
         if verbose:
-            bb_tag = " [BB+]" if bb_bonus_active else ""
+            bb_tag = " [RSI+]" if rsi_bonus_active else ""
             print(
                 f"  {trade['date']}  {ticker} K={K:.0f}"
                 f"  ({trade['otm_pct']:.1f}% OTM)"
@@ -553,7 +569,7 @@ def backtest_ticker(
         "sma200_blocked":  n_sma200_blocked,
         "iv_blocked":      n_iv_blocked,
         "score_blocked":   n_score_blocked,
-        "bb_bonus_trades": sum(1 for t in trades if t.get("bb_bonus")),
+        "rsi_bonus_trades": sum(1 for t in trades if t.get("rsi_bonus")),
         "profit_targets":  sum(1 for t in trades if t["exit_reason"] == "profit_target"),
         "stop_losses":     sum(1 for t in trades if t["exit_reason"] == "stop_loss"),
         "recent":          trades[-5:],
@@ -575,14 +591,14 @@ def print_backtest_results(results: list):
             f"{r['ticker']:<8} {r['trades']:>6} {r['filter_rate']:>7.1f}% {r['win_rate']:>5.1f}%"
             f" {r['total_pnl']:>+9.0f} {r['avg_win']:>+8.0f} {r['avg_loss']:>+9.0f}"
             f" {r['max_drawdown']:>+9.0f} {r['sharpe']:>7.2f}"
-            f" {r['sma200_blocked']:>8} {r['bb_bonus_trades']:>5}"
+            f" {r['sma200_blocked']:>8} {r['rsi_bonus_trades']:>5}"
         )
     print(f"{'-'*90}")
 
     all_pnl  = [r["total_pnl"] for r in results]
     all_wr   = [r["win_rate"]  for r in results]
     all_sma  = sum(r["sma200_blocked"] for r in results)
-    all_bb   = sum(r["bb_bonus_trades"] for r in results)
+    all_bb   = sum(r["rsi_bonus_trades"] for r in results)
     all_tr   = sum(r["trades"] for r in results)
     all_pt   = sum(r["profit_targets"] for r in results)
     all_sl   = sum(r["stop_losses"] for r in results)
@@ -591,7 +607,7 @@ def print_backtest_results(results: list):
     print(f"  Exit breakdown - profit target: {all_pt} ({all_pt/max(all_tr,1)*100:.0f}%) | "
           f"stop-loss: {all_sl} ({all_sl/max(all_tr,1)*100:.0f}%) | "
           f"expiry: {all_tr-all_pt-all_sl}")
-    print(f"  SMA-200 blocked {all_sma} opportunities | BB bonus active on {all_bb} trades")
+    print(f"  SMA-200 blocked {all_sma} opportunities | RSI bonus active on {all_bb} trades")
     print()
 
     # Recent trades sample
@@ -600,7 +616,7 @@ def print_backtest_results(results: list):
           f"{'IVR':>5} {'SCORE':>6} {'BB+':>4} {'SMA200':>7} {'EXIT':>14} {'P&L':>8}")
     for r in results:
         for tr in r.get("recent", []):
-            bb  = "YES" if tr.get("bb_bonus") else ""
+            bb  = "RSI" if tr.get("rsi_bonus") else ""
             sma = "^" if tr.get("above_sma200") else ("v" if tr.get("above_sma200") is False else "-")
             print(
                 f"  {tr['date']:<12} {r['ticker']:<6}"
@@ -652,4 +668,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
 
