@@ -2634,8 +2634,13 @@ async def _autotrader_place_coro(ib: IB, row: dict, cfg: dict, regime: str = "BU
     spot_px    = row.get("stock_price") or row.get("spot") or 0
     otm_pct    = round((float(spot_px) - strike) / float(spot_px) * 100, 1) if spot_px and t == "csp" else 0
     _cfg_stop  = float(cfg.get("stop_loss_mult", 2.0))
-    stop_mult  = 4.0 if (live_iv_entry or 0) > 70 else 3.0 if (live_iv_entry or 0) > 40 else _cfg_stop
-    stop_loss  = round(stop_mult * max_profit, 0) if _cfg_stop > 0 else None
+    if t == "csp":
+        stop_mult = 4.0 if (live_iv_entry or 0) > 70 else 3.0 if (live_iv_entry or 0) > 40 else _cfg_stop
+        stop_loss = round(stop_mult * max_profit, 0) if _cfg_stop > 0 else None
+    else:  # LEAP: IV-adjusted % of cost (matches monitor logic at _autotrader_monitor_coro)
+        leap_stop_pct = 0.40 if (live_iv_entry or 0) > 70 else 0.50 if (live_iv_entry or 0) > 40 else 0.60
+        stop_mult  = leap_stop_pct
+        stop_loss  = round(leap_stop_pct * max_profit, 0)
     earn_note  = f"Earnings are {earn_days} days away — well outside the 14-day block window." if earn_days else "No upcoming earnings detected."
 
     if t == "csp":
@@ -2664,7 +2669,8 @@ async def _autotrader_place_coro(ib: IB, row: dict, cfg: dict, regime: str = "BU
             f"**The contract:** Buy {qty} × {ticker} ${strike} Call expiring {expiry} ({dte} DTE) "
             f"at ${lmt:.2f}, total cost ~${round(lmt*100*qty,0):.0f}.\n\n"
             f"**Risk:** Maximum loss is the premium paid (${round(lmt*100*qty,0):.0f}) if {ticker} "
-            f"stays below ${strike}. Stop-loss at {int(stop_mult*100):.0f}% of cost. {earn_note}"
+            f"stays below ${strike}. Stop-loss triggers at {int(stop_mult*100):.0f}% loss of cost "
+            f"(IV-adjusted: tighter in high-IV to limit crush risk). {earn_note}"
         )
     _decision_log("ENTER", ticker, headline, body)
     _at_save_state()
