@@ -4596,8 +4596,9 @@ def autotrader_status():
     # Deep-copy positions so we can safely add live P&L without mutating state
     positions_enriched = {k: dict(v) for k, v in at["positions"].items()}
 
-    # Enrich with live unrealized P&L from IBKR portfolio if connected
+    # Enrich tracked positions with live P&L; collect untracked portfolio options
     ib = state.get("ib")
+    untracked_positions = []
     if ib and state.get("connected"):
         try:
             for item in ib.portfolio():
@@ -4605,22 +4606,39 @@ def autotrader_status():
                 if getattr(c, "secType", "") != "OPT":
                     continue
                 k = _at_contract_key(c)
+                live_pnl   = round(float(item.unrealizedPNL or 0), 2)
+                live_price = round(float(item.marketPrice or 0), 4)
                 if k in positions_enriched:
-                    positions_enriched[k]["live_pnl"]   = round(float(item.unrealizedPNL or 0), 2)
-                    positions_enriched[k]["live_price"]  = round(float(item.marketPrice or 0), 4)
+                    positions_enriched[k]["live_pnl"]   = live_pnl
+                    positions_enriched[k]["live_price"]  = live_price
+                else:
+                    # Option in portfolio but not tracked by auto-trader (manual trade)
+                    untracked_positions.append({
+                        "ticker":     getattr(c, "symbol", ""),
+                        "strike":     float(getattr(c, "strike", 0)),
+                        "right":      getattr(c, "right", ""),
+                        "expiry":     getattr(c, "lastTradeDateOrContractMonth", ""),
+                        "action":     "BUY" if float(item.position or 0) > 0 else "SELL",
+                        "qty":        abs(int(item.position or 0)),
+                        "live_pnl":   live_pnl,
+                        "live_price": live_price,
+                        "market_value": round(float(item.marketValue or 0), 2),
+                        "avg_cost":   round(float(item.averageCost or 0), 4),
+                    })
         except Exception:
             pass
 
     return {
-        "enabled":           at["enabled"],
-        "config":            clean_cfg,
-        "positions":         positions_enriched,
-        "stopped_out":       dict(at.get("stopped_out", {})),
-        "log":               list(at["log"]),
-        "last_run":          at.get("last_run"),
-        "premium_collected": at.get("premium_collected", 0.0),
-        "leap_pnl":          at.get("leap_pnl", 0.0),
-        "leap_budget":       at.get("leap_budget", 0.0),
+        "enabled":              at["enabled"],
+        "config":               clean_cfg,
+        "positions":            positions_enriched,
+        "untracked_positions":  untracked_positions,
+        "stopped_out":          dict(at.get("stopped_out", {})),
+        "log":                  list(at["log"]),
+        "last_run":             at.get("last_run"),
+        "premium_collected":    at.get("premium_collected", 0.0),
+        "leap_pnl":             at.get("leap_pnl", 0.0),
+        "leap_budget":          at.get("leap_budget", 0.0),
     }
 
 

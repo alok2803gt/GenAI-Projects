@@ -1526,10 +1526,11 @@ function AutoTraderTab() {
     } catch(e) { alert("Cleanup failed: " + e.message); }
   };
 
-  const enabled = status?.enabled || false;
-  const positions = status?.positions || {};
+  const enabled    = status?.enabled || false;
+  const positions  = status?.positions || {};
+  const untracked  = status?.untracked_positions || [];
   const stoppedOut = status?.stopped_out || {};
-  const actLog = [...(status?.log || [])].reverse();
+  const actLog     = [...(status?.log || [])].reverse();
 
   const inp = (extra={}) => ({
     style: { width:"100%", padding:"6px 10px", borderRadius:6,
@@ -1788,7 +1789,7 @@ function AutoTraderTab() {
           <div style={{ overflowX:"auto" }}>
             <table style={{ width:"100%", borderCollapse:"collapse", fontSize:13 }}>
               <thead>
-                <tr style={{ color:"#64748b", borderBottom:"1px solid #1e293b" }}>
+                <tr style={{ color:C.muted, borderBottom:`1px solid ${C.border}` }}>
                   {["Ticker","Type","Strike","Expiry","Qty","Entry","Max P/L","Stop","Live P&L","Progress","Placed",""].map(h =>
                     <th key={h} style={{ padding:"6px 10px", textAlign:"left", fontWeight:600, fontSize:11 }}>{h}</th>
                   )}
@@ -1803,47 +1804,46 @@ function AutoTraderTab() {
                   const stopLoss      = -(stopMult * (p.max_profit || 0));
                   const livePnl       = p.live_pnl;
                   const hasLive       = livePnl != null;
-                  const pnlColor      = !hasLive ? "#64748b"
-                                      : livePnl >= 0 ? "#27ae60" : "#e74c3c";
+                  const pnlColor      = !hasLive ? C.muted
+                                      : livePnl >= 0 ? C.bull : C.bear;
                   const profitTarget  = (cfg.profit_target_pct || 0.5) * (p.max_profit || 0);
                   const progress      = hasLive && profitTarget > 0
                                       ? Math.min(1, Math.max(0, livePnl / profitTarget))
                                       : null;
-                  const progressColor = progress == null ? "#334155"
-                                      : progress >= 1   ? "#f1c40f"
-                                      : progress >= 0.5 ? "#27ae60"
-                                      : livePnl < 0     ? "#e74c3c"
-                                      : "#3b82f6";
+                  const progressColor = progress == null ? C.border
+                                      : progress >= 1   ? "#d97706"
+                                      : progress >= 0.5 ? C.bull
+                                      : livePnl < 0     ? C.bear
+                                      : C.accent;
                   return (
-                  <tr key={key} style={{ borderBottom:"1px solid #0f172a" }}>
-                    <td style={{ padding:"7px 10px", fontWeight:700, color:"#f1f5f9" }}>{p.ticker}</td>
+                  <tr key={key} style={{ borderBottom:`1px solid ${C.border}` }}>
+                    <td style={{ padding:"7px 10px", fontWeight:700, color:C.text }}>{p.ticker}</td>
                     <td style={{ padding:"7px 10px", fontWeight:600,
-                      color: p.right==="C"?"#27ae60":p.right==="P"?"#60a5fa":"#94a3b8" }}>
+                      color: p.right==="C" ? C.bull : p.right==="P" ? "#2563eb" : C.muted }}>
                       {strategyLabel(p)}
                     </td>
-                    <td style={{ padding:"7px 10px", color:"#f1f5f9" }}>${p.strike}</td>
-                    <td style={{ padding:"7px 10px", color:"#94a3b8", fontSize:11 }}>{p.expiry}</td>
-                    <td style={{ padding:"7px 10px", color:"#f1f5f9" }}>{p.qty}</td>
-                    <td style={{ padding:"7px 10px", color:"#94a3b8" }}>${(p.entry_price||0).toFixed(2)}</td>
-                    <td style={{ padding:"7px 10px", color:"#f1c40f" }}>${(p.max_profit||0).toFixed(0)}</td>
+                    <td style={{ padding:"7px 10px", color:C.text }}>${p.strike}</td>
+                    <td style={{ padding:"7px 10px", color:C.muted, fontSize:11 }}>{p.expiry}</td>
+                    <td style={{ padding:"7px 10px", color:C.text }}>{p.qty}</td>
+                    <td style={{ padding:"7px 10px", color:C.muted }}>${(p.entry_price||0).toFixed(2)}</td>
+                    <td style={{ padding:"7px 10px", color:"#d97706", fontWeight:600 }}>${(p.max_profit||0).toFixed(0)}</td>
                     <td style={{ padding:"7px 10px" }}>
-                      <span style={{ color:"#e74c3c", fontWeight:600 }}>-${Math.abs(stopLoss).toFixed(0)}</span>
-                      <span style={{ color:"#64748b", fontSize:10, marginLeft:3 }}>{stopMult}×</span>
+                      <span style={{ color:C.bear, fontWeight:600 }}>-${Math.abs(stopLoss).toFixed(0)}</span>
+                      <span style={{ color:C.muted, fontSize:10, marginLeft:3 }}>{stopMult}×</span>
                     </td>
                     <td style={{ padding:"7px 10px" }}>
                       {hasLive
                         ? <span style={{ fontWeight:700, color:pnlColor }}>{livePnl >= 0 ? "+" : ""}${livePnl.toFixed(0)}</span>
-                        : <span style={{ color:"#475569" }}>—</span>
+                        : <span style={{ color:C.muted }}>—</span>
                       }
                     </td>
-                    <td style={{ padding:"7px 10px", minWidth:100 }}>
+                    <td style={{ padding:"7px 10px", minWidth:110 }}>
                       {progress != null ? (
                         <div>
-                          <div style={{ fontSize:10, color: progressColor, fontWeight:700, marginBottom:2 }}>
-                            {(progress*100).toFixed(0)}% of target
-                            {progress >= 1 && " ✓"}
+                          <div style={{ fontSize:10, color:progressColor, fontWeight:700, marginBottom:2 }}>
+                            {(progress*100).toFixed(0)}% of target{progress >= 1 && " ✓"}
                           </div>
-                          <div style={{ height:5, borderRadius:3, background:"#1e293b", overflow:"hidden" }}>
+                          <div style={{ height:5, borderRadius:3, background:C.border, overflow:"hidden" }}>
                             <div style={{
                               height:"100%", borderRadius:3,
                               width:`${Math.min(100,progress*100)}%`,
@@ -1852,9 +1852,9 @@ function AutoTraderTab() {
                             }}/>
                           </div>
                         </div>
-                      ) : <span style={{ color:"#475569", fontSize:11 }}>awaiting data</span>}
+                      ) : <span style={{ color:C.muted, fontSize:11 }}>awaiting data</span>}
                     </td>
-                    <td style={{ padding:"7px 10px", color:"#64748b", fontSize:11 }}>{p.placed_at}</td>
+                    <td style={{ padding:"7px 10px", color:C.muted, fontSize:11 }}>{p.placed_at}</td>
                     <td style={{ padding:"7px 6px" }}>
                       <button
                         title="Manually close this position"
@@ -1870,12 +1870,55 @@ function AutoTraderTab() {
                         }}
                         style={{
                           fontSize:11, padding:"3px 8px", borderRadius:5,
-                          background:"#7f1d1d", color:"#fca5a5", border:"1px solid #991b1b",
+                          background:"#fee2e2", color:"#b91c1c", border:`1px solid #fca5a5`,
                           cursor:"pointer", fontWeight:700,
                         }}
                       >Close</button>
                     </td>
                   </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </Card>
+      )}
+
+      {/* Untracked / manual option positions */}
+      {untracked.length > 0 && (
+        <Card style={{ marginBottom:20, border:`1px solid #d97706` + "55", background:"#fffbeb" }}>
+          <div style={{ ...sans, fontSize:11, fontWeight:700, color:"#d97706", marginBottom:10 }}>
+            MANUAL / UNTRACKED POSITIONS ({untracked.length}) — in IBKR portfolio but not entered by Auto-Trader
+          </div>
+          <div style={{ overflowX:"auto" }}>
+            <table style={{ width:"100%", borderCollapse:"collapse", fontSize:13 }}>
+              <thead>
+                <tr style={{ color:C.muted, borderBottom:`1px solid ${C.border}` }}>
+                  {["Ticker","Type","Strike","Expiry","Qty","Avg Cost","Live P&L","Mkt Value"].map(h =>
+                    <th key={h} style={{ padding:"5px 10px", textAlign:"left", fontWeight:600, fontSize:11 }}>{h}</th>
+                  )}
+                </tr>
+              </thead>
+              <tbody>
+                {untracked.map((p, i) => {
+                  const pnlColor = p.live_pnl > 0 ? C.bull : p.live_pnl < 0 ? C.bear : C.muted;
+                  const expFmt = p.expiry ? `${p.expiry.slice(0,4)}-${p.expiry.slice(4,6)}-${p.expiry.slice(6,8)}` : "—";
+                  return (
+                    <tr key={i} style={{ borderBottom:`1px solid ${C.border}` }}>
+                      <td style={{ padding:"6px 10px", fontWeight:700, color:C.text }}>{p.ticker}</td>
+                      <td style={{ padding:"6px 10px", fontWeight:600,
+                        color: p.right==="C" ? C.bull : "#2563eb" }}>
+                        {p.action} {p.right==="C" ? "Call" : p.right==="P" ? "Put" : p.right}
+                      </td>
+                      <td style={{ padding:"6px 10px" }}>${p.strike}</td>
+                      <td style={{ padding:"6px 10px", color:C.muted, fontSize:11 }}>{expFmt}</td>
+                      <td style={{ padding:"6px 10px" }}>{p.qty}</td>
+                      <td style={{ padding:"6px 10px", color:C.muted }}>${(p.avg_cost||0).toFixed(2)}</td>
+                      <td style={{ padding:"6px 10px", fontWeight:700, color:pnlColor }}>
+                        {p.live_pnl >= 0 ? "+" : ""}${(p.live_pnl||0).toFixed(0)}
+                      </td>
+                      <td style={{ padding:"6px 10px", color:C.muted }}>${(p.market_value||0).toFixed(0)}</td>
+                    </tr>
                   );
                 })}
               </tbody>
@@ -2664,11 +2707,42 @@ function UniverseTab() {
 
 // ── P&L Dashboard Tab ─────────────────────────────────────────────────────
 function PnLTab() {
-  const [data,      setData]      = useState(null);
-  const [loading,   setLoading]   = useState(true);
-  const [err,       setErr]       = useState(null);
-  const [countdown, setCountdown] = useState(15);
+  const [data,        setData]        = useState(null);
+  const [loading,     setLoading]     = useState(true);
+  const [err,         setErr]         = useState(null);
+  const [countdown,   setCountdown]   = useState(15);
+  const [deltaData,   setDeltaData]   = useState(null);
+  const [ordersData,  setOrdersData]  = useState(null);
+  const [deltaOpen,   setDeltaOpen]   = useState(false);
+  const [deltaLoading,setDeltaLoading]= useState(false);
   const INTERVAL = 15;
+
+  const loadDelta = async () => {
+    setDeltaLoading(true);
+    try {
+      const [pos, ord] = await Promise.all([
+        apiFetch("/portfolio/delta"),
+        apiFetch("/orders"),
+      ]);
+      setDeltaData(pos); setOrdersData(ord);
+    } catch(_) {}
+    setDeltaLoading(false);
+  };
+
+  const cancelOrder = async (id) => {
+    try {
+      await apiFetch(`/orders/${id}`, {method:"DELETE"});
+      await loadDelta();
+    } catch(e) { alert("Cancel failed: " + e.message); }
+  };
+
+  const cancelInactiveOrders = async () => {
+    try {
+      const r = await apiFetch("/orders/cancel-inactive", {method:"POST"});
+      alert(`Cancelled ${r.count} Inactive order(s): [${r.cancelled.join(", ")}]`);
+      await loadDelta();
+    } catch(e) { alert("Cancel inactive failed: " + e.message); }
+  };
 
   const load = useCallback(async () => {
     try {
@@ -2901,6 +2975,122 @@ function PnLTab() {
             </div>
         }
       </Card>
+
+      {/* Portfolio Delta + Orders — collapsible panel (replaces old Positions tab) */}
+      <Card style={{ marginTop:16 }}>
+        <div style={{ display:"flex", alignItems:"center", gap:12, cursor:"pointer" }}
+             onClick={() => { setDeltaOpen(o => !o); if (!deltaData) loadDelta(); }}>
+          <span style={{ ...sans, fontWeight:700, fontSize:13, color:C.text }}>
+            {deltaOpen ? "▾" : "▸"} Portfolio Delta &amp; Open Orders
+          </span>
+          {deltaData && (
+            <span style={{ ...mono, fontSize:14, fontWeight:700,
+              color: Math.abs(deltaData.total_delta||0) > 300 ? C.bear :
+                     Math.abs(deltaData.total_delta||0) < 50  ? C.bull : C.neutral }}>
+              Net Δ {(deltaData.total_delta||0) >= 0 ? "+" : ""}{deltaData.total_delta||0}
+            </span>
+          )}
+          {deltaData && ordersData?.count > 0 && (
+            <span style={{ ...sans, fontSize:11, color:C.bear, fontWeight:600 }}>
+              {ordersData.count} open order{ordersData.count !== 1 ? "s" : ""}
+            </span>
+          )}
+          <button onClick={e => { e.stopPropagation(); loadDelta(); }} style={{
+            ...sans, marginLeft:"auto", fontSize:11, padding:"3px 10px", borderRadius:6,
+            background:C.bg, border:`1px solid ${C.border}`, color:C.muted, cursor:"pointer",
+          }}>{deltaLoading ? "Loading…" : "↻ Refresh"}</button>
+        </div>
+
+        {deltaOpen && deltaData && (
+          <div style={{ marginTop:14 }}>
+            <div style={{ overflowX:"auto", marginBottom:16 }}>
+              <table style={{ fontSize:12, width:"100%", borderCollapse:"collapse" }}>
+                <thead><tr>{["Symbol","Type","Strike","Expiry","DTE","Qty","Avg Cost","Mkt Value","Unreal P&L","δ","Net Δ"].map(h=>(
+                  <th key={h} style={{ ...sans, color:C.muted, fontWeight:600, borderBottom:`1px solid ${C.border}`, padding:"5px 8px", fontSize:11 }}>{h}</th>
+                ))}</tr></thead>
+                <tbody>{(deltaData.positions||[]).map((p,i)=>(
+                  <tr key={i} style={{ borderBottom:`1px solid ${C.border}33` }}>
+                    <td style={{ ...mono, color:C.accent, fontWeight:700, padding:"5px 8px" }}>{p.symbol}</td>
+                    <td style={{ ...mono, fontSize:11, padding:"5px 8px",
+                      color: p.right==="C"?C.bull:p.right==="P"?C.bear:C.muted, fontWeight:600 }}>
+                      {strategyLabel(p)}
+                    </td>
+                    <td style={{ ...mono, padding:"5px 8px" }}>{p.strike ? `$${p.strike}` : "—"}</td>
+                    <td style={{ ...mono, color:C.muted, padding:"5px 8px", fontSize:11 }}>{p.expiry||"—"}</td>
+                    <td style={{ ...mono, padding:"5px 8px",
+                      color:p.dte<21?C.bear:p.dte<30?C.neutral:C.muted }}>
+                      {p.dte != null ? `${p.dte}d` : "—"}
+                    </td>
+                    <td style={{ ...mono, padding:"5px 8px",
+                      color:p.position>=0?C.bull:C.bear, fontWeight:700 }}>{p.position}</td>
+                    <td style={{ ...mono, padding:"5px 8px" }}>{p.avg_cost ? `$${Number(p.avg_cost).toFixed(2)}` : "—"}</td>
+                    <td style={{ ...mono, padding:"5px 8px" }}>{p.market_value != null ? `$${Number(p.market_value).toFixed(0)}` : "—"}</td>
+                    <td style={{ ...mono, padding:"5px 8px", fontWeight:600,
+                      color:p.unrealized_pnl>=0?C.bull:C.bear }}>
+                      {p.unrealized_pnl != null ? `${p.unrealized_pnl>=0?"+":""}$${Math.abs(p.unrealized_pnl).toFixed(0)}` : "—"}
+                    </td>
+                    <td style={{ ...mono, padding:"5px 8px" }}>{p.delta != null ? p.delta.toFixed(3) : "—"}</td>
+                    <td style={{ ...mono, padding:"5px 8px", fontWeight:700,
+                      color:p.position_delta>=0?C.bull:C.bear }}>
+                      {p.position_delta != null ? `${p.position_delta>=0?"+":""}${p.position_delta.toFixed(1)}` : "—"}
+                    </td>
+                  </tr>
+                ))}
+                {(deltaData.positions||[]).length === 0 && (
+                  <tr><td colSpan={11} style={{ ...sans, color:C.muted, padding:"20px", textAlign:"center" }}>
+                    No positions in IBKR — refresh and ensure you are connected
+                  </td></tr>
+                )}
+                </tbody>
+              </table>
+            </div>
+
+            {/* Open orders */}
+            {ordersData?.count > 0 && (
+              <div>
+                <div style={{ ...sans, fontSize:11, fontWeight:700, color:C.text, marginBottom:8,
+                  display:"flex", alignItems:"center", gap:10 }}>
+                  Open Orders ({ordersData.count})
+                  {ordersData.orders.some(o => o.status === "Inactive") && (
+                    <Btn onClick={cancelInactiveOrders} color={C.bear} style={{ padding:"2px 10px", fontSize:10 }}>
+                      ✕ Cancel All Inactive
+                    </Btn>
+                  )}
+                </div>
+                <table style={{ fontSize:12, width:"100%", borderCollapse:"collapse" }}>
+                  <thead><tr>{["ID","Ticker","Contract","Action","Qty","Limit","Status","Cancel"].map(h=>(
+                    <th key={h} style={{ ...sans, color:C.muted, fontWeight:600, borderBottom:`1px solid ${C.border}`, padding:"4px 8px", fontSize:11 }}>{h}</th>
+                  ))}</tr></thead>
+                  <tbody>{ordersData.orders.map((o,i)=>(
+                    <tr key={i} style={{ borderBottom:`1px solid ${C.border}33`,
+                      background: o.status==="Inactive" ? "#fff5f5" : undefined }}>
+                      <td style={{ ...mono, color:C.muted, padding:"5px 8px" }}>{o.order_id}</td>
+                      <td style={{ ...mono, color:C.accent, fontWeight:700, padding:"5px 8px" }}>{o.ticker}</td>
+                      <td style={{ ...mono, fontSize:10, color:C.muted, padding:"5px 8px" }}>
+                        {o.right}{o.strike ? `$${o.strike}` : ""} {o.expiry ? o.expiry.slice(0,8) : ""}
+                      </td>
+                      <td style={{ ...mono, padding:"5px 8px",
+                        color:o.action==="BUY"?C.bull:C.bear, fontWeight:700 }}>{o.action}</td>
+                      <td style={{ ...mono, padding:"5px 8px" }}>{o.quantity}</td>
+                      <td style={{ ...mono, padding:"5px 8px" }}>${Number(o.limit_price||0).toFixed(2)}</td>
+                      <td style={{ ...mono, padding:"5px 8px",
+                        color:o.status==="Inactive"?C.bear:C.neutral }}>
+                        {o.status}{o.why_held ? ` (${o.why_held})` : ""}
+                      </td>
+                      <td style={{ padding:"5px 8px" }}>
+                        <Btn onClick={() => cancelOrder(o.order_id)} color={C.bear} style={{ padding:"2px 8px", fontSize:10 }}>✕</Btn>
+                      </td>
+                    </tr>
+                  ))}</tbody>
+                </table>
+              </div>
+            )}
+            {ordersData?.count === 0 && (
+              <div style={{ ...sans, fontSize:12, color:C.muted }}>No open orders</div>
+            )}
+          </div>
+        )}
+      </Card>
     </div>
   );
 }
@@ -3053,7 +3243,6 @@ function App() {
     { id:"signals",    label:"Signals"     },
     { id:"csp",        label:"CSP Scan"    },
     { id:"leaps",      label:"LEAPs"       },
-    { id:"positions",  label:"Positions"   },
     { id:"autotrader", label:"Auto-Trade"  },
     { id:"backtest",   label:"Backtest"    },
     { id:"0dte",       label:"0DTE / EIV"  },
@@ -3107,7 +3296,6 @@ function App() {
         <div style={{display: tab==="signals"    ? "" : "none"}}><SignalsTab    connected={connected} /></div>
         <div style={{display: tab==="csp"        ? "" : "none"}}><CSPTab        connected={connected} /></div>
         <div style={{display: tab==="leaps"      ? "" : "none"}}><LEAPTab       connected={connected} /></div>
-        <div style={{display: tab==="positions"  ? "" : "none"}}><PositionsTab /></div>
         <div style={{display: tab==="autotrader" ? "" : "none"}}><AutoTraderTab /></div>
         <div style={{display: tab==="backtest"   ? "" : "none"}}><BacktestTab   connected={connected} /></div>
         <div style={{display: tab==="0dte"       ? "" : "none"}}><ZeroDTETab    connected={connected} /></div>
