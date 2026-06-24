@@ -1632,29 +1632,33 @@ async def _autotrader_monitor_coro(ib: IB) -> None:
     stop_mult     = float(cfg.get("stop_loss_mult", 2.0))        # 2× premium for CSP
     today         = date.today()
 
-    # ── Refresh live IV for LEAP positions ───────────────────────────────────
-    # Entry IV can be 6-12 months stale for held LEAPs; stale IV gives wrong
-    # stop thresholds (40/50/60% of cost depend on current IV regime).
-    leap_iv_pairs: list = []
+    # ── Refresh live IV for all tracked positions (LEAP + CSP) ─────────────
+    # Stale entry IV causes wrong stop thresholds:
+    #   CSP: stop tier (2× / 3× / 4×) is chosen from live_iv vs 40/70 thresholds.
+    #   LEAP: stop (40/50/60% of cost) also depends on current IV regime.
+    # Batch-request all positions with one 2s sleep to minimize monitor latency.
+    iv_refresh_pairs: list = []
     for _item in ib.portfolio():
         _k = _at_contract_key(_item.contract)
-        if _k in at["positions"] and at["positions"][_k].get("action") == "BUY":
-            leap_iv_pairs.append((_k, _item.contract))
-    if leap_iv_pairs:
+        if _k in at["positions"]:
+            iv_refresh_pairs.append((_k, _item.contract))
+    if iv_refresh_pairs:
         _iv_tks = {_k: ib.reqMktData(_c, "106", False, False)
-                   for _k, _c in leap_iv_pairs}
+                   for _k, _c in iv_refresh_pairs}
         await asyncio.sleep(2)
         _iv_changed = False
-        for _k, _c in leap_iv_pairs:
+        for _k, _c in iv_refresh_pairs:
             _tq = _iv_tks.get(_k)
             if _tq and _tq.modelGreeks and _tq.modelGreeks.impliedVol:
-                new_iv  = round(float(_tq.modelGreeks.impliedVol) * 100, 1)
-                old_iv  = float(at["positions"][_k].get("live_iv") or 0)
+                new_iv = round(float(_tq.modelGreeks.impliedVol) * 100, 1)
+                old_iv = float(at["positions"][_k].get("live_iv") or 0)
                 at["positions"][_k]["live_iv"] = new_iv
                 if abs(new_iv - old_iv) >= 3:
                     _iv_changed = True
+                    _action = at["positions"][_k].get("action", "SELL")
+                    _label  = "LEAP" if _action == "BUY" else "CSP"
                     _at_log("SYSTEM",
-                            f"{_k}: LEAP IV refreshed {old_iv:.0f}% → {new_iv:.0f}%")
+                            f"{_k}: {_label} IV refreshed {old_iv:.0f}% → {new_iv:.0f}%")
             ib.cancelMktData(_c)
         if _iv_changed:
             _at_save_state()
