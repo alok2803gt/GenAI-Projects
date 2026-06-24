@@ -1907,10 +1907,7 @@ function AutoTraderTab() {
                         </div>
                       ) : <span style={{ color:C.muted, fontSize:11 }}>awaiting data</span>}
                     </td>
-                    <td style={{ padding:"7px 10px", color:C.muted, fontSize:11 }}>
-                      {p.placed_at ? new Date(p.placed_at + (p.placed_at.endsWith("Z") ? "" : "Z"))
-                        .toLocaleString("en-US",{month:"short",day:"numeric",hour:"numeric",minute:"2-digit",hour12:true}) : "—"}
-                    </td>
+                    <td style={{ padding:"7px 10px", color:C.muted, fontSize:11 }}>{p.placed_at || "—"}</td>
                     <td style={{ padding:"7px 6px" }}>
                       <button
                         title="Manually close this position"
