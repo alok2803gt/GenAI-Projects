@@ -3268,6 +3268,7 @@ function TechnicalsTab() {
   const ind = result?.indicators || {};
   const sum = result?.summary || {};
   const brk = result?.breakout || {};
+  const ivr = result?.iv_rank  || {};
   const oc  = overallColors[sum.overall] || overallColors.neutral;
 
   return (
@@ -3450,17 +3451,77 @@ function TechnicalsTab() {
                   </span>
                 </div>
                 <div style={{ borderTop:`1px solid ${C.border}`, paddingTop:10 }}>
+                  <div style={{ fontSize:12, fontWeight:700, color:C.muted, marginBottom:8 }}>
+                    IV Rank
+                  </div>
+                  {ivr.rank != null ? (
+                    <>
+                      <GaugeBar
+                        label={`IV Rank — current IV ${ivr.iv != null ? ivr.iv.toFixed(1)+"%" : "N/A"}`}
+                        value={ivr.rank}
+                        thresholds={[
+                          { at:0,  color:"#16a34a" },
+                          { at:30, color:"#f97316" },
+                          { at:50, color:"#dc2626" },
+                        ]}
+                      />
+                      <div style={{ display:"flex", justifyContent:"space-between", fontSize:10, color:C.muted, marginTop:2 }}>
+                        <span>low IV (cheap premium)</span>
+                        <span>50%</span>
+                        <span>high IV (rich premium)</span>
+                      </div>
+                      {ivr.rv_lo != null && ivr.rv_hi != null && (
+                        <div style={{ fontSize:11, color:C.muted, marginTop:4 }}>
+                          52-week RV range: {ivr.rv_lo.toFixed(1)}% – {ivr.rv_hi.toFixed(1)}%
+                        </div>
+                      )}
+                    </>
+                  ) : (
+                    <div style={{ fontSize:11, color:C.muted }}>IV rank unavailable (yfinance options data not fetched)</div>
+                  )}
+                </div>
+                <div style={{ borderTop:`1px solid ${C.border}`, paddingTop:10, marginTop:4 }}>
                   <div style={{ fontSize:12, fontWeight:700, color:C.muted, marginBottom:6 }}>
                     CSP Implication
                   </div>
-                  <div style={{ fontSize:12, color:C.text, lineHeight:1.5 }}>
-                    {ind.pct_b != null && ind.pct_b < 30 && (ind.rsi14||50) < 45
-                      ? "Price near lower Bollinger Band + RSI oversold → elevated vol likely → good CSP entry if IV rank is high."
-                      : ind.pct_b != null && ind.pct_b > 80
-                      ? "Price near upper Bollinger Band → extended move. CSP assignment risk elevated on reversal."
-                      : brk.signal === "BREAKOUT"
-                      ? "Breakout with volume confirms underlying strength → CSP on pullback to upper BB."
-                      : "Normal range. Standard CSP criteria apply."}
+                  <div style={{ fontSize:12, color:C.text, lineHeight:1.6 }}>
+                    {(() => {
+                      const rank   = ivr.rank;
+                      const bbLow  = ind.pct_b != null && ind.pct_b < 30;
+                      const bbHigh = ind.pct_b != null && ind.pct_b > 80;
+                      const rsiOs  = (ind.rsi14 || 50) < 45;
+                      const ivHigh = rank != null && rank >= 50;
+                      const ivMod  = rank != null && rank >= 30;
+
+                      if (rank == null) {
+                        // IV rank not available — fall back to pure technical signal
+                        if (bbLow && rsiOs)
+                          return "Price near lower BB + RSI oversold → technically set up for a bounce. Check IV rank in the Universe tab before selling puts.";
+                        if (bbHigh)
+                          return "Price near upper BB → extended move. CSP assignment risk elevated; wait for a pullback.";
+                        if (brk.signal === "BREAKOUT")
+                          return "Volume-confirmed breakout → underlying strength. CSP on a pullback to upper BB.";
+                        return "Normal range. Standard CSP criteria apply — confirm IV rank ≥ 50% before entry.";
+                      }
+
+                      const rankLabel = rank >= 50 ? "HIGH" : rank >= 30 ? "MODERATE" : "LOW";
+                      const rankCol   = rank >= 50 ? "#dc2626" : rank >= 30 ? "#f97316" : "#16a34a";
+                      const rankSpan  = <span style={{ fontWeight:700, color:rankCol }}>IV rank {rank.toFixed(0)}% ({rankLabel})</span>;
+
+                      if (ivHigh && bbLow && rsiOs)
+                        return <>{rankSpan} + price near lower BB + RSI oversold → strong CSP setup. Elevated premium with underlying near support — high-conviction entry.</>;
+                      if (ivHigh && bbHigh)
+                        return <>{rankSpan} but price near upper BB → premium is rich but assignment risk is elevated on a reversal. Consider a lower strike.</>;
+                      if (ivHigh && brk.signal === "BREAKOUT")
+                        return <>{rankSpan} + volume breakout → strong momentum. CSP on a pullback to upper BB rather than chasing here.</>;
+                      if (ivHigh)
+                        return <>{rankSpan} → good time to sell premium. Standard CSP entry criteria apply (delta ≤ 0.20, 30–50 DTE).</>;
+                      if (ivMod && bbLow && rsiOs)
+                        return <>{rankSpan} — premium is thin but technicals are supportive. Viable if strike selection is conservative (delta ≤ 0.15).</>;
+                      if (ivMod)
+                        return <>{rankSpan} — premium is below ideal. Consider waiting for IV rank ≥ 50% before selling puts.</>;
+                      return <>{rankSpan} → premium is compressed. Hold off; wait for a vol expansion event before selling puts.</>;
+                    })()}
                   </div>
                 </div>
               </div>

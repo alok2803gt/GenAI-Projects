@@ -4247,6 +4247,12 @@ async def get_technicals(ticker: str):
     elif score <= -1: overall = "sell"
     else: overall = "neutral"
 
+    # IV rank — async, cached 1h per ticker via _iv_rank_for_ticker
+    try:
+        iv_data = await _iv_rank_for_ticker(ticker)
+    except Exception:
+        iv_data = {"iv": None, "rank": None, "rv_lo": None, "rv_hi": None}
+
     return {
         "ticker":     ticker,
         "price":      price,
@@ -4285,6 +4291,7 @@ async def get_technicals(ticker: str):
             "breakout_signal": breakout_signal,
             "overall":         overall,
         },
+        "iv_rank": iv_data,
     }
 
 
