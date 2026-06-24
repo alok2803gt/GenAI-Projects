@@ -2217,16 +2217,30 @@ async def _autotrader_scan_and_trade_coro(ib: IB) -> None:
     # Estimate the cheapest likely CSP (use $100 strike as conservative floor)
     min_csp_cost = 100 * 100   # $10,000 for a $100-strike single-contract CSP
     capital_slots = int(cap["deployable"] / min_csp_cost) if cap["deployable"] > 0 else 0
-    slots = min(count_slots, capital_slots)
+    csp_slots = min(count_slots, capital_slots)
+
+    # LEAP candidates use a separate budget (leap_capital / leap_budget) and must NOT
+    # be gated by CSP capital exhaustion.  Compute LEAP headroom independently so a
+    # depleted CSP pool doesn't zero out `slots` and prevent LEAPs from reaching the
+    # per-candidate check that was added in the previous fix.
+    leap_deployed = sum(float(p.get("max_profit", 0)) for p in at["positions"].values()
+                        if p.get("action") == "BUY")
+    leap_capital_cfg = float(cfg.get("leap_capital", 5000.0))
+    leap_budget_val  = at.get("leap_budget", 0.0)
+    leap_avail_now   = max(0.0, max(leap_capital_cfg, leap_budget_val) - leap_deployed)
+    # Conservative floor: assume cheapest LEAP is ~$1K/contract (low-price stocks)
+    leap_capital_slots = min(count_slots, int(leap_avail_now / 1000)) if leap_avail_now > 0 else 0
+    # Total effective slots: CSP + LEAP are additive (separate budgets, shared count cap)
+    slots = min(count_slots, csp_slots + leap_capital_slots)
 
     _at_log("SCAN",
-            f"Capital: ${cap['consumed']:,.0f} deployed / ${cap['allocated']:,.0f} allocated "
-            f"| ${cap['deployable']:,.0f} deployable (20% buffer=${cap['buffer_held']:,.0f})"
+            f"Capital: ${cap['consumed']:,.0f} CSP deployed / ${cap['allocated']:,.0f} allocated "
+            f"| ${cap['deployable']:,.0f} CSP deployable | LEAP avail=${leap_avail_now:,.0f}"
             + (f" | IBKR available=${cap['ibkr_available']:,.0f}" if cap["ibkr_available"] else ""))
 
     # ── Always scan — needed for rotation decisions even at full capacity ─────
-    _at_log("SCAN", f"Scanning market (count_slots={count_slots}, capital_slots={capital_slots}, "
-                    f"effective_slots={slots}, regime={regime})…")
+    _at_log("SCAN", f"Scanning market (count_slots={count_slots}, csp_slots={csp_slots}, "
+                    f"leap_slots={leap_capital_slots}, effective_slots={slots}, regime={regime})…")
 
     candidates: list = []
     if "csp" in cfg["scan_types"]:
