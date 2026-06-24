@@ -879,6 +879,7 @@ def _universe_load() -> None:
         if tickers:
             CSP_UNIVERSE.clear()
             CSP_UNIVERSE.extend(tickers)
+            state["universe_last_screened"] = data.get("saved_at")   # restore timestamp for UI
             log.info("Universe restored from cache (%d tickers, %dd old)", len(tickers), age_days)
     except Exception as e:
         log.warning("Universe cache load failed: %s", e)
