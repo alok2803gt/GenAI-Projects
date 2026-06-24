@@ -5474,12 +5474,12 @@ def get_journal(limit: int = Query(100, description="Most recent N trades")):
 def get_journal_stats():
     """Win rate, avg P&L, feature importances from completed trades."""
     con = sqlite3.connect(JOURNAL_DB_PATH, check_same_thread=False)
-    rows = con.execute("""
-        SELECT win, pnl, pnl_pct, exit_reason, strategy_type, iv_rank, score
-        FROM trade_journal
-        WHERE closed_at IS NOT NULL AND win IS NOT NULL
-          AND exit_reason != 'orphaned'
-    """).fetchall()
+    rows = con.execute(
+        "SELECT win, pnl, pnl_pct, exit_reason, strategy_type, iv_rank, score "
+        "FROM trade_journal "
+        "WHERE closed_at IS NOT NULL AND win IS NOT NULL "
+        f"AND exit_reason IN ({_REAL_EXIT_REASONS})"
+    ).fetchall()
     model_rows = con.execute(
         "SELECT * FROM model_log ORDER BY id DESC LIMIT 10"
     ).fetchall()

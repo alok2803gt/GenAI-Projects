@@ -2628,7 +2628,7 @@ function LearningTab() {
               <thead>
                 <tr style={{ color:"#64748b", borderBottom:"1px solid #e2e8f0" }}>
                   {["#","Ticker","Type","Strike","Expiry","Hold","Entry","Exit","P&L","Win","Exit Reason",
-                    "IV Rank","Score","Opened"].map(h =>
+                    "IV Rank","IV Exit","Regime","Score","Opened"].map(h =>
                     <th key={h} style={{ padding:"6px 8px", textAlign:"left", fontWeight:600 }}>{h}</th>)}
                 </tr>
               </thead>
@@ -2668,6 +2668,18 @@ function LearningTab() {
                     </td>
                     <td style={{ padding:"5px 8px", color:"#64748b" }}>{t.exit_reason || "—"}</td>
                     <td style={{ padding:"5px 8px" }}>{t.iv_rank?.toFixed(0) || "—"}</td>
+                    <td style={{ padding:"5px 8px", color: t.live_iv_exit != null ? (t.live_iv_exit > (t.live_iv_entry||0) ? "#e74c3c" : "#27ae60") : "#64748b" }}>
+                      {t.live_iv_exit != null ? `${t.live_iv_exit.toFixed(0)}%` : "—"}
+                    </td>
+                    <td style={{ padding:"5px 8px" }}>
+                      {t.market_regime
+                        ? <span style={{ fontSize:10, fontWeight:700, padding:"1px 5px", borderRadius:4,
+                            background: t.market_regime==="BULL"?"#dcfce7":t.market_regime==="BEAR"?"#fee2e2":"#fef3c7",
+                            color: t.market_regime==="BULL"?"#166534":t.market_regime==="BEAR"?"#991b1b":"#92400e" }}>
+                            {t.market_regime}
+                          </span>
+                        : <span style={{ color:"#64748b" }}>—</span>}
+                    </td>
                     <td style={{ padding:"5px 8px" }}>{t.score || "—"}</td>
                     <td style={{ padding:"5px 8px", color:"#64748b" }}>{t.opened_at?.slice(0,10) || "—"}</td>
                   </tr>
