@@ -1863,13 +1863,13 @@ function AutoTraderTab() {
                         // CSP: max_profit = premium collected (true max profit)
                         <span style={{ color:"#d97706", fontWeight:600 }}>${(p.max_profit||0).toFixed(0)}</span>
                       ) : (
-                        // LEAP: max_profit = cost paid; target = 50% of cost
+                        // LEAP: no fixed profit target — exits via stop-loss or 21 DTE
                         <div>
                           <span style={{ color:"#3b82f6", fontWeight:600 }}>
-                            ${((p.max_profit||0) * (cfg.profit_target_pct||0.5)).toFixed(0)} tgt
+                            ${(p.max_profit||0).toFixed(0)} cost
                           </span>
                           <div style={{ color:C.muted, fontSize:10 }}>
-                            cost ${(p.max_profit||0).toFixed(0)}
+                            stop / 21d exit
                           </div>
                         </div>
                       )}
@@ -1907,6 +1907,19 @@ function AutoTraderTab() {
                             }}/>
                           </div>
                         </div>
+                      ) : isLeap && hasLive ? (
+                        /* LEAP: show distance-to-stop instead of a % target */
+                        (() => {
+                          const distToStop = stopLoss != null ? livePnl - stopLoss : null;
+                          return distToStop != null ? (
+                            <div style={{ fontSize:11 }}>
+                              <span style={{ color: livePnl >= 0 ? C.bull : C.bear, fontWeight:700 }}>
+                                {livePnl >= 0 ? "+" : ""}${livePnl.toFixed(0)}
+                              </span>
+                              <span style={{ color:C.muted }}> / buf ${distToStop.toFixed(0)}</span>
+                            </div>
+                          ) : <span style={{ color:pnlColor, fontWeight:700 }}>{livePnl>=0?"+":""}${livePnl.toFixed(0)}</span>;
+                        })()
                       ) : <span style={{ color:C.muted, fontSize:11 }}>awaiting data</span>}
                     </td>
                     <td style={{ padding:"7px 10px", color:C.muted, fontSize:11 }}>{p.placed_at || "—"}</td>
