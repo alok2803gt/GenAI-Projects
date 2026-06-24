@@ -1604,6 +1604,7 @@ async def _autotrader_monitor_coro(ib: IB) -> None:
         upnl       = float(item.unrealizedPNL or 0)
         max_profit = info.get("max_profit", 0)
         if max_profit <= 0:
+            _at_log("WARN", f"{key}: max_profit is 0 or missing — skipping monitor (data issue?)")
             continue
 
         action = info.get("action", "SELL")   # SELL = CSP short put; BUY = LEAP long call
@@ -1867,10 +1868,22 @@ async def _autotrader_close_coro(ib: IB, item, info: dict, key: str) -> None:
     bid = float(ticker_q.bid or 0)
     ask = float(ticker_q.ask or 0)
     ib.cancelMktData(contract)
+
+    # Guard: if IBKR returns no market data at all, do NOT place the order.
+    # A hardcoded fallback price would produce an unfillable limit order, and
+    # unconditionally removing the position from tracking would orphan it —
+    # auto-trader would never manage it again.  Defer to the next monitor cycle.
+    if bid <= 0 and ask <= 0:
+        _at_log("WARN",
+                f"{key}: close skipped — no bid/ask data (will retry next cycle). "
+                f"Check IBKR market data subscription for {c.symbol}.")
+        return
+
     if close_action == "BUY":
-        lmt = round((ask + 0.01) if ask > 0 else (bid * 1.10 if bid > 0 else 0.50), 2)
+        lmt = round((ask + 0.01) if ask > 0 else bid * 1.10, 2)
     else:
-        lmt = round((bid - 0.01) if bid > 0 else (ask * 0.90 if ask > 0 else 0.10), 2)
+        lmt = round((bid - 0.01) if bid > 0 else ask * 0.90, 2)
+
     # Capture live IV at exit for learning
     live_iv_exit = None
     try:
