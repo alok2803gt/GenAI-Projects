@@ -3370,7 +3370,7 @@ async def scan_leaps(ib: IB) -> dict:
                         _fetch_opra_chain(
                             ib, ticker, "C", stock_price,
                             LEAP_MIN_DTE, LEAP_MAX_DTE,
-                            otm_lo_pct=0, otm_hi_pct=20, max_strikes=10,
+                            otm_lo_pct=0, otm_hi_pct=25, max_strikes=25,
                         ),
                         _institutional_signals(ticker, stock_price),
                     )
