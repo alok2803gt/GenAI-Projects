@@ -2966,15 +2966,10 @@ def _journal_record_exit(
 def _update_kelly_from_journal() -> None:
     """EMA-blend actual win rate from real autotrader exits into assumed_win_rate.
 
-    Only counts trades closed by legitimate exit reasons (profit_target, stop_loss,
-    roll_close, roll_max, roll_no_credit, 21dte). Excludes orphaned entries created
-    by cleanup — those aren't real trade outcomes and would collapse Kelly to zero.
-    Requires at least 10 real trades before updating (stay on prior with less data).
+    Only counts trades closed by legitimate exit reasons. Excludes 'orphaned'
+    entries created by cleanup — those aren't real trade outcomes and would
+    collapse Kelly to zero. Requires at least 10 real trades before updating.
     """
-    real_exits = {
-        "profit_target", "stop_loss", "roll_close", "roll_max",
-        "roll_no_credit", "21dte", "manual",
-    }
     con = sqlite3.connect(JOURNAL_DB_PATH, check_same_thread=False)
     rows = con.execute(
         "SELECT win FROM trade_journal "
