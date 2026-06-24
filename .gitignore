@@ -22,6 +22,7 @@ ibkr_trader/backend/universe_cache.json
 .env
 *.env.*
 secrets.json
+ibkr_trader/backend/scanner_config.json
 
 # IDEs
 .vscode/
