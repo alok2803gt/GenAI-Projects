@@ -1478,17 +1478,19 @@ function AutoTraderTab() {
   const [reconnMode,  setReconn]     = useState(null);
   const [acctSummary, setAcctSummary] = useState(null);
   const [cfg, setCfg] = useState({
-    max_positions:     5,
-    profit_target_pct: 0.50,
-    stop_loss_mult:    2.0,
-    scan_types:        ["csp"],
-    csp_capital:       20000,
-    leap_capital:      5000,
-    use_kelly:         true,
-    total_capital:     100000,
-    auto_hedge:        false,
-    hedge_threshold:   100,
+    max_positions:      5,
+    profit_target_pct:  0.50,
+    stop_loss_mult:     2.0,
+    scan_types:         ["csp"],
+    csp_capital:        20000,
+    leap_capital:       5000,
+    use_kelly:          true,
+    total_capital:      100000,
+    auto_hedge:         false,
+    hedge_threshold:    100,
+    tape_filter_enabled: true,
   });
+  const [tapeSentiment, setTapeSentiment] = useState({});
 
   const load = async (syncConfig = false) => {
     try {
@@ -1505,12 +1507,21 @@ function AutoTraderTab() {
     } catch(_) {}
   };
 
+  const loadTapeSentiment = async () => {
+    try {
+      const d = await apiFetch("/tape/sentiment");
+      setTapeSentiment(d || {});
+    } catch(_) {}
+  };
+
   useEffect(() => {
     load(true);  // sync config once on mount
     loadAcct();  // fetch account summary immediately
+    loadTapeSentiment();
     const id  = setInterval(() => load(false), 8000);   // poll status — never overwrite user edits
     const id2 = setInterval(() => loadAcct(), 30000);   // refresh account every 30 s
-    return () => { clearInterval(id); clearInterval(id2); };
+    const id3 = setInterval(() => loadTapeSentiment(), 30000);  // refresh tape sentiment every 30 s
+    return () => { clearInterval(id); clearInterval(id2); clearInterval(id3); };
   }, []);
 
   const saveConfig = async (enabled) => {
@@ -1766,8 +1777,9 @@ function AutoTraderTab() {
         {/* Toggles row */}
         <div style={{ display:"flex", gap:24, marginTop:16, flexWrap:"wrap" }}>
           {[
-            { key:"use_kelly",  label:"Kelly Sizing", sub:`CSP ~$${kellyCspCapital.toLocaleString()} · LEAP ~$${kellyLeapCapital.toLocaleString()}` },
-            { key:"auto_hedge", label:"Auto-Hedge",   sub:"SPY option when delta > threshold" },
+            { key:"use_kelly",          label:"Kelly Sizing",     sub:`CSP ~$${kellyCspCapital.toLocaleString()} · LEAP ~$${kellyLeapCapital.toLocaleString()}` },
+            { key:"auto_hedge",         label:"Auto-Hedge",        sub:"SPY option when delta > threshold" },
+            { key:"tape_filter_enabled", label:"Tape CVD Filter",   sub:"Block entries when order flow is bearish" },
           ].map(t => (
             <label key={t.key} style={{ display:"flex", flexDirection:"column", gap:3, cursor:"pointer" }}>
               <div style={{ display:"flex", alignItems:"center", gap:8 }}>
@@ -1812,6 +1824,65 @@ function AutoTraderTab() {
           {" "}Exit rules: 50% profit target · IV-adjusted stop · roll at 21 DTE · 48h cooldown.
         </div>
       </Card>
+
+      {/* Tape Sentiment grid — live CVD scores for subscribed tickers */}
+      {Object.keys(tapeSentiment).length > 0 && (
+        <Card title="Live CVD Tape Sentiment" style={{ marginBottom:20 }}>
+          <div style={{ ...sans, fontSize:11, color:C.muted, marginBottom:12 }}>
+            Real-time order-flow scores from IBKR reqMktData (tick 233+375) · refreshes every 30s
+            {!cfg.tape_filter_enabled && (
+              <span style={{ marginLeft:10, color:"#f59e0b", fontWeight:600 }}>
+                ⚠ Tape CVD Filter is OFF — scores collected but not blocking trades
+              </span>
+            )}
+          </div>
+          <div style={{ display:"flex", flexWrap:"wrap", gap:12 }}>
+            {Object.entries(tapeSentiment).map(([sym, s]) => {
+              const scoreColor = !s.fresh ? C.muted
+                : s.label.includes("STRONGLY BULL") ? "#4ade80"
+                : s.label.includes("BULL") ? "#86efac"
+                : s.label.includes("STRONGLY BEAR") ? "#f87171"
+                : s.label.includes("BEAR") ? "#fca5a5"
+                : C.muted;
+              const bg = !s.fresh ? "#1e293b"
+                : s.label.includes("BULL") ? "#14532d22"
+                : s.label.includes("BEAR") ? "#450a0a22"
+                : "#1e293b";
+              const barWidth = `${Math.round(Math.abs(s.score || 0) * 50)}%`;
+              const barColor = (s.score || 0) >= 0 ? "#22c55e" : "#ef4444";
+              return (
+                <div key={sym} style={{ background:bg, border:`1px solid ${C.border}`,
+                  borderRadius:8, padding:"10px 14px", minWidth:160, maxWidth:200 }}>
+                  <div style={{ display:"flex", justifyContent:"space-between", alignItems:"baseline" }}>
+                    <span style={{ fontWeight:700, color:C.white, fontFamily:"monospace", fontSize:14 }}>{sym}</span>
+                    <span style={{ fontSize:10, color:C.muted }}>{s.fresh ? "live" : "stale"}</span>
+                  </div>
+                  <div style={{ marginTop:4, fontSize:11, color:scoreColor, fontWeight:700 }}>
+                    {s.label || "NEUTRAL"}
+                  </div>
+                  <div style={{ marginTop:6, fontSize:13, color:scoreColor, fontFamily:"monospace" }}>
+                    {(s.score || 0) >= 0 ? "+" : ""}{(s.score || 0).toFixed(3)}
+                  </div>
+                  {/* Score bar: center = 0, left = bearish, right = bullish */}
+                  <div style={{ marginTop:6, height:4, background:"#334155", borderRadius:2, position:"relative" }}>
+                    <div style={{ position:"absolute",
+                      left: (s.score || 0) >= 0 ? "50%" : `${50 - Math.round(Math.abs(s.score||0)*50)}%`,
+                      width: barWidth, height:"100%", background:barColor, borderRadius:2 }} />
+                  </div>
+                  <div style={{ marginTop:6, display:"flex", gap:6, fontSize:10, color:C.muted, flexWrap:"wrap" }}>
+                    <span>cvd {(s.components?.cvd||0)>=0?"+":""}{(s.components?.cvd||0).toFixed(2)}</span>
+                    <span>vwap {(s.components?.vwap_z||0)>=0?"+":""}{(s.components?.vwap_z||0).toFixed(2)}</span>
+                    <span>mag {(s.components?.vol_mag||0)>=0?"+":""}{(s.components?.vol_mag||0).toFixed(2)}</span>
+                    {(s.components?.div_mult||1) < 1 && (
+                      <span style={{ color:"#f59e0b" }}>⚠div×0.5</span>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </Card>
+      )}
 
       {/* Managed positions */}
       {Object.keys(positions).length > 0 && (
@@ -3882,7 +3953,7 @@ function WatchlistTab() {
           <table style={{ width:"100%", borderCollapse:"collapse", ...sans, fontSize:13 }}>
             <thead>
               <tr style={{ background:"#0f172a" }}>
-                {["Ticker","Signal","Alert Time","Alert Price","Current","Chg %","Pct-B","RSI","Vol Ratio",""].map(h => (
+                {["Ticker","Signal","Alert Time","Alert Price","Current","Chg %","Pct-B","RSI","Vol Ratio","Tape",""].map(h => (
                   <th key={h} style={{ padding:"8px 10px", textAlign:"left", color:C.muted,
                     fontSize:11, fontWeight:600, textTransform:"uppercase", letterSpacing:0.5,
                     borderBottom:`1px solid ${C.border}` }}>{h}</th>
@@ -3934,6 +4005,28 @@ function WatchlistTab() {
                       {e.vol_ratio != null ? `${e.vol_ratio.toFixed(2)}×` : "—"}
                     </td>
                     <td style={{ padding:"8px 10px" }}>
+                      {e.tape_label && e.tape_label !== "NO DATA" ? (
+                        <span title={`CVD score: ${e.tape_score != null ? e.tape_score.toFixed(4) : "—"}`}
+                          style={{
+                            background: e.tape_label.includes("BULL") ? "#14532d44"
+                              : e.tape_label.includes("BEAR") ? "#450a0a44" : "#1e293b",
+                            color: e.tape_label.includes("STRONGLY BULL") ? "#4ade80"
+                              : e.tape_label.includes("BULL") ? "#86efac"
+                              : e.tape_label.includes("STRONGLY BEAR") ? "#f87171"
+                              : e.tape_label.includes("BEAR") ? "#fca5a5" : C.muted,
+                            border: `1px solid ${
+                              e.tape_label.includes("BULL") ? "#16a34a44"
+                              : e.tape_label.includes("BEAR") ? "#7f1d1d44" : C.border}`,
+                            borderRadius:4, padding:"2px 6px", fontSize:10, fontWeight:700,
+                            whiteSpace:"nowrap"
+                          }}>
+                          {e.tape_confirmed ? "✓ " : ""}{e.tape_label.replace("STRONGLY ", "S.")}
+                        </span>
+                      ) : (
+                        <span style={{ color:C.muted, fontSize:11 }}>—</span>
+                      )}
+                    </td>
+                    <td style={{ padding:"8px 10px" }}>
                       <button onClick={() => remove(e.ticker)} style={{
                         background:"none", border:"none", color:C.muted, cursor:"pointer",
                         fontSize:16, lineHeight:1, padding:"2px 6px",
@@ -3944,6 +4037,384 @@ function WatchlistTab() {
               })}
             </tbody>
           </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+// ── Live Tape Tab ─────────────────────────────────────────────────────────
+function TapeTab() {
+  const [ticker,    setTicker]  = useState("MSFT");
+  const [blockSize, setBlock]   = useState(5000);
+  const [running,   setRunning] = useState(false);
+  const [status,    setStatus]  = useState("idle");   // idle|connecting|live|error
+  const [errMsg,    setErrMsg]  = useState("");
+  const [ticks,     setTicks]   = useState([]);        // newest first, max 200
+  const [stats,     setStats]   = useState(null);
+  const wsRef = useRef(null);
+
+  const stop = useCallback(() => {
+    if (wsRef.current) { wsRef.current.close(); wsRef.current = null; }
+    setRunning(false);
+    setStatus("idle");
+  }, []);
+
+  const start = useCallback(() => {
+    stop();
+    const sym = ticker.trim().toUpperCase();
+    if (!sym) return;
+    setStatus("connecting");
+    setTicks([]);
+    setStats(null);
+    setErrMsg("");
+
+    const ws = new WebSocket(`ws://localhost:8000/ws/tape/${sym}?block=${blockSize}`);
+    wsRef.current = ws;
+
+    ws.onmessage = (e) => {
+      const msg = JSON.parse(e.data);
+      if (msg.type === "connected") {
+        setRunning(true);
+        setStatus("live");
+      } else if (msg.type === "error") {
+        setErrMsg(msg.message);
+        setStatus("error");
+        setRunning(false);
+      } else if (msg.type === "tick") {
+        setStats({
+          price:         msg.price,
+          vwap:          msg.vwap,
+          cum_vol:       msg.cum_vol,
+          buy_vol:       msg.buy_vol,
+          sell_vol:      msg.sell_vol,
+          delta:         msg.delta,
+          block_count:   msg.block_count,
+          open_price:    msg.open_price,
+          pct_from_open: msg.pct_from_open,
+          vwap_story:    msg.vwap_story,
+          delta_story:   msg.delta_story,
+          direction:     msg.direction,
+        });
+        setTicks(prev => [msg, ...prev].slice(0, 200));
+      }
+    };
+    ws.onclose = () => { setRunning(false); };
+    ws.onerror = () => {
+      setErrMsg("WebSocket connection failed — is the backend running on port 8000?");
+      setStatus("error");
+      setRunning(false);
+    };
+  }, [ticker, blockSize, stop]);
+
+  useEffect(() => () => stop(), [stop]);
+
+  const dirArrow = (d) => d > 0 ? "↑" : d < 0 ? "↓" : "→";
+  const dirCol   = (d) => d > 0 ? C.bull : d < 0 ? C.bear : C.neutral;
+
+  const fmtV = (v) => {
+    if (v == null) return "—";
+    if (v >= 1e6)  return `${(v/1e6).toFixed(2)}M`;
+    if (v >= 1e3)  return `${(v/1e3).toFixed(1)}K`;
+    return String(v);
+  };
+
+  const statusBadge = () => {
+    if (status === "live")       return { label:"● LIVE",          color:C.bull };
+    if (status === "connecting") return { label:"○ CONNECTING…",   color:C.neutral };
+    if (status === "error")      return { label:"✕ ERROR",         color:C.bear };
+    return                              { label:"○ NOT STARTED",   color:C.muted };
+  };
+  const badge = statusBadge();
+
+  const MetricBox = ({ label, value, sub, color }) => (
+    <div style={{ background:C.card, border:`1px solid ${C.border}`, borderRadius:10,
+      padding:"14px 12px", textAlign:"center", boxShadow:"0 1px 4px rgba(0,0,0,0.07)" }}>
+      <div style={{ ...sans, fontSize:10, color:C.muted, textTransform:"uppercase",
+        letterSpacing:1, marginBottom:6 }}>{label}</div>
+      <div style={{ ...mono, fontSize:22, fontWeight:800, color: color||C.white }}>{value}</div>
+      {sub && <div style={{ ...sans, fontSize:10, color:color||C.muted, marginTop:3 }}>{sub}</div>}
+    </div>
+  );
+
+  return (
+    <div>
+      {/* Header */}
+      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start",
+        marginBottom:16, flexWrap:"wrap", gap:10 }}>
+        <div>
+          <div style={{ ...sans, fontSize:17, fontWeight:700, color:C.white }}>Live Tape Reader</div>
+          <div style={{ ...sans, fontSize:12, color:C.muted, marginTop:2 }}>
+            Every trade that happens in real time — who is buying, who is selling, and what it means
+          </div>
+        </div>
+        <span style={{ ...mono, fontSize:11, color:badge.color, padding:"4px 12px",
+          border:`1px solid ${badge.color}44`, borderRadius:20,
+          background:`${badge.color}11`, whiteSpace:"nowrap" }}>
+          {badge.label}
+        </span>
+      </div>
+
+      {/* Controls */}
+      <Card style={{ marginBottom:14 }}>
+        <div style={{ display:"flex", gap:12, alignItems:"flex-end", flexWrap:"wrap" }}>
+          <div>
+            <div style={{ ...sans, fontSize:11, color:C.muted, marginBottom:4 }}>Ticker</div>
+            <input
+              value={ticker}
+              onChange={e => setTicker(e.target.value.toUpperCase())}
+              onKeyDown={e => e.key==="Enter" && !running && start()}
+              disabled={running}
+              placeholder="MSFT"
+              style={{ ...mono, fontSize:15, fontWeight:700, width:90, padding:"6px 10px",
+                border:`1px solid ${C.border}`, borderRadius:6, background:C.dim,
+                color:C.text, outline:"none" }}
+            />
+          </div>
+          <div>
+            <div style={{ ...sans, fontSize:11, color:C.muted, marginBottom:4 }}>
+              Block alert ≥ (shares)
+            </div>
+            <input
+              type="number"
+              value={blockSize}
+              onChange={e => setBlock(Number(e.target.value))}
+              disabled={running}
+              style={{ ...mono, fontSize:13, width:100, padding:"6px 10px",
+                border:`1px solid ${C.border}`, borderRadius:6, background:C.dim,
+                color:C.text, outline:"none" }}
+            />
+          </div>
+          {!running ? (
+            <button onClick={start} style={{
+              ...sans, fontSize:13, fontWeight:700, padding:"8px 22px", borderRadius:6,
+              background:C.accent, border:"none", color:"#fff", cursor:"pointer" }}>
+              ▶ Start
+            </button>
+          ) : (
+            <button onClick={stop} style={{
+              ...sans, fontSize:13, fontWeight:700, padding:"8px 22px", borderRadius:6,
+              background:C.bear, border:"none", color:"#fff", cursor:"pointer" }}>
+              ■ Stop
+            </button>
+          )}
+          {status === "connecting" && (
+            <span style={{ ...sans, fontSize:12, color:C.muted }}>
+              <span className="spin">⟳</span> Connecting to TWS…
+            </span>
+          )}
+        </div>
+
+        {errMsg && (
+          <div style={{ marginTop:10, padding:"8px 12px", background:`${C.bear}11`,
+            border:`1px solid ${C.bear}33`, borderRadius:6, ...sans, fontSize:12, color:C.bear }}>
+            ⚠ {errMsg}
+          </div>
+        )}
+
+        <div style={{ marginTop:12, padding:"10px 12px", background:C.dim, borderRadius:6,
+          ...sans, fontSize:11, color:C.muted, lineHeight:1.7 }}>
+          <b>What is the tape?</b> The tape shows every single trade that executes for this stock —
+          the exact price, number of shares, and which direction the price moved. Small trades (under {blockSize.toLocaleString()} shares)
+          are usually individual investors. Large "block" trades come from institutions like funds and banks
+          moving serious money. Watching the tape tells you who is in control of the price right now.
+        </div>
+      </Card>
+
+      {/* Live stats bar */}
+      {stats && (() => {
+        const priceCol = dirCol(stats.direction);
+        const deltaCol = stats.delta >= 0 ? C.bull : C.bear;
+        const pctStr   = stats.pct_from_open != null
+          ? `${stats.pct_from_open >= 0 ? "+" : ""}${stats.pct_from_open.toFixed(2)}% from open`
+          : null;
+        return (
+          <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fill,minmax(150px,1fr))",
+            gap:10, marginBottom:14 }}>
+            <MetricBox
+              label="Last Trade Price"
+              value={`$${stats.price.toFixed(2)}`}
+              sub={pctStr}
+              color={priceCol}
+            />
+            <MetricBox
+              label="VWAP (Today's Avg)"
+              value={`$${stats.vwap.toFixed(2)}`}
+              sub="Volume-weighted avg price"
+              color={C.neutral}
+            />
+            <MetricBox
+              label="Volume Seen"
+              value={fmtV(stats.cum_vol)}
+              sub="Shares captured on tape"
+            />
+            <MetricBox
+              label={stats.delta >= 0 ? "Net Buyers" : "Net Sellers"}
+              value={`${stats.delta >= 0 ? "+" : ""}${fmtV(Math.abs(stats.delta))}`}
+              sub={stats.delta >= 0 ? "More bought than sold" : "More sold than bought"}
+              color={deltaCol}
+            />
+            <MetricBox
+              label="Block Trades"
+              value={stats.block_count}
+              sub={`Large prints ≥ ${blockSize.toLocaleString()}`}
+              color="#8b5cf6"
+            />
+          </div>
+        );
+      })()}
+
+      {/* Plain-English market story */}
+      {stats && (
+        <Card title="What Is The Market Telling Us Right Now?" style={{ marginBottom:14 }}>
+          <div style={{ ...sans, fontSize:13, color:C.text, lineHeight:1.8 }}>
+            <p style={{ marginBottom:8 }}>
+              <b style={{ color: stats.delta >= 0 ? C.bull : C.bear }}>
+                {stats.delta >= 0 ? "Buyers" : "Sellers"} are currently in control.&nbsp;
+              </b>
+              {stats.delta_story}.
+            </p>
+            <p style={{ marginBottom:8 }}>
+              <b>Price vs. today's average: </b>{stats.vwap_story}.
+            </p>
+            {stats.block_count > 0 && (
+              <p style={{ color:"#7c3aed", fontWeight:600 }}>
+                {stats.block_count} large block trade{stats.block_count > 1 ? "s" : ""} detected —
+                institutional money (funds, banks, desks) is active in this name today.
+              </p>
+            )}
+          </div>
+
+          <div style={{ marginTop:12, padding:"10px 12px", background:C.dim, borderRadius:6,
+            ...sans, fontSize:11, color:C.muted, lineHeight:1.7 }}>
+            <b>Reading guide:</b>&nbsp;
+            <b style={{color:C.bull}}>↑ green rows</b> = the last trade happened at a higher price (buyers stepping up).&nbsp;
+            <b style={{color:C.bear}}>↓ red rows</b> = the last trade happened at a lower price (sellers pushing down).&nbsp;
+            <b style={{color:"#8b5cf6"}}>🏦 BLOCK rows</b> = a large institution traded.
+            These moves often signal conviction — watch whether they happen above or below VWAP.
+          </div>
+        </Card>
+      )}
+
+      {/* Live tape table */}
+      {ticks.length > 0 && (
+        <Card style={{ padding:0, overflow:"hidden" }}>
+          <div style={{ padding:"12px 16px", borderBottom:`1px solid ${C.border}`,
+            display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+            <span style={{ ...sans, fontSize:13, fontWeight:700, color:C.white }}>
+              Trade Prints — {ticker.toUpperCase()}&nbsp;
+              <span style={{ ...mono, fontSize:11, color:C.muted }}>
+                ({ticks.length} prints shown, newest first)
+              </span>
+            </span>
+            <span style={{ ...sans, fontSize:11, color:C.muted }}>
+              Newest at top · Max 200 rows kept in view
+            </span>
+          </div>
+
+          <div style={{ overflowX:"auto", maxHeight:500, overflowY:"auto" }}>
+            <table style={{ fontSize:12, width:"100%" }}>
+              <thead style={{ position:"sticky", top:0, background:C.surface, zIndex:1 }}>
+                <tr>
+                  {["Time","Price","Shares","Dir","Exchange","What Happened"].map(h => (
+                    <th key={h} style={{ ...mono, fontSize:10, color:C.muted, fontWeight:600,
+                      textTransform:"uppercase", letterSpacing:0.5,
+                      borderBottom:`1px solid ${C.border}`, padding:"7px 10px",
+                      whiteSpace:"nowrap" }}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {ticks.map((t, i) => {
+                  const col = dirCol(t.direction);
+                  if (t.is_block) {
+                    return (
+                      <tr key={i} style={{
+                        background: t.direction >= 0 ? `${C.bull}14` : `${C.bear}14`,
+                        borderLeft: `4px solid ${col}`,
+                      }}>
+                        <td style={{ ...mono, fontSize:11, color:col, padding:"9px 10px", whiteSpace:"nowrap" }}>
+                          {t.time}
+                        </td>
+                        <td style={{ ...mono, fontSize:14, fontWeight:800, color:col, padding:"9px 10px" }}>
+                          ${t.price.toFixed(2)}
+                        </td>
+                        <td style={{ ...mono, fontSize:13, fontWeight:700, color:col, padding:"9px 10px" }}>
+                          {t.size.toLocaleString()}
+                        </td>
+                        <td style={{ ...mono, fontSize:16, color:col, padding:"9px 10px" }}>
+                          {dirArrow(t.direction)}
+                        </td>
+                        <td style={{ ...mono, fontSize:11, padding:"9px 10px" }}>
+                          <span style={{ color:col }}>{t.exchange}</span>
+                          {t.is_after_hours && (
+                            <span style={{ ...mono, fontSize:9, color:"#8b5cf6",
+                              marginLeft:4, background:"#8b5cf611", padding:"1px 5px", borderRadius:8 }}>
+                              AH
+                            </span>
+                          )}
+                        </td>
+                        <td style={{ ...sans, fontSize:12, color:col, fontWeight:600, padding:"9px 10px" }}>
+                          🏦 {t.block_story || t.what_happened}
+                        </td>
+                      </tr>
+                    );
+                  }
+                  return (
+                    <tr key={i} style={{ borderBottom:`1px solid ${C.border}` }}>
+                      <td style={{ ...mono, fontSize:11, color:C.muted, padding:"5px 10px", whiteSpace:"nowrap" }}>
+                        {t.time}
+                      </td>
+                      <td style={{ ...mono, fontSize:12, fontWeight:700, color:col, padding:"5px 10px" }}>
+                        ${t.price.toFixed(2)}
+                      </td>
+                      <td style={{ ...mono, fontSize:12, color:C.text, padding:"5px 10px" }}>
+                        {t.size.toLocaleString()}
+                      </td>
+                      <td style={{ ...mono, fontSize:14, color:col, padding:"5px 10px" }}>
+                        {dirArrow(t.direction)}
+                      </td>
+                      <td style={{ ...mono, fontSize:11, color:C.muted, padding:"5px 10px" }}>
+                        {t.exchange}
+                        {t.is_after_hours && (
+                          <span style={{ ...mono, fontSize:9, color:"#8b5cf6",
+                            marginLeft:4, background:"#8b5cf611", padding:"1px 5px", borderRadius:8 }}>
+                            AH
+                          </span>
+                        )}
+                      </td>
+                      <td style={{ ...sans, fontSize:12, color:C.muted, padding:"5px 10px" }}>
+                        {t.what_happened}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </Card>
+      )}
+
+      {/* Empty states */}
+      {running && ticks.length === 0 && (
+        <div style={{ textAlign:"center", padding:"60px 20px" }}>
+          <div style={{ fontSize:32, marginBottom:12 }}>📡</div>
+          <div style={{ ...sans, fontSize:15, color:C.muted }}>Waiting for trade prints…</div>
+          <div style={{ ...sans, fontSize:12, color:C.muted, marginTop:6 }}>
+            Ticks will appear as soon as shares trade. During pre-market or after-hours,
+            volume is lower so prints may be infrequent — this is normal.
+          </div>
+        </div>
+      )}
+
+      {!running && status === "idle" && (
+        <div style={{ textAlign:"center", padding:"60px 20px" }}>
+          <div style={{ fontSize:32, marginBottom:12 }}>📈</div>
+          <div style={{ ...sans, fontSize:15, color:C.muted }}>Enter a ticker and press Start</div>
+          <div style={{ ...sans, fontSize:12, color:C.muted, marginTop:6 }}>
+            Requires TWS or IB Gateway to be running and connected on port {7497}.
+          </div>
         </div>
       )}
     </div>
@@ -3990,6 +4461,7 @@ function App() {
     { id:"decisions",  label:"Decisions"   },
     { id:"technicals", label:"Technicals"  },
     { id:"watchlist",  label:"Watchlist 📡" },
+    { id:"tape",       label:"Live Tape 📈" },
   ];
 
   const deltaCol = netDelta == null ? C.muted : netDelta >= 0 ? C.bull : C.bear;
@@ -4045,6 +4517,7 @@ function App() {
         <div style={{display: tab==="decisions"  ? "" : "none"}}><DecisionsTab /></div>
         <div style={{display: tab==="technicals" ? "" : "none"}}><TechnicalsTab /></div>
         <div style={{display: tab==="watchlist"  ? "" : "none"}}><WatchlistTab /></div>
+        <div style={{display: tab==="tape"       ? "" : "none"}}><TapeTab /></div>
 
         <div style={{ marginTop:20, ...sans, fontSize:11, color:C.muted, lineHeight:1.7 }}>
           Auto-trader: Kelly sizing · 50% profit target · IV-adjusted stops · 21 DTE roll · 48h cooldown. Backtest: 2-yr simulation with BS pricing.

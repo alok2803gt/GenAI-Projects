@@ -25,7 +25,7 @@ import numpy as np
 import pandas as pd
 import uvicorn
 import yfinance as yf
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from ib_insync import IB, LimitOrder, Option, Stock, util
 from pydantic import BaseModel
@@ -53,10 +53,36 @@ HISTORY_DURATION = "5 D"
 BUY_THRESHOLD = 0.55
 SELL_THRESHOLD = 0.45
 
+# ── Tape reader — client-ID pool (IDs 20-29 reserved for live tape WebSockets) ─
+_TAPE_CLIENT_ID_POOL: set = set(range(20, 30))
+_tape_pool_lock = threading.Lock()
+
+def _acquire_tape_cid() -> Optional[int]:
+    with _tape_pool_lock:
+        if not _TAPE_CLIENT_ID_POOL:
+            return None
+        cid = min(_TAPE_CLIENT_ID_POOL)
+        _TAPE_CLIENT_ID_POOL.discard(cid)
+        return cid
+
+def _release_tape_cid(cid: int) -> None:
+    with _tape_pool_lock:
+        _TAPE_CLIENT_ID_POOL.add(cid)
+
+def _tape_fmt_vol(v: int) -> str:
+    if v >= 1_000_000: return f"{v / 1_000_000:.2f}M"
+    if v >= 1_000:     return f"{v / 1_000:.1f}K"
+    return str(v)
+
+
 FEATURE_COLS = [
     "rsi", "sma5", "sma14", "momentum",
     "vol_ratio", "body_pct", "upper_wick", "lower_wick", "volatility"
 ]
+
+# ── Tape sentiment — CVD scoring ───────────────────────────────────────────
+TAPE_SENTIMENT_MAX_TICKERS = 20   # cap on reqMktData subscriptions for tape
+TAPE_STALENESS_SECS        = 1800 # score treated as 0.0 (neutral) when older than 30 min
 
 
 class _FlowAbort(Exception):
@@ -205,6 +231,8 @@ state: Dict = {
             # Auto-hedge
             "auto_hedge":        False,
             "hedge_threshold":   100.0,
+            # Tape sentiment filter — when False: scores collected but never block trades
+            "tape_filter_enabled": True,
         },
         "positions":          {},     # contract_key → entry metadata
         "stopped_out":        {},     # ticker → ISO timestamp of last stop-loss (48h cooldown)
@@ -215,6 +243,9 @@ state: Dict = {
         "leap_pnl":           0.0,    # cumulative realized LEAP P&L (can be negative)
         "leap_budget":        0.0,    # 50% of CSP income + LEAP P&L (net available)
     },
+    # CVD tape sentiment (populated by reqMktData "233,375" subscriptions)
+    "tape_sentiment": {},  # ticker → per-ticker CVD state dict
+    "tape_subs":      {},  # ticker → ib_insync Ticker object from reqMktData
     # Breakout-scanner watchlist (populated via POST /watchlist/alert)
     "watchlist": {},   # ticker → {signal_type, timestamp_et, price_at_alert, pct_b, rsi, vol_ratio}
     # Reconnect request (set by /reconnect endpoint, read by streaming loop)
@@ -377,6 +408,247 @@ async def subscribe_ticker(ib: IB, ticker: str) -> None:
     on_bar_update(ticker, bars, False)
     log.info(f"Streaming  {ticker}  ({len(bars)} bars seeded)")
 
+    # ── Tape sentiment subscription ─────────────────────────────────────────
+    # Cap at TAPE_SENTIMENT_MAX_TICKERS to stay within standard market-data lines.
+    # Bootstrap avg_vol_per_bar from the historical bars already fetched above.
+    if ticker not in state["tape_subs"] and len(state["tape_subs"]) < TAPE_SENTIMENT_MAX_TICKERS:
+        try:
+            df_vol = _bars_to_df(bars)
+            avg_5min = float(df_vol["volume"].mean()) if not df_vol.empty else 0.0
+        except Exception:
+            avg_5min = 0.0
+        avg_per_min = avg_5min / 5.0   # BAR_SIZE is "5 mins"
+
+        if ticker not in state["tape_sentiment"]:
+            state["tape_sentiment"][ticker] = _tape_initial_state()
+        state["tape_sentiment"][ticker]["avg_vol_per_bar"] = avg_per_min
+
+        tape_tkr = ib.reqMktData(contract, "233,375", False, False)
+        state["tape_subs"][ticker]              = tape_tkr
+        state["tape_sentiment"][ticker]["sub_active"] = True
+        tape_tkr.updateEvent += _make_tape_callback(ticker)
+        log.info("Tape sentiment subscribed for %s (avg_vol_per_bar=%.0f)", ticker, avg_per_min)
+
+
+# ── CVD Tape Sentiment helpers ─────────────────────────────────────────────
+
+def _tape_initial_state() -> dict:
+    """Return a zeroed tape sentiment state for a new ticker subscription."""
+    return {
+        "_last_rtv":          math.nan,  # last tkr.rtTradeVolume processed; nan != nan guards first tick
+        "session_vwap":       0.0,
+        "session_vol":        0,
+        "last_price":         None,
+        "last_dir":           0,         # +1 / -1 carry-forward for tick rule
+        "bars":               [],        # closed 1-min bars: [{delta, vol, open, close}], max 20
+        "cur_bar":            {"delta": 0, "vol": 0, "open": 0.0, "last": 0.0, "minute": -1},
+        "price_history":      [],        # last 100 trade prices (for VWAP std-dev)
+        "avg_vol_per_bar":    0.0,       # seeded from 5-day bars at subscribe time
+        "score":              0.0,
+        "label":              "NEUTRAL",
+        "components":         {"cvd": 0.0, "vwap_z": 0.0, "vol_mag": 0.0, "div_mult": 1.0},
+        "last_updated":       None,      # ISO UTC string; None → treated as stale
+        "sub_active":         False,
+        "_first_tick_logged": False,
+    }
+
+
+def _tape_is_fresh(sent: dict) -> bool:
+    """True when tape sentiment data was updated within TAPE_STALENESS_SECS (30 min)."""
+    lu = sent.get("last_updated")
+    if not lu:
+        return False
+    try:
+        age = (datetime.utcnow() - datetime.fromisoformat(lu)).total_seconds()
+        return age < TAPE_STALENESS_SECS
+    except Exception:
+        return False
+
+
+def _update_tape_bar(sym: str, price: float, size: int, direction: int) -> None:
+    """Accumulate a trade into the current 1-minute bar; close the bar on minute rollover."""
+    from zoneinfo import ZoneInfo
+    sent = state["tape_sentiment"].get(sym)
+    if sent is None:
+        return
+    try:
+        now_et = datetime.now(ZoneInfo("America/New_York"))
+    except Exception:
+        now_et = datetime.now()
+    minute = now_et.hour * 60 + now_et.minute
+    cur = sent["cur_bar"]
+
+    if cur["minute"] != minute:                 # minute boundary — close current bar
+        if cur["vol"] > 0:
+            sent["bars"].append({
+                "delta": cur["delta"],
+                "vol":   cur["vol"],
+                "open":  cur["open"],
+                "close": cur["last"],
+            })
+            if len(sent["bars"]) > 20:          # rolling window: keep last 20 bars
+                sent["bars"].pop(0)
+        sent["cur_bar"] = {
+            "delta": direction * size, "vol": size,
+            "open": price, "last": price, "minute": minute,
+        }
+    else:
+        cur["delta"] += direction * size
+        cur["vol"]   += size
+        cur["last"]   = price
+        if cur["open"] == 0.0:
+            cur["open"] = price
+
+    ph = sent["price_history"]
+    ph.append(price)
+    if len(ph) > 100:
+        ph.pop(0)
+
+
+def _compute_tape_score(sym: str) -> tuple:
+    """Compute the 4-component CVD composite score. Returns (score, label, components_dict)."""
+    sent = state["tape_sentiment"].get(sym)
+    if sent is None:
+        return 0.0, "NEUTRAL", {}
+
+    bars = sent["bars"]
+
+    # Component 1: Normalized rolling CVD (45%)
+    # Rolling 15 bars; need ≥3 bars — guard fires at open before enough history
+    last15    = bars[-15:] if len(bars) >= 3 else []
+    total_vol = sum(b["vol"] for b in last15)
+    cvd_score = (sum(b["delta"] for b in last15) / total_vol
+                 if last15 and total_vol > 0 else 0.0)
+    cvd_score = float(np.clip(cvd_score, -1.0, 1.0))
+
+    # Component 2: VWAP deviation z-score (30%)
+    # Guard: std < 0.01 or < 10 price samples → 0.0 (prevents divide-by-zero at open)
+    ph   = sent["price_history"]
+    vwap = sent.get("session_vwap", 0.0)
+    lp   = sent.get("last_price") or vwap
+    if len(ph) >= 10 and vwap > 0 and lp:
+        std = float(np.std(ph[-20:])) if len(ph) >= 20 else float(np.std(ph))
+        vwap_z = (float(np.clip((lp - vwap) / std, -1.0, 1.0))
+                  if std >= 0.01 else 0.0)
+    else:
+        vwap_z = 0.0
+
+    # Component 3: Volume-weighted delta magnitude (15%)
+    # TOD normalization: 3-bucket multiplier adjusts for intraday volume bias
+    # v1: 3 buckets (open/close 2×, lunch 0.6×, normal 1×). Graduated curve deferred to v2.
+    try:
+        from zoneinfo import ZoneInfo
+        hour = datetime.now(ZoneInfo("America/New_York")).hour
+    except Exception:
+        hour = datetime.now().hour
+    tod = 2.0 if (hour < 10 or hour >= 15) else 0.6 if (12 <= hour < 13) else 1.0
+    adj_avg   = sent.get("avg_vol_per_bar", 0.0) * tod
+    cur       = sent["cur_bar"]
+    cur_ratio = cur["delta"] / cur["vol"] if cur["vol"] > 0 else 0.0
+    vol_mag   = (float(np.clip(cur_ratio * min(2.0, cur["vol"] / adj_avg), -1.0, 1.0))
+                 if adj_avg > 0 else 0.0)
+
+    # Component 4: Divergence multiplier (binary, v1)
+    # Price up + CVD down = buyer exhaustion. Price down + CVD up = seller absorption.
+    # Guard: fewer than 5 bars (market just opened) → no divergence penalty
+    # v1: binary 0.5/1.0. Graduated version using corr(price_returns, bar_deltas) deferred to v2.
+    if len(bars) < 5:
+        div_mult = 1.0
+    else:
+        price_up = bars[-1]["close"] > bars[-5]["close"]
+        cvd_running, cvd_series = 0, []
+        for b in bars[-5:]:
+            cvd_running += b["delta"]
+            cvd_series.append(cvd_running)
+        cvd_up   = cvd_series[-1] > cvd_series[0]
+        div_mult = 0.5 if (price_up != cvd_up) else 1.0
+
+    composite = 0.45 * cvd_score + 0.30 * vwap_z + 0.15 * vol_mag
+    score     = float(np.clip(composite * div_mult, -1.0, 1.0))
+
+    if   score >  0.50: label = "STRONGLY BULLISH"
+    elif score >  0.25: label = "BULLISH"
+    elif score < -0.50: label = "STRONGLY BEARISH"
+    elif score < -0.25: label = "BEARISH"
+    else:               label = "NEUTRAL"
+
+    return round(score, 4), label, {
+        "cvd":      round(cvd_score, 4),
+        "vwap_z":   round(vwap_z,   4),
+        "vol_mag":  round(vol_mag,  4),
+        "div_mult": div_mult,
+    }
+
+
+def _make_tape_callback(sym: str):
+    """Factory: returns an on_tape_update closure bound to sym for updateEvent registration."""
+    def on_tape_update(tkr) -> None:
+        # ── Dedup on rtTradeVolume sentinel ──────────────────────────────────
+        # nan != nan in Python — so first tick (cur_rtv is a real number,
+        # _last_rtv is nan) always passes through. This is the correct behaviour.
+        cur_rtv = tkr.rtTradeVolume
+        if cur_rtv is None or math.isnan(cur_rtv):
+            return
+        sent = state["tape_sentiment"].get(sym)
+        if sent is None:
+            return
+        if cur_rtv == sent.get("_last_rtv", math.nan):
+            return                          # same trade; callback fired for another field
+        sent["_last_rtv"] = cur_rtv
+
+        # ── Price and size ────────────────────────────────────────────────────
+        price = tkr.last
+        size  = tkr.lastSize          # typed float in ib_insync Ticker; cast to int below
+        if price is None or math.isnan(price) or price <= 0:
+            return
+        if size  is None or math.isnan(size)  or size  <= 0:
+            # size <= 0 also filters odd-lot prints (lastSize == 0 for < 100-share fills)
+            return
+
+        # ── Session VWAP and volume from IBKR's own calculation (tick 233) ──
+        if tkr.vwap and not math.isnan(tkr.vwap) and tkr.vwap > 0:
+            sent["session_vwap"] = tkr.vwap
+        if tkr.volume and not math.isnan(tkr.volume):
+            sent["session_vol"] = int(tkr.volume)
+
+        # ── Live NBBO — read directly from Ticker, no stale prev_bid/ask lag ─
+        bid = tkr.bid if tkr.bid and not math.isnan(tkr.bid) and tkr.bid > 0 else None
+        ask = tkr.ask if tkr.ask and not math.isnan(tkr.ask) and tkr.ask > 0 else None
+
+        # ── Quote rule → tick rule fallback ──────────────────────────────────
+        lp = sent.get("last_price")
+        if ask and price >= ask:
+            direction = 1
+        elif bid and price <= bid:
+            direction = -1
+        elif lp and price > lp:
+            direction = 1;  sent["last_dir"] = 1
+        elif lp and price < lp:
+            direction = -1; sent["last_dir"] = -1
+        else:
+            direction = sent.get("last_dir", 0)
+
+        sent["last_price"] = price
+
+        # ── First-tick runtime field-mapping verification ────────────────────
+        if not sent.get("_first_tick_logged"):
+            log.debug(
+                "Tape first tick [%s]: last=%.2f lastSize=%d vwap=%.4f vol=%d rtv=%.0f",
+                sym, price, int(size),
+                sent.get("session_vwap", 0), sent.get("session_vol", 0), cur_rtv,
+            )
+            sent["_first_tick_logged"] = True
+
+        # ── Update 1-minute bar buffer and recompute score ────────────────────
+        _update_tape_bar(sym, price, int(size), direction)
+        score, label, components = _compute_tape_score(sym)
+        sent["score"]      = score
+        sent["label"]      = label
+        sent["components"] = components
+        sent["last_updated"] = datetime.utcnow().isoformat()
+
+    return on_tape_update
+
 
 async def _subscribe_pending(ib: IB, known: set) -> set:
     with _tickers_lock:
@@ -400,6 +672,11 @@ async def streaming_loop_async() -> None:
                 if errorCode == 1102:
                     ctx["known"] = set()
                     state["subscriptions"].clear()
+                    # Tape subscriptions are on the same connection — mark inactive so
+                    # subscribe_ticker re-subscribes them as tickers are re-added.
+                    state["tape_subs"].clear()
+                    for _ts in state["tape_sentiment"].values():
+                        _ts["sub_active"] = False
                     log.info("IBKR reconnected (1102) — re-subscribing all tickers within 10 s")
                 elif errorCode in (2104, 2106, 2158, 2119):
                     pass  # benign farm/connectivity notifications
@@ -1542,6 +1819,21 @@ def _filter_csp_recommended(candidates: list, log_diag: bool = False) -> list:
             f"[warnings:{n_warnings} liq:{n_liq} iv_rank:{n_iv} "
             f"score:{n_score} trend(sma20/50/200):{n_trend} earnings:{n_earnings}]")
 
+    # ── Tape sentiment filter (CSP: block when score < −0.30 and data is fresh) ─
+    if state.get("autotrader", {}).get("config", {}).get("tape_filter_enabled", True):
+        tape_clean = []
+        for r in clean:
+            sent  = state["tape_sentiment"].get(r["ticker"], {})
+            score = sent.get("score", 0.0)
+            if _tape_is_fresh(sent) and score < -0.30:
+                if log_diag:
+                    _at_log("SCAN",
+                        f"Tape filter excluded {r['ticker']} CSP: "
+                        f"score={score:+.2f} ({sent.get('label','?')}) — net sellers in control")
+            else:
+                tape_clean.append(r)
+        clean = tape_clean
+
     # Augment with learned model score if available
     for r in clean:
         ls = _learned_score(r)
@@ -1561,6 +1853,20 @@ def _filter_leap_recommended(candidates: list) -> list:
              if not any("excl. recommended" in w for w in r.get("warnings", []))
              and r["liquidity_score"] >= 60
              and r.get("iv_rank", 50) <= 75]   # avoid buying when IV is too elevated
+
+    # ── Tape sentiment filter (LEAP: block when score < 0.10 and data is fresh) ─
+    if state.get("autotrader", {}).get("config", {}).get("tape_filter_enabled", True):
+        tape_clean = []
+        for r in clean:
+            sent  = state["tape_sentiment"].get(r["ticker"], {})
+            score = sent.get("score", 0.0)
+            if _tape_is_fresh(sent) and score < 0.10:
+                log.info("Tape filter excluded %s LEAP: score=%+.2f (%s) — needs bullish tape",
+                         r["ticker"], score, sent.get("label", "?"))
+            else:
+                tape_clean.append(r)
+        clean = tape_clean
+
     for r in clean:
         ls = _learned_score(r)
         r["learned_score"] = ls
@@ -2558,6 +2864,32 @@ async def _autotrader_place_coro(ib: IB, row: dict, cfg: dict, regime: str = "BU
     await ib.qualifyContractsAsync(contract)
     if not contract.conId:
         raise ValueError(f"Could not qualify {ticker} {expiry} {strike}{right}")
+    # ── Tape sentiment gate — re-check CVD score at execution time ────────────
+    # The scan snapshot can be minutes old; tape sentiment reflects real-time order flow.
+    # Tape never blocks when data is absent or stale — only blocks on confirmed bearish flow.
+    if state["autotrader"].get("config", {}).get("tape_filter_enabled", True):
+        _sent      = state["tape_sentiment"].get(ticker, {})
+        _tape_score = _sent.get("score", None)
+        if _tape_score is not None and _tape_is_fresh(_sent):
+            _tape_label = _sent.get("label", "NEUTRAL")
+            if t == "csp" and _tape_score < -0.30:
+                _abort_msg = (
+                    f"Tape bearish at execution: CVD score {_tape_score:+.4f} ({_tape_label}) "
+                    f"— net sellers in control. Aborting CSP {ticker} ${strike}P"
+                )
+                _at_log("SKIP", f"Tape gate: {_abort_msg}")
+                raise _FlowAbort(_abort_msg)
+            elif t == "leap" and _tape_score < 0.10:
+                _abort_msg = (
+                    f"Tape not bullish at execution: CVD score {_tape_score:+.4f} ({_tape_label}) "
+                    f"— LEAP requires bullish tape. Aborting LEAP {ticker} ${strike}C"
+                )
+                _at_log("SKIP", f"Tape gate: {_abort_msg}")
+                raise _FlowAbort(_abort_msg)
+            else:
+                log.info("Tape gate [%s %s]: score=%+.4f (%s) — PASS",
+                         ticker, t.upper(), _tape_score, _tape_label)
+
     # ── Live IBKR/OPRA price for limit order (replaces stale yfinance bid) ──
     live_iv_entry = None
     lmt           = None
@@ -2715,6 +3047,15 @@ async def _autotrader_place_coro(ib: IB, row: dict, cfg: dict, regime: str = "BU
         stop_loss  = round(leap_stop_pct * max_profit, 0)
     earn_note  = f"Earnings are {earn_days} days away — well outside the 14-day block window." if earn_days else "No upcoming earnings detected."
 
+    _tape_sent  = state["tape_sentiment"].get(ticker, {})
+    _tape_fresh = _tape_is_fresh(_tape_sent)
+    _tape_line  = (
+        f"Tape CVD score at entry: {_tape_sent['score']:+.2f} ({_tape_sent.get('label','NO DATA')}) "
+        f"[cvd={_tape_sent.get('components',{}).get('cvd',0):+.2f}, "
+        f"vwap_z={_tape_sent.get('components',{}).get('vwap_z',0):+.2f}, "
+        f"vol_mag={_tape_sent.get('components',{}).get('vol_mag',0):+.2f}]."
+    ) if _tape_fresh else "Tape sentiment: no fresh data at entry time."
+
     if t == "csp":
         headline = f"Sold {qty}× {ticker} ${strike} Put — {dte} DTE, collecting ${round(lmt*100*qty,0):.0f} premium"
         body = (
@@ -2729,7 +3070,7 @@ async def _autotrader_place_coro(ib: IB, row: dict, cfg: dict, regime: str = "BU
             f"**Risk:** Maximum profit is ${round(max_profit,0):.0f} if {ticker} stays above ${strike} "
             f"at expiration. "
             + (f"Stop-loss fires if the position loses more than ${stop_loss:.0f} ({stop_mult:.0f}× the premium collected). " if stop_loss else "No stop-loss — holding to expiry. ")
-            + earn_note
+            + earn_note + f"\n\n**{_tape_line}**"
         )
     else:
         headline = f"Bought {qty}× {ticker} ${strike} Call (LEAP) — {dte} DTE"
@@ -2742,7 +3083,7 @@ async def _autotrader_place_coro(ib: IB, row: dict, cfg: dict, regime: str = "BU
             f"at ${lmt:.2f}, total cost ~${round(lmt*100*qty,0):.0f}.\n\n"
             f"**Risk:** Maximum loss is the premium paid (${round(lmt*100*qty,0):.0f}) if {ticker} "
             f"stays below ${strike}. Stop-loss triggers at {int(stop_mult*100):.0f}% loss of cost "
-            f"(IV-adjusted: tighter in high-IV to limit crush risk). {earn_note}"
+            f"(IV-adjusted: tighter in high-IV to limit crush risk). {earn_note}\n\n**{_tape_line}**"
         )
     _decision_log("ENTER", ticker, headline, body)
     _at_save_state()
@@ -5128,7 +5469,9 @@ def watchlist_add_alert(req: WatchlistAlertRequest):
         _watchlist_save()
         return {"ok": True, "action": "refreshed"}
 
-    # New entry
+    # New entry — enrich with current tape sentiment at alert time
+    _wl_sent  = state["tape_sentiment"].get(tk, {})
+    _wl_fresh = _tape_is_fresh(_wl_sent)
     state["watchlist"][tk] = {
         "ticker":         tk,
         "signal_type":    req.signal_type,
@@ -5138,6 +5481,9 @@ def watchlist_add_alert(req: WatchlistAlertRequest):
         "vol_ratio":      round(req.vol_ratio, 2) if req.vol_ratio is not None else None,
         "timestamp_et":   req.timestamp_et or now_et.strftime("%H:%M ET %Y-%m-%d"),
         "added_iso":      now_et.isoformat(),
+        "tape_score":     round(_wl_sent["score"], 4) if _wl_fresh else None,
+        "tape_label":     _wl_sent.get("label", "NO DATA") if _wl_fresh else "NO DATA",
+        "tape_confirmed": bool(_wl_fresh and _wl_sent.get("score", 0.0) > 0.20),
     }
     _watchlist_save()
     return {"ok": True, "action": "added"}
@@ -5945,6 +6291,233 @@ def trigger_retrain():
         return result
     except Exception as exc:
         raise HTTPException(500, str(exc))
+
+
+# ── Tape Sentiment REST endpoints ─────────────────────────────────────────
+@app.get("/tape/sentiment")
+def tape_sentiment_all():
+    """Return CVD tape sentiment for all subscribed tickers."""
+    out = {}
+    for sym, sent in state["tape_sentiment"].items():
+        out[sym] = {
+            "score":       sent.get("score", 0.0),
+            "label":       sent.get("label", "NEUTRAL"),
+            "components":  sent.get("components", {}),
+            "session_vwap": sent.get("session_vwap", 0.0),
+            "session_vol": sent.get("session_vol", 0),
+            "last_updated": sent.get("last_updated"),
+            "sub_active":  sent.get("sub_active", False),
+            "fresh":       _tape_is_fresh(sent),
+        }
+    return out
+
+
+@app.get("/tape/sentiment/{ticker}")
+def tape_sentiment_single(ticker: str):
+    """Return CVD tape sentiment for a single ticker."""
+    sym  = ticker.upper()
+    sent = state["tape_sentiment"].get(sym)
+    if sent is None:
+        raise HTTPException(404, f"No tape sentiment data for {sym} — not subscribed or not in watchlist")
+    return {
+        "ticker":       sym,
+        "score":        sent.get("score", 0.0),
+        "label":        sent.get("label", "NEUTRAL"),
+        "components":   sent.get("components", {}),
+        "session_vwap": sent.get("session_vwap", 0.0),
+        "session_vol":  sent.get("session_vol", 0),
+        "last_updated": sent.get("last_updated"),
+        "sub_active":   sent.get("sub_active", False),
+        "fresh":        _tape_is_fresh(sent),
+    }
+
+
+# ── Live Tape WebSocket ─────────────────────────────────────────────────────
+@app.websocket("/ws/tape/{ticker}")
+async def ws_tape(websocket: WebSocket, ticker: str, block: int = Query(default=5000)):
+    """
+    Stream real-time tick-by-tick trade data (Time & Sales) for a stock.
+    Each message is a JSON object with the raw tick plus plain-English explanations.
+    Uses a separate IB client ID (pool 20-29) so it never conflicts with the main app.
+    """
+    await websocket.accept()
+
+    cid = _acquire_tape_cid()
+    if cid is None:
+        await websocket.send_json({
+            "type": "error",
+            "message": "Too many concurrent tape connections (max 10). Please try again shortly.",
+        })
+        await websocket.close()
+        return
+
+    tape_ib = IB()
+    contract = None
+
+    try:
+        await tape_ib.connectAsync(TWS_HOST, TWS_PORT, clientId=cid, timeout=15)
+
+        contract = Stock(ticker.upper(), "SMART", "USD")
+        await tape_ib.qualifyContractsAsync(contract)
+
+        # Per-session accumulators
+        cum_vol:    int   = 0
+        cum_pv:     float = 0.0
+        buy_vol:    int   = 0
+        sell_vol:   int   = 0
+        last_price: Optional[float] = None
+        last_dir:   int   = 0
+        open_price: Optional[float] = None
+        block_count: int  = 0
+        tick_idx:   int   = 0
+
+        tick_queue: asyncio.Queue = asyncio.Queue()
+
+        def _direction(price: float) -> int:
+            nonlocal last_price, last_dir
+            if last_price is None:      return 0
+            if price > last_price:      last_dir = 1
+            elif price < last_price:    last_dir = -1
+            return last_dir
+
+        def on_update(t):
+            nonlocal tick_idx
+            new = t.tickByTicks[tick_idx:]
+            tick_idx = len(t.tickByTicks)
+            for tk in new:
+                tick_queue.put_nowait(tk)
+
+        ticker_sub = tape_ib.reqTickByTickData(
+            contract, "AllLast", numberOfTicks=0, ignoreSize=False
+        )
+        ticker_sub.updateEvent += on_update
+
+        await websocket.send_json({"type": "connected", "ticker": ticker.upper(), "client_id": cid})
+
+        while True:
+            try:
+                tk = await asyncio.wait_for(tick_queue.get(), timeout=20)
+            except asyncio.TimeoutError:
+                # keep the WS alive during quiet periods (pre-market, AH)
+                await websocket.send_json({"type": "heartbeat"})
+                if not tape_ib.isConnected():
+                    break
+                continue
+
+            price = float(tk.price)
+            size  = int(tk.size)
+            if size == 0 or price <= 0:
+                continue
+
+            d = _direction(price)
+            if open_price is None:
+                open_price = price
+
+            cum_vol  += size
+            cum_pv   += price * size
+            vwap      = cum_pv / cum_vol
+            if d >= 0: buy_vol  += size
+            else:      sell_vol += size
+            net_delta = buy_vol - sell_vol
+            is_block  = size >= block
+            if is_block:
+                block_count += 1
+            last_price = price
+
+            # ── Plain-English explanations ──────────────────────────────────
+            side     = "bought" if d >= 0 else "sold"
+            dir_word = "UP" if d > 0 else "DOWN" if d < 0 else "flat"
+
+            what_happened = (
+                f"{size:,} shares {side} at ${price:.2f}"
+                + (f" — price ticked {dir_word}" if d != 0 else "")
+            )
+
+            vwap_diff = price - vwap
+            if abs(vwap_diff) < 0.03:
+                vwap_story = (
+                    f"Trading right at the session average (VWAP ${vwap:.2f}) — "
+                    f"neither side has an edge right now"
+                )
+            elif vwap_diff > 0:
+                vwap_story = (
+                    f"${vwap_diff:.2f} above today's average — buyers are willing to pay up "
+                    f"(VWAP ${vwap:.2f})"
+                )
+            else:
+                vwap_story = (
+                    f"${abs(vwap_diff):.2f} below today's average — price looks cheap "
+                    f"relative to where most trading happened today (VWAP ${vwap:.2f})"
+                )
+
+            if net_delta > 0:
+                delta_story = (
+                    f"Buyers are in control — {_tape_fmt_vol(net_delta)} more shares "
+                    f"bought than sold so far today"
+                )
+            elif net_delta < 0:
+                delta_story = (
+                    f"Sellers are in control — {_tape_fmt_vol(abs(net_delta))} more shares "
+                    f"sold than bought so far today"
+                )
+            else:
+                delta_story = "Perfectly balanced — equal buying and selling pressure so far"
+
+            block_story = None
+            if is_block:
+                block_story = (
+                    f"Large institutional print: {size:,} shares {side} at ${price:.2f}. "
+                    f"Block trades (≥ {block:,} shares) come from funds or trading desks "
+                    f"moving a large position — they rarely trade like this by accident."
+                )
+
+            pct_from_open = None
+            if open_price and open_price > 0:
+                pct_from_open = round((price - open_price) / open_price * 100, 2)
+
+            await websocket.send_json({
+                "type":           "tick",
+                "time":           tk.time.strftime("%H:%M:%S.%f")[:-3],
+                "price":          price,
+                "size":           size,
+                "direction":      d,
+                "cum_vol":        cum_vol,
+                "vwap":           round(vwap, 2),
+                "buy_vol":        buy_vol,
+                "sell_vol":       sell_vol,
+                "delta":          net_delta,
+                "exchange":       tk.exchange or "—",
+                "is_block":       is_block,
+                "is_after_hours": tk.tickAttribLast.pastLimit,
+                "block_count":    block_count,
+                "open_price":     open_price,
+                "pct_from_open":  pct_from_open,
+                "what_happened":  what_happened,
+                "vwap_story":     vwap_story,
+                "delta_story":    delta_story,
+                "block_story":    block_story,
+            })
+
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:
+        log.error("Tape WS error for %s: %s", ticker, exc)
+        try:
+            await websocket.send_json({"type": "error", "message": str(exc)})
+        except Exception:
+            pass
+    finally:
+        try:
+            if contract and tape_ib.isConnected():
+                tape_ib.cancelTickByTickData(contract, "AllLast")
+        except Exception:
+            pass
+        try:
+            tape_ib.disconnect()
+        except Exception:
+            pass
+        _release_tape_cid(cid)
+        log.info("Tape WS closed for %s (cid=%d)", ticker, cid)
 
 
 # ── Shared guard ───────────────────────────────────────────────────────────
