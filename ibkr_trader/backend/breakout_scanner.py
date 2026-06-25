@@ -139,6 +139,23 @@ def send_telegram(token: str, chat_id: str, text: str) -> bool:
         return False
 
 
+def fetch_tape_sentiment(backend_url: str, ticker: str) -> dict | None:
+    """Fetch CVD tape sentiment for ticker from backend. Returns None on any error or stale data."""
+    if not backend_url:
+        return None
+    try:
+        r = requests.get(
+            f"{backend_url.rstrip('/')}/tape/sentiment/{ticker}",
+            timeout=2,
+        )
+        if not r.ok:
+            return None
+        d = r.json()
+        return d if d.get("fresh") else None
+    except Exception:
+        return None
+
+
 def post_to_backend(backend_url: str, ind: dict, signal_type: str) -> bool:
     """POST alert to IBKR Trader backend watchlist. Silent if backend not running."""
     if not backend_url:
@@ -162,21 +179,40 @@ def post_to_backend(backend_url: str, ind: dict, signal_type: str) -> bool:
         return False  # backend not running — don't log noise
 
 
-def fmt_alert(ind: dict, signal: str) -> str:
+def fmt_alert(ind: dict, signal: str, tape: dict | None = None) -> str:
     emoji   = "🚨" if signal == "BREAKOUT" else "⚡"
-    trend   = "✓" if (ind["above_sma20"] and ind["above_sma50"] and ind["above_sma200"]) else \
-              ("✓" if (ind["above_sma20"] and ind["above_sma50"]) else "~")
     sma_txt = "All SMAs ✓" if (ind["above_sma20"] and ind["above_sma50"] and ind["above_sma200"]) else \
               ("20/50 SMA ✓" if (ind["above_sma20"] and ind["above_sma50"]) else "partial trend")
     day_sign  = "+" if ind["day_chg_pct"] >= 0 else ""
     scale     = ind.get("vol_scale", 1.0)
     vol_str   = (f"{ind['vol_ratio']:.2f}×" if ind.get("vol_ratio") else "N/A")
     proj_note = f" (proj {scale:.1f}×)" if scale > 1.05 else ""
+
+    tape_line = ""
+    if tape:
+        score = tape.get("score", 0.0)
+        label = tape.get("label", "NEUTRAL")
+        comp  = tape.get("components", {})
+        sign  = "+" if score >= 0 else ""
+        tape_emoji = (
+            "🟢" if label.startswith("STRONGLY BULL") else
+            "🟩" if label.startswith("BULL")          else
+            "🔴" if label.startswith("STRONGLY BEAR") else
+            "🟥" if label.startswith("BEAR")          else
+            "⬜"
+        )
+        tape_line = (
+            f"\n🎯 Tape: {tape_emoji} <b>{label}</b> ({sign}{score:.2f})"
+            f"  cvd {'+' if comp.get('cvd',0)>=0 else ''}{comp.get('cvd',0):.2f}"
+            f" · vwap_z {'+' if comp.get('vwap_z',0)>=0 else ''}{comp.get('vwap_z',0):.2f}"
+        )
+
     return (
         f"{emoji} <b>{signal}</b> — {ind['ticker']}\n"
         f"💰 Price: ${ind['price']:.2f} ({day_sign}{ind['day_chg_pct']:.1f}%)\n"
         f"📊 %B: {ind['pct_b']:.1f}  |  Vol: {vol_str}{proj_note} (90th-pct: {ind['vol_90pct']:.2f}×)\n"
         f"📈 RSI: {ind['rsi']:.0f}  |  {sma_txt}"
+        f"{tape_line}"
     )
 
 
@@ -494,8 +530,10 @@ def main():
                 if prev == "BREAKOUT" and sig_type == "PRE-BREAKOUT":
                     continue   # don't downgrade BREAKOUT back to PRE-BREAKOUT
                 alerted_today[tk] = sig_type
-                msg = fmt_alert(ind, sig_type)
-                log.info("Alerting: %s %s", sig_type, tk)
+                tape = fetch_tape_sentiment(backend_url, tk)
+                msg  = fmt_alert(ind, sig_type, tape)
+                log.info("Alerting: %s %s (tape=%s)", sig_type, tk,
+                         tape.get("label") if tape else "no data")
                 send_telegram(token, chat_id, msg)
                 time.sleep(0.3)   # Telegram rate limit: ~30 msg/s
 
