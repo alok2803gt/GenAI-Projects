@@ -17,6 +17,9 @@ ibkr_trader/backend/autotrader_state.json
 ibkr_trader/backend/iv_history.json
 ibkr_trader/backend/trade_journal.db
 ibkr_trader/backend/universe_cache.json
+ibkr_trader/backend/watchlist.json
+ibkr_trader/backend/scanner.log
+ibkr_trader/backend/scanner_err.log
 
 # Secrets / local config
 .env

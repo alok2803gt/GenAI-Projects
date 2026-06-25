@@ -99,6 +99,7 @@ DEFAULT_CONFIG = {
     "pre_breakout_pct_b_min": 75,
     "pre_breakout_rsi_min":   60,
     "vol_threshold_pct":      0.75,
+    "backend_url":            "http://localhost:8000",
 }
 
 
@@ -136,6 +137,29 @@ def send_telegram(token: str, chat_id: str, text: str) -> bool:
     except Exception as exc:
         log.warning("Telegram send failed: %s", exc)
         return False
+
+
+def post_to_backend(backend_url: str, ind: dict, signal_type: str) -> bool:
+    """POST alert to IBKR Trader backend watchlist. Silent if backend not running."""
+    if not backend_url:
+        return False
+    try:
+        r = requests.post(
+            f"{backend_url.rstrip('/')}/watchlist/alert",
+            json={
+                "ticker":         ind["ticker"],
+                "signal_type":    signal_type,
+                "price_at_alert": ind.get("price", 0),
+                "pct_b":          ind.get("pct_b", 0),
+                "rsi":            ind.get("rsi14"),
+                "vol_ratio":      ind.get("vol_ratio"),
+                "timestamp_et":   datetime.now(ET).strftime("%H:%M ET %Y-%m-%d"),
+            },
+            timeout=3,
+        )
+        return r.ok
+    except Exception:
+        return False  # backend not running — don't log noise
 
 
 def fmt_alert(ind: dict, signal: str) -> str:
@@ -465,6 +489,7 @@ def main():
                 msg = fmt_alert(ind, sig_type)
                 log.info("Alerting: %s %s", sig_type, tk)
                 send_telegram(token, chat_id, msg)
+                post_to_backend(cfg.get("backend_url", ""), ind, sig_type)
                 time.sleep(0.3)   # Telegram rate limit: ~30 msg/s
 
         # If nothing found, log a quiet pulse every other cycle

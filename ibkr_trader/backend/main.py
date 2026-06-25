@@ -95,6 +95,7 @@ JOURNAL_MIN_TRADES  = 20    # trades needed before learned model is reliable
 RETRAIN_EVERY       = 5     # retrain model every N new closed trades
 AT_STATE_PATH       = "autotrader_state.json"  # persisted across restarts
 UNIVERSE_CACHE_PATH = "universe_cache.json"     # screened universe (refreshed nightly)
+WATCHLIST_PATH      = "watchlist.json"          # breakout scanner watchlist
 
 # ── Config — LEAP scanner ──────────────────────────────────────────────────
 LEAP_MIN_DTE   = 180   # ≥ 6 months
@@ -214,6 +215,8 @@ state: Dict = {
         "leap_pnl":           0.0,    # cumulative realized LEAP P&L (can be negative)
         "leap_budget":        0.0,    # 50% of CSP income + LEAP P&L (net available)
     },
+    # Breakout-scanner watchlist (populated via POST /watchlist/alert)
+    "watchlist": {},   # ticker → {signal_type, timestamp_et, price_at_alert, pct_b, rsi, vol_ratio}
     # Reconnect request (set by /reconnect endpoint, read by streaming loop)
     "reconnect_port": None,
     # Continuous learning
@@ -859,6 +862,25 @@ def _at_load_state() -> None:
         )
     except Exception as e:
         log.warning(f"Auto-trader state load failed (starting fresh): {e}")
+
+def _watchlist_save() -> None:
+    try:
+        with open(WATCHLIST_PATH, "w") as f:
+            json.dump(state["watchlist"], f, indent=2, default=str)
+    except Exception as e:
+        log.warning("Watchlist save failed: %s", e)
+
+
+def _watchlist_load() -> None:
+    if not os.path.exists(WATCHLIST_PATH):
+        return
+    try:
+        with open(WATCHLIST_PATH, "r") as f:
+            state["watchlist"] = json.load(f)
+        log.info("Watchlist restored: %d entries", len(state["watchlist"]))
+    except Exception as e:
+        log.warning("Watchlist load failed: %s", e)
+
 
 def _universe_save(tickers: list) -> None:
     """Persist screened universe to disk so restarts don't revert to hardcoded list."""
@@ -4154,6 +4176,9 @@ async def lifespan(app: FastAPI):
     # Restore auto-trader positions + config from last shutdown
     _at_load_state()
 
+    # Restore breakout watchlist
+    _watchlist_load()
+
     # Restore screened universe from cache (avoids reverting to hardcoded 19 on restart)
     _universe_load()
 
@@ -5056,6 +5081,99 @@ def account_summary():
                 pass
 
     return result
+
+
+# ── Watchlist endpoints (breakout scanner integration) ────────────────────
+
+class WatchlistAlertRequest(BaseModel):
+    ticker:        str
+    signal_type:   str              # "BREAKOUT" or "PRE-BREAKOUT"
+    price_at_alert: float
+    pct_b:         float
+    rsi:           Optional[float] = None
+    vol_ratio:     Optional[float] = None
+    timestamp_et:  Optional[str]   = None   # "HH:MM ET YYYY-MM-DD"
+
+
+@app.post("/watchlist/alert")
+def watchlist_add_alert(req: WatchlistAlertRequest):
+    """Called by the breakout scanner whenever a BREAKOUT or PRE-BREAKOUT fires."""
+    from zoneinfo import ZoneInfo
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+    entry = {
+        "ticker":         req.ticker.upper(),
+        "signal_type":    req.signal_type,
+        "price_at_alert": round(req.price_at_alert, 2),
+        "pct_b":          round(req.pct_b, 1),
+        "rsi":            round(req.rsi, 1) if req.rsi is not None else None,
+        "vol_ratio":      round(req.vol_ratio, 2) if req.vol_ratio is not None else None,
+        "timestamp_et":   req.timestamp_et or now_et.strftime("%H:%M ET %Y-%m-%d"),
+        "added_iso":      now_et.isoformat(),
+    }
+    existing = state["watchlist"].get(req.ticker.upper())
+    # Only overwrite PRE-BREAKOUT if the new signal is an upgrade (BREAKOUT)
+    if existing and existing["signal_type"] == "BREAKOUT" and req.signal_type == "PRE-BREAKOUT":
+        return {"ok": True, "action": "skipped_downgrade"}
+    state["watchlist"][req.ticker.upper()] = entry
+    _watchlist_save()
+    return {"ok": True, "action": "added"}
+
+
+@app.get("/watchlist")
+async def watchlist_get():
+    """Return watchlist entries enriched with current prices from yfinance."""
+    entries = list(state["watchlist"].values())
+    if not entries:
+        return {"entries": []}
+
+    tickers = [e["ticker"] for e in entries]
+
+    def _fetch_prices():
+        try:
+            data = yf.download(tickers, period="1d", interval="1m",
+                               group_by="ticker", progress=False, auto_adjust=True)
+            prices = {}
+            for tk in tickers:
+                try:
+                    if len(tickers) == 1:
+                        col = data["Close"] if "Close" in data else None
+                    else:
+                        col = data[tk]["Close"] if tk in data else None
+                    prices[tk] = float(col.dropna().iloc[-1]) if col is not None and not col.dropna().empty else None
+                except Exception:
+                    prices[tk] = None
+            return prices
+        except Exception:
+            return {tk: None for tk in tickers}
+
+    current_prices = await asyncio.get_event_loop().run_in_executor(None, _fetch_prices)
+
+    enriched = []
+    for e in entries:
+        cp = current_prices.get(e["ticker"])
+        ap = e["price_at_alert"]
+        pct_chg = round((cp - ap) / ap * 100, 2) if cp and ap else None
+        enriched.append({**e, "current_price": round(cp, 2) if cp else None, "pct_change": pct_chg})
+
+    enriched.sort(key=lambda x: x.get("added_iso", ""), reverse=True)
+    return {"entries": enriched}
+
+
+@app.delete("/watchlist/{ticker}")
+def watchlist_remove(ticker: str):
+    """Remove a ticker from the watchlist."""
+    removed = state["watchlist"].pop(ticker.upper(), None)
+    if removed:
+        _watchlist_save()
+    return {"ok": True, "removed": removed is not None}
+
+
+@app.delete("/watchlist")
+def watchlist_clear():
+    """Clear all watchlist entries."""
+    state["watchlist"].clear()
+    _watchlist_save()
+    return {"ok": True}
 
 
 # ── Auto-trader endpoints ──────────────────────────────────────────────────

@@ -3804,6 +3804,153 @@ function DecisionsTab() {
 }
 
 
+// ── Watchlist Tab (Breakout Scanner) ─────────────────────────────────────
+function WatchlistTab() {
+  const [entries,  setEntries]  = useState([]);
+  const [loading,  setLoading]  = useState(true);
+  const [clearing, setClearing] = useState(false);
+
+  const load = async () => {
+    try {
+      const r = await apiFetch("/watchlist");
+      setEntries(r.entries || []);
+    } catch(_) {}
+    finally { setLoading(false); }
+  };
+
+  useEffect(() => {
+    load();
+    const id = setInterval(load, 30000);
+    return () => clearInterval(id);
+  }, []);
+
+  const remove = async (ticker) => {
+    try {
+      await apiFetch(`/watchlist/${ticker}`, { method: "DELETE" });
+      setEntries(e => e.filter(x => x.ticker !== ticker));
+    } catch(_) {}
+  };
+
+  const clearAll = async () => {
+    setClearing(true);
+    try {
+      await apiFetch("/watchlist", { method: "DELETE" });
+      setEntries([]);
+    } catch(_) {}
+    finally { setClearing(false); }
+  };
+
+  const sigColor = s => s === "BREAKOUT" ? "#ef4444" : "#f59e0b";
+  const sigEmoji = s => s === "BREAKOUT" ? "🚨" : "⚡";
+
+  return (
+    <div>
+      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:16 }}>
+        <div>
+          <div style={{ ...sans, fontSize:17, fontWeight:700, color:C.white }}>Breakout Watchlist</div>
+          <div style={{ ...sans, fontSize:12, color:C.muted, marginTop:2 }}>
+            Auto-populated by the breakout scanner · refreshes every 30s · current prices from yfinance
+          </div>
+        </div>
+        <div style={{ display:"flex", gap:8 }}>
+          <button onClick={load} style={{ ...sans, fontSize:12, padding:"6px 14px", borderRadius:6,
+            background:"#1e293b", border:`1px solid ${C.border}`, color:C.text, cursor:"pointer" }}>
+            Refresh
+          </button>
+          {entries.length > 0 && (
+            <button onClick={clearAll} disabled={clearing} style={{ ...sans, fontSize:12, padding:"6px 14px",
+              borderRadius:6, background:"#450a0a", border:"1px solid #7f1d1d", color:"#fca5a5",
+              cursor:"pointer" }}>
+              Clear All
+            </button>
+          )}
+        </div>
+      </div>
+
+      {loading ? (
+        <div style={{ color:C.muted, ...sans, fontSize:13 }}>Loading…</div>
+      ) : entries.length === 0 ? (
+        <div style={{ textAlign:"center", padding:"60px 20px" }}>
+          <div style={{ fontSize:32, marginBottom:12 }}>📡</div>
+          <div style={{ ...sans, fontSize:15, color:C.muted }}>No breakout alerts yet</div>
+          <div style={{ ...sans, fontSize:12, color:C.muted, marginTop:6 }}>
+            Tickers will appear here automatically when the breakout scanner fires BREAKOUT or PRE-BREAKOUT signals.
+          </div>
+        </div>
+      ) : (
+        <div style={{ overflowX:"auto" }}>
+          <table style={{ width:"100%", borderCollapse:"collapse", ...sans, fontSize:13 }}>
+            <thead>
+              <tr style={{ background:"#0f172a" }}>
+                {["Ticker","Signal","Alert Time","Alert Price","Current","Chg %","Pct-B","RSI","Vol Ratio",""].map(h => (
+                  <th key={h} style={{ padding:"8px 10px", textAlign:"left", color:C.muted,
+                    fontSize:11, fontWeight:600, textTransform:"uppercase", letterSpacing:0.5,
+                    borderBottom:`1px solid ${C.border}` }}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {entries.map(e => {
+                const chgColor = e.pct_change == null ? C.muted
+                  : e.pct_change >= 2 ? "#22c55e"
+                  : e.pct_change >= 0 ? "#86efac"
+                  : e.pct_change >= -2 ? "#fca5a5"
+                  : "#ef4444";
+                return (
+                  <tr key={e.ticker} style={{ borderBottom:`1px solid ${C.border}` }}>
+                    <td style={{ padding:"8px 10px", fontWeight:700, color:C.white, fontFamily:"monospace" }}>
+                      {e.ticker}
+                    </td>
+                    <td style={{ padding:"8px 10px" }}>
+                      <span style={{ background:`${sigColor(e.signal_type)}22`,
+                        color:sigColor(e.signal_type), border:`1px solid ${sigColor(e.signal_type)}44`,
+                        borderRadius:4, padding:"2px 7px", fontSize:11, fontWeight:700 }}>
+                        {sigEmoji(e.signal_type)} {e.signal_type}
+                      </span>
+                    </td>
+                    <td style={{ padding:"8px 10px", color:C.muted, fontSize:12 }}>{e.timestamp_et}</td>
+                    <td style={{ padding:"8px 10px", color:C.text, fontFamily:"monospace" }}>
+                      ${(e.price_at_alert||0).toFixed(2)}
+                    </td>
+                    <td style={{ padding:"8px 10px", fontFamily:"monospace", fontWeight:600,
+                      color: e.current_price ? C.white : C.muted }}>
+                      {e.current_price ? `$${e.current_price.toFixed(2)}` : "—"}
+                    </td>
+                    <td style={{ padding:"8px 10px", fontWeight:700, color:chgColor }}>
+                      {e.pct_change != null
+                        ? `${e.pct_change >= 0 ? "+" : ""}${e.pct_change.toFixed(2)}%`
+                        : "—"}
+                    </td>
+                    <td style={{ padding:"8px 10px" }}>
+                      <span style={{ color: e.pct_b >= 95 ? "#ef4444" : e.pct_b >= 75 ? "#f59e0b" : C.muted,
+                        fontWeight: e.pct_b >= 75 ? 700 : 400 }}>
+                        {e.pct_b != null ? `${e.pct_b.toFixed(1)}%` : "—"}
+                      </span>
+                    </td>
+                    <td style={{ padding:"8px 10px", color: e.rsi >= 70 ? "#ef4444" : e.rsi >= 60 ? "#f59e0b" : C.text }}>
+                      {e.rsi != null ? e.rsi.toFixed(1) : "—"}
+                    </td>
+                    <td style={{ padding:"8px 10px", color: e.vol_ratio >= 1.5 ? "#22c55e" : C.muted }}>
+                      {e.vol_ratio != null ? `${e.vol_ratio.toFixed(2)}×` : "—"}
+                    </td>
+                    <td style={{ padding:"8px 10px" }}>
+                      <button onClick={() => remove(e.ticker)} style={{
+                        background:"none", border:"none", color:C.muted, cursor:"pointer",
+                        fontSize:16, lineHeight:1, padding:"2px 6px",
+                      }} title="Remove">×</button>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+
 // ── Root App ──────────────────────────────────────────────────────────────
 function App() {
   const [tab, setTab]         = useState("pnl");
@@ -3842,6 +3989,7 @@ function App() {
     { id:"universe",   label:"Universe"    },
     { id:"decisions",  label:"Decisions"   },
     { id:"technicals", label:"Technicals"  },
+    { id:"watchlist",  label:"Watchlist 📡" },
   ];
 
   const deltaCol = netDelta == null ? C.muted : netDelta >= 0 ? C.bull : C.bear;
@@ -3896,6 +4044,7 @@ function App() {
         <div style={{display: tab==="universe"   ? "" : "none"}}><UniverseTab /></div>
         <div style={{display: tab==="decisions"  ? "" : "none"}}><DecisionsTab /></div>
         <div style={{display: tab==="technicals" ? "" : "none"}}><TechnicalsTab /></div>
+        <div style={{display: tab==="watchlist"  ? "" : "none"}}><WatchlistTab /></div>
 
         <div style={{ marginTop:20, ...sans, fontSize:11, color:C.muted, lineHeight:1.7 }}>
           Auto-trader: Kelly sizing · 50% profit target · IV-adjusted stops · 21 DTE roll · 48h cooldown. Backtest: 2-yr simulation with BS pricing.
