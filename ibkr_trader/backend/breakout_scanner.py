@@ -472,7 +472,15 @@ def main():
             time.monotonic() - scan_start, len(breakouts), len(pre_bo),
         )
 
-        # Send alerts (dedup: only if new or escalated signal)
+        backend_url = cfg.get("backend_url", "")
+
+        # Sync ALL current breakouts to the UI watchlist every cycle (no dedup).
+        # The watchlist should always reflect live scan state, not just first alerts.
+        for sig_type, bucket in [("BREAKOUT", breakouts), ("PRE-BREAKOUT", pre_bo)]:
+            for ind in bucket:
+                post_to_backend(backend_url, ind, sig_type)
+
+        # Send Telegram alerts (dedup: only if new or escalated signal)
         for sig_type in ["BREAKOUT", "PRE-BREAKOUT"]:
             if sig_type not in alert_on:
                 continue
@@ -489,7 +497,6 @@ def main():
                 msg = fmt_alert(ind, sig_type)
                 log.info("Alerting: %s %s", sig_type, tk)
                 send_telegram(token, chat_id, msg)
-                post_to_backend(cfg.get("backend_url", ""), ind, sig_type)
                 time.sleep(0.3)   # Telegram rate limit: ~30 msg/s
 
         # If nothing found, log a quiet pulse every other cycle

@@ -5097,11 +5097,40 @@ class WatchlistAlertRequest(BaseModel):
 
 @app.post("/watchlist/alert")
 def watchlist_add_alert(req: WatchlistAlertRequest):
-    """Called by the breakout scanner whenever a BREAKOUT or PRE-BREAKOUT fires."""
+    """Called by the breakout scanner on every cycle for every detected signal.
+
+    New tickers are inserted with the current timestamp and price as the alert baseline.
+    Existing tickers get live metrics (pct_b, vol_ratio) refreshed each cycle so the
+    watchlist reflects the current scan state, while preserving the original alert
+    timestamp and price_at_alert so % change is always vs. the first alert price.
+    PRE-BREAKOUT is never allowed to overwrite an existing BREAKOUT entry.
+    """
     from zoneinfo import ZoneInfo
-    now_et = datetime.now(ZoneInfo("America/New_York"))
-    entry = {
-        "ticker":         req.ticker.upper(),
+    now_et  = datetime.now(ZoneInfo("America/New_York"))
+    tk      = req.ticker.upper()
+    existing = state["watchlist"].get(tk)
+
+    # Don't downgrade BREAKOUT → PRE-BREAKOUT
+    if existing and existing["signal_type"] == "BREAKOUT" and req.signal_type == "PRE-BREAKOUT":
+        # Still refresh live metrics so pct_b / vol_ratio stay current
+        existing["pct_b"]      = round(req.pct_b, 1)
+        if req.rsi      is not None: existing["rsi"]       = round(req.rsi, 1)
+        if req.vol_ratio is not None: existing["vol_ratio"] = round(req.vol_ratio, 2)
+        _watchlist_save()
+        return {"ok": True, "action": "refreshed"}
+
+    if existing:
+        # Preserve original alert timestamp and price; refresh live scan metrics
+        existing["signal_type"] = req.signal_type
+        existing["pct_b"]       = round(req.pct_b, 1)
+        if req.rsi       is not None: existing["rsi"]       = round(req.rsi, 1)
+        if req.vol_ratio is not None: existing["vol_ratio"] = round(req.vol_ratio, 2)
+        _watchlist_save()
+        return {"ok": True, "action": "refreshed"}
+
+    # New entry
+    state["watchlist"][tk] = {
+        "ticker":         tk,
         "signal_type":    req.signal_type,
         "price_at_alert": round(req.price_at_alert, 2),
         "pct_b":          round(req.pct_b, 1),
@@ -5110,11 +5139,6 @@ def watchlist_add_alert(req: WatchlistAlertRequest):
         "timestamp_et":   req.timestamp_et or now_et.strftime("%H:%M ET %Y-%m-%d"),
         "added_iso":      now_et.isoformat(),
     }
-    existing = state["watchlist"].get(req.ticker.upper())
-    # Only overwrite PRE-BREAKOUT if the new signal is an upgrade (BREAKOUT)
-    if existing and existing["signal_type"] == "BREAKOUT" and req.signal_type == "PRE-BREAKOUT":
-        return {"ok": True, "action": "skipped_downgrade"}
-    state["watchlist"][req.ticker.upper()] = entry
     _watchlist_save()
     return {"ok": True, "action": "added"}
 
