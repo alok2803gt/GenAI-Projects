@@ -117,6 +117,7 @@ REGIME_CACHE_TTL    = 300    # 5 min
 IV_HISTORY_PATH     = "iv_history.json"
 IV_HISTORY_MIN_PTS  = 20    # samples needed before percentile rank is reliable
 JOURNAL_DB_PATH     = "trade_journal.db"
+TAPE_DB_PATH        = "tape_data.db"
 JOURNAL_MIN_TRADES  = 20    # trades needed before learned model is reliable
 RETRAIN_EVERY       = 5     # retrain model every N new closed trades
 AT_STATE_PATH       = "autotrader_state.json"  # persisted across restarts
@@ -444,6 +445,8 @@ def _tape_initial_state() -> dict:
         "cur_bar":            {"delta": 0, "vol": 0, "open": 0.0, "last": 0.0, "minute": -1},
         "price_history":      [],        # last 100 trade prices (for VWAP std-dev)
         "avg_vol_per_bar":    0.0,       # seeded from 5-day bars at subscribe time
+        "session_buy_vol":    0,         # cumulative session buy volume (for bar DB rows)
+        "session_sell_vol":   0,         # cumulative session sell volume
         "score":              0.0,
         "label":              "NEUTRAL",
         "components":         {"cvd": 0.0, "vwap_z": 0.0, "vol_mag": 0.0, "div_mult": 1.0},
@@ -480,14 +483,33 @@ def _update_tape_bar(sym: str, price: float, size: int, direction: int) -> None:
 
     if cur["minute"] != minute:                 # minute boundary — close current bar
         if cur["vol"] > 0:
-            sent["bars"].append({
+            closed_bar = {
                 "delta": cur["delta"],
                 "vol":   cur["vol"],
                 "open":  cur["open"],
                 "close": cur["last"],
-            })
+            }
+            sent["bars"].append(closed_bar)
             if len(sent["bars"]) > 20:          # rolling window: keep last 20 bars
                 sent["bars"].pop(0)
+            # Persist the completed bar to tape_data.db for historical analysis
+            try:
+                bar_score, bar_label, bar_comps = _compute_tape_score(sym)
+                bar_start_str = now_et.replace(minute=cur["minute"] % 60,
+                                               hour=cur["minute"] // 60,
+                                               second=0, microsecond=0).isoformat()
+                sess_date = now_et.strftime("%Y-%m-%d")
+                bar_bvol  = sent.get("session_buy_vol", 0)
+                bar_svol  = sent.get("session_sell_vol", 0)
+                _tape_db_insert_bar(
+                    sym, closed_bar, bar_start_str, sess_date,
+                    bar_bvol, bar_svol,
+                    round(bar_score, 4),
+                    round(bar_comps.get("vwap_z", 0.0), 4),
+                    bar_label,
+                )
+            except Exception:
+                pass
         sent["cur_bar"] = {
             "delta": direction * size, "vol": size,
             "open": price, "last": price, "minute": minute,
@@ -629,6 +651,10 @@ def _make_tape_callback(sym: str):
             direction = sent.get("last_dir", 0)
 
         sent["last_price"] = price
+        if direction >= 0:
+            sent["session_buy_vol"]  += int(size)
+        else:
+            sent["session_sell_vol"] += int(size)
 
         # ── First-tick runtime field-mapping verification ────────────────────
         if not sent.get("_first_tick_logged"):
@@ -3293,6 +3319,93 @@ _JOURNAL_FEATURE_COLS = [
 ]
 
 
+def _tape_db_init() -> None:
+    con = sqlite3.connect(TAPE_DB_PATH, check_same_thread=False)
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS tape_prints (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts             TEXT    NOT NULL,
+            session_date   TEXT    NOT NULL,
+            ticker         TEXT    NOT NULL,
+            price          REAL    NOT NULL,
+            size           INTEGER NOT NULL,
+            direction      INTEGER,
+            exchange       TEXT,
+            is_block       INTEGER,
+            is_after_hours INTEGER,
+            vwap           REAL,
+            cum_vol        INTEGER,
+            buy_vol        INTEGER,
+            sell_vol       INTEGER,
+            net_delta      INTEGER,
+            pct_from_open  REAL,
+            cvd_score      REAL
+        )
+    """)
+    con.execute("CREATE INDEX IF NOT EXISTS idx_tp_ticker_date ON tape_prints (ticker, session_date)")
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS tape_bars (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            bar_start    TEXT    NOT NULL,
+            session_date TEXT    NOT NULL,
+            ticker       TEXT    NOT NULL,
+            open         REAL,
+            close        REAL,
+            delta        INTEGER,
+            vol          INTEGER,
+            buy_vol      INTEGER,
+            sell_vol     INTEGER,
+            cvd_score    REAL,
+            vwap_z       REAL,
+            label        TEXT
+        )
+    """)
+    con.execute("CREATE INDEX IF NOT EXISTS idx_tb_ticker_date ON tape_bars (ticker, session_date)")
+    con.commit()
+    con.close()
+    log.info("Tape DB initialised at %s", TAPE_DB_PATH)
+
+
+def _tape_db_flush_prints(ticker: str, rows: list) -> None:
+    """Batch-insert a list of tape print dicts into tape_prints. Safe to call from any thread."""
+    if not rows:
+        return
+    try:
+        con = sqlite3.connect(TAPE_DB_PATH, check_same_thread=False)
+        con.executemany("""
+            INSERT INTO tape_prints
+            (ts, session_date, ticker, price, size, direction, exchange, is_block,
+             is_after_hours, vwap, cum_vol, buy_vol, sell_vol, net_delta, pct_from_open, cvd_score)
+            VALUES (:ts,:session_date,:ticker,:price,:size,:direction,:exchange,:is_block,
+                    :is_after_hours,:vwap,:cum_vol,:buy_vol,:sell_vol,:net_delta,:pct_from_open,:cvd_score)
+        """, rows)
+        con.commit()
+        con.close()
+    except Exception as exc:
+        log.debug("tape_db flush prints error: %s", exc)
+
+
+def _tape_db_insert_bar(ticker: str, bar: dict, bar_start: str, session_date: str,
+                         buy_vol: int, sell_vol: int, cvd_score: float,
+                         vwap_z: float, label: str) -> None:
+    """Insert a completed 1-minute CVD bar into tape_bars. Safe to call from any thread."""
+    try:
+        con = sqlite3.connect(TAPE_DB_PATH, check_same_thread=False)
+        con.execute("""
+            INSERT INTO tape_bars
+            (bar_start, session_date, ticker, open, close, delta, vol,
+             buy_vol, sell_vol, cvd_score, vwap_z, label)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (bar_start, session_date, ticker,
+              bar.get("open"), bar.get("close"), bar.get("delta"), bar.get("vol"),
+              buy_vol, sell_vol, cvd_score, vwap_z, label))
+        con.commit()
+        con.close()
+    except Exception as exc:
+        log.debug("tape_db insert bar error: %s", exc)
+
+
 def _journal_init() -> None:
     con = sqlite3.connect(JOURNAL_DB_PATH, check_same_thread=False)
     con.execute("PRAGMA journal_mode=WAL")
@@ -4537,6 +4650,7 @@ async def lifespan(app: FastAPI):
 
     state["iv_history"] = _load_iv_history()
     log.info(f"Loaded IV history for {len(state['iv_history'])} tickers")
+    _tape_db_init()
     _journal_init()
 
     # Restore auto-trader positions + config from last shutdown
@@ -6426,6 +6540,86 @@ def tape_sentiment_single(ticker: str):
     }
 
 
+@app.get("/tape/prints/{ticker}")
+def tape_prints_history(
+    ticker: str,
+    date: Optional[str] = Query(None, description="Session date YYYY-MM-DD (default: today)"),
+    blocks_only: bool   = Query(False, description="Return only block prints (is_block=1)"),
+    limit: int          = Query(1000, description="Max rows to return"),
+):
+    """Historical tick-by-tick prints for a ticker from tape_data.db."""
+    sym          = ticker.upper()
+    session_date = date or datetime.utcnow().strftime("%Y-%m-%d")
+    try:
+        con   = sqlite3.connect(TAPE_DB_PATH, check_same_thread=False)
+        where = "ticker=? AND session_date=?"
+        args  = [sym, session_date]
+        if blocks_only:
+            where += " AND is_block=1"
+        rows = con.execute(
+            f"SELECT ts,price,size,direction,exchange,is_block,is_after_hours,"
+            f"vwap,cum_vol,buy_vol,sell_vol,net_delta,pct_from_open,cvd_score "
+            f"FROM tape_prints WHERE {where} ORDER BY ts DESC LIMIT ?",
+            args + [limit],
+        ).fetchall()
+        con.close()
+        cols = ["ts","price","size","direction","exchange","is_block","is_after_hours",
+                "vwap","cum_vol","buy_vol","sell_vol","net_delta","pct_from_open","cvd_score"]
+        return {"ticker": sym, "date": session_date, "count": len(rows),
+                "prints": [dict(zip(cols, r)) for r in rows]}
+    except Exception as exc:
+        raise HTTPException(500, str(exc))
+
+
+@app.get("/tape/bars/{ticker}")
+def tape_bars_history(
+    ticker: str,
+    date: Optional[str] = Query(None, description="Session date YYYY-MM-DD (default: today)"),
+    limit: int          = Query(500, description="Max bars to return"),
+):
+    """Historical 1-minute CVD bars for a ticker from tape_data.db."""
+    sym          = ticker.upper()
+    session_date = date or datetime.utcnow().strftime("%Y-%m-%d")
+    try:
+        con  = sqlite3.connect(TAPE_DB_PATH, check_same_thread=False)
+        rows = con.execute(
+            "SELECT bar_start,open,close,delta,vol,buy_vol,sell_vol,cvd_score,vwap_z,label "
+            "FROM tape_bars WHERE ticker=? AND session_date=? ORDER BY bar_start LIMIT ?",
+            (sym, session_date, limit),
+        ).fetchall()
+        con.close()
+        cols = ["bar_start","open","close","delta","vol","buy_vol","sell_vol",
+                "cvd_score","vwap_z","label"]
+        return {"ticker": sym, "date": session_date, "count": len(rows),
+                "bars": [dict(zip(cols, r)) for r in rows]}
+    except Exception as exc:
+        raise HTTPException(500, str(exc))
+
+
+@app.get("/tape/sessions")
+def tape_sessions(
+    ticker: Optional[str] = Query(None, description="Filter by ticker (optional)"),
+):
+    """List all session dates available in tape_data.db."""
+    try:
+        con = sqlite3.connect(TAPE_DB_PATH, check_same_thread=False)
+        if ticker:
+            rows = con.execute(
+                "SELECT ticker, session_date, COUNT(*) as prints "
+                "FROM tape_prints WHERE ticker=? GROUP BY ticker, session_date ORDER BY session_date DESC",
+                (ticker.upper(),),
+            ).fetchall()
+        else:
+            rows = con.execute(
+                "SELECT ticker, session_date, COUNT(*) as prints "
+                "FROM tape_prints GROUP BY ticker, session_date ORDER BY session_date DESC, ticker",
+            ).fetchall()
+        con.close()
+        return {"sessions": [{"ticker": r[0], "date": r[1], "prints": r[2]} for r in rows]}
+    except Exception as exc:
+        raise HTTPException(500, str(exc))
+
+
 # ── Live Tape WebSocket ─────────────────────────────────────────────────────
 @app.websocket("/ws/tape/{ticker}")
 async def ws_tape(websocket: WebSocket, ticker: str, block: int = Query(default=5000)):
@@ -6466,6 +6660,7 @@ async def ws_tape(websocket: WebSocket, ticker: str, block: int = Query(default=
         tick_idx:   int   = 0
 
         tick_queue: asyncio.Queue = asyncio.Queue()
+        tape_print_buffer: list  = []   # accumulated this session; flushed to DB on close
 
         def _direction(price: float) -> int:
             nonlocal last_price, last_dir
@@ -6569,6 +6764,11 @@ async def ws_tape(websocket: WebSocket, ticker: str, block: int = Query(default=
             if open_price and open_price > 0:
                 pct_from_open = round((price - open_price) / open_price * 100, 2)
 
+            ts_str    = tk.time.strftime("%Y-%m-%dT%H:%M:%S")
+            sess_date = tk.time.strftime("%Y-%m-%d")
+            cvd_score_now = (state["tape_sentiment"].get(ticker.upper(), {})
+                             .get("score"))
+
             await websocket.send_json({
                 "type":           "tick",
                 "time":           tk.time.strftime("%H:%M:%S.%f")[:-3],
@@ -6592,6 +6792,26 @@ async def ws_tape(websocket: WebSocket, ticker: str, block: int = Query(default=
                 "block_story":    block_story,
             })
 
+            # Buffer this print for DB persistence (flushed in batch on session close)
+            tape_print_buffer.append({
+                "ts":             ts_str,
+                "session_date":   sess_date,
+                "ticker":         ticker.upper(),
+                "price":          price,
+                "size":           size,
+                "direction":      d,
+                "exchange":       tk.exchange or "",
+                "is_block":       int(is_block),
+                "is_after_hours": int(bool(tk.tickAttribLast.pastLimit)),
+                "vwap":           round(vwap, 4),
+                "cum_vol":        cum_vol,
+                "buy_vol":        buy_vol,
+                "sell_vol":       sell_vol,
+                "net_delta":      net_delta,
+                "pct_from_open":  pct_from_open,
+                "cvd_score":      cvd_score_now,
+            })
+
     except WebSocketDisconnect:
         pass
     except Exception as exc:
@@ -6611,7 +6831,16 @@ async def ws_tape(websocket: WebSocket, ticker: str, block: int = Query(default=
         except Exception:
             pass
         _release_tape_cid(cid)
-        log.info("Tape WS closed for %s (cid=%d)", ticker, cid)
+        # Persist all buffered prints to tape_data.db in one batch write
+        if tape_print_buffer:
+            loop = asyncio.get_event_loop()
+            loop.run_in_executor(
+                None, _tape_db_flush_prints, ticker.upper(), tape_print_buffer
+            )
+            log.info("Tape WS closed for %s (cid=%d) — flushing %d prints to tape_data.db",
+                     ticker, cid, len(tape_print_buffer))
+        else:
+            log.info("Tape WS closed for %s (cid=%d)", ticker, cid)
 
 
 # ── Shared guard ───────────────────────────────────────────────────────────
