@@ -85,6 +85,17 @@ TAPE_SENTIMENT_MAX_TICKERS = 20   # cap on reqMktData subscriptions for tape
 TAPE_STALENESS_SECS        = 1800 # score treated as 0.0 (neutral) when older than 30 min
 TAPE_BLOCK_MIN_SHARES      = 5000 # CVD-callback block threshold for real-time capture
 
+# ── Market index banner ────────────────────────────────────────────────────
+INDEX_CONFIG = [
+    {"sym": "SPY",  "yf": "SPY",  "name": "S&P 500"},
+    {"sym": "QQQ",  "yf": "QQQ",  "name": "Nasdaq"},
+    {"sym": "DIA",  "yf": "DIA",  "name": "Dow"},
+    {"sym": "IWM",  "yf": "IWM",  "name": "Russell"},
+    {"sym": "VIX",  "yf": "^VIX", "name": "VIX"},
+]
+_index_cache: dict = {"data": None, "ts": 0.0}
+INDEX_CACHE_TTL    = 15   # seconds between yfinance refreshes
+
 
 class _FlowAbort(Exception):
     """Raised when the live order-book flow gate intentionally aborts a trade.
@@ -6842,6 +6853,64 @@ def tape_block_report(
         }
     except Exception as exc:
         raise HTTPException(500, str(exc))
+
+
+@app.get("/market/indexes")
+def market_indexes():
+    """
+    Live prices for the five main market indexes (S&P 500, Nasdaq, Dow, Russell, VIX).
+
+    Price source priority:
+      1. IBKR tape_sentiment last_price  — real-time when ticker is subscribed (SPY/QQQ/IWM)
+      2. yfinance fast_info              — ~15-min delayed fallback for DIA + VIX
+    yfinance results are cached 15 s so the endpoint returns instantly on every poll.
+    """
+    import time as _time
+
+    now = _time.time()
+    # Rebuild from yfinance only when cache is stale
+    if _index_cache["data"] is None or now - _index_cache["ts"] > INDEX_CACHE_TTL:
+        fresh: list = []
+        for cfg in INDEX_CONFIG:
+            entry = {
+                "sym":        cfg["sym"],
+                "name":       cfg["name"],
+                "price":      None,
+                "prev_close": None,
+                "change":     None,
+                "change_pct": None,
+                "is_live":    False,
+            }
+            try:
+                fi = yf.Ticker(cfg["yf"]).fast_info
+                lp = getattr(fi, "last_price", None)
+                pc = getattr(fi, "previous_close", None)
+                if lp:  entry["price"]      = round(float(lp), 2)
+                if pc:  entry["prev_close"] = round(float(pc), 2)
+            except Exception:
+                pass
+            fresh.append(entry)
+        _index_cache["data"] = fresh
+        _index_cache["ts"]   = now
+
+    # Deep-copy cached data and overlay live IBKR prices where subscribed
+    import copy
+    result = copy.deepcopy(_index_cache["data"])
+    for entry in result:
+        sym  = entry["sym"]
+        sent = state["tape_sentiment"].get(sym)
+        if sent and sent.get("last_price") and _tape_is_fresh(sent):
+            entry["price"]   = round(float(sent["last_price"]), 2)
+            entry["is_live"] = True
+
+        # Compute change from prev_close (works for both IBKR and yfinance price)
+        if entry["price"] is not None and entry["prev_close"]:
+            entry["change"]     = round(entry["price"] - entry["prev_close"], 2)
+            entry["change_pct"] = round(
+                (entry["price"] - entry["prev_close"]) / entry["prev_close"] * 100, 2
+            )
+
+    return result
 
 
 # ── Live Tape WebSocket ─────────────────────────────────────────────────────

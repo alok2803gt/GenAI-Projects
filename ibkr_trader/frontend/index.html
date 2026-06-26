@@ -4731,6 +4731,111 @@ function InstFlowTab() {
 }
 
 
+// ── Market Index Banner ───────────────────────────────────────────────────
+function IndexBanner() {
+  const [indexes, setIndexes] = useState([]);
+
+  useEffect(() => {
+    const load = async () => {
+      try {
+        const data = await apiFetch("/market/indexes");
+        if (Array.isArray(data)) setIndexes(data);
+      } catch(_) {}
+    };
+    load();
+    const iv = setInterval(load, 5000);
+    return () => clearInterval(iv);
+  }, []);
+
+  if (!indexes.length) return null;
+
+  return (
+    <div style={{
+      position: "fixed", top: 0, left: 0, right: 0, zIndex: 1000,
+      background: "#070b14",
+      borderBottom: "1px solid #1e293b",
+      display: "flex", alignItems: "center",
+      padding: "0 16px", height: 38,
+      gap: 0,
+      overflowX: "auto",
+      boxShadow: "0 2px 12px rgba(0,0,0,0.5)",
+    }}>
+      {/* Label */}
+      <div style={{ ...mono, fontSize: 9, color: "#334155",
+        textTransform: "uppercase", letterSpacing: 2,
+        paddingRight: 16, borderRight: "1px solid #1e293b",
+        marginRight: 16, whiteSpace: "nowrap", flexShrink: 0 }}>
+        Markets
+      </div>
+
+      {indexes.map((idx, i) => {
+        const up      = idx.change_pct != null && idx.change_pct >= 0;
+        const col     = idx.change_pct == null ? "#64748b"
+                      : up ? "#22c55e" : "#ef4444";
+        const isVix   = idx.sym === "VIX";
+        // VIX: rising is bad (red), falling is green — invert color
+        const dispCol = isVix ? (up ? "#ef4444" : "#22c55e") : col;
+        const arrow   = idx.change_pct == null ? "" : up ? "▲" : "▼";
+        const pctStr  = idx.change_pct != null
+          ? `${up ? "+" : ""}${idx.change_pct.toFixed(2)}%`
+          : "—";
+        const chgStr  = idx.change != null
+          ? `${up ? "+" : ""}${idx.change.toFixed(2)}`
+          : "";
+
+        return (
+          <div key={idx.sym} style={{
+            display: "flex", alignItems: "center", gap: 8,
+            padding: "0 16px",
+            borderRight: i < indexes.length - 1 ? "1px solid #1e293b" : "none",
+            flexShrink: 0,
+          }}>
+            {/* Name */}
+            <span style={{ ...sans, fontSize: 10, color: "#64748b",
+              fontWeight: 600, whiteSpace: "nowrap" }}>
+              {idx.name}
+            </span>
+            {/* Price */}
+            <span style={{ ...mono, fontSize: 13, fontWeight: 800, color: "#f1f5f9",
+              whiteSpace: "nowrap" }}>
+              {idx.price != null ? (isVix ? idx.price.toFixed(2) : `$${idx.price.toFixed(2)}`) : "—"}
+            </span>
+            {/* Change */}
+            <span style={{ ...mono, fontSize: 11, fontWeight: 700, color: dispCol,
+              whiteSpace: "nowrap" }}>
+              {arrow} {pctStr}
+            </span>
+            {/* Dollar change — smaller, muted */}
+            {chgStr && (
+              <span style={{ ...mono, fontSize: 10, color: dispCol + "99",
+                whiteSpace: "nowrap" }}>
+                {chgStr}
+              </span>
+            )}
+            {/* Live dot when IBKR-sourced */}
+            {idx.is_live && (
+              <span title="Live from IBKR" style={{
+                width: 5, height: 5, borderRadius: "50%",
+                background: "#22c55e",
+                boxShadow: "0 0 4px #22c55e",
+                display: "inline-block", flexShrink: 0,
+              }} />
+            )}
+          </div>
+        );
+      })}
+
+      {/* Spacer + timestamp hint */}
+      <div style={{ flex: 1 }} />
+      <div style={{ ...mono, fontSize: 9, color: "#1e293b",
+        paddingLeft: 16, flexShrink: 0, whiteSpace: "nowrap" }}>
+        ● live 5s
+      </div>
+    </div>
+  );
+}
+
+
 // ── Root App ──────────────────────────────────────────────────────────────
 function App() {
   const [tab, setTab]         = useState("pnl");
@@ -4777,7 +4882,8 @@ function App() {
   const deltaCol = netDelta == null ? C.muted : netDelta >= 0 ? C.bull : C.bear;
 
   return (
-    <div style={{ minHeight:"100vh", background:C.bg, padding:"20px 16px" }}>
+    <div style={{ minHeight:"100vh", background:C.bg, padding:"20px 16px", paddingTop: 58 }}>
+      <IndexBanner />
       <div style={{ maxWidth:1200, margin:"0 auto" }}>
 
         {/* Header */}
