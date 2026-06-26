@@ -695,6 +695,93 @@ async def _subscribe_pending(ib: IB, known: set) -> set:
     return current
 
 
+async def _tape_preseed_subscribe(ib: IB, ticker: str) -> None:
+    """Tape-only subscription for pre-seeding — no keepUpToDate bars, just CVD sentiment.
+    Does NOT add to TICKERS or state['subscriptions']; only fills a tape slot."""
+    if ticker in state["tape_subs"] or len(state["tape_subs"]) >= TAPE_SENTIMENT_MAX_TICKERS:
+        return
+    contract = Stock(ticker, "SMART", "USD")
+    await ib.qualifyContractsAsync(contract)
+
+    # Snapshot history for avg_vol_per_bar bootstrap (keepUpToDate=False — no persistent sub)
+    avg_per_min = 0.0
+    try:
+        snap = await ib.reqHistoricalDataAsync(
+            contract, endDateTime="", durationStr="5 D",
+            barSizeSetting="5 mins", whatToShow="TRADES",
+            useRTH=True, formatDate=1, keepUpToDate=False,
+        )
+        if snap:
+            df_v = _bars_to_df(snap)
+            avg_per_min = float(df_v["volume"].mean()) / 5.0 if not df_v.empty else 0.0
+    except Exception:
+        pass
+
+    if ticker not in state["tape_sentiment"]:
+        state["tape_sentiment"][ticker] = _tape_initial_state()
+    state["tape_sentiment"][ticker]["avg_vol_per_bar"] = avg_per_min
+
+    tape_tkr = ib.reqMktData(contract, "233,375", False, False)
+    state["tape_subs"][ticker]                    = tape_tkr
+    state["tape_sentiment"][ticker]["sub_active"] = True
+    tape_tkr.updateEvent += _make_tape_callback(ticker)
+    log.info("Tape pre-seeded [%s]  avg_vol_per_bar=%.0f", ticker, avg_per_min)
+
+
+async def _tape_preseed(ib: IB) -> None:
+    """Fill remaining tape subscription slots from a priority-ordered candidate list:
+
+      1. Active auto-trader positions  — tickers with live trades (highest priority)
+      2. Breakout scanner watchlist    — recently alerted candidates
+      3. Top-ranked universe tickers   — sorted by XGBoost score (broadest coverage)
+
+    Called once after initial connect and again after each 1102 reconnect so block
+    flow capture starts at market open without waiting for the scanner to run.
+    Is a no-op when all TAPE_SENTIMENT_MAX_TICKERS slots are already filled.
+    """
+    slots_free = TAPE_SENTIMENT_MAX_TICKERS - len(state["tape_subs"])
+    if slots_free <= 0:
+        return
+
+    seen:    set  = set(state["tape_subs"].keys())
+    ordered: list = []
+
+    def _enqueue(ticker: str) -> None:
+        t = (ticker or "").strip().upper()
+        if t and t not in seen:
+            seen.add(t)
+            ordered.append(t)
+
+    # 1 — active positions (money on the line — always monitor these)
+    for info in state["autotrader"].get("positions", {}).values():
+        _enqueue(info.get("ticker", ""))
+
+    # 2 — breakout watchlist (dict keyed by ticker string)
+    for tk in state.get("watchlist", {}).keys():
+        _enqueue(tk)
+
+    # 3 — universe top-N by score (already sorted desc when screened)
+    for row in state.get("universe_scores", []):
+        _enqueue(row.get("ticker", "") if isinstance(row, dict) else str(row))
+
+    candidates = ordered[:slots_free]
+    if not candidates:
+        log.info("Tape pre-seed: no new candidates (positions=%d watchlist=%d universe=%d)",
+                 len(state["autotrader"].get("positions", {})),
+                 len(state.get("watchlist", {})),
+                 len(state.get("universe_scores", [])))
+        return
+
+    log.info("Tape pre-seed: %d slot(s) free → subscribing %s", slots_free, candidates)
+    for ticker in candidates:
+        if len(state["tape_subs"]) >= TAPE_SENTIMENT_MAX_TICKERS:
+            break
+        try:
+            await _tape_preseed_subscribe(ib, ticker)
+        except Exception as exc:
+            log.warning("Tape pre-seed failed [%s]: %s", ticker, exc)
+
+
 # ── Background streaming loop ──────────────────────────────────────────────
 async def streaming_loop_async() -> None:
     while True:
@@ -748,6 +835,9 @@ async def streaming_loop_async() -> None:
             # Without this, reqTickersAsync races with bar subscriptions and returns nan.
             await asyncio.sleep(3)
             state["opra_active"] = await _check_opra_subscription(ib)
+            # Pre-seed tape CVD slots from positions → watchlist → universe on connect.
+            # Runs before first scan so block flow capture starts at market open.
+            await _tape_preseed(ib)
             # Retry once — occasionally the first snapshot arrives before OPRA feed is warm
             if not state["opra_active"]:
                 await asyncio.sleep(3)
@@ -759,6 +849,10 @@ async def streaming_loop_async() -> None:
             _heartbeat_tick = 0
             while ib.isConnected():
                 ctx["known"] = await _subscribe_pending(ib, ctx["known"])
+                # After 1102 reconnect tape_subs is cleared — re-preseed open slots.
+                # Also fills slots lazily as universe scores update throughout the day.
+                if len(state["tape_subs"]) < TAPE_SENTIMENT_MAX_TICKERS:
+                    await _tape_preseed(ib)
                 _heartbeat_tick += 1
                 if _heartbeat_tick % 24 == 0:   # every 24 × 10 s = 4 min
                     state["opra_active"] = await _check_opra_subscription(ib)
