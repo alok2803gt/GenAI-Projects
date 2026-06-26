@@ -4422,6 +4422,315 @@ function TapeTab() {
 }
 
 
+// ── Institutional Flow Tab ────────────────────────────────────────────────
+function InstFlowTab() {
+  const today = new Date().toISOString().slice(0, 10);
+  const [date,    setDate]    = useState(today);
+  const [data,    setData]    = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [lastAt,  setLastAt]  = useState(null);
+  const [sortCol, setSortCol] = useState("size");
+  const [sortDir, setSortDir] = useState(-1);  // -1 = desc
+
+  const load = async (d) => {
+    setLoading(true);
+    try {
+      const res = await apiFetch(`/tape/blocks?date=${d}&limit=500`);
+      setData(res);
+      setLastAt(new Date().toLocaleTimeString());
+    } catch(_) { setData(null); }
+    setLoading(false);
+  };
+
+  useEffect(() => { load(date); }, []);
+
+  const fmtV = (v) => {
+    if (v == null) return "—";
+    if (Math.abs(v) >= 1e9)  return `${(v/1e9).toFixed(2)}B`;
+    if (Math.abs(v) >= 1e6)  return `${(v/1e6).toFixed(2)}M`;
+    if (Math.abs(v) >= 1e3)  return `${(v/1e3).toFixed(1)}K`;
+    return v.toLocaleString();
+  };
+  const fmt$ = (v) => v == null ? "—" : `$${(v/1e6).toFixed(2)}M`;
+  const fmt$k = (v) => v == null ? "—" : v >= 1e6 ? `$${(v/1e6).toFixed(2)}M` : v >= 1e3 ? `$${(v/1e3).toFixed(1)}K` : `$${v}`;
+
+  const biasColor = (b) => b && b.includes("BULL") ? C.bull : b && b.includes("BEAR") ? C.bear : C.neutral;
+  const biasShort = (b) => b === "STRONGLY BULLISH" ? "S.BULL" : b === "STRONGLY BEARISH" ? "S.BEAR" : b || "—";
+
+  // Sort the prints
+  const prints = data?.prints ? [...data.prints].sort((a, b) => {
+    const av = a[sortCol] ?? 0, bv = b[sortCol] ?? 0;
+    return sortDir * (typeof av === "string" ? av.localeCompare(bv) : bv - av) * -1;
+  }) : [];
+
+  const Th = ({ col, label }) => (
+    <th onClick={() => { if (sortCol === col) setSortDir(d => -d); else { setSortCol(col); setSortDir(-1); } }}
+      style={{ ...mono, fontSize:10, color: sortCol===col ? C.accent : C.muted, fontWeight:600,
+        textTransform:"uppercase", letterSpacing:0.5, padding:"8px 10px", whiteSpace:"nowrap",
+        borderBottom:`1px solid ${C.border}`, cursor:"pointer", userSelect:"none" }}>
+      {label}{sortCol===col ? (sortDir<0 ? " ↓" : " ↑") : ""}
+    </th>
+  );
+
+  const noData = !data || data.total_blocks === 0;
+  const buyPct = data && data.total_shares > 0
+    ? Math.round(data.buy_shares / data.total_shares * 100) : 50;
+
+  return (
+    <div>
+      {/* Header */}
+      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start",
+        marginBottom:16, flexWrap:"wrap", gap:10 }}>
+        <div>
+          <div style={{ ...sans, fontSize:17, fontWeight:700, color:C.white }}>
+            Institutional Block Flow
+          </div>
+          <div style={{ ...sans, fontSize:12, color:C.muted, marginTop:2 }}>
+            Large prints ≥ 5,000 shares captured from all subscribed tickers · stored in tape_data.db
+          </div>
+        </div>
+        <div style={{ display:"flex", gap:10, alignItems:"center" }}>
+          <input type="date" value={date} max={today}
+            onChange={e => setDate(e.target.value)}
+            style={{ ...mono, fontSize:12, padding:"6px 10px", borderRadius:6,
+              background:C.dim, border:`1px solid ${C.border}`, color:C.text, outline:"none" }} />
+          <button onClick={() => load(date)} disabled={loading}
+            style={{ ...sans, fontSize:12, fontWeight:700, padding:"7px 18px", borderRadius:6,
+              background:C.accent, border:"none", color:"#fff", cursor:"pointer", opacity:loading?0.6:1 }}>
+            {loading ? "⟳ Loading…" : "↻ Refresh"}
+          </button>
+          {lastAt && <span style={{ ...sans, fontSize:10, color:C.muted }}>Updated {lastAt}</span>}
+        </div>
+      </div>
+
+      {/* Summary strip */}
+      {data && (
+        <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fill,minmax(180px,1fr))",
+          gap:12, marginBottom:20 }}>
+          {[
+            { label:"Block Prints",     value: data.total_blocks.toLocaleString(),
+              sub:"Total institutional prints",  color: C.white },
+            { label:"Institutional Vol",value: fmtV(data.total_shares),
+              sub:"Total shares in blocks",       color:"#8b5cf6" },
+            { label:"Dollar Volume",    value: fmt$(data.total_dollar_vol),
+              sub:"Estimated $ traded in blocks", color:"#f59e0b" },
+            { label:"Buy Pressure",     value: `${buyPct}%`,
+              sub: `${fmtV(data.buy_shares)} buy vs ${fmtV(data.sell_shares)} sell`,
+              color: buyPct >= 55 ? C.bull : buyPct <= 45 ? C.bear : C.neutral },
+            { label:"Tickers Active",   value: data.by_ticker?.length ?? 0,
+              sub:"Unique tickers with blocks",   color: C.text },
+          ].map(s => (
+            <div key={s.label} style={{ background:C.card, border:`1px solid ${C.border}`,
+              borderRadius:10, padding:"14px 12px", textAlign:"center" }}>
+              <div style={{ ...sans, fontSize:10, color:C.muted, textTransform:"uppercase",
+                letterSpacing:1, marginBottom:6 }}>{s.label}</div>
+              <div style={{ ...mono, fontSize:22, fontWeight:800, color:s.color }}>{s.value}</div>
+              <div style={{ ...sans, fontSize:10, color:C.muted, marginTop:3 }}>{s.sub}</div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Buy/Sell flow bar */}
+      {data && data.total_shares > 0 && (
+        <Card style={{ marginBottom:16, padding:"12px 16px" }}>
+          <div style={{ ...sans, fontSize:11, fontWeight:700, color:C.muted,
+            textTransform:"uppercase", letterSpacing:1, marginBottom:8 }}>
+            Session Buy vs Sell Flow (Block Trades Only)
+          </div>
+          <div style={{ display:"flex", height:18, borderRadius:6, overflow:"hidden", gap:1 }}>
+            <div style={{ width:`${buyPct}%`, background:C.bull, borderRadius:"6px 0 0 6px",
+              transition:"width 0.4s", position:"relative" }}>
+              {buyPct > 15 && <span style={{ ...mono, fontSize:10, color:"#fff", fontWeight:700,
+                position:"absolute", left:8, top:"50%", transform:"translateY(-50%)" }}>
+                BUY {buyPct}%
+              </span>}
+            </div>
+            <div style={{ flex:1, background:C.bear, borderRadius:"0 6px 6px 0" }}>
+              {(100-buyPct) > 15 && <span style={{ ...mono, fontSize:10, color:"#fff", fontWeight:700,
+                position:"absolute", right:8, top:"50%", transform:"translateY(-50%)" }}>
+                SELL {100-buyPct}%
+              </span>}
+            </div>
+          </div>
+          <div style={{ display:"flex", justifyContent:"space-between", marginTop:4 }}>
+            <span style={{ ...mono, fontSize:10, color:C.bull }}>
+              {fmtV(data.buy_shares)} shares bought
+            </span>
+            <span style={{ ...mono, fontSize:10, color:C.bear }}>
+              {fmtV(data.sell_shares)} shares sold
+            </span>
+          </div>
+        </Card>
+      )}
+
+      {/* Per-ticker summary grid */}
+      {data && data.by_ticker?.length > 0 && (
+        <Card title="Block Flow by Ticker" style={{ marginBottom:16 }}>
+          <div style={{ overflowX:"auto" }}>
+            <table style={{ fontSize:12, width:"100%", borderCollapse:"collapse" }}>
+              <thead>
+                <tr style={{ background:C.surface }}>
+                  {["Ticker","Blocks","Total Shares","Buy Shares","Sell Shares","Net Flow","$ Volume","Bias","First","Last"].map(h => (
+                    <th key={h} style={{ ...mono, fontSize:10, color:C.muted, fontWeight:600,
+                      textTransform:"uppercase", letterSpacing:0.5,
+                      borderBottom:`1px solid ${C.border}`, padding:"7px 10px",
+                      textAlign:"left", whiteSpace:"nowrap" }}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {data.by_ticker.map((t, i) => {
+                  const netCol = t.net_flow >= 0 ? C.bull : C.bear;
+                  const bc     = biasColor(t.bias);
+                  return (
+                    <tr key={t.ticker} style={{
+                      borderBottom:`1px solid ${C.border}`,
+                      background: i % 2 === 0 ? "transparent" : C.surface,
+                    }}>
+                      <td style={{ ...mono, fontWeight:800, fontSize:13, color:C.white,
+                        padding:"8px 10px" }}>{t.ticker}</td>
+                      <td style={{ ...mono, color:C.muted, padding:"8px 10px" }}>
+                        {t.block_count}</td>
+                      <td style={{ ...mono, color:"#8b5cf6", fontWeight:700, padding:"8px 10px" }}>
+                        {fmtV(t.total_shares)}</td>
+                      <td style={{ ...mono, color:C.bull, padding:"8px 10px" }}>
+                        {fmtV(t.buy_shares)}</td>
+                      <td style={{ ...mono, color:C.bear, padding:"8px 10px" }}>
+                        {fmtV(t.sell_shares)}</td>
+                      <td style={{ ...mono, color:netCol, fontWeight:700, padding:"8px 10px" }}>
+                        {t.net_flow >= 0 ? "+" : ""}{fmtV(t.net_flow)}</td>
+                      <td style={{ ...mono, color:"#f59e0b", padding:"8px 10px" }}>
+                        {fmt$k(t.dollar_vol)}</td>
+                      <td style={{ padding:"8px 10px" }}>
+                        <span style={{ ...mono, fontSize:10, fontWeight:700, color:bc,
+                          background:`${bc}15`, border:`1px solid ${bc}33`,
+                          borderRadius:4, padding:"2px 7px" }}>
+                          {biasShort(t.bias)}
+                        </span>
+                      </td>
+                      <td style={{ ...mono, fontSize:10, color:C.muted, padding:"8px 10px" }}>
+                        {t.first_seen?.slice(11,19) || "—"}</td>
+                      <td style={{ ...mono, fontSize:10, color:C.muted, padding:"8px 10px" }}>
+                        {t.last_seen?.slice(11,19) || "—"}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </Card>
+      )}
+
+      {/* Ranked individual block prints */}
+      {data && prints.length > 0 && (
+        <Card style={{ padding:0, overflow:"hidden" }}>
+          <div style={{ padding:"12px 16px", borderBottom:`1px solid ${C.border}`,
+            display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+            <span style={{ ...sans, fontSize:13, fontWeight:700, color:C.white }}>
+              Individual Block Prints &nbsp;
+              <span style={{ ...mono, fontSize:11, color:C.muted }}>
+                ({prints.length} total · click column header to sort)
+              </span>
+            </span>
+            <span style={{ ...sans, fontSize:10, color:C.muted }}>
+              Blocks ≥ 5,000 shares · CVD score at time of print
+            </span>
+          </div>
+          <div style={{ overflowX:"auto", maxHeight:600, overflowY:"auto" }}>
+            <table style={{ fontSize:12, width:"100%", borderCollapse:"collapse" }}>
+              <thead style={{ position:"sticky", top:0, background:C.surface, zIndex:1 }}>
+                <tr>
+                  <Th col="rank"        label="#"          />
+                  <Th col="ticker"      label="Ticker"     />
+                  <Th col="ts"          label="Time"       />
+                  <Th col="price"       label="Price"      />
+                  <Th col="size"        label="Shares"     />
+                  <Th col="dollar_value"label="$ Value"    />
+                  <Th col="side"        label="Side"       />
+                  <Th col="exchange"    label="Exch"       />
+                  <Th col="pct_from_open" label="% Open"  />
+                  <Th col="cvd_score"   label="CVD Score"  />
+                </tr>
+              </thead>
+              <tbody>
+                {prints.map((p, i) => {
+                  const sideCol = p.side === "BUY" ? C.bull : C.bear;
+                  const cvdCol  = p.cvd_score == null ? C.muted
+                    : p.cvd_score > 0.25 ? C.bull : p.cvd_score < -0.25 ? C.bear : C.neutral;
+                  return (
+                    <tr key={i} style={{
+                      borderBottom:`1px solid ${C.border}`,
+                      borderLeft:`3px solid ${sideCol}`,
+                      background: p.side === "BUY" ? `${C.bull}08` : `${C.bear}08`,
+                    }}>
+                      <td style={{ ...mono, color:C.muted, padding:"7px 10px", fontSize:11 }}>
+                        {p.rank}</td>
+                      <td style={{ ...mono, fontWeight:800, fontSize:13, color:C.white,
+                        padding:"7px 10px" }}>{p.ticker}</td>
+                      <td style={{ ...mono, fontSize:11, color:C.muted, padding:"7px 10px",
+                        whiteSpace:"nowrap" }}>
+                        {p.ts?.slice(11,19) || p.ts}</td>
+                      <td style={{ ...mono, fontWeight:700, color:sideCol, padding:"7px 10px" }}>
+                        ${parseFloat(p.price).toFixed(2)}</td>
+                      <td style={{ ...mono, fontWeight:700, color:"#8b5cf6", padding:"7px 10px" }}>
+                        {parseInt(p.size).toLocaleString()}</td>
+                      <td style={{ ...mono, color:"#f59e0b", fontWeight:600, padding:"7px 10px" }}>
+                        {fmt$k(p.dollar_value)}</td>
+                      <td style={{ padding:"7px 10px" }}>
+                        <span style={{ ...mono, fontSize:11, fontWeight:800, color:sideCol,
+                          background:`${sideCol}18`, border:`1px solid ${sideCol}44`,
+                          borderRadius:4, padding:"2px 8px" }}>
+                          {p.side}
+                        </span>
+                      </td>
+                      <td style={{ ...mono, fontSize:11, color:C.muted, padding:"7px 10px" }}>
+                        {p.exchange || "—"}
+                        {p.is_after_hours ? (
+                          <span style={{ marginLeft:4, fontSize:9, color:"#8b5cf6",
+                            background:"#8b5cf611", padding:"1px 4px", borderRadius:6 }}>AH</span>
+                        ) : null}
+                      </td>
+                      <td style={{ ...mono, fontSize:11, padding:"7px 10px",
+                        color: p.pct_from_open == null ? C.muted
+                          : p.pct_from_open >= 0 ? C.bull : C.bear }}>
+                        {p.pct_from_open != null
+                          ? `${p.pct_from_open >= 0 ? "+" : ""}${p.pct_from_open.toFixed(2)}%`
+                          : "—"}
+                      </td>
+                      <td style={{ ...mono, fontSize:11, fontWeight:700, color:cvdCol,
+                        padding:"7px 10px" }}>
+                        {p.cvd_score != null
+                          ? `${p.cvd_score >= 0 ? "+" : ""}${parseFloat(p.cvd_score).toFixed(3)}`
+                          : "—"}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </Card>
+      )}
+
+      {/* Empty state */}
+      {!loading && noData && (
+        <div style={{ textAlign:"center", padding:"80px 20px" }}>
+          <div style={{ fontSize:40, marginBottom:14 }}>🏦</div>
+          <div style={{ ...sans, fontSize:15, color:C.muted, marginBottom:8 }}>
+            No block trades captured for {date}
+          </div>
+          <div style={{ ...sans, fontSize:12, color:C.muted, lineHeight:1.7, maxWidth:480, margin:"0 auto" }}>
+            Block prints are captured automatically once the backend is running and tickers are
+            subscribed. Open the <b>Live Tape</b> tab for additional tickers to start accumulating.
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+
 // ── Root App ──────────────────────────────────────────────────────────────
 function App() {
   const [tab, setTab]         = useState("pnl");
@@ -4460,8 +4769,9 @@ function App() {
     { id:"universe",   label:"Universe"    },
     { id:"decisions",  label:"Decisions"   },
     { id:"technicals", label:"Technicals"  },
-    { id:"watchlist",  label:"Watchlist 📡" },
-    { id:"tape",       label:"Live Tape 📈" },
+    { id:"watchlist",  label:"Watchlist 📡"   },
+    { id:"tape",       label:"Live Tape 📈"   },
+    { id:"instflow",   label:"Inst. Flow 🏦"  },
   ];
 
   const deltaCol = netDelta == null ? C.muted : netDelta >= 0 ? C.bull : C.bear;
@@ -4518,6 +4828,7 @@ function App() {
         <div style={{display: tab==="technicals" ? "" : "none"}}><TechnicalsTab /></div>
         <div style={{display: tab==="watchlist"  ? "" : "none"}}><WatchlistTab /></div>
         <div style={{display: tab==="tape"       ? "" : "none"}}><TapeTab /></div>
+        <div style={{display: tab==="instflow"   ? "" : "none"}}><InstFlowTab /></div>
 
         <div style={{ marginTop:20, ...sans, fontSize:11, color:C.muted, lineHeight:1.7 }}>
           Auto-trader: Kelly sizing · 50% profit target · IV-adjusted stops · 21 DTE roll · 48h cooldown. Backtest: 2-yr simulation with BS pricing.

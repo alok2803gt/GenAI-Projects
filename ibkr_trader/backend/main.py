@@ -83,6 +83,7 @@ FEATURE_COLS = [
 # ── Tape sentiment — CVD scoring ───────────────────────────────────────────
 TAPE_SENTIMENT_MAX_TICKERS = 20   # cap on reqMktData subscriptions for tape
 TAPE_STALENESS_SECS        = 1800 # score treated as 0.0 (neutral) when older than 30 min
+TAPE_BLOCK_MIN_SHARES      = 5000 # CVD-callback block threshold for real-time capture
 
 
 class _FlowAbort(Exception):
@@ -672,6 +673,13 @@ def _make_tape_callback(sym: str):
         sent["label"]      = label
         sent["components"] = components
         sent["last_updated"] = datetime.utcnow().isoformat()
+
+        # ── Real-time block capture for institutional flow report ─────────────
+        if int(size) >= TAPE_BLOCK_MIN_SHARES:
+            _tape_db_insert_block_immediate(
+                sym, price, int(size), direction,
+                sent.get("session_vwap", 0.0), score,
+            )
 
     return on_tape_update
 
@@ -3384,6 +3392,36 @@ def _tape_db_flush_prints(ticker: str, rows: list) -> None:
         con.close()
     except Exception as exc:
         log.debug("tape_db flush prints error: %s", exc)
+
+
+def _tape_db_insert_block_immediate(sym: str, price: float, size: int, direction: int,
+                                     session_vwap: float, cvd_score: float) -> None:
+    """Write a single block print immediately from the CVD callback (always-on capture)."""
+    try:
+        from zoneinfo import ZoneInfo
+        now_et = datetime.now(ZoneInfo("America/New_York"))
+    except Exception:
+        now_et = datetime.now()
+    ts_str      = now_et.strftime("%Y-%m-%dT%H:%M:%S")
+    sess_date   = now_et.strftime("%Y-%m-%d")
+    sent        = state["tape_sentiment"].get(sym, {})
+    buy_vol_now = sent.get("session_buy_vol", 0)
+    sell_vol_now= sent.get("session_sell_vol", 0)
+    try:
+        con = sqlite3.connect(TAPE_DB_PATH, check_same_thread=False)
+        con.execute("""
+            INSERT INTO tape_prints
+            (ts, session_date, ticker, price, size, direction, exchange, is_block,
+             is_after_hours, vwap, cum_vol, buy_vol, sell_vol, net_delta, pct_from_open, cvd_score)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (ts_str, sess_date, sym, price, size, direction, "SMART", 1,
+              0, session_vwap, sent.get("session_vol", 0),
+              buy_vol_now, sell_vol_now, buy_vol_now - sell_vol_now,
+              None, round(cvd_score, 4)))
+        con.commit()
+        con.close()
+    except Exception as exc:
+        log.debug("tape_db block immediate write error [%s]: %s", sym, exc)
 
 
 def _tape_db_insert_bar(ticker: str, bar: dict, bar_start: str, session_date: str,
@@ -6616,6 +6654,98 @@ def tape_sessions(
             ).fetchall()
         con.close()
         return {"sessions": [{"ticker": r[0], "date": r[1], "prints": r[2]} for r in rows]}
+    except Exception as exc:
+        raise HTTPException(500, str(exc))
+
+
+@app.get("/tape/blocks")
+def tape_block_report(
+    date:  Optional[str] = Query(None, description="Session date YYYY-MM-DD (default: today ET)"),
+    limit: int           = Query(500,  description="Max individual block rows to return"),
+):
+    """
+    Institutional block flow report for a given session date.
+    Returns both individual block prints (sorted by size DESC) and a per-ticker summary.
+    Blocks are captured in real-time from the CVD sentiment subscription for all tracked
+    tickers, plus any WS sessions the user opened that day.
+    """
+    try:
+        from zoneinfo import ZoneInfo
+        sess_date = date or datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
+    except Exception:
+        sess_date = date or datetime.utcnow().strftime("%Y-%m-%d")
+    try:
+        con = sqlite3.connect(TAPE_DB_PATH, check_same_thread=False)
+
+        # Individual block prints — largest first
+        rows = con.execute("""
+            SELECT ts, ticker, price, size, direction, exchange,
+                   is_after_hours, vwap, net_delta, pct_from_open, cvd_score
+            FROM tape_prints
+            WHERE session_date=? AND is_block=1
+            ORDER BY size DESC LIMIT ?
+        """, (sess_date, limit)).fetchall()
+
+        # Per-ticker aggregates
+        agg_rows = con.execute("""
+            SELECT ticker,
+                   COUNT(*)                                               AS block_count,
+                   SUM(size)                                              AS total_shares,
+                   SUM(CASE WHEN direction >= 0 THEN size ELSE 0 END)    AS buy_shares,
+                   SUM(CASE WHEN direction  < 0 THEN size ELSE 0 END)    AS sell_shares,
+                   MAX(size)                                              AS largest_print,
+                   ROUND(SUM(price * size) / NULLIF(SUM(size), 0), 2)    AS vwap_block,
+                   MIN(ts)                                                AS first_seen,
+                   MAX(ts)                                                AS last_seen
+            FROM tape_prints
+            WHERE session_date=? AND is_block=1
+            GROUP BY ticker
+            ORDER BY total_shares DESC
+        """, (sess_date,)).fetchall()
+        con.close()
+
+        # Build print dicts with computed fields
+        pcols = ["ts","ticker","price","size","direction","exchange",
+                 "is_after_hours","vwap","net_delta","pct_from_open","cvd_score"]
+        prints = []
+        for i, r in enumerate(rows, 1):
+            p = dict(zip(pcols, r))
+            p["rank"]        = i
+            p["dollar_value"]= round(float(p["price"]) * int(p["size"]))
+            p["side"]        = "BUY" if (p["direction"] or 0) >= 0 else "SELL"
+            prints.append(p)
+
+        # Build ticker summary dicts
+        acols = ["ticker","block_count","total_shares","buy_shares","sell_shares",
+                 "largest_print","vwap_block","first_seen","last_seen"]
+        by_ticker = []
+        for r in agg_rows:
+            s = dict(zip(acols, r))
+            s["buy_shares"]  = s["buy_shares"]  or 0
+            s["sell_shares"] = s["sell_shares"] or 0
+            s["net_flow"]    = s["buy_shares"] - s["sell_shares"]
+            s["dollar_vol"]  = round(float(s["vwap_block"] or 0) * int(s["total_shares"] or 0))
+            s["bias"]        = ("STRONGLY BULLISH" if s["net_flow"] > s["total_shares"] * 0.6 else
+                                "BULLISH"          if s["net_flow"] > 0                  else
+                                "STRONGLY BEARISH" if s["net_flow"] < -s["total_shares"] * 0.6 else
+                                "BEARISH")
+            by_ticker.append(s)
+
+        total_shares = sum(p["size"] for p in prints)
+        buy_shares   = sum(p["size"] for p in prints if p["side"] == "BUY")
+        sell_shares  = total_shares - buy_shares
+        total_dolval = sum(p["dollar_value"] for p in prints)
+
+        return {
+            "date":          sess_date,
+            "total_blocks":  len(prints),
+            "total_shares":  total_shares,
+            "buy_shares":    buy_shares,
+            "sell_shares":   sell_shares,
+            "total_dollar_vol": total_dolval,
+            "by_ticker":     by_ticker,
+            "prints":        prints,
+        }
     except Exception as exc:
         raise HTTPException(500, str(exc))
 
