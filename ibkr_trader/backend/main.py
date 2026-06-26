@@ -5593,11 +5593,38 @@ def autotrader_status():
                 if getattr(c, "secType", "") != "OPT":
                     continue
                 k = _at_contract_key(c)
-                live_pnl   = round(float(item.unrealizedPNL or 0), 2)
-                live_price = round(float(item.marketPrice or 0), 4)
+                # Guard against None and nan — IBKR returns None when it hasn't
+                # computed the value yet (e.g. after hours, data farm not warm).
+                # `None or 0` would silently give $0, so we check explicitly.
+                def _to_float_or_none(v):
+                    if v is None: return None
+                    try:
+                        f = float(v)
+                        return None if math.isnan(f) else f
+                    except (TypeError, ValueError):
+                        return None
+
+                upnl_raw   = _to_float_or_none(item.unrealizedPNL)
+                mprice_raw = _to_float_or_none(item.marketPrice)
+                live_price = round(mprice_raw, 4) if mprice_raw is not None else None
+
                 if k in positions_enriched:
-                    positions_enriched[k]["live_pnl"]   = live_pnl
-                    positions_enriched[k]["live_price"]  = live_price
+                    pos_info = positions_enriched[k]
+                    if upnl_raw is not None:
+                        # IBKR computed it — use directly
+                        live_pnl = round(upnl_raw, 2)
+                    elif mprice_raw is not None and mprice_raw > 0:
+                        # Compute from last known market price vs our stored entry price
+                        entry = float(pos_info.get("entry_price", 0))
+                        qty   = int(pos_info.get("qty", 1))
+                        if pos_info.get("action") == "SELL":
+                            live_pnl = round((entry - mprice_raw) * qty * 100, 2)
+                        else:
+                            live_pnl = round((mprice_raw - entry) * qty * 100, 2)
+                    else:
+                        live_pnl = None   # no data — UI shows "—" not "$0"
+                    pos_info["live_pnl"]  = live_pnl
+                    pos_info["live_price"] = live_price
                 else:
                     # Option in portfolio but not tracked by auto-trader (manual trade)
                     untracked_positions.append({
@@ -5607,7 +5634,7 @@ def autotrader_status():
                         "expiry":     (getattr(c, "lastTradeDateOrContractMonth", "") or "")[:8],
                         "action":     "BUY" if float(item.position or 0) > 0 else "SELL",
                         "qty":        abs(int(item.position or 0)),
-                        "live_pnl":   live_pnl,
+                        "live_pnl":   round(upnl_raw, 2) if upnl_raw is not None else None,
                         "live_price": live_price,
                         "market_value": round(float(item.marketValue or 0), 2),
                         "avg_cost":   round(float(item.averageCost or 0), 4),
