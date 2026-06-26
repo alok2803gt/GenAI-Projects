@@ -5441,9 +5441,14 @@ def account_summary():
 
     for av in ib.accountValues(account_id):
         key = want_map.get(av.tag)
-        if key and av.currency == "USD":
+        # IBKR returns account totals with currency="" (base) on paper accounts
+        # and "BASE" or "USD" on live accounts. Accept all three; prefer non-zero
+        # so a later USD-tagged entry doesn't overwrite a valid base-currency value.
+        if key and av.currency in ("USD", "", "BASE"):
             try:
-                result[key] = round(float(av.value), 2)
+                v = round(float(av.value), 2)
+                if result[key] == 0.0 or av.currency == "USD":
+                    result[key] = v
             except (ValueError, TypeError):
                 pass
 
