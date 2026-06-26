@@ -5452,7 +5452,42 @@ def account_summary():
             except (ValueError, TypeError):
                 pass
 
+    # Fallback: if IBKR account-level UnrealizedPnL is still 0 (tag absent or zeroed
+    # at market close on paper accounts), compute from portfolio item.unrealizedPNL.
+    # This is accurate as long as marketPrice is populated (which it is from closing marks).
+    if result["unrealized_pnl"] == 0.0:
+        try:
+            portfolio_upnl = 0.0
+            for item in ib.portfolio():
+                v = item.unrealizedPNL
+                if v is not None:
+                    try:
+                        f = float(v)
+                        if not math.isnan(f):
+                            portfolio_upnl += f
+                    except (TypeError, ValueError):
+                        pass
+            if portfolio_upnl != 0.0:
+                result["unrealized_pnl"] = round(portfolio_upnl, 2)
+        except Exception:
+            pass
+
     return result
+
+
+@app.get("/account/raw-values")
+def account_raw_values():
+    """Debug: return all raw IBKR accountValues so we can see exact tag+currency pairs."""
+    _require_connection()
+    ib = state["ib"]
+    accounts = ib.managedAccounts()
+    account_id = accounts[0] if accounts else ""
+    rows = []
+    for av in ib.accountValues(account_id):
+        rows.append({"tag": av.tag, "value": av.value, "currency": av.currency, "account": av.account})
+    # Return only P&L and value-related tags to keep the response readable
+    pnl_tags = [r for r in rows if any(k in r["tag"] for k in ("PnL","Pnl","pnl","Cash","Liq","Margin","Fund","Power","Position","Value"))]
+    return {"account": account_id, "pnl_tags": pnl_tags, "total_tags": len(rows)}
 
 
 # ── Watchlist endpoints (breakout scanner integration) ────────────────────
