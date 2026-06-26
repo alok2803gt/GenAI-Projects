@@ -2144,7 +2144,9 @@ async def _autotrader_monitor_coro(ib: IB) -> None:
             expiry_date = datetime.strptime(expiry_str, "%Y%m%d").date()
         except ValueError:
             continue
-        if expiry_date < today and key not in live_keys:
+        if expiry_date <= today and key not in live_keys:
+            # <= catches same-day expiries: options are delisted at settlement
+            # so they disappear from portfolio() on expiration day itself
             orphans.append(key)
 
     for key in orphans:
@@ -3224,6 +3226,29 @@ async def _autotrader_hedge_coro(ib: IB) -> None:
     await asyncio.sleep(1)
     _at_log("HEDGE", (f"Placed SPY {hedge_right}{strike} {expiry_k} hedge @ ${lmt:.2f} "
                       f"(portfolio delta={net_delta:+.0f}, order #{trade.order.orderId})"))
+
+    # Track in at["positions"] so the monitor handles profit-close and expiry cleanup.
+    # strategy_type="hedge" lets the monitor treat it like a LEAP BUY (profit target + 21 DTE).
+    from zoneinfo import ZoneInfo
+    hedge_key = _at_contract_key(contract)
+    state["autotrader"]["positions"][hedge_key] = {
+        "ticker":        "SPY",
+        "expiry":        expiry_k,
+        "strike":        float(strike),
+        "right":         hedge_right,
+        "action":        "BUY",
+        "qty":           1,
+        "entry_price":   lmt,
+        "max_profit":    round(lmt * 100, 2),   # cost basis (monitor treats as LEAP BUY)
+        "order_id":      trade.order.orderId,
+        "placed_at":     datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %H:%M ET"),
+        "score":         0,
+        "journal_id":    None,
+        "live_iv":       None,
+        "roll_count":    0,
+        "strategy_type": "hedge",
+    }
+    _at_save_state()
 
 
 async def _autotrader_background() -> None:
@@ -5208,8 +5233,9 @@ class AutoTraderConfigRequest(BaseModel):
     total_capital:      float     = 100000.0
     # assumed_win_rate is intentionally excluded — it is system-managed via
     # _update_kelly_from_journal and should not be overwritten by the UI.
-    auto_hedge:         bool      = False
-    hedge_threshold:    float     = 100.0
+    auto_hedge:           bool    = False
+    hedge_threshold:      float   = 100.0
+    tape_filter_enabled:  bool    = True
 
 
 class ReconnectRequest(BaseModel):
@@ -5620,8 +5646,9 @@ def update_autotrader_config(req: AutoTraderConfigRequest):
         "use_kelly":         req.use_kelly,
         "total_capital":     req.total_capital,
         # assumed_win_rate is NOT updated here — managed by _update_kelly_from_journal
-        "auto_hedge":        req.auto_hedge,
-        "hedge_threshold":   req.hedge_threshold,
+        "auto_hedge":          req.auto_hedge,
+        "hedge_threshold":     req.hedge_threshold,
+        "tape_filter_enabled": req.tape_filter_enabled,
     })
     if req.enabled and not was:
         _at_log("SYSTEM", "Auto-trader ENABLED — will scan every 5 min")
