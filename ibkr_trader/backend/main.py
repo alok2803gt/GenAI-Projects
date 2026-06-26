@@ -27,7 +27,7 @@ import uvicorn
 import yfinance as yf
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from ib_insync import IB, LimitOrder, Option, Stock, util
+from ib_insync import IB, Index, LimitOrder, Option, Stock, util
 from pydantic import BaseModel
 from xgboost import XGBClassifier
 from sklearn.model_selection import TimeSeriesSplit
@@ -87,14 +87,17 @@ TAPE_BLOCK_MIN_SHARES      = 5000 # CVD-callback block threshold for real-time c
 
 # ── Market index banner ────────────────────────────────────────────────────
 INDEX_CONFIG = [
-    {"sym": "SPY",  "yf": "SPY",  "name": "S&P 500"},
-    {"sym": "QQQ",  "yf": "QQQ",  "name": "Nasdaq"},
-    {"sym": "DIA",  "yf": "DIA",  "name": "Dow"},
-    {"sym": "IWM",  "yf": "IWM",  "name": "Russell"},
-    {"sym": "VIX",  "yf": "^VIX", "name": "VIX"},
+    {"sym": "SPY",  "name": "S&P 500"},
+    {"sym": "QQQ",  "name": "Nasdaq"},
+    {"sym": "DIA",  "name": "Dow"},
+    {"sym": "IWM",  "name": "Russell"},
+    {"sym": "VIX",  "name": "VIX"},
 ]
+# These four ETFs are always subscribed (before universe/watchlist candidates)
+# so the index banner has live IBKR prices from market open.
+INDEX_ETF_TICKERS  = ["SPY", "QQQ", "DIA", "IWM"]
 _index_cache: dict = {"data": None, "ts": 0.0}
-INDEX_CACHE_TTL    = 15   # seconds between yfinance refreshes
+INDEX_CACHE_TTL    = 15   # seconds between fallback yfinance refreshes
 
 
 class _FlowAbort(Exception):
@@ -259,6 +262,8 @@ state: Dict = {
     # CVD tape sentiment (populated by reqMktData "233,375" subscriptions)
     "tape_sentiment": {},  # ticker → per-ticker CVD state dict
     "tape_subs":      {},  # ticker → ib_insync Ticker object from reqMktData
+    # VIX live price (separate Index contract subscription)
+    "vix_live":       {"price": None, "prev_close": None, "updated": None},
     # Breakout-scanner watchlist (populated via POST /watchlist/alert)
     "watchlist": {},   # ticker → {signal_type, timestamp_et, price_at_alert, pct_b, rsi, vol_ratio}
     # Reconnect request (set by /reconnect endpoint, read by streaming loop)
@@ -739,12 +744,62 @@ async def _tape_preseed_subscribe(ib: IB, ticker: str) -> None:
     log.info("Tape pre-seeded [%s]  avg_vol_per_bar=%.0f", ticker, avg_per_min)
 
 
+async def _subscribe_vix(ib: IB) -> None:
+    """Subscribe to live VIX index price via IBKR Index contract.
+    Stores price in state['vix_live']. Falls back silently if CBOE data is unavailable."""
+    try:
+        vix_contract = Index("VIX", "CBOE")
+        await ib.qualifyContractsAsync(vix_contract)
+
+        # Fetch previous close from 2-day history (snapshot only)
+        prev_close = None
+        try:
+            snap = await ib.reqHistoricalDataAsync(
+                vix_contract, endDateTime="", durationStr="2 D",
+                barSizeSetting="1 day", whatToShow="TRADES",
+                useRTH=True, formatDate=1, keepUpToDate=False,
+            )
+            if snap and len(snap) >= 2:
+                prev_close = round(float(snap[-2].close), 2)
+            elif snap:
+                prev_close = round(float(snap[-1].close), 2)
+        except Exception:
+            pass
+
+        vix_tkr = ib.reqMktData(vix_contract, "")
+
+        def _on_vix(t):
+            price = None
+            for attr in ("last", "close", "marketPrice"):
+                v = getattr(t, attr, None)
+                if v is not None:
+                    try:
+                        f = float(v)
+                        if not math.isnan(f) and f > 0:
+                            price = round(f, 2)
+                            break
+                    except (TypeError, ValueError):
+                        pass
+            if price:
+                state["vix_live"]["price"]      = price
+                state["vix_live"]["updated"]    = datetime.utcnow().isoformat()
+                if prev_close:
+                    state["vix_live"]["prev_close"] = prev_close
+
+        vix_tkr.updateEvent += _on_vix
+        state["vix_live"]["_sub"] = vix_tkr   # keep reference alive
+        log.info("VIX Index subscribed via IBKR (CBOE)")
+    except Exception as exc:
+        log.warning("VIX IBKR subscription failed (will use yfinance fallback): %s", exc)
+
+
 async def _tape_preseed(ib: IB) -> None:
     """Fill remaining tape subscription slots from a priority-ordered candidate list:
 
-      1. Active auto-trader positions  — tickers with live trades (highest priority)
-      2. Breakout scanner watchlist    — recently alerted candidates
-      3. Top-ranked universe tickers   — sorted by XGBoost score (broadest coverage)
+      0. Index ETFs (SPY, QQQ, DIA, IWM) — always subscribed first for the banner
+      1. Active auto-trader positions     — tickers with live trades
+      2. Breakout scanner watchlist       — recently alerted candidates
+      3. Top-ranked universe tickers      — sorted by XGBoost score
 
     Called once after initial connect and again after each 1102 reconnect so block
     flow capture starts at market open without waiting for the scanner to run.
@@ -762,6 +817,10 @@ async def _tape_preseed(ib: IB) -> None:
         if t and t not in seen:
             seen.add(t)
             ordered.append(t)
+
+    # 0 — index ETFs always first (live banner prices)
+    for t in INDEX_ETF_TICKERS:
+        _enqueue(t)
 
     # 1 — active positions (money on the line — always monitor these)
     for info in state["autotrader"].get("positions", {}).values():
@@ -809,6 +868,7 @@ async def streaming_loop_async() -> None:
                     state["tape_subs"].clear()
                     for _ts in state["tape_sentiment"].values():
                         _ts["sub_active"] = False
+                    state["vix_live"]["_sub"] = None   # VIX sub lost on reconnect
                     log.info("IBKR reconnected (1102) — re-subscribing all tickers within 10 s")
                 elif errorCode in (2104, 2106, 2158, 2119):
                     pass  # benign farm/connectivity notifications
@@ -849,6 +909,8 @@ async def streaming_loop_async() -> None:
             # Pre-seed tape CVD slots from positions → watchlist → universe on connect.
             # Runs before first scan so block flow capture starts at market open.
             await _tape_preseed(ib)
+            # Subscribe VIX as a live Index contract for the index banner.
+            await _subscribe_vix(ib)
             # Retry once — occasionally the first snapshot arrives before OPRA feed is warm
             if not state["opra_active"]:
                 await asyncio.sleep(3)
@@ -864,6 +926,9 @@ async def streaming_loop_async() -> None:
                 # Also fills slots lazily as universe scores update throughout the day.
                 if len(state["tape_subs"]) < TAPE_SENTIMENT_MAX_TICKERS:
                     await _tape_preseed(ib)
+                # Re-subscribe VIX if the 1102 reconnect cleared it.
+                if state["vix_live"].get("_sub") is None:
+                    await _subscribe_vix(ib)
                 _heartbeat_tick += 1
                 if _heartbeat_tick % 24 == 0:   # every 24 × 10 s = 4 min
                     state["opra_active"] = await _check_opra_subscription(ib)
@@ -6860,15 +6925,16 @@ def market_indexes():
     """
     Live prices for the five main market indexes (S&P 500, Nasdaq, Dow, Russell, VIX).
 
-    Price source priority:
-      1. IBKR tape_sentiment last_price  — real-time when ticker is subscribed (SPY/QQQ/IWM)
-      2. yfinance fast_info              — ~15-min delayed fallback for DIA + VIX
-    yfinance results are cached 15 s so the endpoint returns instantly on every poll.
+    Price source priority for each ticker:
+      1. IBKR tape_sentiment last_price — real-time for SPY/QQQ/DIA/IWM (Stock ETF subs)
+      2. IBKR vix_live                  — real-time for VIX (Index contract sub)
+      3. yfinance fast_info             — fallback prev_close + price when IBKR unavailable
+    yfinance results cached 15 s; IBKR prices overlaid on every call (no extra latency).
     """
-    import time as _time
+    import time as _time, copy
 
     now = _time.time()
-    # Rebuild from yfinance only when cache is stale
+    # Rebuild yfinance baseline only when cache is stale
     if _index_cache["data"] is None or now - _index_cache["ts"] > INDEX_CACHE_TTL:
         fresh: list = []
         for cfg in INDEX_CONFIG:
@@ -6881,9 +6947,10 @@ def market_indexes():
                 "change_pct": None,
                 "is_live":    False,
             }
+            yf_sym = "^VIX" if cfg["sym"] == "VIX" else cfg["sym"]
             try:
-                fi = yf.Ticker(cfg["yf"]).fast_info
-                lp = getattr(fi, "last_price", None)
+                fi = yf.Ticker(yf_sym).fast_info
+                lp = getattr(fi, "last_price",    None)
                 pc = getattr(fi, "previous_close", None)
                 if lp:  entry["price"]      = round(float(lp), 2)
                 if pc:  entry["prev_close"] = round(float(pc), 2)
@@ -6893,17 +6960,27 @@ def market_indexes():
         _index_cache["data"] = fresh
         _index_cache["ts"]   = now
 
-    # Deep-copy cached data and overlay live IBKR prices where subscribed
-    import copy
+    # Deep-copy cached data then overlay live IBKR prices
     result = copy.deepcopy(_index_cache["data"])
     for entry in result:
-        sym  = entry["sym"]
-        sent = state["tape_sentiment"].get(sym)
-        if sent and sent.get("last_price") and _tape_is_fresh(sent):
-            entry["price"]   = round(float(sent["last_price"]), 2)
-            entry["is_live"] = True
+        sym = entry["sym"]
 
-        # Compute change from prev_close (works for both IBKR and yfinance price)
+        if sym == "VIX":
+            # VIX from dedicated Index contract subscription
+            vl = state.get("vix_live", {})
+            if vl.get("price"):
+                entry["price"]   = vl["price"]
+                entry["is_live"] = True
+            if vl.get("prev_close") and not entry["prev_close"]:
+                entry["prev_close"] = vl["prev_close"]
+        else:
+            # ETF from tape_sentiment (last_price field populated by CVD callback)
+            sent = state["tape_sentiment"].get(sym)
+            if sent and sent.get("last_price") and _tape_is_fresh(sent):
+                entry["price"]   = round(float(sent["last_price"]), 2)
+                entry["is_live"] = True
+
+        # Recompute change after price overlay
         if entry["price"] is not None and entry["prev_close"]:
             entry["change"]     = round(entry["price"] - entry["prev_close"], 2)
             entry["change_pct"] = round(
