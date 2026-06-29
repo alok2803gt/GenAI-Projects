@@ -223,6 +223,10 @@ state: Dict = {
         "iv_rank":  {},   # ticker → {"iv": float|None, "rank": float, "rv_lo": float|None, "rv_hi": float|None, "ts": datetime}
         "regime":   None, # full market regime dict
     },
+    # General-purpose cache (regime, etc.)
+    "cache": {
+        "regime": None,   # SPY SMA-200, per-stock 20d returns — refreshed at connect + every 4h
+    },
     # OPRA subscription status — set once at startup, re-checked on reconnect
     "opra_active": None,   # None = not yet checked, True/False thereafter
     # IV history — persisted daily snapshots for true percentile rank
@@ -5966,6 +5970,8 @@ class WatchlistAlertRequest(BaseModel):
     rsi:           Optional[float] = None
     vol_ratio:     Optional[float] = None
     timestamp_et:  Optional[str]   = None   # "HH:MM ET YYYY-MM-DD"
+    tape_score:    Optional[float] = None   # CVD score from scanner's /tape/sentiment call
+    tape_label:    Optional[str]   = None   # e.g. "BULLISH", "BEARISH", "NEUTRAL"
 
 
 @app.post("/watchlist/alert")
@@ -6000,12 +6006,27 @@ def watchlist_add_alert(req: WatchlistAlertRequest):
                     "reason": (f"SPY ${regime.get('spy_price', 0):.2f} "
                                f"below SMA-200 ${regime.get('spy_sma200', 0):.0f}")}
 
+    def _resolve_tape(req_score, req_label):
+        """Pick best available tape: scanner-provided → backend live state → NO DATA."""
+        if req_label and req_label not in ("NO DATA", "NEUTRAL"):
+            return req_score, req_label
+        _sent  = state["tape_sentiment"].get(tk, {})
+        _fresh = _tape_is_fresh(_sent)
+        if _fresh:
+            return round(_sent["score"], 4), _sent.get("label", "NO DATA")
+        # Fall back to what scanner sent even if neutral
+        return req_score, req_label or "NO DATA"
+
     # Don't downgrade BREAKOUT → PRE-BREAKOUT
     if existing and existing["signal_type"] == "BREAKOUT" and req.signal_type == "PRE-BREAKOUT":
-        # Still refresh live metrics so pct_b / vol_ratio stay current
+        # Still refresh live metrics so pct_b / vol_ratio / tape stay current
         existing["pct_b"]      = round(req.pct_b, 1)
-        if req.rsi      is not None: existing["rsi"]       = round(req.rsi, 1)
+        if req.rsi       is not None: existing["rsi"]       = round(req.rsi, 1)
         if req.vol_ratio is not None: existing["vol_ratio"] = round(req.vol_ratio, 2)
+        ts, tl = _resolve_tape(req.tape_score, req.tape_label)
+        existing["tape_score"]     = ts
+        existing["tape_label"]     = tl
+        existing["tape_confirmed"] = bool(ts is not None and ts > 0.20)
         _watchlist_save()
         return {"ok": True, "action": "refreshed"}
 
@@ -6015,14 +6036,15 @@ def watchlist_add_alert(req: WatchlistAlertRequest):
         existing["pct_b"]       = round(req.pct_b, 1)
         if req.rsi       is not None: existing["rsi"]       = round(req.rsi, 1)
         if req.vol_ratio is not None: existing["vol_ratio"] = round(req.vol_ratio, 2)
+        ts, tl = _resolve_tape(req.tape_score, req.tape_label)
+        existing["tape_score"]     = ts
+        existing["tape_label"]     = tl
+        existing["tape_confirmed"] = bool(ts is not None and ts > 0.20)
         _watchlist_save()
         return {"ok": True, "action": "refreshed"}
 
-    # New entry — enrich with current tape sentiment at alert time
-    _wl_sent  = state["tape_sentiment"].get(tk, {})
-    _wl_fresh = _tape_is_fresh(_wl_sent)
-    _ts = round(_wl_sent["score"], 4) if _wl_fresh else None
-    _tl = _wl_sent.get("label", "NO DATA") if _wl_fresh else "NO DATA"
+    # New entry
+    ts, tl = _resolve_tape(req.tape_score, req.tape_label)
     state["watchlist"][tk] = {
         "ticker":         tk,
         "signal_type":    req.signal_type,
@@ -6032,9 +6054,9 @@ def watchlist_add_alert(req: WatchlistAlertRequest):
         "vol_ratio":      round(req.vol_ratio, 2) if req.vol_ratio is not None else None,
         "timestamp_et":   req.timestamp_et or now_et.strftime("%H:%M ET %Y-%m-%d"),
         "added_iso":      now_et.isoformat(),
-        "tape_score":     _ts,
-        "tape_label":     _tl,
-        "tape_confirmed": bool(_wl_fresh and _wl_sent.get("score", 0.0) > 0.20),
+        "tape_score":     ts,
+        "tape_label":     tl,
+        "tape_confirmed": bool(ts is not None and ts > 0.20),
     }
     # Persist every new alert to alert_history for backtesting
     _alert_history_insert(tk, req.signal_type, req.price_at_alert,

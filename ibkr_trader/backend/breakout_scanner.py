@@ -206,6 +206,36 @@ def post_to_backend(backend_url: str, ind: dict, signal_type: str) -> dict:
         return {"action": "no_backend"}
 
 
+def post_to_backend_with_tape(backend_url: str, ind: dict, signal_type: str,
+                               tape: dict | None) -> dict:
+    """post_to_backend that also includes tape sentiment in the payload."""
+    if not backend_url:
+        return {"action": "no_backend"}
+    try:
+        payload: dict = {
+            "ticker":         ind["ticker"],
+            "signal_type":    signal_type,
+            "price_at_alert": ind.get("price", 0),
+            "pct_b":          ind.get("pct_b", 0),
+            "rsi":            ind.get("rsi"),          # was incorrectly "rsi14"
+            "vol_ratio":      ind.get("vol_ratio"),
+            "timestamp_et":   datetime.now(ET).strftime("%H:%M ET %Y-%m-%d"),
+        }
+        if tape:
+            payload["tape_score"] = tape.get("score")
+            payload["tape_label"] = tape.get("label")
+        r = requests.post(
+            f"{backend_url.rstrip('/')}/watchlist/alert",
+            json=payload,
+            timeout=3,
+        )
+        if r.ok:
+            return r.json()
+        return {"action": "error", "status": r.status_code}
+    except Exception:
+        return {"action": "no_backend"}
+
+
 def fmt_alert(ind: dict, signal: str, tape: dict | None = None) -> str:
     emoji   = "🚨" if signal == "BREAKOUT" else "⚡"
     sma_txt = "All SMAs ✓" if (ind["above_sma20"] and ind["above_sma50"] and ind["above_sma200"]) else \
@@ -395,23 +425,31 @@ def classify_signal(ind: dict, cfg: dict) -> str | None:
 
 
 def apply_quality_filters(candidates: list[dict], regime: dict, cfg: dict) -> list[dict]:
-    """F2 / F3 / F5 scanner-side quality gates applied after classify_signal.
+    """F2 / F5 scanner-side quality gates applied after classify_signal.
 
     F2 Relative strength: stock 20d return must exceed SPY 20d return.
-    F3 Pullback:          %B must have been < 50 at least once in the prior 10 bars.
-    F5 Close quality:     today's close must be in the top 25% of the day's range.
+    F5 Close quality:     today's close must be in the top 50% of the day's range (≥ midpoint).
+
+    NOTE: F3 (pullback — %B < 50 in prior 10 bars) is intentionally excluded from real-time
+    scanning. It uses complete historical daily bars and is appropriate for end-of-day backtests,
+    but kills most intraday signals from stocks in sustained uptrends. It remains in the
+    backtest analysis endpoint (_backtest_breakout_filtered_one) where it operates correctly.
+
+    F5 threshold is relaxed to 50% (vs 75% in backtests) because intraday partial bars have
+    a High that was set earlier in the session — close_pos of 50-75% is still a quality bar
+    closing in the upper half of range, just not necessarily at the intraday high.
 
     Gates are skipped (pass-through) when the required data is unavailable so cold
     starts and data gaps never suppress alerts by default.
     """
     spy_ret20 = regime.get("spy_ret20")
     kept      = []
-    n_f2 = n_f3 = n_f5 = 0
+    n_f2 = n_f5 = 0
 
     for ind in candidates:
         tk = ind["ticker"]
 
-        # F2: relative strength vs SPY
+        # F2: relative strength vs SPY — stock 20d return must beat SPY 20d return
         ret_20d = ind.get("ret_20d")
         if spy_ret20 is not None and ret_20d is not None and ret_20d < spy_ret20:
             log.info("F2 relative-strength gate dropped %s: %.1f%% < SPY %.1f%%",
@@ -419,26 +457,19 @@ def apply_quality_filters(candidates: list[dict], regime: dict, cfg: dict) -> li
             n_f2 += 1
             continue
 
-        # F3: required pullback — %B dipped below 50 at least once in prior 10 bars
-        pct_b_min10 = ind.get("pct_b_min10")
-        if pct_b_min10 is not None and pct_b_min10 >= 50:
-            log.info("F3 pullback gate dropped %s: pct_b_min10=%.1f (no dip below 50 in 10d)",
-                     tk, pct_b_min10)
-            n_f3 += 1
-            continue
-
-        # F5: close quality — close must be in top 25% of today's H-L range
+        # F5: close quality — close in upper half of today's H-L range (≥ midpoint)
+        # Threshold is 50% not 75% because intraday partial bars have dynamic H/L
         close_pos = ind.get("close_pos", 50.0)
-        if close_pos < 75:
-            log.info("F5 close-quality gate dropped %s: close_pos=%.1f%% (< 75%%)", tk, close_pos)
+        if close_pos < 50:
+            log.info("F5 close-quality gate dropped %s: close_pos=%.1f%% (< 50%% of range)",
+                     tk, close_pos)
             n_f5 += 1
             continue
 
         kept.append(ind)
 
-    if n_f2 or n_f3 or n_f5:
-        log.info("Quality filters: dropped %d (F2 rel-str), %d (F3 pullback), %d (F5 close-quality)",
-                 n_f2, n_f3, n_f5)
+    if n_f2 or n_f5:
+        log.info("Quality filters: dropped %d (F2 rel-str), %d (F5 close-quality)", n_f2, n_f5)
     return kept
 
 
@@ -655,8 +686,11 @@ def main():
             for ind in sorted(bucket, key=lambda x: x["pct_b"], reverse=True):
                 tk = ind["ticker"]
 
-                # Always sync to backend
-                response = post_to_backend(backend_url, ind, sig_type)
+                # Fetch tape once per ticker (used in both POST and Telegram)
+                tape = fetch_tape_sentiment(backend_url, tk)
+
+                # Always sync to backend (includes tape so watchlist shows tape label)
+                response = post_to_backend_with_tape(backend_url, ind, sig_type, tape)
                 action   = response.get("action", "no_backend")
 
                 if action == "blocked":
@@ -682,8 +716,7 @@ def main():
                 # Fire Telegram
                 alerted_today[tk] = sig_type
                 n_alerted_this_cycle += 1
-                tape = fetch_tape_sentiment(backend_url, tk)
-                msg  = fmt_alert(ind, sig_type, tape)
+                msg = fmt_alert(ind, sig_type, tape)
                 log.info("Alerting: %s %s (tape=%s, backend=%s)",
                          sig_type, tk, tape.get("label") if tape else "no data", action)
                 send_telegram(token, chat_id, msg)
