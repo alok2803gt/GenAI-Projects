@@ -915,6 +915,9 @@ async def streaming_loop_async() -> None:
             if not state["opra_active"]:
                 await asyncio.sleep(3)
                 state["opra_active"] = await _check_opra_subscription(ib)
+            # Prime regime cache on connect so filters are active from first scan.
+            _loop = asyncio.get_event_loop()
+            await _loop.run_in_executor(None, _update_regime_cache_sync)
 
             # Heartbeat: keep usopt farm alive + re-check OPRA every 4 min.
             # Without this, the options data farm idles and the first scan
@@ -932,6 +935,8 @@ async def streaming_loop_async() -> None:
                 _heartbeat_tick += 1
                 if _heartbeat_tick % 24 == 0:   # every 24 × 10 s = 4 min
                     state["opra_active"] = await _check_opra_subscription(ib)
+                if _heartbeat_tick % 1440 == 120:  # every ~4 h (staggered 20 min after OPRA)
+                    await _loop.run_in_executor(None, _update_regime_cache_sync)
                 await asyncio.sleep(10)
 
             state["connected"] = False
@@ -1976,6 +1981,54 @@ async def _universe_scheduler() -> None:
             await asyncio.sleep(3600)  # back off 1 h on unexpected failure
 
 
+# ── Market regime cache ────────────────────────────────────────────────────
+
+def _update_regime_cache_sync() -> None:
+    """Compute SPY SMA-200, 20d returns (SPY + universe stocks) and store in state.
+
+    Called once at connect and every 4 h from the streaming heartbeat.
+    All filters read state['cache']['regime'] — stale beats missing.
+    """
+    try:
+        spy_hist  = yf.Ticker("SPY").history(period="1y")
+        spy_c     = spy_hist["Close"].astype(float)
+        spy_sma200 = float(spy_c.rolling(200).mean().iloc[-1])
+        spy_price  = float(spy_c.iloc[-1])
+        spy_ret20  = float((spy_c.iloc[-1] / spy_c.iloc[-21] - 1) * 100) \
+                     if len(spy_c) >= 21 else 0.0
+    except Exception as exc:
+        log.warning("Regime cache: SPY download failed: %s", exc)
+        return   # leave existing cache intact rather than clobber with bad data
+
+    # Bulk-download 30d of closes for every universe ticker to get 20d returns
+    tickers = list(CSP_UNIVERSE)
+    stock_ret20: dict[str, float] = {}
+    try:
+        bulk = yf.download(tickers, period="30d", auto_adjust=True,
+                           progress=False, threads=True)
+        close_df = bulk["Close"] if isinstance(bulk.columns, pd.MultiIndex) else bulk
+        for t in tickers:
+            if t not in close_df.columns:
+                continue
+            c = close_df[t].dropna()
+            if len(c) >= 21:
+                stock_ret20[t] = round(float((c.iloc[-1] / c.iloc[-21] - 1) * 100), 2)
+    except Exception as exc:
+        log.warning("Regime cache: bulk stock download failed: %s", exc)
+
+    state["cache"]["regime"] = {
+        "spy_price":        round(spy_price, 2),
+        "spy_sma200":       round(spy_sma200, 2),
+        "spy_above_sma200": spy_price > spy_sma200,
+        "spy_ret20":        round(spy_ret20, 2),
+        "stock_ret20":      stock_ret20,
+        "updated":          datetime.now().isoformat(),
+    }
+    bull = "BULL" if spy_price > spy_sma200 else "BEAR"
+    log.info("Regime cache refreshed: SPY=%.2f SMA200=%.2f [%s] spy_ret20=%.2f%% %d stocks",
+             spy_price, spy_sma200, bull, spy_ret20, len(stock_ret20))
+
+
 # ── Recommendation filters (mirrors frontend JS) ──────────────────────────
 
 def _filter_csp_recommended(candidates: list, log_diag: bool = False) -> list:
@@ -2038,6 +2091,26 @@ def _filter_csp_recommended(candidates: list, log_diag: bool = False) -> list:
                 tape_clean.append(r)
         clean = tape_clean
 
+    # ── Market regime gate (F1): SPY > SMA-200 AND VIX < 25 ──────────────────
+    # Selling puts in a bear market or panic spike carries outsized assignment risk.
+    # Gate is advisory when regime data is missing — never block on absence of data.
+    regime = state["cache"].get("regime") or {}
+    if regime:
+        spy_above = regime.get("spy_above_sma200")
+        if spy_above is False:
+            if log_diag:
+                _at_log("REGIME",
+                    f"CSP gate: SPY ${regime['spy_price']} below SMA-200 ${regime['spy_sma200']:.0f} "
+                    f"— bear market confirmed, no new CSP entries")
+            return []
+
+    vix_price = state["vix_live"].get("price") or regime.get("vix_price")
+    if vix_price is not None and vix_price >= 25:
+        if log_diag:
+            _at_log("REGIME",
+                f"CSP gate: VIX={vix_price:.1f} ≥ 25 — fear spike, no new CSP entries")
+        return []
+
     # Augment with learned model score if available
     for r in clean:
         ls = _learned_score(r)
@@ -2070,6 +2143,38 @@ def _filter_leap_recommended(candidates: list) -> list:
             else:
                 tape_clean.append(r)
         clean = tape_clean
+
+    # ── Market regime gate (F1): SPY > SMA-200 AND VIX < 25 ──────────────────
+    # Buying long-dated calls in a bear market burns premium into a falling tape.
+    regime = state["cache"].get("regime") or {}
+    if regime:
+        spy_above = regime.get("spy_above_sma200")
+        if spy_above is False:
+            log.info("LEAP regime gate: SPY $%.2f below SMA-200 $%.0f — no new LEAP entries",
+                     regime["spy_price"], regime["spy_sma200"])
+            return []
+
+    vix_price = state["vix_live"].get("price") or regime.get("vix_price")
+    if vix_price is not None and vix_price >= 25:
+        log.info("LEAP VIX gate: VIX=%.1f ≥ 25 — fear spike, no new LEAP entries", vix_price)
+        return []
+
+    # ── Relative strength gate (F2): stock 20d return must beat SPY 20d return ─
+    # LEAPs need momentum — buying a call on an underperformer bleeds theta quickly.
+    # Only applied when regime cache has per-stock data; absent data = benefit of doubt.
+    stock_ret20 = regime.get("stock_ret20", {})
+    spy_ret20   = regime.get("spy_ret20")
+    if stock_ret20 and spy_ret20 is not None:
+        rs_clean = []
+        for r in clean:
+            s_ret = stock_ret20.get(r["ticker"])
+            if s_ret is not None and s_ret < spy_ret20:
+                log.info(
+                    "LEAP rel-strength gate excluded %s: stock_ret20=%.1f%% < spy_ret20=%.1f%%",
+                    r["ticker"], s_ret, spy_ret20)
+            else:
+                rs_clean.append(r)
+        clean = rs_clean
 
     for r in clean:
         ls = _learned_score(r)
