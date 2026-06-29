@@ -3645,9 +3645,48 @@ def _tape_db_init() -> None:
         )
     """)
     con.execute("CREATE INDEX IF NOT EXISTS idx_tb_ticker_date ON tape_bars (ticker, session_date)")
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS alert_history (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            fired_at     TEXT NOT NULL,
+            session_date TEXT NOT NULL,
+            ticker       TEXT NOT NULL,
+            signal_type  TEXT NOT NULL,
+            price        REAL,
+            pct_b        REAL,
+            rsi          REAL,
+            vol_ratio    REAL,
+            tape_score   REAL,
+            tape_label   TEXT
+        )
+    """)
+    con.execute("CREATE INDEX IF NOT EXISTS idx_ah_ticker ON alert_history (ticker, session_date)")
     con.commit()
     con.close()
     log.info("Tape DB initialised at %s", TAPE_DB_PATH)
+
+
+def _alert_history_insert(ticker: str, signal_type: str, price: Optional[float],
+                           pct_b: Optional[float], rsi: Optional[float],
+                           vol_ratio: Optional[float], tape_score: Optional[float],
+                           tape_label: Optional[str]) -> None:
+    """Persist one scanner alert to alert_history (fire-and-forget, never raises)."""
+    try:
+        from zoneinfo import ZoneInfo
+        now_et = datetime.now(ZoneInfo("America/New_York"))
+        con = sqlite3.connect(TAPE_DB_PATH, check_same_thread=False)
+        con.execute(
+            """INSERT INTO alert_history
+               (fired_at, session_date, ticker, signal_type, price,
+                pct_b, rsi, vol_ratio, tape_score, tape_label)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            (datetime.utcnow().isoformat(), now_et.strftime("%Y-%m-%d"),
+             ticker, signal_type, price, pct_b, rsi, vol_ratio, tape_score, tape_label),
+        )
+        con.commit()
+        con.close()
+    except Exception as exc:
+        log.debug("alert_history insert failed: %s", exc)
 
 
 def _tape_db_flush_prints(ticker: str, rows: list) -> None:
@@ -5965,6 +6004,8 @@ def watchlist_add_alert(req: WatchlistAlertRequest):
     # New entry — enrich with current tape sentiment at alert time
     _wl_sent  = state["tape_sentiment"].get(tk, {})
     _wl_fresh = _tape_is_fresh(_wl_sent)
+    _ts = round(_wl_sent["score"], 4) if _wl_fresh else None
+    _tl = _wl_sent.get("label", "NO DATA") if _wl_fresh else "NO DATA"
     state["watchlist"][tk] = {
         "ticker":         tk,
         "signal_type":    req.signal_type,
@@ -5974,10 +6015,13 @@ def watchlist_add_alert(req: WatchlistAlertRequest):
         "vol_ratio":      round(req.vol_ratio, 2) if req.vol_ratio is not None else None,
         "timestamp_et":   req.timestamp_et or now_et.strftime("%H:%M ET %Y-%m-%d"),
         "added_iso":      now_et.isoformat(),
-        "tape_score":     round(_wl_sent["score"], 4) if _wl_fresh else None,
-        "tape_label":     _wl_sent.get("label", "NO DATA") if _wl_fresh else "NO DATA",
+        "tape_score":     _ts,
+        "tape_label":     _tl,
         "tape_confirmed": bool(_wl_fresh and _wl_sent.get("score", 0.0) > 0.20),
     }
+    # Persist every new alert to alert_history for backtesting
+    _alert_history_insert(tk, req.signal_type, req.price_at_alert,
+                          req.pct_b, req.rsi, req.vol_ratio, _ts, _tl)
     _watchlist_save()
     return {"ok": True, "action": "added"}
 
@@ -6742,6 +6786,245 @@ async def backtest_breakout_filtered_endpoint():
     """
     loop = asyncio.get_event_loop()
     result = await loop.run_in_executor(None, _run_breakout_backtest_filtered)
+    return result
+
+
+# ── Watchlist alert history + backtest ─────────────────────────────────────
+
+@app.get("/alerts/history")
+def alerts_history_endpoint(limit: int = 500):
+    """Return persisted breakout alert history from alert_history table.
+
+    Each row is one unique alert-fire event (only new tickers logged, not refreshes).
+    Returns most-recent first.
+    """
+    try:
+        con = sqlite3.connect(TAPE_DB_PATH, check_same_thread=False)
+        rows = con.execute(
+            """SELECT id, fired_at, session_date, ticker, signal_type, price,
+                      pct_b, rsi, vol_ratio, tape_score, tape_label
+               FROM alert_history
+               ORDER BY id DESC
+               LIMIT ?""",
+            (limit,),
+        ).fetchall()
+        con.close()
+        cols = ["id", "fired_at", "session_date", "ticker", "signal_type",
+                "price", "pct_b", "rsi", "vol_ratio", "tape_score", "tape_label"]
+        return {"alerts": [dict(zip(cols, r)) for r in rows], "total": len(rows)}
+    except Exception as exc:
+        return {"alerts": [], "total": 0, "error": str(exc)}
+
+
+def _run_watchlist_backtest() -> dict:
+    """Two-part watchlist backtest:
+
+    Part 1 — Actual outcomes: for every alert in alert_history, fetch forward prices
+    from yfinance and compute the real return at 5d / 10d / 20d from the alert price.
+    This is a true paper-trading simulation of past alerts.
+
+    Part 2 — Filter analysis: run the same 6-filter walk-forward analysis as
+    /backtest/breakout/filtered but on the alerted tickers specifically (not just the
+    CSP universe). Shows which filters would have improved the alerted signal set.
+    """
+    # ── Load alert history ──────────────────────────────────────────────────
+    alerted_tickers: list[str] = []
+    alert_rows: list[dict] = []
+    try:
+        con = sqlite3.connect(TAPE_DB_PATH, check_same_thread=False)
+        raw = con.execute(
+            """SELECT id, fired_at, session_date, ticker, signal_type,
+                      price, pct_b, rsi, vol_ratio, tape_score, tape_label
+               FROM alert_history ORDER BY fired_at""",
+        ).fetchall()
+        con.close()
+        cols = ["id", "fired_at", "session_date", "ticker", "signal_type",
+                "price", "pct_b", "rsi", "vol_ratio", "tape_score", "tape_label"]
+        alert_rows = [dict(zip(cols, r)) for r in raw]
+        alerted_tickers = list({r["ticker"] for r in alert_rows})
+    except Exception as exc:
+        log.warning("Watchlist BT: alert_history read failed: %s", exc)
+
+    # Merge with current watchlist tickers (may include tickers from before DB existed)
+    wl_tickers = list(state["watchlist"].keys())
+    all_tickers = list({*alerted_tickers, *wl_tickers})
+
+    # ── Part 1: Actual outcomes ─────────────────────────────────────────────
+    # Group alerts by ticker, bulk-download price history, compute forward returns
+    actual_outcomes: list[dict] = []
+    if alert_rows:
+        ticker_groups: dict[str, list[dict]] = {}
+        for r in alert_rows:
+            ticker_groups.setdefault(r["ticker"], []).append(r)
+
+        for ticker, alerts in ticker_groups.items():
+            try:
+                hist = yf.Ticker(ticker).history(period="2y")
+                if hist.empty:
+                    continue
+                closes = hist["Close"].astype(float)
+                # Normalise dates for lookup
+                date_to_idx: dict[str, int] = {
+                    str(d)[:10]: i for i, d in enumerate(hist.index)
+                }
+                n = len(closes)
+                close_arr = closes.to_numpy()
+
+                for al in alerts:
+                    alert_date = al["session_date"]
+                    entry_price = al["price"]
+                    if not entry_price or entry_price <= 0:
+                        continue
+                    idx = date_to_idx.get(alert_date)
+                    if idx is None:
+                        # Try T+1 (alert fired after close or on a holiday)
+                        for offset in (1, 2):
+                            try:
+                                d = (datetime.strptime(alert_date, "%Y-%m-%d")
+                                     + timedelta(days=offset)).strftime("%Y-%m-%d")
+                                if d in date_to_idx:
+                                    idx = date_to_idx[d]
+                                    break
+                            except Exception:
+                                pass
+                    if idx is None:
+                        continue
+
+                    def _fwd(h):
+                        end = idx + h
+                        if end >= n:
+                            return None
+                        return round((close_arr[end] / entry_price - 1) * 100, 2)
+
+                    actual_outcomes.append({
+                        "id":           al["id"],
+                        "ticker":       ticker,
+                        "signal_type":  al["signal_type"],
+                        "session_date": alert_date,
+                        "fired_at":     al["fired_at"],
+                        "price":        entry_price,
+                        "pct_b":        al["pct_b"],
+                        "rsi":          al["rsi"],
+                        "tape_label":   al["tape_label"],
+                        "ret_5d":       _fwd(5),
+                        "ret_10d":      _fwd(10),
+                        "ret_20d":      _fwd(20),
+                        "win_5d":       _fwd(5) is not None and _fwd(5) > 0,
+                        "win_10d":      _fwd(10) is not None and _fwd(10) > 0,
+                        "win_20d":      _fwd(20) is not None and _fwd(20) > 0,
+                    })
+            except Exception as exc:
+                log.warning("Watchlist BT actual outcomes %s: %s", ticker, exc)
+
+    # Aggregate actual outcome stats
+    def _agg_outcomes(rows: list[dict], horizon: str) -> dict:
+        rets = [r[f"ret_{horizon}"] for r in rows if r.get(f"ret_{horizon}") is not None]
+        wins = [r for r in rets if r > 0]
+        return {
+            "n":        len(rets),
+            "win_rate": round(len(wins) / len(rets) * 100, 1) if rets else None,
+            "avg_ret":  round(sum(rets) / len(rets), 2) if rets else None,
+        }
+
+    breakout_outcomes  = [r for r in actual_outcomes if r["signal_type"] == "BREAKOUT"]
+    pre_bo_outcomes    = [r for r in actual_outcomes if r["signal_type"] == "PRE-BREAKOUT"]
+
+    outcome_summary = {
+        "all": {
+            "5d":  _agg_outcomes(actual_outcomes, "5d"),
+            "10d": _agg_outcomes(actual_outcomes, "10d"),
+            "20d": _agg_outcomes(actual_outcomes, "20d"),
+        },
+        "breakout": {
+            "5d":  _agg_outcomes(breakout_outcomes, "5d"),
+            "10d": _agg_outcomes(breakout_outcomes, "10d"),
+            "20d": _agg_outcomes(breakout_outcomes, "20d"),
+        },
+        "pre_breakout": {
+            "5d":  _agg_outcomes(pre_bo_outcomes, "5d"),
+            "10d": _agg_outcomes(pre_bo_outcomes, "10d"),
+            "20d": _agg_outcomes(pre_bo_outcomes, "20d"),
+        },
+    }
+
+    # ── Part 2: 6-filter walk-forward analysis on alerted tickers ──────────
+    filter_results: list[dict] = []
+    filter_summary: dict = {}
+    if all_tickers:
+        try:
+            spy_raw  = yf.Ticker("SPY").history(period="2y")
+            spy_c    = _norm_idx(spy_raw["Close"].astype(float))
+            spy_s200 = spy_c.rolling(200).mean()
+            spy_r20  = spy_c.pct_change(20).shift(1)
+        except Exception:
+            spy_c = spy_s200 = spy_r20 = pd.Series(dtype=float)
+        try:
+            vix_c = _norm_idx(yf.Ticker("^VIX").history(period="2y")["Close"].astype(float))
+        except Exception:
+            vix_c = pd.Series(dtype=float)
+
+        for ticker in all_tickers:
+            try:
+                r = _backtest_breakout_filtered_one(ticker, spy_c, spy_s200, spy_r20, vix_c)
+                if r:
+                    filter_results.append(r)
+            except Exception as exc:
+                log.warning("Watchlist filter BT %s: %s", ticker, exc)
+
+        _LAYERS = ("baseline", "regime", "rel_strength", "pullback",
+                   "cvd_proxy", "close_quality", "with_stops")
+
+        def _agg_layer(lname: str) -> dict:
+            layer_rows = [r[lname] for r in filter_results if lname in r]
+            total_sig  = sum(x["signals"] for x in layer_rows)
+            def _wagg(key):
+                pairs = [(x[key], x["signals"]) for x in layer_rows
+                         if x.get(key) is not None and x["signals"] > 0]
+                if not pairs: return None
+                tw = sum(w for _, w in pairs)
+                return round(sum(v * w for v, w in pairs) / tw, 1) if tw else None
+            def _savg(key):
+                vals = [x[key] for x in layer_rows if x.get(key) is not None]
+                return round(sum(vals) / len(vals), 2) if vals else None
+            return {
+                "signals":        total_sig,
+                "tickers_active": sum(1 for x in layer_rows if x["signals"] > 0),
+                "win_rate_5d":    _wagg("win_rate_5d"),
+                "win_rate_10d":   _wagg("win_rate_10d"),
+                "win_rate_20d":   _wagg("win_rate_20d"),
+                "avg_ret_10d":    _savg("avg_ret_10d"),
+                "expectancy_10d": _savg("expectancy_10d"),
+            }
+
+        filter_summary = {lname: _agg_layer(lname) for lname in _LAYERS}
+
+    return {
+        "tickers":         all_tickers,
+        "n_alerted":       len(alerted_tickers),
+        "n_watchlist":     len(wl_tickers),
+        "actual_outcomes": actual_outcomes,
+        "outcome_summary": outcome_summary,
+        "filter_results":  filter_results,
+        "filter_summary":  filter_summary,
+    }
+
+
+@app.get("/backtest/watchlist")
+async def backtest_watchlist_endpoint():
+    """Two-part watchlist backtest.
+
+    Part 1 — Actual outcomes: each alert in alert_history is looked up in yfinance
+    price data. Returns real 5d / 10d / 20d forward return from the alert price —
+    a true paper-trading simulation of every alert that was generated.
+
+    Part 2 — Filter analysis: 6-layer filtered walk-forward backtest run on all
+    ever-alerted tickers so you can see which filters improve the specific signal set
+    the breakout scanner has been generating.
+
+    Takes ~45–90 s depending on how many unique tickers are in alert history.
+    """
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(None, _run_watchlist_backtest)
     return result
 
 
