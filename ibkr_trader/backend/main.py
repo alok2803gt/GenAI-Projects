@@ -227,6 +227,12 @@ state: Dict = {
     "cache": {
         "regime": None,   # SPY SMA-200, per-stock 20d returns — refreshed at connect + every 4h
     },
+    # Daily near-miss log — tickers that were evaluated but not selected for CSP/LEAP
+    "near_miss_log": {
+        "date":    None,   # "YYYY-MM-DD" — reset each trading day
+        "tickers": {},     # ticker → {type, score, iv_rank, reasons, last_seen, seen_count}
+        "digest_sent": False,  # True once end-of-day digest has been emitted today
+    },
     # OPRA subscription status — set once at startup, re-checked on reconnect
     "opra_active": None,   # None = not yet checked, True/False thereafter
     # IV history — persisted daily snapshots for true percentile rank
@@ -941,6 +947,12 @@ async def streaming_loop_async() -> None:
                     state["opra_active"] = await _check_opra_subscription(ib)
                 if _heartbeat_tick % 1440 == 120:  # every ~4 h (staggered 20 min after OPRA)
                     await _loop.run_in_executor(None, _update_regime_cache_sync)
+                # End-of-day near-miss digest at 16:05 ET (once per day)
+                from zoneinfo import ZoneInfo as _ZI
+                _now_et = datetime.now(_ZI("America/New_York"))
+                if (_now_et.hour == 16 and _now_et.minute == 5
+                        and not state["near_miss_log"].get("digest_sent", False)):
+                    _emit_eod_digest()
                 await asyncio.sleep(10)
 
             state["connected"] = False
@@ -2033,64 +2045,125 @@ def _update_regime_cache_sync() -> None:
              spy_price, spy_sma200, bull, spy_ret20, len(stock_ret20))
 
 
+# ── Near-miss tracking ────────────────────────────────────────────────────
+
+def _record_near_miss(ticker: str, strategy: str, score: float, iv_rank: float,
+                      reasons: list[str]) -> None:
+    """Accumulate per-ticker CSP/LEAP rejection reasons for the daily near-miss log.
+
+    Called from both filter functions every scan cycle. The same ticker may appear
+    multiple times across cycles — reasons are merged (unique), counts incremented.
+    Resets automatically at the start of each new trading day.
+    """
+    from zoneinfo import ZoneInfo
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+    today  = now_et.strftime("%Y-%m-%d")
+    nm     = state["near_miss_log"]
+
+    if nm.get("date") != today:
+        nm["date"]         = today
+        nm["tickers"]      = {}
+        nm["digest_sent"]  = False
+
+    entry = nm["tickers"].setdefault(ticker, {
+        "type":       strategy,
+        "score":      score,
+        "iv_rank":    iv_rank,
+        "reasons":    [],
+        "last_seen":  None,
+        "seen_count": 0,
+    })
+    # Merge reasons (keep unique, preserve order)
+    for r in reasons:
+        if r not in entry["reasons"]:
+            entry["reasons"].append(r)
+    entry["last_seen"]  = now_et.strftime("%H:%M ET")
+    entry["seen_count"] += 1
+    if score > entry.get("score", 0):
+        entry["score"]   = score
+        entry["iv_rank"] = iv_rank
+        entry["type"]    = strategy
+
+
+def _emit_eod_digest() -> None:
+    """Log the end-of-day near-miss digest and mark it sent for today."""
+    from zoneinfo import ZoneInfo
+    nm = state["near_miss_log"]
+    if not nm.get("tickers"):
+        _at_log("EOD-DIGEST", "No near-miss tickers today — all scans were empty or positions full.")
+        nm["digest_sent"] = True
+        return
+
+    tickers = nm["tickers"]
+    lines = ["End-of-day near-miss digest — tickers evaluated but not selected:\n"]
+    for tk, d in sorted(tickers.items(), key=lambda x: x[1].get("score", 0), reverse=True):
+        reason_str = " | ".join(d["reasons"]) if d["reasons"] else "passed filters — no capital slot"
+        lines.append(
+            f"  {tk:6s} [{d['type'].upper():4s}] "
+            f"score={d['score']:.0f}  iv={d['iv_rank']:.0f}  "
+            f"seen={d['seen_count']}×  last={d['last_seen']}  "
+            f"→ {reason_str}"
+        )
+    _at_log("EOD-DIGEST", "\n".join(lines))
+    log.info("[EOD-DIGEST] %d near-miss tickers logged", len(tickers))
+    nm["digest_sent"] = True
+
+
 # ── Recommendation filters (mirrors frontend JS) ──────────────────────────
 
 def _filter_csp_recommended(candidates: list, log_diag: bool = False) -> list:
     """Filter scan candidates to recommended CSPs. Set log_diag=True to emit AT diagnostics."""
-    # Only block on warnings that explicitly say "excl. recommended".
-    # Informational warnings (e.g. earnings in 29-30d) should show in Recommended with a badge,
-    # not silently exclude the candidate.
     def _excl(r): return any("excl. recommended" in w for w in r.get("warnings", []))
-    n_total     = len(candidates)
-    n_warnings  = sum(1 for r in candidates if _excl(r))
-    n_liq       = sum(1 for r in candidates if not _excl(r) and r["liquidity_score"] < 50)
-    n_iv        = sum(1 for r in candidates if not _excl(r)
-                      and r["liquidity_score"] >= 50 and r["iv_rank"] < IV_RANK_MIN_CSP)
-    n_score     = sum(1 for r in candidates if not _excl(r)
-                      and r["liquidity_score"] >= 50 and r["iv_rank"] >= IV_RANK_MIN_CSP
-                      and r["score"] < 70)
-    n_trend     = sum(1 for r in candidates if not _excl(r)
-                      and r["liquidity_score"] >= 50 and r["iv_rank"] >= IV_RANK_MIN_CSP
-                      and r["score"] >= 70
-                      and (r.get("above_sma50") is False or r.get("above_sma20") is False
-                           or r.get("above_sma200") is False))
-    n_earnings  = sum(1 for r in candidates if not _excl(r)
-                      and r["liquidity_score"] >= 50 and r["iv_rank"] >= IV_RANK_MIN_CSP
-                      and r["score"] >= 70
-                      and r.get("above_sma50") is not False and r.get("above_sma20") is not False
-                      and r.get("above_sma200") is not False
-                      and r["earnings_days_out"] is not None
-                      and r["earnings_days_out"] <= EARNINGS_BLOCK_DAYS * 2)
 
-    # SMA-20/50/200 must be True or None (None = not enough history → benefit of doubt).
-    # above_sma200 is False only when we have 200 bars and the price is below — confirmed downtrend.
-    clean = [r for r in candidates
-             if not _excl(r)
-             and r["liquidity_score"] >= 50
-             and r["iv_rank"] >= IV_RANK_MIN_CSP
-             and r["score"] >= 70
-             and r.get("above_sma50") is not False
-             and r.get("above_sma20") is not False
-             and r.get("above_sma200") is not False
-             and (r["earnings_days_out"] is None or r["earnings_days_out"] > EARNINGS_BLOCK_DAYS * 2)]
+    # ── Per-ticker rejection pass — builds reasons for near-miss log ──────────
+    clean = []
+    for r in candidates:
+        tk      = r["ticker"]
+        score   = r.get("score", 0)
+        iv_rank = r.get("iv_rank", 0)
+        reasons: list[str] = []
 
-    if log_diag and n_total > 0:
+        if _excl(r):
+            w = next((w for w in r.get("warnings", []) if "excl. recommended" in w), "screening warning")
+            reasons.append(f"warning: {w[:80]}")
+        elif r["liquidity_score"] < 50:
+            reasons.append(f"liquidity={r['liquidity_score']:.0f} (< 50)")
+        elif iv_rank < IV_RANK_MIN_CSP:
+            reasons.append(f"iv_rank={iv_rank:.0f} (< {IV_RANK_MIN_CSP} — not enough premium)")
+        elif score < 70:
+            reasons.append(f"score={score:.0f} (< 70)")
+        elif r.get("above_sma50") is False or r.get("above_sma20") is False or r.get("above_sma200") is False:
+            below = [n for n, k in [("SMA20","above_sma20"),("SMA50","above_sma50"),("SMA200","above_sma200")]
+                     if r.get(k) is False]
+            reasons.append(f"below {'+'.join(below)} — downtrend")
+        elif r.get("earnings_days_out") is not None and r["earnings_days_out"] <= EARNINGS_BLOCK_DAYS * 2:
+            reasons.append(f"earnings in {r['earnings_days_out']}d (block ≤ {EARNINGS_BLOCK_DAYS*2}d)")
+
+        if reasons:
+            if log_diag:
+                _at_log("NEAR-MISS",
+                    f"CSP skip {tk}: score={score:.0f} iv={iv_rank:.0f} liq={r['liquidity_score']:.0f}"
+                    f" → {' | '.join(reasons)}")
+            _record_near_miss(tk, "csp", score, iv_rank, reasons)
+        else:
+            clean.append(r)
+
+    if log_diag:
         _at_log("SCAN",
-            f"CSP filter: {n_total} raw → {len(clean)} passed "
-            f"[warnings:{n_warnings} liq:{n_liq} iv_rank:{n_iv} "
-            f"score:{n_score} trend(sma20/50/200):{n_trend} earnings:{n_earnings}]")
+            f"CSP filter: {len(candidates)} raw → {len(clean)} passed "
+            f"({len(candidates)-len(clean)} skipped — see NEAR-MISS log for details)")
 
     # ── Tape sentiment filter (CSP: block when score < −0.30 and data is fresh) ─
     if state.get("autotrader", {}).get("config", {}).get("tape_filter_enabled", True):
         tape_clean = []
         for r in clean:
-            sent  = state["tape_sentiment"].get(r["ticker"], {})
-            score = sent.get("score", 0.0)
-            if _tape_is_fresh(sent) and score < -0.30:
+            sent       = state["tape_sentiment"].get(r["ticker"], {})
+            tape_score = sent.get("score", 0.0)
+            if _tape_is_fresh(sent) and tape_score < -0.30:
+                reason = f"tape={tape_score:+.2f} {sent.get('label','?')} (< -0.30, net sellers)"
                 if log_diag:
-                    _at_log("SCAN",
-                        f"Tape filter excluded {r['ticker']} CSP: "
-                        f"score={score:+.2f} ({sent.get('label','?')}) — net sellers in control")
+                    _at_log("NEAR-MISS", f"CSP skip {r['ticker']}: {reason}")
+                _record_near_miss(r["ticker"], "csp", r.get("score", 0), r.get("iv_rank", 0), [reason])
             else:
                 tape_clean.append(r)
         clean = tape_clean
@@ -2130,20 +2203,39 @@ def _filter_csp_recommended(candidates: list, log_diag: bool = False) -> list:
 
 
 def _filter_leap_recommended(candidates: list) -> list:
-    clean = [r for r in candidates
-             if not any("excl. recommended" in w for w in r.get("warnings", []))
-             and r["liquidity_score"] >= 60
-             and r.get("iv_rank", 50) <= 75]   # avoid buying when IV is too elevated
+    # ── Per-ticker rejection pass ─────────────────────────────────────────────
+    clean = []
+    for r in candidates:
+        tk      = r["ticker"]
+        score   = r.get("score", 0)
+        iv_rank = r.get("iv_rank", 50)
+        reasons: list[str] = []
+
+        if any("excl. recommended" in w for w in r.get("warnings", [])):
+            w = next((w for w in r.get("warnings", []) if "excl. recommended" in w), "screening warning")
+            reasons.append(f"warning: {w[:80]}")
+        elif r["liquidity_score"] < 60:
+            reasons.append(f"liquidity={r['liquidity_score']:.0f} (< 60 for LEAP)")
+        elif iv_rank > 75:
+            reasons.append(f"iv_rank={iv_rank:.0f} (> 75 — IV too high to buy calls)")
+
+        if reasons:
+            log.info("NEAR-MISS LEAP skip %s: score=%.0f iv=%.0f → %s",
+                     tk, score, iv_rank, " | ".join(reasons))
+            _record_near_miss(tk, "leap", score, iv_rank, reasons)
+        else:
+            clean.append(r)
 
     # ── Tape sentiment filter (LEAP: block when score < 0.10 and data is fresh) ─
     if state.get("autotrader", {}).get("config", {}).get("tape_filter_enabled", True):
         tape_clean = []
         for r in clean:
-            sent  = state["tape_sentiment"].get(r["ticker"], {})
-            score = sent.get("score", 0.0)
-            if _tape_is_fresh(sent) and score < 0.10:
-                log.info("Tape filter excluded %s LEAP: score=%+.2f (%s) — needs bullish tape",
-                         r["ticker"], score, sent.get("label", "?"))
+            sent       = state["tape_sentiment"].get(r["ticker"], {})
+            tape_score = sent.get("score", 0.0)
+            if _tape_is_fresh(sent) and tape_score < 0.10:
+                reason = f"tape={tape_score:+.2f} {sent.get('label','?')} (< 0.10, needs bullish tape)"
+                log.info("NEAR-MISS LEAP skip %s: %s", r["ticker"], reason)
+                _record_near_miss(r["ticker"], "leap", r.get("score", 0), r.get("iv_rank", 50), [reason])
             else:
                 tape_clean.append(r)
         clean = tape_clean
@@ -2154,18 +2246,22 @@ def _filter_leap_recommended(candidates: list) -> list:
     if regime:
         spy_above = regime.get("spy_above_sma200")
         if spy_above is False:
-            log.info("LEAP regime gate: SPY $%.2f below SMA-200 $%.0f — no new LEAP entries",
-                     regime["spy_price"], regime["spy_sma200"])
+            reason = (f"regime: SPY ${regime['spy_price']:.2f} below SMA-200 "
+                      f"${regime['spy_sma200']:.0f} — bear market")
+            log.info("LEAP regime gate: %s — no new LEAP entries", reason)
+            for r in clean:
+                _record_near_miss(r["ticker"], "leap", r.get("score",0), r.get("iv_rank",50), [reason])
             return []
 
     vix_price = state["vix_live"].get("price") or regime.get("vix_price")
     if vix_price is not None and vix_price >= 25:
-        log.info("LEAP VIX gate: VIX=%.1f ≥ 25 — fear spike, no new LEAP entries", vix_price)
+        reason = f"VIX={vix_price:.1f} ≥ 25 — fear spike"
+        log.info("LEAP VIX gate: %s — no new LEAP entries", reason)
+        for r in clean:
+            _record_near_miss(r["ticker"], "leap", r.get("score",0), r.get("iv_rank",50), [reason])
         return []
 
     # ── Relative strength gate (F2): stock 20d return must beat SPY 20d return ─
-    # LEAPs need momentum — buying a call on an underperformer bleeds theta quickly.
-    # Only applied when regime cache has per-stock data; absent data = benefit of doubt.
     stock_ret20 = regime.get("stock_ret20", {})
     spy_ret20   = regime.get("spy_ret20")
     if stock_ret20 and spy_ret20 is not None:
@@ -2173,9 +2269,10 @@ def _filter_leap_recommended(candidates: list) -> list:
         for r in clean:
             s_ret = stock_ret20.get(r["ticker"])
             if s_ret is not None and s_ret < spy_ret20:
-                log.info(
-                    "LEAP rel-strength gate excluded %s: stock_ret20=%.1f%% < spy_ret20=%.1f%%",
-                    r["ticker"], s_ret, spy_ret20)
+                reason = (f"rel-strength: {r['ticker']} 20d={s_ret:.1f}% "
+                          f"< SPY 20d={spy_ret20:.1f}%")
+                log.info("NEAR-MISS LEAP skip %s: %s", r["ticker"], reason)
+                _record_near_miss(r["ticker"], "leap", r.get("score",0), r.get("iv_rank",50), [reason])
             else:
                 rs_clean.append(r)
         clean = rs_clean
@@ -3073,9 +3170,29 @@ async def _autotrader_scan_and_trade_coro(ib: IB) -> None:
     cooled = [c["ticker"] for c in candidates if _in_cooldown(c["ticker"])]
     if cooled:
         _at_log("SCAN", f"48h cooldown — skipping: {cooled}")
+        for tk in cooled:
+            _record_near_miss(tk, next((c["_type"] for c in candidates if c["ticker"]==tk), "csp"),
+                              next((c.get("score",0) for c in candidates if c["ticker"]==tk), 0),
+                              next((c.get("iv_rank",0) for c in candidates if c["ticker"]==tk), 0),
+                              ["48h stop-loss cooldown"])
+
+    already_active = [c["ticker"] for c in candidates if c["ticker"] in active_t]
+    if already_active:
+        _at_log("SCAN", f"Already active — skipping: {already_active}")
+
     candidates = [c for c in candidates
                   if c["ticker"] not in active_t and not _in_cooldown(c["ticker"])]
     _at_log("SCAN", f"Found {len(candidates)} qualifying candidates after dedup + cooldown")
+
+    # Tickers that passed ALL filters but exceed available slots → record as no-slot near-miss
+    if candidates[slots:]:
+        no_slot = candidates[slots:]
+        _at_log("SCAN", f"No capital slot for {len(no_slot)} qualified candidates: "
+                        f"{[c['ticker'] for c in no_slot]}")
+        for c in no_slot:
+            _record_near_miss(c["ticker"], c.get("_type", "csp"),
+                              c.get("score", 0), c.get("iv_rank", 0),
+                              ["passed all filters — no capital slot available"])
 
     placed = 0
     if slots > 0:
@@ -6123,6 +6240,40 @@ def watchlist_clear():
 
 
 # ── Auto-trader endpoints ──────────────────────────────────────────────────
+
+@app.get("/autotrader/near-miss")
+def autotrader_near_miss():
+    """Daily log of tickers evaluated but not selected for CSP or LEAP.
+
+    Resets each trading day. Reasons are merged across all 5-min scan cycles so
+    the same ticker can accumulate multiple reasons if the blocking criteria changed
+    during the day (e.g. started below score threshold, later fell into earnings window).
+    """
+    nm      = state["near_miss_log"]
+    tickers = nm.get("tickers", {})
+    rows    = sorted(
+        [
+            {
+                "ticker":     tk,
+                "type":       d["type"],
+                "score":      round(d["score"], 1),
+                "iv_rank":    round(d["iv_rank"], 1),
+                "reasons":    d["reasons"],
+                "last_seen":  d["last_seen"],
+                "seen_count": d["seen_count"],
+            }
+            for tk, d in tickers.items()
+        ],
+        key=lambda x: x["score"],
+        reverse=True,
+    )
+    return {
+        "date":         nm.get("date"),
+        "total":        len(rows),
+        "digest_sent":  nm.get("digest_sent", False),
+        "tickers":      rows,
+    }
+
 
 @app.get("/autotrader/status")
 def autotrader_status():
