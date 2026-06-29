@@ -6375,6 +6375,271 @@ async def backtest_breakout_endpoint():
     return result
 
 
+# ── Breakout Backtest — 6-Filter Analysis ───────────────────────────────────
+
+_STOP_PCT = 0.05  # hard stop fraction for with_stops layer
+
+
+def _norm_idx(s: pd.Series) -> pd.Series:
+    """Strip timezone and normalise DatetimeIndex to date precision for cross-series alignment."""
+    try:
+        idx = pd.DatetimeIndex([pd.Timestamp(str(d)[:10]) for d in s.index])
+        return pd.Series(s.values, index=idx)
+    except Exception:
+        return s
+
+
+def _backtest_breakout_filtered_one(
+    ticker: str,
+    spy_close: pd.Series,
+    spy_sma200: pd.Series,
+    spy_ret20: pd.Series,
+    vix_close: pd.Series,
+) -> Optional[dict]:
+    """Walk-forward breakout backtest with 6 cumulative filter layers.
+
+    Layers (each cumulative):
+      baseline      — %B > 95 AND vol_ratio >= rolling vol_90pct (no look-ahead)
+      regime        — SPY > SMA-200 AND VIX < 25
+      rel_strength  — stock 20d return > SPY 20d return (prior window, no look-ahead)
+      pullback      — %B dipped below 50 in prior 10 days (coiled-spring setup)
+      cvd_proxy     — breakout candle closes above open (net buy-pressure proxy)
+      close_quality — close in top 25% of the day's high-low range
+      with_stops    — same signals as close_quality; returns capped at -5% if
+                      any intraday Low triggers the stop during the holding period
+    """
+    try:
+        df = yf.Ticker(ticker).history(period="2y")
+    except Exception as e:
+        log.debug("Filtered BT fetch %s: %s", ticker, e)
+        return None
+    if len(df) < 252:
+        return None
+
+    # Normalise index to date-only so cross-series reindex works cleanly
+    df.index = pd.DatetimeIndex([pd.Timestamp(str(d)[:10]) for d in df.index])
+
+    closes  = df["Close"].astype(float)
+    highs   = df["High"].astype(float)
+    lows    = df["Low"].astype(float)
+    opens   = df["Open"].astype(float)
+    volumes = df["Volume"].astype(float)
+    n = len(closes)
+
+    # ── Bollinger Bands / %B ─────────────────────────────────────────────
+    sma20    = closes.rolling(20).mean()
+    bb_std   = closes.rolling(20).std()
+    bb_upper = sma20 + 2 * bb_std
+    bb_lower = sma20 - 2 * bb_std
+    pct_b    = ((closes - bb_lower) / (bb_upper - bb_lower).replace(0, float("nan"))) * 100
+
+    # ── Volume 90th-pct threshold ────────────────────────────────────────
+    roll_avg  = volumes.rolling(20).mean().shift(1)
+    vol_ratio = volumes / roll_avg.replace(0, float("nan"))
+    vol_90pct = vol_ratio.rolling(252, min_periods=60).quantile(0.90)
+
+    # ── Relative strength: prior 20d stock return (shift=1, no look-ahead) ─
+    stock_ret20 = closes.pct_change(20).shift(1)
+
+    # ── Close position within day range (0=low, 100=high) ───────────────
+    day_range = (highs - lows).replace(0, float("nan"))
+    close_pos = (closes - lows) / day_range * 100
+
+    # ── Min %B in prior 10 days (shift=1 excludes today) ────────────────
+    pct_b_min10 = pct_b.shift(1).rolling(10, min_periods=3).min()
+
+    # ── Align SPY / VIX reference series to ticker dates ────────────────
+    spy_c  = spy_close.reindex(closes.index, method="ffill")
+    spy_s  = spy_sma200.reindex(closes.index, method="ffill")
+    spy_r  = spy_ret20.reindex(closes.index, method="ffill")
+    vix_c  = vix_close.reindex(closes.index, method="ffill")
+
+    # ── Build cumulative signal masks ────────────────────────────────────
+    m0 = (
+        (pct_b > 95)
+        & (vol_ratio >= vol_90pct)
+        & vol_ratio.notna()
+        & vol_90pct.notna()
+    )
+    m1 = m0 & spy_c.notna() & spy_s.notna() & vix_c.notna() \
+             & (spy_c > spy_s) & (vix_c < 25)
+    m2 = m1 & stock_ret20.notna() & spy_r.notna() \
+             & (stock_ret20 > spy_r)
+    m3 = m2 & pct_b_min10.notna() & (pct_b_min10 < 50)
+    m4 = m3 & (closes > opens)
+    m5 = m4 & close_pos.notna() & (close_pos >= 75)
+
+    # ── Win-rate + expectancy calculator ─────────────────────────────────
+    close_arr = closes.to_numpy()
+    low_arr   = lows.to_numpy()
+
+    def _stats(mask: pd.Series, apply_stops: bool = False) -> dict:
+        idxs = [i for i, v in enumerate(mask.to_numpy()) if v]
+        if not idxs:
+            return {
+                "signals": 0,
+                "win_rate_5d": None, "win_rate_10d": None, "win_rate_20d": None,
+                "avg_ret_5d":  None, "avg_ret_10d":  None, "avg_ret_20d":  None,
+                "expectancy_10d": None,
+            }
+
+        rets5: list[float] = []
+        rets10: list[float] = []
+        rets20: list[float] = []
+
+        for idx in idxs:
+            p0 = close_arr[idx]
+            if p0 <= 0:
+                continue
+            stop_px = p0 * (1 - _STOP_PCT) if apply_stops else None
+
+            for horizon, bucket in ((5, rets5), (10, rets10), (20, rets20)):
+                end = idx + horizon
+                if end >= n:
+                    continue
+                if apply_stops:
+                    ret = (close_arr[end] / p0 - 1) * 100
+                    for j in range(1, horizon + 1):
+                        if idx + j >= n:
+                            break
+                        if low_arr[idx + j] <= stop_px:
+                            ret = -_STOP_PCT * 100  # stopped out
+                            break
+                    bucket.append(ret)
+                else:
+                    bucket.append((close_arr[end] / p0 - 1) * 100)
+
+        def _wr(rs):  return round(sum(1 for r in rs if r > 0) / len(rs) * 100, 1) if rs else None
+        def _avg(rs): return round(sum(rs) / len(rs), 2) if rs else None
+
+        # Expectancy at 10d: wr * avg_win + (1-wr) * avg_loss
+        pos10 = [r for r in rets10 if r > 0]
+        neg10 = [r for r in rets10 if r <= 0]
+        exp10: Optional[float] = None
+        if rets10:
+            wr_f  = len(pos10) / len(rets10)
+            avg_w = sum(pos10) / len(pos10) if pos10 else 0.0
+            avg_l = sum(neg10) / len(neg10) if neg10 else 0.0
+            exp10 = round(wr_f * avg_w + (1 - wr_f) * avg_l, 2)
+
+        return {
+            "signals":        len(idxs),
+            "win_rate_5d":    _wr(rets5),
+            "win_rate_10d":   _wr(rets10),
+            "win_rate_20d":   _wr(rets20),
+            "avg_ret_5d":     _avg(rets5),
+            "avg_ret_10d":    _avg(rets10),
+            "avg_ret_20d":    _avg(rets20),
+            "expectancy_10d": exp10,
+        }
+
+    return {
+        "ticker":        ticker,
+        "baseline":      _stats(m0),
+        "regime":        _stats(m1),
+        "rel_strength":  _stats(m2),
+        "pullback":      _stats(m3),
+        "cvd_proxy":     _stats(m4),
+        "close_quality": _stats(m5),
+        "with_stops":    _stats(m5, apply_stops=True),
+    }
+
+
+def _run_breakout_backtest_filtered() -> dict:
+    """Download SPY + VIX once; run 6-layer filtered backtest on all universe tickers."""
+    try:
+        spy_raw  = yf.Ticker("SPY").history(period="2y")
+        spy_c    = _norm_idx(spy_raw["Close"].astype(float))
+        spy_s200 = spy_c.rolling(200).mean()
+        spy_r20  = spy_c.pct_change(20).shift(1)
+    except Exception as exc:
+        log.warning("Filtered BT: SPY download failed: %s", exc)
+        spy_c = spy_s200 = spy_r20 = pd.Series(dtype=float)
+
+    try:
+        vix_raw = yf.Ticker("^VIX").history(period="2y")
+        vix_c   = _norm_idx(vix_raw["Close"].astype(float))
+    except Exception as exc:
+        log.warning("Filtered BT: VIX download failed: %s", exc)
+        vix_c = pd.Series(dtype=float)
+
+    tickers = list(CSP_UNIVERSE)
+    rows: list[dict] = []
+    for ticker in tickers:
+        try:
+            r = _backtest_breakout_filtered_one(ticker, spy_c, spy_s200, spy_r20, vix_c)
+            if r:
+                rows.append(r)
+        except Exception as exc:
+            log.warning("Filtered BT %s: %s", ticker, exc)
+
+    # ── Aggregate summary per layer ───────────────────────────────────────
+    _LAYERS = ("baseline", "regime", "rel_strength", "pullback",
+               "cvd_proxy", "close_quality", "with_stops")
+
+    def _agg_layer(lname: str) -> dict:
+        layer_rows = [r[lname] for r in rows if lname in r]
+        total_sig  = sum(x["signals"] for x in layer_rows)
+
+        # Signal-count-weighted average win rates
+        def _wagg(key: str) -> Optional[float]:
+            pairs = [(x[key], x["signals"]) for x in layer_rows
+                     if x.get(key) is not None and x["signals"] > 0]
+            if not pairs:
+                return None
+            tw = sum(w for _, w in pairs)
+            return round(sum(v * w for v, w in pairs) / tw, 1) if tw else None
+
+        def _savg(key: str) -> Optional[float]:
+            vals = [x[key] for x in layer_rows if x.get(key) is not None]
+            return round(sum(vals) / len(vals), 2) if vals else None
+
+        return {
+            "signals":        total_sig,
+            "tickers_active": sum(1 for x in layer_rows if x["signals"] > 0),
+            "win_rate_5d":    _wagg("win_rate_5d"),
+            "win_rate_10d":   _wagg("win_rate_10d"),
+            "win_rate_20d":   _wagg("win_rate_20d"),
+            "avg_ret_10d":    _savg("avg_ret_10d"),
+            "avg_ret_20d":    _savg("avg_ret_20d"),
+            "expectancy_10d": _savg("expectancy_10d"),
+        }
+
+    summary = {lname: _agg_layer(lname) for lname in _LAYERS}
+
+    return {
+        "results": rows,
+        "summary": summary,
+        "tickers": tickers,
+        "meta": {
+            "filters": [
+                "Baseline: %B > 95 AND volume ≥ rolling 90th-percentile threshold",
+                "F1 Regime: SPY > SMA-200 AND VIX < 25 (healthy market environment)",
+                "F2 Relative Strength: stock 20d return > SPY 20d return",
+                "F3 Pullback: %B dipped below 50 in prior 10 days (coiled-spring setup)",
+                "F4 CVD proxy: breakout candle closes above open (net buy-pressure)",
+                "F5 Close Quality: close in top 25% of the day's high-low range",
+                "F5 + Stops: 5% hard stop scanned against daily Low each holding day",
+            ],
+            "stop_pct": _STOP_PCT * 100,
+        },
+    }
+
+
+@app.get("/backtest/breakout/filtered")
+async def backtest_breakout_filtered_endpoint():
+    """Breakout backtest with 6 cumulative filter layers + with-stops variant.
+
+    Downloads SPY + ^VIX once, then runs per-ticker with all filter layers in order.
+    Returns win rates at 5d / 10d / 20d and expectancy (expected return per signal)
+    for each layer so you can see exactly how much each filter moves the needle.
+    Uses yfinance only — no IBKR connection required.  Takes ~30-60 s on 20 tickers.
+    """
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(None, _run_breakout_backtest_filtered)
+    return result
+
+
 # ── Live account reconnect ──────────────────────────────────────────────────
 
 @app.post("/reconnect")
