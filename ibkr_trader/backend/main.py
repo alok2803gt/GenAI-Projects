@@ -5977,11 +5977,28 @@ def watchlist_add_alert(req: WatchlistAlertRequest):
     watchlist reflects the current scan state, while preserving the original alert
     timestamp and price_at_alert so % change is always vs. the first alert price.
     PRE-BREAKOUT is never allowed to overwrite an existing BREAKOUT entry.
+
+    Backend gate (F1 — real-time VIX + SPY regime):
+    New entries are blocked when VIX ≥ 25 (live IBKR feed) or SPY is below its
+    SMA-200 (regime cache). Refreshes of existing entries always pass through so the
+    watchlist stays current. Returns action='blocked' so the scanner can suppress Telegram.
     """
     from zoneinfo import ZoneInfo
     now_et  = datetime.now(ZoneInfo("America/New_York"))
     tk      = req.ticker.upper()
     existing = state["watchlist"].get(tk)
+
+    # ── Backend gate: only for NEW entries (refreshes always pass through) ──
+    if not existing:
+        vix_live = state["vix_live"].get("price")
+        if vix_live is not None and vix_live >= 25:
+            return {"ok": False, "action": "blocked",
+                    "reason": f"VIX={vix_live:.1f} ≥ 25 (live IBKR feed)"}
+        regime = state["cache"].get("regime") or {}
+        if regime.get("spy_above_sma200") is False:
+            return {"ok": False, "action": "blocked",
+                    "reason": (f"SPY ${regime.get('spy_price', 0):.2f} "
+                               f"below SMA-200 ${regime.get('spy_sma200', 0):.0f}")}
 
     # Don't downgrade BREAKOUT → PRE-BREAKOUT
     if existing and existing["signal_type"] == "BREAKOUT" and req.signal_type == "PRE-BREAKOUT":
@@ -7571,6 +7588,41 @@ def tape_block_report(
         }
     except Exception as exc:
         raise HTTPException(500, str(exc))
+
+
+@app.get("/market/regime")
+def market_regime():
+    """Market regime snapshot for the breakout scanner.
+
+    Returns the cached SPY SMA-200 regime + live IBKR VIX so the scanner can
+    apply F1 (regime/VIX) filters without duplicating the computation.
+    regime_ok=False means the scanner should suppress all new alerts this cycle.
+    """
+    regime   = state["cache"].get("regime") or {}
+    vix_live = state["vix_live"].get("price")
+    spy_ok   = regime.get("spy_above_sma200", True)  # True = benefit of doubt when cache cold
+    vix_ok   = vix_live is None or vix_live < 25
+
+    reason: list[str] = []
+    if spy_ok is False:
+        reason.append(
+            f"SPY ${regime.get('spy_price', 0):.2f} below SMA-200 ${regime.get('spy_sma200', 0):.0f}"
+        )
+    if not vix_ok:
+        reason.append(f"VIX={vix_live:.1f} ≥ 25")
+
+    return {
+        "regime_ok":        spy_ok is not False and vix_ok,
+        "spy_price":        regime.get("spy_price"),
+        "spy_sma200":       regime.get("spy_sma200"),
+        "spy_above_sma200": spy_ok,
+        "spy_ret20":        regime.get("spy_ret20"),
+        "stock_ret20":      regime.get("stock_ret20", {}),
+        "vix_live":         vix_live,
+        "vix_threshold":    25,
+        "reason":           " | ".join(reason) if reason else "ok",
+        "updated":          regime.get("updated"),
+    }
 
 
 @app.get("/market/indexes")

@@ -156,10 +156,35 @@ def fetch_tape_sentiment(backend_url: str, ticker: str) -> dict | None:
         return None
 
 
-def post_to_backend(backend_url: str, ind: dict, signal_type: str) -> bool:
-    """POST alert to IBKR Trader backend watchlist. Silent if backend not running."""
+def fetch_regime(backend_url: str) -> dict:
+    """Fetch market regime from backend (SPY SMA-200 + live VIX).
+
+    Returns permissive defaults when backend is unreachable so alerts are never
+    suppressed purely due to a backend outage.
+    """
     if not backend_url:
-        return False
+        return {"regime_ok": True}
+    try:
+        r = requests.get(f"{backend_url.rstrip('/')}/market/regime", timeout=3)
+        if r.ok:
+            return r.json()
+    except Exception:
+        pass
+    return {"regime_ok": True}  # permissive — backend down ≠ bad market
+
+
+def post_to_backend(backend_url: str, ind: dict, signal_type: str) -> dict:
+    """POST alert to IBKR Trader backend watchlist.
+
+    Returns the response dict with 'action' key:
+      added    — new watchlist entry accepted
+      refreshed — existing entry updated
+      blocked  — backend gate rejected (VIX spike or bear regime)
+      error    — backend returned non-2xx
+      no_backend — backend unreachable
+    """
+    if not backend_url:
+        return {"action": "no_backend"}
     try:
         r = requests.post(
             f"{backend_url.rstrip('/')}/watchlist/alert",
@@ -174,9 +199,11 @@ def post_to_backend(backend_url: str, ind: dict, signal_type: str) -> bool:
             },
             timeout=3,
         )
-        return r.ok
+        if r.ok:
+            return r.json()
+        return {"action": "error", "status": r.status_code}
     except Exception:
-        return False  # backend not running — don't log noise
+        return {"action": "no_backend"}
 
 
 def fmt_alert(ind: dict, signal: str, tape: dict | None = None) -> str:
@@ -207,11 +234,22 @@ def fmt_alert(ind: dict, signal: str, tape: dict | None = None) -> str:
             f" · vwap_z {'+' if comp.get('vwap_z',0)>=0 else ''}{comp.get('vwap_z',0):.2f}"
         )
 
+    # Quality context line — shows the extra filter metrics when available
+    quality_parts = []
+    if ind.get("pct_b_min10") is not None:
+        quality_parts.append(f"Pullback %B min={ind['pct_b_min10']:.0f}")
+    if ind.get("close_pos") is not None:
+        quality_parts.append(f"Close top {ind['close_pos']:.0f}% of range")
+    if ind.get("ret_20d") is not None:
+        quality_parts.append(f"20d ret={ind['ret_20d']:+.1f}%")
+    quality_line = ("\n🔍 " + "  |  ".join(quality_parts)) if quality_parts else ""
+
     return (
         f"{emoji} <b>{signal}</b> — {ind['ticker']}\n"
         f"💰 Price: ${ind['price']:.2f} ({day_sign}{ind['day_chg_pct']:.1f}%)\n"
         f"📊 %B: {ind['pct_b']:.1f}  |  Vol: {vol_str}{proj_note} (90th-pct: {ind['vol_90pct']:.2f}×)\n"
         f"📈 RSI: {ind['rsi']:.0f}  |  {sma_txt}"
+        f"{quality_line}"
         f"{tape_line}"
     )
 
@@ -256,6 +294,33 @@ def compute_indicators(ticker: str, hist: pd.DataFrame) -> dict | None:
         band_w  = float(upper.iloc[-1] - lower.iloc[-1])
         pct_b   = float((last_close - lower.iloc[-1]) / band_w * 100) if band_w > 0 else 50.0
 
+        # F3 Pullback: min %B over the 10 bars BEFORE today (excludes today so we don't
+        # count the current breakout bar itself as the pullback day)
+        band_denom   = (upper - lower).replace(0, float("nan"))
+        pct_b_series = (closes - lower) / band_denom * 100
+        pct_b_min10  = (
+            float(pct_b_series.iloc[-11:-1].min())
+            if len(pct_b_series) >= 11 else None
+        )
+
+        # F5 Close quality: where did today's close land within today's H-L range?
+        highs_s   = hist["High"].dropna()
+        lows_s    = hist["Low"].dropna()
+        day_range = (
+            float(highs_s.iloc[-1]) - float(lows_s.iloc[-1])
+            if (len(highs_s) and len(lows_s)) else 0
+        )
+        close_pos = (
+            (last_close - float(lows_s.iloc[-1])) / day_range * 100
+            if day_range > 0 else 50.0
+        )
+
+        # F2 Relative strength: 20-day return for comparison against SPY
+        ret_20d = (
+            float((last_close / closes.iloc[-21] - 1) * 100)
+            if len(closes) >= 21 else None
+        )
+
         # RSI(14) — Wilder EMA method
         delta  = closes.diff()
         gain   = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
@@ -298,10 +363,14 @@ def compute_indicators(ticker: str, hist: pd.DataFrame) -> dict | None:
             "rsi":          round(rsi, 1),
             "vol_ratio":    vol_ratio,
             "vol_90pct":    round(vol_90pct, 2),
-            "vol_scale":    round(scale, 2),   # projection multiplier (1.0 = full day / after hours)
+            "vol_scale":    round(scale, 2),
             "above_sma20":  last_close > sma20_v > 0,
             "above_sma50":  last_close > sma50_v > 0,
             "above_sma200": last_close > sma200_v > 0,
+            # Quality filter fields (used by apply_quality_filters)
+            "ret_20d":      round(ret_20d, 2) if ret_20d is not None else None,
+            "pct_b_min10":  round(pct_b_min10, 1) if pct_b_min10 is not None else None,
+            "close_pos":    round(close_pos, 1),
         }
     except Exception as exc:
         log.debug("Indicator error for %s: %s", ticker, exc)
@@ -323,6 +392,54 @@ def classify_signal(ind: dict, cfg: dict) -> str | None:
             and vol_ratio >= vol_90pct * cfg["vol_threshold_pct"]):
         return "PRE-BREAKOUT"
     return None
+
+
+def apply_quality_filters(candidates: list[dict], regime: dict, cfg: dict) -> list[dict]:
+    """F2 / F3 / F5 scanner-side quality gates applied after classify_signal.
+
+    F2 Relative strength: stock 20d return must exceed SPY 20d return.
+    F3 Pullback:          %B must have been < 50 at least once in the prior 10 bars.
+    F5 Close quality:     today's close must be in the top 25% of the day's range.
+
+    Gates are skipped (pass-through) when the required data is unavailable so cold
+    starts and data gaps never suppress alerts by default.
+    """
+    spy_ret20 = regime.get("spy_ret20")
+    kept      = []
+    n_f2 = n_f3 = n_f5 = 0
+
+    for ind in candidates:
+        tk = ind["ticker"]
+
+        # F2: relative strength vs SPY
+        ret_20d = ind.get("ret_20d")
+        if spy_ret20 is not None and ret_20d is not None and ret_20d < spy_ret20:
+            log.info("F2 relative-strength gate dropped %s: %.1f%% < SPY %.1f%%",
+                     tk, ret_20d, spy_ret20)
+            n_f2 += 1
+            continue
+
+        # F3: required pullback — %B dipped below 50 at least once in prior 10 bars
+        pct_b_min10 = ind.get("pct_b_min10")
+        if pct_b_min10 is not None and pct_b_min10 >= 50:
+            log.info("F3 pullback gate dropped %s: pct_b_min10=%.1f (no dip below 50 in 10d)",
+                     tk, pct_b_min10)
+            n_f3 += 1
+            continue
+
+        # F5: close quality — close must be in top 25% of today's H-L range
+        close_pos = ind.get("close_pos", 50.0)
+        if close_pos < 75:
+            log.info("F5 close-quality gate dropped %s: close_pos=%.1f%% (< 75%%)", tk, close_pos)
+            n_f5 += 1
+            continue
+
+        kept.append(ind)
+
+    if n_f2 or n_f3 or n_f5:
+        log.info("Quality filters: dropped %d (F2 rel-str), %d (F3 pullback), %d (F5 close-quality)",
+                 n_f2, n_f3, n_f5)
+    return kept
 
 
 # ── Download + scan ───────────────────────────────────────────────────────────
@@ -496,44 +613,79 @@ def main():
             )
             log.info("New day — scanning %d tickers", len(sp500))
 
-        scan_start = time.monotonic()
+        scan_start  = time.monotonic()
+        backend_url = cfg.get("backend_url", "")
+
+        # ── F1 Regime gate (live VIX + SPY SMA-200 from backend) ─────────────
+        regime     = fetch_regime(backend_url)
+        regime_ok  = regime.get("regime_ok", True)
+        if not regime_ok:
+            log.info("REGIME GATE ACTIVE: %s — Telegram suppressed this cycle",
+                     regime.get("reason", "bad regime"))
+
         log.info("Starting scan (%d tickers)…", len(sp500))
 
-        candidates = scan_universe(sp500, cfg)
-        breakouts  = [c for c in candidates if c["signal"] == "BREAKOUT"]
-        pre_bo     = [c for c in candidates if c["signal"] == "PRE-BREAKOUT"]
+        raw_candidates = scan_universe(sp500, cfg)
+
+        # ── F2 / F3 / F5 Quality filters (scanner-side) ──────────────────────
+        candidates = apply_quality_filters(raw_candidates, regime, cfg)
+        n_dropped  = len(raw_candidates) - len(candidates)
+        if n_dropped:
+            log.info("Quality filters dropped %d/%d raw signals", n_dropped, len(raw_candidates))
+
+        breakouts = [c for c in candidates if c["signal"] == "BREAKOUT"]
+        pre_bo    = [c for c in candidates if c["signal"] == "PRE-BREAKOUT"]
 
         log.info(
-            "Scan complete in %.0fs — %d BREAKOUT, %d PRE-BREAKOUT",
+            "Scan complete in %.0fs — %d BREAKOUT, %d PRE-BREAKOUT (after quality filters)",
             time.monotonic() - scan_start, len(breakouts), len(pre_bo),
         )
 
-        backend_url = cfg.get("backend_url", "")
-
-        # Sync ALL current breakouts to the UI watchlist every cycle (no dedup).
-        # The watchlist should always reflect live scan state, not just first alerts.
-        for sig_type, bucket in [("BREAKOUT", breakouts), ("PRE-BREAKOUT", pre_bo)]:
-            for ind in bucket:
-                post_to_backend(backend_url, ind, sig_type)
-
-        # Send Telegram alerts (dedup: only if new or escalated signal)
+        # ── Combined backend sync + contingent Telegram ───────────────────────
+        # BREAKOUT processed first (higher priority); PRE-BREAKOUT second.
+        # For each signal:
+        #   1. POST to backend (always — keeps watchlist current for refreshes)
+        #   2. Backend gate may return action='blocked' for new entries → skip Telegram
+        #   3. Telegram fires only when: backend accepted (action='added' or 'no_backend')
+        #      AND signal is new or escalated today (dedup)
+        n_alerted_this_cycle = 0
         for sig_type in ["BREAKOUT", "PRE-BREAKOUT"]:
-            if sig_type not in alert_on:
-                continue
             bucket = breakouts if sig_type == "BREAKOUT" else pre_bo
+
             for ind in sorted(bucket, key=lambda x: x["pct_b"], reverse=True):
-                tk     = ind["ticker"]
-                prev   = alerted_today.get(tk)
-                # Alert if: never alerted, or escalating from PRE → BREAKOUT
-                if prev == sig_type:
+                tk = ind["ticker"]
+
+                # Always sync to backend
+                response = post_to_backend(backend_url, ind, sig_type)
+                action   = response.get("action", "no_backend")
+
+                if action == "blocked":
+                    log.info("Backend gate blocked %s %s: %s",
+                             sig_type, tk, response.get("reason", "—"))
                     continue
+
+                # Skip Telegram if regime gate is active (F1)
+                if not regime_ok:
+                    continue
+
+                # Skip if this signal type is not in alert_on config
+                if sig_type not in alert_on:
+                    continue
+
+                # Dedup: only alert on new or escalated signals
+                prev = alerted_today.get(tk)
+                if prev == sig_type:
+                    continue  # already alerted today at this level
                 if prev == "BREAKOUT" and sig_type == "PRE-BREAKOUT":
-                    continue   # don't downgrade BREAKOUT back to PRE-BREAKOUT
+                    continue  # never downgrade BREAKOUT → PRE-BREAKOUT
+
+                # Fire Telegram
                 alerted_today[tk] = sig_type
+                n_alerted_this_cycle += 1
                 tape = fetch_tape_sentiment(backend_url, tk)
                 msg  = fmt_alert(ind, sig_type, tape)
-                log.info("Alerting: %s %s (tape=%s)", sig_type, tk,
-                         tape.get("label") if tape else "no data")
+                log.info("Alerting: %s %s (tape=%s, backend=%s)",
+                         sig_type, tk, tape.get("label") if tape else "no data", action)
                 send_telegram(token, chat_id, msg)
                 time.sleep(0.3)   # Telegram rate limit: ~30 msg/s
 
@@ -541,13 +693,17 @@ def main():
         if not candidates and not (len(alerted_today) % 2):
             log.info("No signals this cycle — market quiet")
 
-        # Scan summary message (only when signals found)
-        if breakouts or pre_bo:
+        # Scan summary (only when signals were alerted this cycle)
+        if n_alerted_this_cycle > 0:
+            bo_count  = sum(1 for v in alerted_today.values() if v == "BREAKOUT")
+            pre_count = sum(1 for v in alerted_today.values() if v == "PRE-BREAKOUT")
             summary = (
                 f"📋 <b>Scan summary</b> {datetime.now(ET).strftime('%H:%M ET')}\n"
-                f"🚨 BREAKOUT: {len([x for x in breakouts if x['ticker'] in {k for k,v in alerted_today.items() if v=='BREAKOUT'}])}\n"
-                f"⚡ PRE-BREAKOUT: {len([x for x in pre_bo if x['ticker'] in {k for k,v in alerted_today.items() if v=='PRE-BREAKOUT'}])}\n"
-                f"Total alerts today: {len(alerted_today)}"
+                f"🚨 BREAKOUT today: {bo_count}\n"
+                f"⚡ PRE-BREAKOUT today: {pre_count}\n"
+                f"Total alerts today: {len(alerted_today)}\n"
+                f"Filters active: F2 rel-str ✓ | F3 pullback ✓ | F5 close-quality ✓"
+                + (f"\n⚠️ Regime gate active: {regime.get('reason')}" if not regime_ok else "")
             )
             send_telegram(token, chat_id, summary)
 
