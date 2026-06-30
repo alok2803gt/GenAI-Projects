@@ -5248,6 +5248,230 @@ function IndexBanner() {
 }
 
 
+// ── Performance Tab ──────────────────────────────────────────────────────
+function PerformanceTab() {
+  const todayET = () => {
+    const d = new Date();
+    const et = new Intl.DateTimeFormat("en-CA", { timeZone: "America/New_York", year: "numeric", month: "2-digit", day: "2-digit" }).format(d);
+    return et;
+  };
+  const [selDate, setSelDate]       = useState(todayET());
+  const [data, setData]             = useState(null);
+  const [loading, setLoading]       = useState(false);
+  const [enriching, setEnriching]   = useState(false);
+  const [showAnalysis, setShowAnalysis] = useState(false);
+  const [analysis, setAnalysis]     = useState(null);
+  const [analysisLoading, setAnalysisLoading] = useState(false);
+
+  const loadDay = async (d) => {
+    setLoading(true);
+    try {
+      const r = await apiFetch(`/performance/daily?date=${d}`);
+      setData(r);
+    } catch(_) { setData(null); }
+    finally { setLoading(false); }
+  };
+
+  useEffect(() => { loadDay(selDate); }, [selDate]);
+
+  const enrich = async () => {
+    setEnriching(true);
+    try {
+      await apiFetch(`/performance/enrich?date=${selDate}`, { method: "POST" });
+      await loadDay(selDate);
+    } catch(_) {}
+    finally { setEnriching(false); }
+  };
+
+  const loadAnalysis = async () => {
+    if (analysis) { setShowAnalysis(s => !s); return; }
+    setShowAnalysis(true);
+    setAnalysisLoading(true);
+    try {
+      const r = await apiFetch("/performance/indicators?days=30");
+      setAnalysis(r);
+    } catch(_) {}
+    finally { setAnalysisLoading(false); }
+  };
+
+  const fmtRet = (v) => v == null ? "—" : `${v >= 0 ? "+" : ""}${v.toFixed(2)}%`;
+  const retColor = (v) => v == null ? C.muted : v > 0 ? "#16a34a" : "#dc2626";
+  const winColor = (wr) => wr >= 65 ? "#16a34a" : wr >= 45 ? "#d97706" : "#dc2626";
+
+  const rows = data?.rows || [];
+  const sum  = data?.summary || {};
+
+  const best  = sum.best  ? `${sum.best.ticker} ${fmtRet(sum.best.eod_return_pct)}`  : "—";
+  const worst = sum.worst ? `${sum.worst.ticker} ${fmtRet(sum.worst.eod_return_pct)}` : "—";
+
+  const IndicatorTable = ({ title, rows: trows, keyField }) => {
+    if (!trows || trows.length === 0) return null;
+    return (
+      <div style={{ marginBottom: 20 }}>
+        <div style={{ ...sans, fontSize: 11, fontWeight: 700, color: C.muted, textTransform: "uppercase", letterSpacing: 1, marginBottom: 6 }}>{title}</div>
+        <table style={{ width: "100%", borderCollapse: "collapse", ...sans, fontSize: 12 }}>
+          <thead>
+            <tr style={{ borderBottom: `1px solid ${C.border}` }}>
+              {["Label", "Count", "Win %", "Avg Return"].map(h => (
+                <th key={h} style={{ padding: "5px 8px", textAlign: "left", color: C.muted, fontSize: 10, fontWeight: 600, textTransform: "uppercase" }}>{h}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {trows.map((r, i) => (
+              <tr key={i} style={{ borderBottom: `1px solid ${C.border}33` }}>
+                <td style={{ padding: "5px 8px", color: C.white, ...mono, fontSize: 11 }}>{r[keyField]}</td>
+                <td style={{ padding: "5px 8px", color: C.muted }}>{r.count}</td>
+                <td style={{ padding: "5px 8px", color: winColor(r.win_rate), fontWeight: 700 }}>{r.win_rate}%</td>
+                <td style={{ padding: "5px 8px", color: retColor(r.avg_return), fontWeight: 600 }}>{fmtRet(r.avg_return)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    );
+  };
+
+  const keyInsight = () => {
+    if (!analysis) return null;
+    const candidates = [];
+    const push = (rows, key) => (rows || []).filter(r => r.count >= 5).forEach(r => candidates.push({ label: `${key}: ${r[Object.keys(r)[0]]}`, win_rate: r.win_rate, count: r.count }));
+    push(analysis.by_signal_type, "Signal");
+    push(analysis.by_rsi, "RSI");
+    push(analysis.by_pct_b, "%B");
+    push(analysis.by_vol_ratio, "Vol Ratio");
+    push(analysis.by_tape, "Tape");
+    push(analysis.by_hour, "Hour");
+    if (!candidates.length) return null;
+    const best = candidates.reduce((a, b) => b.win_rate > a.win_rate ? b : a);
+    return best;
+  };
+
+  return (
+    <div>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 16, flexWrap: "wrap", gap: 10 }}>
+        <div>
+          <div style={{ ...sans, fontSize: 17, fontWeight: 700, color: C.white }}>Alert Performance</div>
+          <div style={{ ...sans, fontSize: 12, color: C.muted, marginTop: 2 }}>EOD return from alert price · auto-enriched at 16:15 ET</div>
+        </div>
+        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          <input type="date" value={selDate} onChange={e => setSelDate(e.target.value)}
+            style={{ ...mono, fontSize: 12, padding: "5px 10px", borderRadius: 6, background: C.surface, border: `1px solid ${C.border}`, color: C.text, cursor: "pointer" }} />
+          <button onClick={enrich} disabled={enriching}
+            style={{ ...sans, fontSize: 12, padding: "6px 14px", borderRadius: 6, background: C.accent, border: "none", color: "#fff", cursor: "pointer", opacity: enriching ? 0.6 : 1 }}>
+            {enriching ? "Refreshing…" : "Refresh EOD Data"}
+          </button>
+        </div>
+      </div>
+
+      {loading ? (
+        <div style={{ color: C.muted, ...sans, fontSize: 13, padding: "40px 0", textAlign: "center" }}>Loading…</div>
+      ) : (
+        <>
+          <div style={{ display: "flex", gap: 12, marginBottom: 20, flexWrap: "wrap" }}>
+            {[
+              { label: "Total Alerts", value: sum.total ?? "—", color: C.white },
+              { label: "Win Rate",     value: sum.win_rate != null ? `${sum.win_rate}%` : "—", color: sum.win_rate != null ? (sum.win_rate > 50 ? "#16a34a" : "#dc2626") : C.muted },
+              { label: "Avg Return",   value: fmtRet(sum.avg_return), color: retColor(sum.avg_return) },
+              { label: "Best",         value: best, color: "#16a34a" },
+              { label: "Worst",        value: worst, color: "#dc2626" },
+            ].map(({ label, value, color }) => (
+              <div key={label} style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 8, padding: "12px 16px", minWidth: 120, flex: "1 1 120px" }}>
+                <div style={{ ...sans, fontSize: 10, color: C.muted, textTransform: "uppercase", letterSpacing: 1, marginBottom: 4 }}>{label}</div>
+                <div style={{ ...mono, fontSize: 15, fontWeight: 700, color }}>{value}</div>
+              </div>
+            ))}
+          </div>
+
+          {rows.length === 0 ? (
+            <div style={{ textAlign: "center", padding: "60px 20px", color: C.muted, ...sans, fontSize: 14 }}>No alerts found for {selDate}</div>
+          ) : (
+            <div style={{ overflowX: "auto", marginBottom: 24 }}>
+              <table style={{ width: "100%", borderCollapse: "collapse", ...sans, fontSize: 13 }}>
+                <thead>
+                  <tr style={{ borderBottom: `2px solid ${C.border}` }}>
+                    {["Time (ET)", "Ticker", "Signal", "Alert $", "EOD $", "Return %", "Result"].map(h => (
+                      <th key={h} style={{ padding: "8px 10px", textAlign: "left", color: C.muted, fontSize: 11, fontWeight: 600, textTransform: "uppercase", letterSpacing: 0.5 }}>{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {rows.map((r, i) => {
+                    const enriched = r.eod_return_pct != null;
+                    const rowBg = !enriched ? `${C.muted}11` : r.is_win ? "#16a34a11" : "#dc262611";
+                    const sigColor = r.signal_type === "BREAKOUT" ? "#ef4444" : "#f59e0b";
+                    return (
+                      <tr key={i} style={{ background: rowBg, borderBottom: `1px solid ${C.border}33` }}>
+                        <td style={{ padding: "7px 10px", ...mono, fontSize: 11, color: C.muted }}>{r.alert_time_et || "—"}</td>
+                        <td style={{ padding: "7px 10px", fontWeight: 700, color: C.white }}>{r.ticker}</td>
+                        <td style={{ padding: "7px 10px" }}>
+                          <span style={{ ...mono, fontSize: 10, padding: "2px 7px", borderRadius: 10, background: `${sigColor}22`, color: sigColor, border: `1px solid ${sigColor}44`, fontWeight: 700 }}>{r.signal_type}</span>
+                        </td>
+                        <td style={{ padding: "7px 10px", ...mono, fontSize: 12 }}>{r.alert_price != null ? `$${r.alert_price.toFixed(2)}` : "—"}</td>
+                        <td style={{ padding: "7px 10px", ...mono, fontSize: 12 }}>{r.eod_price != null ? `$${r.eod_price.toFixed(2)}` : "—"}</td>
+                        <td style={{ padding: "7px 10px", ...mono, fontSize: 12, fontWeight: 700, color: retColor(r.eod_return_pct) }}>{fmtRet(r.eod_return_pct)}</td>
+                        <td style={{ padding: "7px 10px" }}>
+                          {!enriched ? (
+                            <span style={{ ...sans, fontSize: 11, color: C.muted }}>Pending</span>
+                          ) : r.is_win ? (
+                            <span style={{ ...mono, fontSize: 10, padding: "2px 7px", borderRadius: 10, background: "#16a34a22", color: "#16a34a", border: "1px solid #16a34a44", fontWeight: 700 }}>WIN</span>
+                          ) : (
+                            <span style={{ ...mono, fontSize: 10, padding: "2px 7px", borderRadius: 10, background: "#dc262622", color: "#dc2626", border: "1px solid #dc262644", fontWeight: 700 }}>LOSS</span>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+
+          <div style={{ border: `1px solid ${C.border}`, borderRadius: 8, overflow: "hidden" }}>
+            <button onClick={loadAnalysis} style={{ width: "100%", display: "flex", justifyContent: "space-between", alignItems: "center",
+              padding: "12px 16px", background: C.surface, border: "none", cursor: "pointer", ...sans, fontSize: 13, fontWeight: 600, color: C.white }}>
+              <span>Indicator Analysis (last 30 days)</span>
+              <span style={{ ...mono, fontSize: 14, color: C.accent }}>{showAnalysis ? "▲" : "▼"}</span>
+            </button>
+            {showAnalysis && (
+              <div style={{ padding: "16px", borderTop: `1px solid ${C.border}`, background: C.bg }}>
+                {analysisLoading ? (
+                  <div style={{ color: C.muted, ...sans, fontSize: 13, textAlign: "center", padding: "20px 0" }}>Loading analysis…</div>
+                ) : !analysis ? (
+                  <div style={{ color: C.muted, ...sans, fontSize: 13 }}>No data available</div>
+                ) : (
+                  <>
+                    {(() => { const ki = keyInsight(); return ki ? (
+                      <div style={{ background: `${C.accent}15`, border: `1px solid ${C.accent}44`, borderRadius: 6, padding: "10px 14px", marginBottom: 16, ...sans, fontSize: 12, color: C.text }}>
+                        <b style={{ color: C.accent }}>Key Insight:</b> Strongest predictor — <b>{ki.label}</b> with {ki.win_rate}% win rate ({ki.count} alerts)
+                      </div>
+                    ) : null; })()}
+                    <div style={{ ...sans, fontSize: 11, color: C.muted, marginBottom: 16 }}>
+                      {analysis.total_alerts} alerts across {analysis.days_analyzed} days · Overall win rate: <b style={{ color: winColor(analysis.overall?.win_rate) }}>{analysis.overall?.win_rate}%</b> · Avg return: <b style={{ color: retColor(analysis.overall?.avg_return) }}>{fmtRet(analysis.overall?.avg_return)}</b>
+                    </div>
+                    <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(320px, 1fr))", gap: 20 }}>
+                      <IndicatorTable title="By Signal Type" rows={analysis.by_signal_type} keyField="label" />
+                      <IndicatorTable title="By RSI" rows={analysis.by_rsi} keyField="bin" />
+                      <IndicatorTable title="By %B" rows={analysis.by_pct_b} keyField="bin" />
+                      <IndicatorTable title="By Vol Ratio" rows={analysis.by_vol_ratio} keyField="bin" />
+                      <IndicatorTable title="By Tape Label" rows={analysis.by_tape} keyField="label" />
+                      <IndicatorTable title="By Hour (ET)" rows={analysis.by_hour} keyField="hour" />
+                    </div>
+                    <div style={{ marginTop: 4 }}>
+                      <IndicatorTable title="Top Tickers" rows={analysis.by_ticker} keyField="ticker" />
+                    </div>
+                  </>
+                )}
+              </div>
+            )}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+
 // ── Root App ──────────────────────────────────────────────────────────────
 function App() {
   const [tab, setTab]         = useState("pnl");
@@ -5287,8 +5511,9 @@ function App() {
     { id:"decisions",  label:"Decisions"   },
     { id:"technicals", label:"Technicals"  },
     { id:"watchlist",  label:"Watchlist 📡"   },
-    { id:"tape",       label:"Live Tape 📈"   },
+    { id:"tape",        label:"Live Tape 📈"   },
     { id:"instflow",   label:"Inst. Flow 🏦"  },
+    { id:"performance", label:"Performance 📊" },
   ];
 
   const deltaCol = netDelta == null ? C.muted : netDelta >= 0 ? C.bull : C.bear;
@@ -5346,7 +5571,8 @@ function App() {
         <div style={{display: tab==="technicals" ? "" : "none"}}><TechnicalsTab /></div>
         <div style={{display: tab==="watchlist"  ? "" : "none"}}><WatchlistTab /></div>
         <div style={{display: tab==="tape"       ? "" : "none"}}><TapeTab /></div>
-        <div style={{display: tab==="instflow"   ? "" : "none"}}><InstFlowTab /></div>
+        <div style={{display: tab==="instflow"    ? "" : "none"}}><InstFlowTab /></div>
+        <div style={{display: tab==="performance" ? "" : "none"}}><PerformanceTab /></div>
 
         <div style={{ marginTop:20, ...sans, fontSize:11, color:C.muted, lineHeight:1.7 }}>
           Auto-trader: Kelly sizing · 50% profit target · IV-adjusted stops · 21 DTE roll · 48h cooldown. Backtest: 2-yr simulation with BS pricing.
