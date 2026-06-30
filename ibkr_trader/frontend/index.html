@@ -1974,6 +1974,8 @@ function AutoTraderTab() {
                     <td style={{ padding:"7px 10px" }}>
                       {hasLive
                         ? <span style={{ fontWeight:700, color:pnlColor }}>{livePnl >= 0 ? "+" : ""}${livePnl.toFixed(0)}</span>
+                        : p.order_status === "pending"
+                        ? <span style={{ color:"#f39c12", fontSize:11 }}>pending fill</span>
                         : <span style={{ color:C.muted }}>—</span>
                       }
                     </td>
@@ -2005,7 +2007,9 @@ function AutoTraderTab() {
                             </div>
                           ) : <span style={{ color:pnlColor, fontWeight:700 }}>{livePnl>=0?"+":""}${livePnl.toFixed(0)}</span>;
                         })()
-                      ) : <span style={{ color:C.muted, fontSize:11 }}>awaiting data</span>}
+                      ) : p.order_status === "pending"
+                        ? <span style={{ color:"#f39c12", fontSize:11 }}>⏳ order pending</span>
+                        : <span style={{ color:C.muted, fontSize:11 }}>awaiting data</span>}
                     </td>
                     <td style={{ padding:"7px 10px", color:C.muted, fontSize:11 }}>{p.placed_at || "—"}</td>
                     <td style={{ padding:"7px 6px" }}>

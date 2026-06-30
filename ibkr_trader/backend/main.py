@@ -6810,6 +6810,89 @@ def autotrader_status():
         except Exception:
             pass
 
+    # ── Mark positions with active open orders (not yet filled) ─────────────────
+    # These have no P&L yet — show "order pending" in the UI instead of "awaiting data".
+    if ib and state.get("connected"):
+        try:
+            pending_order_ids = {
+                t.order.orderId
+                for t in ib.openTrades()
+                if t.orderStatus.status in ("Submitted", "PreSubmitted", "PendingSubmit")
+            }
+            for info in positions_enriched.values():
+                oid = info.get("order_id")
+                if oid is not None and oid in pending_order_ids:
+                    info["order_status"] = "pending"
+        except Exception:
+            pass
+
+    # ── Fallback: direct option quote for positions missing from ib.portfolio() ──
+    # ib.portfolio() sometimes omits CSP positions (e.g. after reconnect or when
+    # IBKR hasn't reconciled the account yet).  For any tracked position that still
+    # has no live_pnl, request a snapshot quote directly and compute P&L from mid.
+    # Skip positions with pending orders — no real P&L exists until the order fills.
+    if ib and state.get("connected"):
+        missing = [
+            (k, v) for k, v in positions_enriched.items()
+            if "live_pnl" not in v and v.get("order_status") != "pending"
+        ]
+        if missing:
+            try:
+                async def _batch_mid(ib_conn, pos_list):
+                    contracts = []
+                    for _, info in pos_list:
+                        tk     = info.get("ticker", "")
+                        expiry = (info.get("expiry") or "")[:8]
+                        strike = float(info.get("strike") or 0)
+                        right  = info.get("right", "P").upper()
+                        if tk and expiry and strike:
+                            contracts.append(Option(tk, expiry, strike, right, "SMART"))
+                    if not contracts:
+                        return []
+                    await ib_conn.qualifyContractsAsync(*contracts)
+                    valid = [c for c in contracts if c.conId]
+                    if not valid:
+                        return []
+                    return await ib_conn.reqTickersAsync(*valid)
+
+                tickers_data = _run_in_streaming_loop(
+                    _batch_mid(ib, missing), timeout=15
+                )
+                # Build conId → Ticker map for quick lookup
+                ticker_map = {td.contract.conId: td for td in tickers_data}
+                for _, info in missing:
+                    tk     = info.get("ticker", "")
+                    expiry = (info.get("expiry") or "")[:8]
+                    strike = float(info.get("strike") or 0)
+                    right  = info.get("right", "P").upper()
+                    # Find the matching ticker by symbol+strike+expiry
+                    td = next(
+                        (t for t in tickers_data
+                         if getattr(t.contract, "symbol", "") == tk
+                         and abs(float(getattr(t.contract, "strike", 0)) - strike) < 0.01
+                         and getattr(t.contract, "lastTradeDateOrContractMonth", "")[:8] == expiry),
+                        None,
+                    )
+                    if td is None:
+                        continue
+                    bid = td.bid if td.bid and not math.isnan(td.bid) else None
+                    ask = td.ask if td.ask and not math.isnan(td.ask) else None
+                    mid = (bid + ask) / 2 if bid and ask else (ask or bid)
+                    if mid is None:
+                        continue
+                    entry = float(info.get("entry_price") or 0)
+                    qty   = int(info.get("qty") or 1)
+                    action = info.get("action", "SELL")
+                    live_pnl = round(
+                        (entry - mid) * qty * 100 if action == "SELL"
+                        else (mid - entry) * qty * 100,
+                        2,
+                    )
+                    info["live_pnl"]   = live_pnl
+                    info["live_price"] = round(mid, 4)
+            except Exception as _e:
+                log.debug("Fallback quote fetch failed: %s", _e)
+
     return {
         "enabled":              at["enabled"],
         "config":               clean_cfg,
@@ -8004,10 +8087,29 @@ def pnl_dashboard():
         # Guard: only orphan when portfolio_items is non-empty. If the feed is
         # temporarily empty (post-reconnect, TWS restart), ibkr_keys = {} and
         # every open entry would be falsely orphaned, corrupting the journal.
+        # Also guard: skip entries that have an active open order (Submitted /
+        # PreSubmitted) — unfilled limit orders are not in the portfolio yet
+        # and should not be marked orphaned before they have a chance to fill.
+        active_order_jkeys: set = set()
+        try:
+            for t in state["ib"].openTrades():
+                if t.orderStatus.status in ("Submitted", "PreSubmitted", "PendingSubmit"):
+                    c = t.contract
+                    active_order_jkeys.add(_jkey(
+                        getattr(c, "symbol", ""),
+                        getattr(c, "strike", None),
+                        getattr(c, "right", None),
+                        (getattr(c, "lastTradeDateOrContractMonth", "") or "")[:8],
+                    ))
+        except Exception:
+            pass
+
         orphan_ids = [
             t["id"] for t in open_trades
             if _jkey(t.get("ticker",""), t.get("strike"), t.get("right",""), t.get("expiry",""))
             not in ibkr_keys
+            and _jkey(t.get("ticker",""), t.get("strike"), t.get("right",""), t.get("expiry",""))
+            not in active_order_jkeys
         ]
         if orphan_ids and portfolio_items:
             try:
