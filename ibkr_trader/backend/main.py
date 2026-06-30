@@ -3851,41 +3851,73 @@ def _tape_db_init() -> None:
     con.execute("CREATE INDEX IF NOT EXISTS idx_tb_ticker_date ON tape_bars (ticker, session_date)")
     con.execute("""
         CREATE TABLE IF NOT EXISTS alert_history (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            fired_at     TEXT NOT NULL,
-            session_date TEXT NOT NULL,
-            ticker       TEXT NOT NULL,
-            signal_type  TEXT NOT NULL,
-            price        REAL,
-            pct_b        REAL,
-            rsi          REAL,
-            vol_ratio    REAL,
-            tape_score   REAL,
-            tape_label   TEXT
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            fired_at            TEXT NOT NULL,
+            session_date        TEXT NOT NULL,
+            ticker              TEXT NOT NULL,
+            signal_type         TEXT NOT NULL,
+            price               REAL,
+            pct_b               REAL,
+            rsi                 REAL,
+            vol_ratio           REAL,
+            tape_score          REAL,
+            tape_label          TEXT,
+            prev_state          TEXT,
+            mins_in_pre_breakout INTEGER,
+            state_path          TEXT
         )
     """)
     con.execute("CREATE INDEX IF NOT EXISTS idx_ah_ticker ON alert_history (ticker, session_date)")
     con.execute("""
         CREATE TABLE IF NOT EXISTS alert_performance (
-            id             INTEGER PRIMARY KEY AUTOINCREMENT,
-            alert_id       INTEGER UNIQUE,
-            session_date   TEXT NOT NULL,
-            ticker         TEXT NOT NULL,
-            signal_type    TEXT NOT NULL,
-            alert_time_et  TEXT,
-            alert_price    REAL,
-            eod_price      REAL,
-            eod_return_pct REAL,
-            is_win         INTEGER,
-            pct_b          REAL,
-            rsi            REAL,
-            vol_ratio      REAL,
-            tape_score     REAL,
-            tape_label     TEXT,
-            enriched_at    TEXT
+            id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+            alert_id             INTEGER UNIQUE,
+            session_date         TEXT NOT NULL,
+            ticker               TEXT NOT NULL,
+            signal_type          TEXT NOT NULL,
+            alert_time_et        TEXT,
+            alert_price          REAL,
+            eod_price            REAL,
+            eod_return_pct       REAL,
+            is_win               INTEGER,
+            pct_b                REAL,
+            rsi                  REAL,
+            vol_ratio            REAL,
+            tape_score           REAL,
+            tape_label           TEXT,
+            enriched_at          TEXT,
+            prev_state           TEXT,
+            mins_in_pre_breakout INTEGER,
+            state_path           TEXT
         )
     """)
     con.execute("CREATE INDEX IF NOT EXISTS idx_ap_date ON alert_performance (session_date)")
+    # State transitions table — one row per %B state change, all 112 tickers, all day
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS state_transitions (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_date        TEXT NOT NULL,
+            ticker              TEXT NOT NULL,
+            prev_state          TEXT NOT NULL,
+            new_state           TEXT NOT NULL,
+            pct_b               REAL,
+            rsi                 REAL,
+            transition_time_et  TEXT NOT NULL,
+            mins_in_prev_state  INTEGER
+        )
+    """)
+    con.execute("CREATE INDEX IF NOT EXISTS idx_st_date ON state_transitions (session_date, ticker)")
+    # Migrate existing alert_history rows — add new columns if absent (safe for existing DBs)
+    for col, typedef in [("prev_state", "TEXT"), ("mins_in_pre_breakout", "INTEGER"), ("state_path", "TEXT")]:
+        try:
+            con.execute(f"ALTER TABLE alert_history ADD COLUMN {col} {typedef}")
+        except Exception:
+            pass   # column already exists
+    for col, typedef in [("prev_state", "TEXT"), ("mins_in_pre_breakout", "INTEGER"), ("state_path", "TEXT")]:
+        try:
+            con.execute(f"ALTER TABLE alert_performance ADD COLUMN {col} {typedef}")
+        except Exception:
+            pass
     con.commit()
     con.close()
     log.info("Tape DB initialised at %s", TAPE_DB_PATH)
@@ -3894,7 +3926,10 @@ def _tape_db_init() -> None:
 def _alert_history_insert(ticker: str, signal_type: str, price: Optional[float],
                            pct_b: Optional[float], rsi: Optional[float],
                            vol_ratio: Optional[float], tape_score: Optional[float],
-                           tape_label: Optional[str]) -> None:
+                           tape_label: Optional[str],
+                           prev_state: Optional[str] = None,
+                           mins_in_pre_breakout: Optional[int] = None,
+                           state_path: Optional[str] = None) -> None:
     """Persist one scanner alert to alert_history (fire-and-forget, never raises)."""
     try:
         from zoneinfo import ZoneInfo
@@ -3903,10 +3938,12 @@ def _alert_history_insert(ticker: str, signal_type: str, price: Optional[float],
         con.execute(
             """INSERT INTO alert_history
                (fired_at, session_date, ticker, signal_type, price,
-                pct_b, rsi, vol_ratio, tape_score, tape_label)
-               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                pct_b, rsi, vol_ratio, tape_score, tape_label,
+                prev_state, mins_in_pre_breakout, state_path)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (datetime.utcnow().isoformat(), now_et.strftime("%Y-%m-%d"),
-             ticker, signal_type, price, pct_b, rsi, vol_ratio, tape_score, tape_label),
+             ticker, signal_type, price, pct_b, rsi, vol_ratio, tape_score, tape_label,
+             prev_state, mins_in_pre_breakout, state_path),
         )
         con.commit()
         con.close()
@@ -3981,11 +4018,13 @@ async def _enrich_day_performance(session_date: str) -> int:
         con.execute(
             """INSERT OR IGNORE INTO alert_performance
                (alert_id, session_date, ticker, signal_type, alert_time_et, alert_price,
-                eod_price, eod_return_pct, is_win, pct_b, rsi, vol_ratio, tape_score, tape_label, enriched_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                eod_price, eod_return_pct, is_win, pct_b, rsi, vol_ratio, tape_score, tape_label,
+                enriched_at, prev_state, mins_in_pre_breakout, state_path)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (r["id"], r["session_date"], ticker, r["signal_type"], alert_time_et, alert_price,
              eod_price, eod_return_pct, is_win, r.get("pct_b"), r.get("rsi"),
-             r.get("vol_ratio"), r.get("tape_score"), r.get("tape_label"), enriched_at)
+             r.get("vol_ratio"), r.get("tape_score"), r.get("tape_label"), enriched_at,
+             r.get("prev_state"), r.get("mins_in_pre_breakout"), r.get("state_path"))
         )
         count += 1
     con.commit()
@@ -6470,15 +6509,19 @@ def account_raw_values():
 # ── Watchlist endpoints (breakout scanner integration) ────────────────────
 
 class WatchlistAlertRequest(BaseModel):
-    ticker:        str
-    signal_type:   str              # "BREAKOUT" or "PRE-BREAKOUT"
-    price_at_alert: float
-    pct_b:         float
-    rsi:           Optional[float] = None
-    vol_ratio:     Optional[float] = None
-    timestamp_et:  Optional[str]   = None   # "HH:MM ET YYYY-MM-DD"
-    tape_score:    Optional[float] = None   # CVD score from scanner's /tape/sentiment call
-    tape_label:    Optional[str]   = None   # e.g. "BULLISH", "BEARISH", "NEUTRAL"
+    ticker:               str
+    signal_type:          str              # "BREAKOUT" or "PRE-BREAKOUT"
+    price_at_alert:       float
+    pct_b:                float
+    rsi:                  Optional[float] = None
+    vol_ratio:            Optional[float] = None
+    timestamp_et:         Optional[str]   = None   # "HH:MM ET YYYY-MM-DD"
+    tape_score:           Optional[float] = None   # CVD score from scanner's /tape/sentiment call
+    tape_label:           Optional[str]   = None   # e.g. "BULLISH", "BEARISH", "NEUTRAL"
+    # State lifecycle context — populated by breakout_scanner when _ticker_states has history
+    prev_state:           Optional[str]   = None   # state before entering current signal zone
+    mins_in_pre_breakout: Optional[int]   = None   # minutes spent in PRE-BREAKOUT before BREAKOUT
+    state_path:           Optional[str]   = None   # e.g. "NEUTRAL→PRE-BREAKOUT→BREAKOUT"
 
 
 @app.post("/watchlist/alert")
@@ -6565,9 +6608,12 @@ def watchlist_add_alert(req: WatchlistAlertRequest):
         "tape_label":     tl,
         "tape_confirmed": bool(ts is not None and ts > 0.20),
     }
-    # Persist every new alert to alert_history for backtesting
+    # Persist every new alert to alert_history for backtesting (includes state path context)
     _alert_history_insert(tk, req.signal_type, req.price_at_alert,
-                          req.pct_b, req.rsi, req.vol_ratio, _ts, _tl)
+                          req.pct_b, req.rsi, req.vol_ratio, _ts, _tl,
+                          prev_state=req.prev_state,
+                          mins_in_pre_breakout=req.mins_in_pre_breakout,
+                          state_path=req.state_path)
     _watchlist_save()
     return {"ok": True, "action": "added"}
 

@@ -25,6 +25,7 @@ import json
 import logging
 import logging.handlers
 import os
+import sqlite3
 import time
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -227,6 +228,10 @@ def post_to_backend_with_tape(backend_url: str, ind: dict, signal_type: str,
         if tape:
             payload["tape_score"] = tape.get("score")
             payload["tape_label"] = tape.get("label")
+        # State lifecycle context (Stage 2 enrichment)
+        if ind.get("prev_state")           is not None: payload["prev_state"]           = ind["prev_state"]
+        if ind.get("mins_in_pre_breakout") is not None: payload["mins_in_pre_breakout"] = ind["mins_in_pre_breakout"]
+        if ind.get("state_path")           is not None: payload["state_path"]           = ind["state_path"]
         r = requests.post(
             f"{backend_url.rstrip('/')}/watchlist/alert",
             json=payload,
@@ -267,6 +272,14 @@ def fmt_alert(ind: dict, signal: str, tape: dict | None = None) -> str:
             f" · vwap_z {'+' if comp.get('vwap_z',0)>=0 else ''}{comp.get('vwap_z',0):.2f}"
         )
 
+    # Intraday confirmation line (dual-%B signals only)
+    intraday_line = ""
+    if ind.get("intraday_confirmed"):
+        intraday_line = (
+            f"\n📡 <b>Intraday confirmed</b>: 15m %B={ind.get('intraday_pct_b', 0):.0f}"
+            f"  |  daily %B={ind['pct_b']:.1f}  (wide bands — intraday move)"
+        )
+
     # Quality context line — shows the extra filter metrics when available
     quality_parts = []
     if ind.get("pct_b_min10") is not None:
@@ -303,6 +316,7 @@ def fmt_alert(ind: dict, signal: str, tape: dict | None = None) -> str:
         f"💰 Price: ${ind['price']:.2f} ({day_sign}{ind['day_chg_pct']:.1f}%)\n"
         f"📊 %B: {ind['pct_b']:.1f}  |  Vol: {vol_str}{proj_note} (90th-pct: {ind['vol_90pct']:.2f}×)\n"
         f"📈 RSI: {ind['rsi']:.0f}  |  {sma_txt}"
+        f"{intraday_line}"
         f"{quality_line}"
         f"{score_line}"
         f"{tape_line}"
@@ -314,6 +328,7 @@ def fmt_alert(ind: dict, signal: str, tape: dict | None = None) -> str:
 # scan_universe() reads from here — no yfinance in the hot path.
 _hist_cache:    dict[str, pd.DataFrame] = {}
 _ticker_states: dict[str, dict]        = {}   # state ledger — persists for the trading session
+TAPE_DB = os.path.join(SCRIPT_DIR, "tape_data.db")
 
 
 def _chunked(lst: list, n: int):
@@ -351,6 +366,51 @@ def _yf_batch_download(tickers: list[str], period: str,
             log.warning("  yfinance batch error: %s", exc)
         if i < len(batches):
             time.sleep(0.5)
+    return result
+
+
+def fetch_intraday_pct_b(tickers: list[str]) -> dict[str, float]:
+    """Fetch 15-min intraday bars and compute 20-bar Bollinger %B for each ticker.
+
+    Used by the dual-%B check in scan_universe() to catch strong intraday moves
+    that are invisible on daily Bollinger Bands (wide bands, mid-range close).
+    Returns {ticker: pct_b_15m} for tickers with >= 20 intraday bars available.
+    """
+    if not tickers:
+        return {}
+    try:
+        # Use 2d so yesterday's bars warm up the 20-bar BB early in the session.
+        # A 15-min chart has ~26 bars/day, so 2d gives ~52 bars — plenty for BB(20).
+        raw = yf.download(
+            tickers, period="2d", interval="15m",
+            progress=False, auto_adjust=True, threads=True,
+        )
+    except Exception as exc:
+        log.warning("Intraday fetch failed: %s", exc)
+        return {}
+
+    result: dict[str, float] = {}
+    is_multi = isinstance(raw.columns, pd.MultiIndex)
+    for tk in tickers:
+        try:
+            if is_multi:
+                df = raw.xs(tk, axis=1, level=1).dropna(how="all")
+            else:
+                df = raw.copy() if len(tickers) == 1 else pd.DataFrame()
+            c = df["Close"].squeeze()
+            if len(c) < 20:
+                continue
+            sma   = c.rolling(20).mean()
+            std   = c.rolling(20).std()
+            upper = sma + 2 * std
+            lower = sma - 2 * std
+            bw    = upper - lower
+            pct_b = (c - lower) / bw * 100
+            val   = float(pct_b.iloc[-1])
+            if pd.notna(val):
+                result[tk] = round(val, 1)
+        except Exception:
+            pass
     return result
 
 
@@ -701,6 +761,26 @@ def _fmt_duration(since: datetime) -> str:
     return f"{mins}m" if mins < 60 else f"{mins // 60}h{mins % 60:02d}m"
 
 
+def _persist_state_transition(session_date: str, tk: str, prev_state: str, new_state: str,
+                              pct_b: float, rsi: float | None, now: datetime,
+                              mins_in_prev: int) -> None:
+    """Write one state transition row to state_transitions table (fire-and-forget)."""
+    try:
+        con = sqlite3.connect(TAPE_DB, check_same_thread=False)
+        con.execute(
+            """INSERT INTO state_transitions
+               (session_date, ticker, prev_state, new_state, pct_b, rsi,
+                transition_time_et, mins_in_prev_state)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            (session_date, tk, prev_state, new_state, pct_b,
+             rsi, now.strftime("%H:%M:%S"), mins_in_prev),
+        )
+        con.commit()
+        con.close()
+    except Exception as exc:
+        log.debug("state_transitions insert failed: %s", exc)
+
+
 def process_state_transitions(
     all_inds: list[dict],
     token: str,
@@ -710,40 +790,80 @@ def process_state_transitions(
     """Compare every ticker's current %B state to its stored state.
 
     On the first scan of the day (is_first_scan=True) we populate the ledger
-    without alerting — we only want TRANSITIONS that happen during the day,
-    not the initial snapshot at 9:30 AM.
+    silently — no alerts, no DB writes. Only subsequent intraday transitions
+    are persisted and optionally sent to Telegram.
 
-    Significant transitions are grouped into a single Telegram message to
-    avoid individual per-ticker spam.
+    State ledger per ticker tracks:
+      state              — current state string
+      since              — when it entered current state
+      prev_state         — state before current (for Stage 2 enrichment)
+      pre_breakout_since — when it entered PRE-BREAKOUT (to compute conviction time)
+      path               — ordered list of states visited today
+      pct_b              — latest %B value
     """
     global _ticker_states
-    now = datetime.now(ET)
+    now          = datetime.now(ET)
+    session_date = now.strftime("%Y-%m-%d")
 
-    # Collect (emoji, label, ind, prev_state, duration_str) for alertable transitions
+    # Collect (emoji, label, ind, prev_state, duration_str) for alertable Telegram transitions
     transitions: list[tuple[str, str, dict, str, str]] = []
 
     for ind in all_inds:
         tk        = ind["ticker"]
         new_state = classify_state(ind)
+        rsi_val   = ind.get("rsi")
 
         stored = _ticker_states.get(tk)
         if stored is None:
-            # First time we've seen this ticker — initialise without alerting
-            _ticker_states[tk] = {"state": new_state, "since": now, "pct_b": ind["pct_b"]}
+            # First encounter — initialise ledger without alerting or persisting
+            _ticker_states[tk] = {
+                "state":              new_state,
+                "since":              now,
+                "prev_state":         None,
+                "pre_breakout_since": now if new_state == "PRE-BREAKOUT" else None,
+                "path":               [new_state],
+                "pct_b":              ind["pct_b"],
+            }
             continue
 
         prev_state = stored["state"]
         if new_state == prev_state:
-            # Update pct_b for freshness but don't alert
             stored["pct_b"] = ind["pct_b"]
             continue
 
-        # State changed — compute duration in previous state before overwriting
+        # State changed — capture duration before overwriting
+        mins_in_prev = int((now - stored["since"]).total_seconds() / 60)
         duration_str = _fmt_duration(stored["since"])
-        _ticker_states[tk] = {"state": new_state, "since": now, "pct_b": ind["pct_b"]}
+
+        # Update path (cap at 10 steps to avoid unbounded growth)
+        new_path = stored["path"] + [new_state]
+        if len(new_path) > 10:
+            new_path = new_path[-10:]
+
+        # Track when PRE-BREAKOUT was entered (conviction time for Stage 2)
+        pre_bo_since = stored.get("pre_breakout_since")
+        if new_state == "PRE-BREAKOUT":
+            pre_bo_since = now
+        elif new_state not in {"PRE-BREAKOUT", "BREAKOUT", "EXTENDED"}:
+            pre_bo_since = None   # left the bullish zone — reset
+
+        _ticker_states[tk] = {
+            "state":              new_state,
+            "since":              now,
+            "prev_state":         prev_state,
+            "pre_breakout_since": pre_bo_since,
+            "path":               new_path,
+            "pct_b":              ind["pct_b"],
+        }
 
         if is_first_scan:
-            continue   # never alert on the initial population pass
+            continue   # never write or alert on initial population pass
+
+        # Persist every transition to DB (not just alertable ones — all data is valuable)
+        _persist_state_transition(
+            session_date, tk, prev_state, new_state,
+            ind["pct_b"], rsi_val, now, mins_in_prev,
+        )
 
         result = _transition_alert(prev_state, new_state)
         if result:
@@ -763,11 +883,11 @@ def process_state_transitions(
     lines = [f"🔄 <b>STATE CHANGES</b> — {now.strftime('%H:%M ET')}\n"]
     for header, items in groups.items():
         lines.append(header)
-        for ind, prev, dur in items[:6]:   # cap at 6 per group
-            tk     = ind["ticker"]
-            new_s  = classify_state(ind)
-            rsi_s  = f"RSI={ind['rsi']:.0f}" if ind.get("rsi") else ""
-            dur_s  = f"  (held {dur})" if prev in {"BREAKOUT", "EXTENDED", "PRE-BREAKOUT"} else ""
+        for ind, prev, dur in items[:6]:
+            tk    = ind["ticker"]
+            new_s = classify_state(ind)
+            rsi_s = f"RSI={ind['rsi']:.0f}" if ind.get("rsi") else ""
+            dur_s = f"  (held {dur})" if prev in {"BREAKOUT", "EXTENDED", "PRE-BREAKOUT"} else ""
             lines.append(
                 f"  <b>{tk}</b>  %B={ind['pct_b']:.0f}  {rsi_s}  "
                 f"{prev}→{new_s}{dur_s}"
@@ -775,6 +895,34 @@ def process_state_transitions(
         lines.append("")
 
     send_telegram(token, chat_id, "\n".join(lines).rstrip())
+
+
+def _get_state_context(ticker: str) -> dict:
+    """Read state ledger for one ticker and return Stage 2 enrichment fields.
+
+    Called just before firing a BREAKOUT/PRE-BREAKOUT alert so the state path
+    context is stamped into alert_history at the moment of alert.
+
+    Returns dict with keys: prev_state, mins_in_pre_breakout, state_path.
+    All values may be None if the ledger has no history (e.g. first scan).
+    """
+    stored = _ticker_states.get(ticker)
+    if not stored:
+        return {"prev_state": None, "mins_in_pre_breakout": None, "state_path": None}
+
+    prev_state   = stored.get("prev_state")
+    state_path   = "→".join(stored.get("path", [stored["state"]])) or None
+
+    mins_in_pre  = None
+    pre_since    = stored.get("pre_breakout_since")
+    if pre_since is not None:
+        mins_in_pre = int((datetime.now(ET) - pre_since).total_seconds() / 60)
+
+    return {
+        "prev_state":           prev_state,
+        "mins_in_pre_breakout": mins_in_pre,
+        "state_path":           state_path,
+    }
 
 
 def apply_quality_filters(candidates: list[dict], regime: dict, cfg: dict) -> list[dict]:
@@ -839,13 +987,17 @@ def apply_quality_filters(candidates: list[dict], regime: dict, cfg: dict) -> li
         # BREAKOUT: strict — any fade below the open means the move already failed.
         # PRE-BREAKOUT: only enforced in the first half-hour (09:30-09:59 ET), where
         # opening-print gaps that immediately reverse are the dominant failure mode.
+        # Intraday-confirmed signals skip F6: the intraday %B already confirms
+        # the move is occurring within the session, not a pre-market gap artifact.
         today_ret = ind.get("today_ret_pct", 0.0)
         sig_type  = ind.get("signal", "")
-        if sig_type == "BREAKOUT" and today_ret < 0:
+        if ind.get("intraday_confirmed"):
+            pass  # F6 n/a — intraday move confirmed by 15m %B, not a gap artifact
+        elif sig_type == "BREAKOUT" and today_ret < 0:
             log.info("F6 gap-reverse gate dropped %s (BREAKOUT): today_ret=%.2f%%", tk, today_ret)
             n_f6 += 1
             continue
-        if sig_type == "PRE-BREAKOUT" and now_et_q.hour == 9 and today_ret < -0.5:
+        elif sig_type == "PRE-BREAKOUT" and now_et_q.hour == 9 and today_ret < -0.5:
             log.info("F6 gap-reverse gate dropped %s (PRE-BO, opening): today_ret=%.2f%%", tk, today_ret)
             n_f6 += 1
             continue
@@ -953,6 +1105,42 @@ def scan_universe(tickers: list[str], cfg: dict) -> tuple[list[dict], list[dict]
         if sig:
             ind["signal"] = sig
             found.append(ind)
+
+    # ── Dual-%B check: catch intraday momentum invisible on daily Bollinger Bands ──
+    # Tickers with daily %B 50-94 (above midband, below BREAKOUT threshold), RSI >= 55,
+    # and above SMA20 get their 15-min intraday %B computed. If intraday %B >= 75 the
+    # ticker qualifies as PRE-BREAKOUT; if >= 95 it qualifies as BREAKOUT — even though
+    # the daily BB didn't trigger. Marked intraday_confirmed=True so fmt_alert and
+    # F6 handling can show/skip appropriately.
+    already_signaled = {s["ticker"] for s in found}
+    intra_check = [
+        d["ticker"] for d in all_inds
+        if 50 <= d.get("pct_b", 0) < cfg["breakout_pct_b_min"]
+        and d.get("rsi", 0) >= 55
+        and d.get("above_sma20", False)
+        and d["ticker"] not in already_signaled
+    ]
+    if intra_check and is_market_open():
+        log.info("Intraday dual-%%B check: %d candidate tickers", len(intra_check))
+        intra_pct_b = fetch_intraday_pct_b(intra_check)
+        ind_by_tk   = {d["ticker"]: d for d in all_inds}
+        for tk, ipb in intra_pct_b.items():
+            d = ind_by_tk.get(tk)
+            if d is None:
+                continue
+            daily_pb = d.get("pct_b", 0)
+            if ipb >= cfg["breakout_pct_b_min"] and daily_pb >= 50:
+                d["signal"]             = "BREAKOUT"
+                d["intraday_pct_b"]     = ipb
+                d["intraday_confirmed"] = True
+                found.append(d)
+                log.info("  Intraday BREAKOUT: %s  daily=%.1f%%B  15m=%.1f%%B", tk, daily_pb, ipb)
+            elif ipb >= cfg["pre_breakout_pct_b_min"] and daily_pb >= 50:
+                d["signal"]             = "PRE-BREAKOUT"
+                d["intraday_pct_b"]     = ipb
+                d["intraday_confirmed"] = True
+                found.append(d)
+                log.info("  Intraday PRE-BREAKOUT: %s  daily=%.1f%%B  15m=%.1f%%B", tk, daily_pb, ipb)
 
     # Composite score: rank each signal against the full evaluated universe
     compute_composite_scores(found, all_inds)
@@ -1370,6 +1558,7 @@ def main():
         #   3. Telegram fires only when: backend accepted (action='added' or 'no_backend')
         #      AND signal is new or escalated today (dedup)
         n_alerted_this_cycle = 0
+        n_f9_dropped         = 0
         for sig_type in ["BREAKOUT", "PRE-BREAKOUT"]:
             bucket = breakouts if sig_type == "BREAKOUT" else pre_bo
 
@@ -1378,6 +1567,10 @@ def main():
 
                 # Fetch tape once per ticker (used in both POST and Telegram)
                 tape = fetch_tape_sentiment(backend_url, tk)
+
+                # Attach state context so backend can persist it in alert_history
+                state_ctx = _get_state_context(tk)
+                ind.update(state_ctx)
 
                 # Always sync to backend (includes tape so watchlist shows tape label)
                 response = post_to_backend_with_tape(backend_url, ind, sig_type, tape)
@@ -1410,6 +1603,19 @@ def main():
                              sig_type, tk, _now_for_alert.strftime("%H:%M"))
                     continue
 
+                # F9: Path quality gate — BREAKOUT must approach via PRE-BREAKOUT.
+                # Backtest: instant jumps (0d in PRE-BO) → 52.9% win rate, -0.03% avg 5d.
+                # 2-step path (via PRE-BO)              → 62.0% win rate, +1.31% avg 5d.
+                # Pass-through when prev_state is None (no intraday history yet — first scan).
+                if (sig_type == "BREAKOUT"
+                        and cfg.get("require_2step_breakout", True)
+                        and ind.get("prev_state") is not None
+                        and ind.get("prev_state") != "PRE-BREAKOUT"):
+                    log.info("F9 path-gate dropped %s: BREAKOUT jumped from %s (not via PRE-BREAKOUT)",
+                             tk, ind["prev_state"])
+                    n_f9_dropped += 1
+                    continue
+
                 # Dedup: only alert on new or escalated signals
                 prev = alerted_today.get(tk)
                 if prev == sig_type:
@@ -1437,12 +1643,13 @@ def main():
         if n_alerted_this_cycle > 0:
             bo_count  = sum(1 for v in alerted_today.values() if v == "BREAKOUT")
             pre_count = sum(1 for v in alerted_today.values() if v == "PRE-BREAKOUT")
+            f9_note   = f" | F9 path-gate ✓ ({n_f9_dropped} dropped)" if cfg.get("require_2step_breakout") else ""
             summary = (
                 f"📋 <b>Scan summary</b> {datetime.now(ET).strftime('%H:%M ET')}\n"
                 f"🚨 BREAKOUT today: {bo_count}\n"
                 f"⚡ PRE-BREAKOUT today: {pre_count}\n"
                 f"Total alerts today: {len(alerted_today)}\n"
-                f"Filters active: F2 rel-str ✓ | F5 close-qual ✓ | F6 gap-rev ✓ | F7 intraday-RS ✓ | F8 ADX ✓"
+                f"Filters active: F2 rel-str ✓ | F5 close-qual ✓ | F6 gap-rev ✓ | F7 intraday-RS ✓ | F8 ADX ✓{f9_note}"
                 + (f"\n⚠️ Regime gate active: {regime.get('reason')}" if not regime_ok else "")
             )
             send_telegram(token, chat_id, summary)
