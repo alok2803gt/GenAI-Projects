@@ -1272,6 +1272,69 @@ def run_premarket_scan(tickers: list[str], cfg: dict, token: str, chat_id: str) 
         log.warning("Pre-market scan failed: %s", exc)
 
 
+def run_eod_summary(
+    alerted_today: dict[str, str],
+    cfg: dict,
+    token: str,
+    chat_id: str,
+    regime: dict | None = None,
+) -> None:
+    """Fire once at ~4:02 PM ET — backward-looking daily recap sent to Telegram.
+
+    Shows what happened today: alerts by tier, SPY performance, market regime.
+    Complements the forward-looking EOD watchlist that fires at 4:15 PM.
+    """
+    try:
+        today_str = datetime.now(ET).strftime("%a %b %d")
+
+        # SPY return today from hist cache
+        spy_ret: str = ""
+        spy_hist = _hist_cache.get("SPY")
+        if spy_hist is not None and len(spy_hist) >= 2:
+            closes = spy_hist["Close"].dropna()
+            if len(closes) >= 2:
+                ret = (closes.iloc[-1] / closes.iloc[-2] - 1) * 100
+                arrow = "📈" if ret >= 0 else "📉"
+                spy_ret = f"{arrow} SPY {ret:+.2f}%"
+
+        # Regime line
+        regime_label = ""
+        if regime:
+            r = regime.get("regime", "")
+            r_emoji = {"BULL": "🟢", "BEAR": "🔴", "NEUTRAL": "🟡"}.get(r, "⚪")
+            regime_label = f"{r_emoji} Regime: {r}"
+
+        # Split alerts by tier
+        bo_tickers  = [tk for tk, sig in alerted_today.items() if sig == "BREAKOUT"]
+        pre_tickers = [tk for tk, sig in alerted_today.items() if sig == "PRE-BREAKOUT"]
+        total = len(alerted_today)
+
+        lines = [f"📊 <b>EOD Summary — {today_str}</b>"]
+        if spy_ret:
+            lines.append(spy_ret)
+        if regime_label:
+            lines.append(regime_label)
+        lines.append("")
+
+        if total == 0:
+            lines.append("😶 Quiet session — 0 alerts fired today")
+        else:
+            if bo_tickers:
+                lines.append(f"🚨 <b>BREAKOUT</b> ({len(bo_tickers)}): {', '.join(bo_tickers)}")
+            if pre_tickers:
+                lines.append(f"⚡ <b>PRE-BREAKOUT</b> ({len(pre_tickers)}): {', '.join(pre_tickers)}")
+            lines.append(f"\n<i>{total} alert{'s' if total != 1 else ''} today"
+                         + (f" — {len(bo_tickers)} breakout, {len(pre_tickers)} pre-breakout" if bo_tickers and pre_tickers else "")
+                         + "</i>")
+
+        lines.append("\n🌙 EOD watchlist incoming at 4:15 ET — setups for tomorrow.")
+        send_telegram(token, chat_id, "\n".join(lines))
+        log.info("EOD summary sent: %d alerts today (%d BO, %d PRE)",
+                 total, len(bo_tickers), len(pre_tickers))
+    except Exception as exc:
+        log.warning("EOD summary failed: %s", exc)
+
+
 def run_eod_watchlist_scan(tickers: list[str], cfg: dict, token: str, chat_id: str,
                            regime: dict | None = None) -> None:
     """Fire once at ~4:15 PM ET after market close.
@@ -1489,9 +1552,10 @@ def _main_loop():
 
     alerted_today: dict[str, str] = {}   # ticker → last signal type alerted
     last_scan_day: date | None = None
-    premarket_sent_day: str = ""
-    eod_watch_sent_day: str = ""
-    state_first_scan:   bool = True      # suppress transition alerts on first scan of the day
+    premarket_sent_day:  str = ""
+    eod_summary_sent_day: str = ""
+    eod_watch_sent_day:  str = ""
+    state_first_scan:    bool = True     # suppress transition alerts on first scan of the day
 
     while True:
         if not is_market_open():
@@ -1504,6 +1568,14 @@ def _main_loop():
                     and premarket_sent_day != _today_str):
                 premarket_sent_day = _today_str
                 run_premarket_scan(tickers, cfg, token, chat_id)
+
+            # EOD recap at 4:02-4:12 ET — backward-looking daily summary
+            if (_now_et.weekday() < 5
+                    and _now_et.hour == 16 and 2 <= _now_et.minute <= 12
+                    and eod_summary_sent_day != _today_str):
+                eod_summary_sent_day = _today_str
+                _regime = fetch_regime(cfg.get("backend_url", ""))
+                run_eod_summary(alerted_today, cfg, token, chat_id, regime=_regime)
 
             # EOD watchlist at 4:15-4:30 ET (uses today's complete close from _hist_cache)
             if (_now_et.weekday() < 5
