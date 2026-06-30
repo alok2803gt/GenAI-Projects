@@ -1402,7 +1402,49 @@ def run_eod_watchlist_scan(tickers: list[str], cfg: dict, token: str, chat_id: s
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
+_SINGLETON_PORT = 47892  # Dedicated loopback port — only one scanner can bind it
+_singleton_sock = None  # Kept alive for the lifetime of the process
+
+
+def _acquire_singleton() -> None:
+    """Bind a loopback port as a process-scoped mutex.
+
+    The OS guarantees only one process can hold the bind at a time, with no
+    race window and automatic release on crash or clean exit.
+    """
+    global _singleton_sock
+    import socket as _socket
+    try:
+        _singleton_sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+        _singleton_sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 0)
+        _singleton_sock.bind(("127.0.0.1", _SINGLETON_PORT))
+    except OSError:
+        log.warning(
+            "Another scanner instance is already running (port %d bound). Exiting.",
+            _SINGLETON_PORT,
+        )
+        raise SystemExit(0)
+
+
+def _release_singleton() -> None:
+    global _singleton_sock
+    try:
+        if _singleton_sock is not None:
+            _singleton_sock.close()
+            _singleton_sock = None
+    except Exception:
+        pass
+
+
 def main():
+    _acquire_singleton()
+    try:
+        _main_loop()
+    finally:
+        _release_singleton()
+
+
+def _main_loop():
     cfg = load_config()
 
     token   = cfg["telegram_token"]

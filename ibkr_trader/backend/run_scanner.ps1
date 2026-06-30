@@ -3,7 +3,7 @@
 # Scanner writes its own log via RotatingFileHandler — no redirection needed here.
 
 $BackendDir  = "C:\Projects\GenAI-Projects\ibkr_trader\backend"
-$Python      = "C:\Projects\GenAI-Projects\ibkr_trader\venv\Scripts\python.exe"
+$Python      = "C:\Users\AlokD\AppData\Local\Programs\Python\Python311\python.exe"
 $Script      = Join-Path $BackendDir "breakout_scanner.py"
 $WatchdogLog = Join-Path $BackendDir "scanner_watchdog.log"
 
