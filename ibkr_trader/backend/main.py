@@ -23,6 +23,7 @@ from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
+import requests
 import uvicorn
 import yfinance as yf
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
@@ -97,7 +98,7 @@ INDEX_CONFIG = [
 # so the index banner has live IBKR prices from market open.
 INDEX_ETF_TICKERS  = ["SPY", "QQQ", "DIA", "IWM"]
 _index_cache: dict = {"data": None, "ts": 0.0}
-INDEX_CACHE_TTL    = 15   # seconds between fallback yfinance refreshes
+INDEX_CACHE_TTL    = 14400  # 4 hours — prev_close doesn't change intraday; IBKR live prices overlay on every call
 
 
 class _FlowAbort(Exception):
@@ -953,6 +954,11 @@ async def streaming_loop_async() -> None:
                 if (_now_et.hour == 16 and _now_et.minute == 5
                         and not state["near_miss_log"].get("digest_sent", False)):
                     _emit_eod_digest()
+                if _now_et.hour == 16 and _now_et.minute == 15:
+                    _today_str = _now_et.strftime("%Y-%m-%d")
+                    if not state.get("_perf_enrich_date") == _today_str:
+                        state["_perf_enrich_date"] = _today_str
+                        asyncio.create_task(_enrich_then_notify(_today_str))
                 await asyncio.sleep(10)
 
             state["connected"] = False
@@ -1380,8 +1386,59 @@ def _watchlist_load() -> None:
         with open(WATCHLIST_PATH, "r") as f:
             state["watchlist"] = json.load(f)
         log.info("Watchlist restored: %d entries", len(state["watchlist"]))
+        _sync_watchlist_to_alert_history()
     except Exception as e:
         log.warning("Watchlist load failed: %s", e)
+
+
+def _sync_watchlist_to_alert_history() -> None:
+    """Backfill alert_history from watchlist.json entries missed due to restarts."""
+    try:
+        wl = state.get("watchlist", {})
+        if not wl:
+            return
+        from zoneinfo import ZoneInfo as _ZI
+        from datetime import timezone as _utctz
+        et = _ZI("America/New_York")
+        con = sqlite3.connect(TAPE_DB_PATH, check_same_thread=False)
+        existing = {
+            f"{r[0]}|{r[1]}"
+            for r in con.execute("SELECT session_date, ticker FROM alert_history").fetchall()
+        }
+        added = 0
+        for entry in wl.values():
+            tk = entry.get("ticker", "")
+            added_iso = entry.get("added_iso", "")
+            if not tk or not added_iso:
+                continue
+            try:
+                dt = datetime.fromisoformat(added_iso)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=_utctz.utc)
+                session_date = dt.astimezone(et).strftime("%Y-%m-%d")
+            except Exception:
+                session_date = added_iso[:10]
+            key = f"{session_date}|{tk}"
+            if key in existing:
+                continue
+            con.execute(
+                """INSERT INTO alert_history
+                   (fired_at, session_date, ticker, signal_type, price,
+                    pct_b, rsi, vol_ratio, tape_score, tape_label)
+                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                (added_iso, session_date, tk,
+                 entry.get("signal_type"), entry.get("price_at_alert"),
+                 entry.get("pct_b"), entry.get("rsi"), entry.get("vol_ratio"),
+                 entry.get("tape_score"), entry.get("tape_label")),
+            )
+            existing.add(key)
+            added += 1
+        con.commit()
+        con.close()
+        if added:
+            log.info("Synced %d watchlist entries → alert_history", added)
+    except Exception as exc:
+        log.warning("_sync_watchlist_to_alert_history failed: %s", exc)
 
 
 def _universe_save(tickers: list) -> None:
@@ -1965,9 +2022,35 @@ async def _screen_universe(top_n: int = 25) -> Optional[List[str]]:
 
 
 async def _universe_scheduler() -> None:
-    """Background task: refresh universe daily at 08:30 ET on weekdays."""
+    """Background task: refresh universe daily at 08:30 ET on weekdays.
+
+    If the backend restarts after 08:30 ET and the universe cache is empty or
+    stale (no screen today), trigger an immediate screen so the auto-trader
+    has candidates without waiting until the next morning.
+    """
     from zoneinfo import ZoneInfo
     ET = ZoneInfo("America/New_York")
+
+    # On startup: if today's screen was missed (cache empty or dated before today),
+    # run one immediately in the background rather than sleeping until tomorrow.
+    await asyncio.sleep(30)   # brief delay so IBKR connection is stable first
+    _now = datetime.now(ET)
+    _today_str = _now.strftime("%Y-%m-%d")
+    _last_screened = state.get("universe_last_screened") or ""
+    if _now.weekday() < 5 and (not CSP_UNIVERSE or _today_str not in _last_screened):
+        log.info("Universe scheduler: missed today's 08:30 screen — running now")
+        try:
+            tickers = await _screen_universe()
+            if tickers:
+                CSP_UNIVERSE.clear()
+                CSP_UNIVERSE.extend(tickers)
+                state["scan_cache"]["csp"]   = None
+                state["scan_cache"]["leaps"] = None
+                _universe_save(tickers)
+                log.info("Catch-up universe screen complete: %d tickers", len(CSP_UNIVERSE))
+        except Exception as exc:
+            log.error("Catch-up universe screen failed: %s", exc)
+
     while True:
         try:
             now = datetime.now(ET)
@@ -3782,6 +3865,27 @@ def _tape_db_init() -> None:
         )
     """)
     con.execute("CREATE INDEX IF NOT EXISTS idx_ah_ticker ON alert_history (ticker, session_date)")
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS alert_performance (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            alert_id       INTEGER UNIQUE,
+            session_date   TEXT NOT NULL,
+            ticker         TEXT NOT NULL,
+            signal_type    TEXT NOT NULL,
+            alert_time_et  TEXT,
+            alert_price    REAL,
+            eod_price      REAL,
+            eod_return_pct REAL,
+            is_win         INTEGER,
+            pct_b          REAL,
+            rsi            REAL,
+            vol_ratio      REAL,
+            tape_score     REAL,
+            tape_label     TEXT,
+            enriched_at    TEXT
+        )
+    """)
+    con.execute("CREATE INDEX IF NOT EXISTS idx_ap_date ON alert_performance (session_date)")
     con.commit()
     con.close()
     log.info("Tape DB initialised at %s", TAPE_DB_PATH)
@@ -3808,6 +3912,291 @@ def _alert_history_insert(ticker: str, signal_type: str, price: Optional[float],
         con.close()
     except Exception as exc:
         log.debug("alert_history insert failed: %s", exc)
+
+
+async def _enrich_day_performance(session_date: str) -> int:
+    from zoneinfo import ZoneInfo
+    from datetime import timezone as _tz
+    con = sqlite3.connect(TAPE_DB_PATH, check_same_thread=False)
+    con.row_factory = sqlite3.Row
+    existing_ids = {r[0] for r in con.execute(
+        "SELECT alert_id FROM alert_performance WHERE session_date=?", (session_date,)
+    ).fetchall()}
+    rows = con.execute(
+        "SELECT * FROM alert_history WHERE session_date=?", (session_date,)
+    ).fetchall()
+    con.row_factory = None
+    to_enrich = [dict(r) for r in rows if r["id"] not in existing_ids]
+    if not to_enrich:
+        con.close()
+        return 0
+    tickers = list({r["ticker"] for r in to_enrich})
+    try:
+        next_date = (datetime.strptime(session_date, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+        loop = asyncio.get_event_loop()
+        raw = await loop.run_in_executor(
+            None,
+            lambda: yf.download(tickers, start=session_date, end=next_date,
+                                 interval="1d", auto_adjust=True, progress=False)
+        )
+        closes: dict = {}
+        if not raw.empty:
+            if isinstance(raw.columns, pd.MultiIndex):
+                close_df = raw["Close"] if "Close" in raw.columns.get_level_values(0) else pd.DataFrame()
+            else:
+                close_df = raw[["Close"]] if "Close" in raw.columns else pd.DataFrame()
+            if not close_df.empty:
+                for t in tickers:
+                    try:
+                        val = close_df[t].iloc[0] if t in close_df.columns else close_df.iloc[0, 0]
+                        if pd.notna(val):
+                            closes[t] = float(val)
+                    except Exception:
+                        pass
+    except Exception as exc:
+        log.warning("_enrich_day_performance yfinance error: %s", exc)
+        closes = {}
+    et_zone = ZoneInfo("America/New_York")
+    enriched_at = datetime.utcnow().isoformat()
+    count = 0
+    for r in to_enrich:
+        ticker = r["ticker"]
+        alert_price = r.get("price")
+        eod_price = closes.get(ticker)
+        eod_return_pct = None
+        is_win = None
+        if eod_price is not None and alert_price and alert_price > 0:
+            eod_return_pct = (eod_price - alert_price) / alert_price * 100
+            is_win = 1 if eod_return_pct > 0 else 0
+        alert_time_et = None
+        fired_at = r.get("fired_at")
+        if fired_at:
+            try:
+                dt_utc = datetime.fromisoformat(fired_at.replace("Z", "+00:00"))
+                if dt_utc.tzinfo is None:
+                    dt_utc = dt_utc.replace(tzinfo=_tz.utc)
+                alert_time_et = dt_utc.astimezone(et_zone).strftime("%H:%M")
+            except Exception:
+                pass
+        con.execute(
+            """INSERT OR IGNORE INTO alert_performance
+               (alert_id, session_date, ticker, signal_type, alert_time_et, alert_price,
+                eod_price, eod_return_pct, is_win, pct_b, rsi, vol_ratio, tape_score, tape_label, enriched_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (r["id"], r["session_date"], ticker, r["signal_type"], alert_time_et, alert_price,
+             eod_price, eod_return_pct, is_win, r.get("pct_b"), r.get("rsi"),
+             r.get("vol_ratio"), r.get("tape_score"), r.get("tape_label"), enriched_at)
+        )
+        count += 1
+    con.commit()
+    con.close()
+    log.info("_enrich_day_performance %s: enriched %d rows", session_date, count)
+    return count
+
+
+def _compute_indicator_analysis(days: int = 30) -> dict:
+    cutoff = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
+    con = sqlite3.connect(TAPE_DB_PATH, check_same_thread=False)
+    df = pd.read_sql_query(
+        "SELECT * FROM alert_performance WHERE session_date >= ? AND eod_return_pct IS NOT NULL",
+        con, params=(cutoff,)
+    )
+    con.close()
+    if df.empty:
+        return {
+            "total_alerts": 0, "days_analyzed": 0,
+            "overall": {"win_rate": 0.0, "avg_return": 0.0, "median_return": 0.0},
+            "by_signal_type": [], "by_rsi": [], "by_pct_b": [],
+            "by_vol_ratio": [], "by_tape": [], "by_hour": [], "by_ticker": [],
+        }
+
+    # SQLite None → numpy NaN so pd.cut / comparisons work correctly
+    for col in ("rsi", "pct_b", "vol_ratio", "tape_score", "eod_return_pct", "is_win",
+                "alert_price", "eod_price"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    def _agg(grp):
+        return pd.Series({
+            "count": len(grp),
+            "win_rate": round(grp["is_win"].mean() * 100, 1) if grp["is_win"].notna().any() else 0.0,
+            "avg_return": round(grp["eod_return_pct"].mean(), 2),
+        })
+
+    _apply_kw = {"include_groups": False} if pd.__version__ >= "2.2" else {}
+
+    days_analyzed = df["session_date"].nunique()
+    overall_wr = round(df["is_win"].mean() * 100, 1) if df["is_win"].notna().any() else 0.0
+
+    by_signal = (
+        df.groupby("signal_type").apply(_agg, **_apply_kw).reset_index()
+          .rename(columns={"signal_type": "label"})
+          .to_dict(orient="records")
+    )
+
+    rsi_bins = [0, 65, 70, 75, 80, float("inf")]
+    rsi_labels = ["<65", "65-70", "70-75", "75-80", ">80"]
+    df["_rsi_bin"] = pd.cut(df["rsi"], bins=rsi_bins, labels=rsi_labels, right=False)
+    by_rsi = (
+        df.dropna(subset=["rsi"]).groupby("_rsi_bin", observed=True)
+          .apply(_agg, **_apply_kw).reset_index()
+          .rename(columns={"_rsi_bin": "bin"})
+          .to_dict(orient="records")
+    )
+
+    pctb_bins = [0, 75, 85, 95, 105, float("inf")]
+    pctb_labels = ["<75", "75-85", "85-95", "95-105", ">105"]
+    df["_pctb_bin"] = pd.cut(df["pct_b"], bins=pctb_bins, labels=pctb_labels, right=False)
+    by_pct_b = (
+        df.dropna(subset=["pct_b"]).groupby("_pctb_bin", observed=True)
+          .apply(_agg, **_apply_kw).reset_index()
+          .rename(columns={"_pctb_bin": "bin"})
+          .to_dict(orient="records")
+    )
+
+    vr_bins = [0, 1.0, 1.5, 2.0, 3.0, float("inf")]
+    vr_labels = ["<1.0", "1.0-1.5", "1.5-2.0", "2.0-3.0", ">3.0"]
+    df["_vr_bin"] = pd.cut(df["vol_ratio"], bins=vr_bins, labels=vr_labels, right=False)
+    by_vol_ratio = (
+        df.dropna(subset=["vol_ratio"]).groupby("_vr_bin", observed=True)
+          .apply(_agg, **_apply_kw).reset_index()
+          .rename(columns={"_vr_bin": "bin"})
+          .to_dict(orient="records")
+    )
+
+    by_tape = []
+    if "tape_label" in df.columns:
+        by_tape = (
+            df.dropna(subset=["tape_label"]).groupby("tape_label")
+              .apply(_agg, **_apply_kw).reset_index()
+              .rename(columns={"tape_label": "label"})
+              .to_dict(orient="records")
+        )
+
+    by_hour = []
+    if "alert_time_et" in df.columns:
+        df["_hour"] = df["alert_time_et"].str[:2].apply(
+            lambda h: f"{h}:xx" if pd.notna(h) and h != "" else None
+        )
+        by_hour = (
+            df.dropna(subset=["_hour"]).groupby("_hour")
+              .apply(_agg, **_apply_kw).reset_index()
+              .rename(columns={"_hour": "hour"})
+              .sort_values("hour")
+              .to_dict(orient="records")
+        )
+
+    by_ticker = (
+        df.groupby("ticker").apply(_agg, **_apply_kw).reset_index()
+          .sort_values("count", ascending=False)
+          .head(20)
+          .to_dict(orient="records")
+    )
+
+    return {
+        "total_alerts": len(df),
+        "days_analyzed": days_analyzed,
+        "overall": {
+            "win_rate": overall_wr,
+            "avg_return": round(df["eod_return_pct"].mean(), 2),
+            "median_return": round(df["eod_return_pct"].median(), 2),
+        },
+        "by_signal_type": by_signal,
+        "by_rsi": by_rsi,
+        "by_pct_b": by_pct_b,
+        "by_vol_ratio": by_vol_ratio,
+        "by_tape": by_tape,
+        "by_hour": by_hour,
+        "by_ticker": by_ticker,
+    }
+
+
+def _load_telegram_creds() -> tuple[str, str]:
+    """Read telegram_token/telegram_chat_id from scanner_config.json (shared with breakout_scanner.py)."""
+    try:
+        with open("scanner_config.json", "r") as f:
+            cfg = json.load(f)
+        return cfg.get("telegram_token", ""), cfg.get("telegram_chat_id", "")
+    except Exception:
+        return "", ""
+
+
+def _send_telegram_sync(token: str, chat_id: str, text: str) -> bool:
+    if not token or not chat_id:
+        log.warning("Telegram not configured — EOD digest suppressed")
+        return False
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
+            timeout=10,
+        )
+        if not r.ok:
+            log.warning("Telegram send failed [HTTP %d] → %s", r.status_code, r.text)
+            return False
+        return True
+    except Exception as exc:
+        log.warning("Telegram send failed: %s", exc)
+        return False
+
+
+def _format_eod_performance_digest(session_date: str) -> str | None:
+    con = sqlite3.connect(TAPE_DB_PATH, check_same_thread=False)
+    con.row_factory = sqlite3.Row
+    rows = [dict(r) for r in con.execute(
+        "SELECT * FROM alert_performance WHERE session_date=? AND eod_return_pct IS NOT NULL "
+        "ORDER BY eod_return_pct DESC",
+        (session_date,)
+    ).fetchall()]
+    con.close()
+    if not rows:
+        return None
+
+    wins      = sum(1 for r in rows if r["is_win"] == 1)
+    total     = len(rows)
+    win_rate  = round(wins / total * 100, 1)
+    avg_ret   = round(sum(r["eod_return_pct"] for r in rows) / total, 2)
+    day_label = datetime.strptime(session_date, "%Y-%m-%d").strftime("%a %b %d")
+
+    top_winners = rows[:2]
+    top_losers  = rows[-2:][::-1]   # worst first
+
+    lines = [
+        f"📊 <b>EOD Alert Performance</b> — {day_label}\n",
+        f"Total alerts: {total}",
+        f"Win rate: {win_rate}% ({wins}W / {total - wins}L)",
+        f"Avg return: {avg_ret:+.2f}%\n",
+        "🏆 <b>Top winners:</b>",
+    ]
+    for r in top_winners:
+        lines.append(f"  {r['ticker']:6s} {r['signal_type']:14s} {r['eod_return_pct']:+.2f}%")
+    lines.append("\n📉 <b>Top losers:</b>")
+    for r in top_losers:
+        lines.append(f"  {r['ticker']:6s} {r['signal_type']:14s} {r['eod_return_pct']:+.2f}%")
+
+    return "\n".join(lines)
+
+
+async def _send_eod_performance_digest(session_date: str) -> bool:
+    msg = await asyncio.get_event_loop().run_in_executor(
+        None, _format_eod_performance_digest, session_date
+    )
+    if not msg:
+        log.info("EOD performance digest: no enriched alerts for %s — skipped", session_date)
+        return False
+    token, chat_id = _load_telegram_creds()
+    sent = await asyncio.get_event_loop().run_in_executor(
+        None, _send_telegram_sync, token, chat_id, msg
+    )
+    if sent:
+        log.info("EOD performance digest sent to Telegram for %s", session_date)
+    return sent
+
+
+async def _enrich_then_notify(session_date: str) -> None:
+    """EOD heartbeat hook: enrich today's alerts with closing prices, then push the Telegram digest."""
+    await _enrich_day_performance(session_date)
+    await _send_eod_performance_digest(session_date)
 
 
 def _tape_db_flush_prints(ticker: str, rows: list) -> None:
@@ -5167,6 +5556,7 @@ async def lifespan(app: FastAPI):
 
     asyncio.create_task(_initial_screen())
     asyncio.create_task(_universe_scheduler())
+    asyncio.create_task(_watchlist_price_refresh_loop())
     log.info("Universe screener + daily scheduler started")
     yield
     if state["ib"] and state["ib"].isConnected():
@@ -6182,34 +6572,65 @@ def watchlist_add_alert(req: WatchlistAlertRequest):
     return {"ok": True, "action": "added"}
 
 
-@app.get("/watchlist")
-async def watchlist_get():
-    """Return watchlist entries enriched with current prices from yfinance."""
-    entries = list(state["watchlist"].values())
-    if not entries:
-        return {"entries": []}
+# Watchlist price cache — populated by _watchlist_price_refresh_loop() background task.
+# The endpoint reads from this dict; no yfinance call ever happens inside a request handler.
+_watchlist_price_cache: dict = {"prices": {}, "ts": 0.0}
 
-    tickers = [e["ticker"] for e in entries]
 
-    def _fetch_prices():
+async def _watchlist_price_refresh_loop() -> None:
+    """Background task: refresh watchlist prices via yfinance every 30 s.
+
+    Running yfinance outside the request handler means /watchlist always returns
+    instantly from the in-memory cache (~1 ms) instead of blocking for 4-6 s.
+    """
+    import time as _time
+
+    def _fetch(tickers: list) -> dict:
+        if not tickers:
+            return {}
         try:
-            data = yf.download(tickers, period="1d", interval="1m",
-                               group_by="ticker", progress=False, auto_adjust=True)
+            data = yf.download(tickers, period="1d", interval="5m",
+                               group_by="ticker", progress=False,
+                               auto_adjust=True, threads=True)
             prices = {}
             for tk in tickers:
                 try:
-                    if len(tickers) == 1:
-                        col = data["Close"] if "Close" in data else None
-                    else:
-                        col = data[tk]["Close"] if tk in data else None
+                    col = (data["Close"] if len(tickers) == 1
+                           else data[tk]["Close"] if tk in data else None)
                     prices[tk] = float(col.dropna().iloc[-1]) if col is not None and not col.dropna().empty else None
                 except Exception:
                     prices[tk] = None
             return prices
         except Exception:
-            return {tk: None for tk in tickers}
+            return {}
 
-    current_prices = await asyncio.get_event_loop().run_in_executor(None, _fetch_prices)
+    while True:
+        try:
+            await asyncio.sleep(30)
+            tickers = [e["ticker"] for e in state["watchlist"].values()]
+            if tickers:
+                prices = await asyncio.get_event_loop().run_in_executor(None, _fetch, tickers)
+                if prices:
+                    _watchlist_price_cache["prices"].update(prices)
+                    _watchlist_price_cache["ts"] = _time.monotonic()
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            pass
+
+
+@app.get("/watchlist")
+async def watchlist_get():
+    """Return watchlist entries enriched with current prices.
+
+    Prices come from the background-refreshed _watchlist_price_cache (~1 ms).
+    The first call before the background task fires returns prices as None.
+    """
+    entries = list(state["watchlist"].values())
+    if not entries:
+        return {"entries": []}
+
+    current_prices = _watchlist_price_cache["prices"]
 
     enriched = []
     for e in entries:
@@ -7218,6 +7639,127 @@ async def backtest_watchlist_endpoint():
     return result
 
 
+# ── Alert Performance endpoints ────────────────────────────────────────────
+
+@app.get("/performance/daily")
+async def performance_daily(date: Optional[str] = Query(None)):
+    from zoneinfo import ZoneInfo
+    if date is None:
+        date = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
+    today = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
+    if date == today:
+        await _enrich_day_performance(date)
+    con = sqlite3.connect(TAPE_DB_PATH, check_same_thread=False)
+    con.row_factory = sqlite3.Row
+    rows = con.execute(
+        "SELECT * FROM alert_performance WHERE session_date=? ORDER BY eod_return_pct DESC NULLS LAST",
+        (date,)
+    ).fetchall()
+    con.close()
+    records = [dict(r) for r in rows]
+    enriched = [r for r in records if r.get("eod_return_pct") is not None]
+    wins = sum(1 for r in enriched if r.get("is_win") == 1)
+    summary = {
+        "date": date,
+        "total": len(records),
+        "enriched": len(enriched),
+        "wins": wins,
+        "losses": len(enriched) - wins,
+        "win_rate": round(wins / len(enriched) * 100, 1) if enriched else None,
+        "avg_return": round(sum(r["eod_return_pct"] for r in enriched) / len(enriched), 2) if enriched else None,
+        "best": max(enriched, key=lambda r: r["eod_return_pct"], default=None),
+        "worst": min(enriched, key=lambda r: r["eod_return_pct"], default=None),
+    }
+    return {"date": date, "rows": records, "summary": summary}
+
+
+@app.get("/performance/summary")
+async def performance_summary(days: int = Query(30)):
+    cutoff = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
+    con = sqlite3.connect(TAPE_DB_PATH, check_same_thread=False)
+    con.row_factory = sqlite3.Row
+    rows = [dict(r) for r in con.execute(
+        "SELECT * FROM alert_performance WHERE session_date >= ? AND eod_return_pct IS NOT NULL ORDER BY session_date",
+        (cutoff,)
+    ).fetchall()]
+    con.close()
+    if not rows:
+        return {"days": days, "total_alerts": 0, "rows": [], "daily": [], "by_ticker_count": [], "by_ticker_return": []}
+    wins = sum(1 for r in rows if r.get("is_win") == 1)
+    avg_ret = sum(r["eod_return_pct"] for r in rows) / len(rows)
+    by_date: dict = {}
+    for r in rows:
+        d = r["session_date"]
+        if d not in by_date:
+            by_date[d] = {"date": d, "count": 0, "wins": 0, "returns": []}
+        by_date[d]["count"] += 1
+        if r.get("is_win") == 1:
+            by_date[d]["wins"] += 1
+        by_date[d]["returns"].append(r["eod_return_pct"])
+    daily = []
+    for d, v in sorted(by_date.items()):
+        daily.append({
+            "date": d,
+            "count": v["count"],
+            "win_rate": round(v["wins"] / v["count"] * 100, 1),
+            "avg_return": round(sum(v["returns"]) / len(v["returns"]), 2),
+        })
+    ticker_stats: dict = {}
+    for r in rows:
+        t = r["ticker"]
+        if t not in ticker_stats:
+            ticker_stats[t] = {"ticker": t, "count": 0, "wins": 0, "returns": []}
+        ticker_stats[t]["count"] += 1
+        if r.get("is_win") == 1:
+            ticker_stats[t]["wins"] += 1
+        ticker_stats[t]["returns"].append(r["eod_return_pct"])
+    ticker_list = []
+    for t, v in ticker_stats.items():
+        ticker_list.append({
+            "ticker": t,
+            "count": v["count"],
+            "win_rate": round(v["wins"] / v["count"] * 100, 1),
+            "avg_return": round(sum(v["returns"]) / len(v["returns"]), 2),
+        })
+    return {
+        "days": days,
+        "total_alerts": len(rows),
+        "wins": wins,
+        "losses": len(rows) - wins,
+        "win_rate": round(wins / len(rows) * 100, 1),
+        "avg_return": round(avg_ret, 2),
+        "daily": daily,
+        "by_ticker_count": sorted(ticker_list, key=lambda x: x["count"], reverse=True)[:20],
+        "by_ticker_return": sorted(ticker_list, key=lambda x: x["avg_return"], reverse=True)[:20],
+    }
+
+
+@app.get("/performance/indicators")
+async def performance_indicators(days: int = Query(30)):
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(None, lambda: _compute_indicator_analysis(days))
+    return result
+
+
+@app.post("/performance/enrich")
+async def performance_enrich(date: Optional[str] = Query(None)):
+    from zoneinfo import ZoneInfo
+    if date is None:
+        date = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
+    count = await _enrich_day_performance(date)
+    return {"date": date, "enriched": count}
+
+
+@app.post("/performance/telegram-digest")
+async def performance_telegram_digest(date: Optional[str] = Query(None)):
+    """Manually (re)send the EOD win-rate/avg-return/top-winners-losers digest to Telegram."""
+    from zoneinfo import ZoneInfo
+    if date is None:
+        date = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
+    sent = await _send_eod_performance_digest(date)
+    return {"date": date, "sent": sent}
+
+
 # ── Live account reconnect ──────────────────────────────────────────────────
 
 @app.post("/reconnect")
@@ -7761,6 +8303,59 @@ def tape_block_report(
         }
     except Exception as exc:
         raise HTTPException(500, str(exc))
+
+
+@app.post("/market/history/bulk")
+async def market_history_bulk(tickers: List[str], days: int = Query(5, ge=1, le=30)):
+    """Fetch last N trading days of daily OHLCV for multiple tickers via IBKR.
+
+    Used by the breakout scanner to refresh its historical cache each cycle.
+    Falls back to empty data for any ticker IBKR cannot serve (not a subscriber,
+    not connected, etc.) — the scanner falls back to yfinance for those.
+
+    Paced per IBKR rules: up to 50 simultaneous requests, 2s between groups.
+    """
+    ib = state.get("ib")
+    if not ib or not ib.isConnected():
+        raise HTTPException(503, "IBKR not connected — scanner should use yfinance fallback")
+
+    duration_str = f"{max(days * 2, 10)} D"   # extra buffer for weekends/holidays
+
+    async def _one(ticker: str) -> tuple[str, list]:
+        try:
+            from ib_insync import Stock
+            contract = Stock(ticker, "SMART", "USD")
+            bars = await asyncio.wait_for(
+                ib.reqHistoricalDataAsync(
+                    contract, endDateTime="", durationStr=duration_str,
+                    barSizeSetting="1 day", whatToShow="TRADES",
+                    useRTH=True, keepUpToDate=False,
+                ),
+                timeout=15,
+            )
+            if not bars:
+                return ticker, []
+            return ticker, [
+                {"date": str(b.date), "open": b.open, "high": b.high,
+                 "low": b.low, "close": b.close, "volume": b.volume}
+                for b in bars[-days:]      # trim to exactly the requested days
+            ]
+        except Exception:
+            return ticker, []
+
+    results: dict[str, list] = {}
+    # IBKR allows ~50 simultaneous historical requests; batch with 2s pause
+    batch_size = 40
+    for i in range(0, len(tickers), batch_size):
+        batch = tickers[i:i + batch_size]
+        batch_results = await asyncio.gather(*[_one(tk) for tk in batch])
+        for tk, bars in batch_results:
+            if bars:
+                results[tk] = bars
+        if i + batch_size < len(tickers):
+            await asyncio.sleep(2)   # IBKR pacing between batches
+
+    return {"data": results, "tickers_requested": len(tickers), "tickers_returned": len(results)}
 
 
 @app.get("/market/regime")
