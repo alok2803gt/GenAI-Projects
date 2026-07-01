@@ -35,6 +35,12 @@ from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import accuracy_score
 import joblib
 import os
+try:
+    from ibkr_technicals import router as technicals_router
+    _technicals_router_ok = True
+except Exception as _tech_err:
+    _technicals_router_ok = False
+    technicals_router = None  # loaded later with graceful skip
 
 # ── Logging ────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -2551,6 +2557,49 @@ async def _autotrader_monitor_coro(ib: IB) -> None:
             await _autotrader_close_coro(ib, item, info, key)
             continue
 
+        # ── 1.5. LEAP partial profit: lock in 50% at 100% gain (2× cost) ────
+        # max_profit stores entry_price × qty × 100 (the cost paid for the LEAP).
+        # When unrealized P&L equals that cost the position has doubled — close
+        # half to bank the gain, let the other half ride the directional thesis.
+        # partial_taken flag prevents re-triggering once the partial is placed.
+        if (action == "BUY"
+                and not info.get("partial_taken")
+                and upnl >= max_profit
+                and max_profit > 0):
+            _pos_qty = max(1, abs(int(item.position)))
+            half_qty = _pos_qty // 2 if _pos_qty > 1 else 0
+            if half_qty:
+                _at_log("PARTIAL",
+                        f"{key}: LEAP doubled — partial close {half_qty}/{_pos_qty} contracts "
+                        f"(upnl=${upnl:.0f} >= cost=${max_profit:.0f})")
+                try:
+                    _c_p = item.contract
+                    _con_p = Option(
+                        symbol=_c_p.symbol,
+                        lastTradeDateOrContractMonth=_c_p.lastTradeDateOrContractMonth,
+                        strike=float(_c_p.strike), right=_c_p.right,
+                        exchange="SMART", currency="USD", multiplier="100",
+                    )
+                    await ib.qualifyContractsAsync(_con_p)
+                    _tk_p = ib.reqMktData(_con_p, "", False, False)
+                    await asyncio.sleep(2)
+                    _bid_p = float(_tk_p.bid or 0)
+                    _ask_p = float(_tk_p.ask or 0)
+                    ib.cancelMktData(_con_p)
+                    if _bid_p > 0 or _ask_p > 0:
+                        _lmt_p = round((_bid_p - 0.01) if _bid_p > 0 else _ask_p * 0.90, 2)
+                        ib.placeOrder(_con_p, LimitOrder("SELL", half_qty, _lmt_p))
+                        info["partial_taken"] = True
+                        _at_save_state()
+                        _at_log("PARTIAL",
+                                f"{key}: SELL {half_qty}x @ ${_lmt_p:.2f} placed — "
+                                f"{_pos_qty - half_qty} contracts remain")
+                    else:
+                        _at_log("WARN", f"{key}: partial close skipped — no market data")
+                except Exception as _pe:
+                    _at_log("WARN", f"{key}: partial close failed: {_pe}")
+                continue   # skip stop-loss check this cycle; next cycle manages the remainder
+
         # ── 2. Hard stop-loss (IV-adjusted for high-vol underlyings) ────────
         # CSP: base 2× premium; widened for high-IV options so normal vol
         #   swings don't fire the stop prematurely (NVDA/QCOM backtest showed
@@ -2659,6 +2708,29 @@ async def _autotrader_monitor_coro(ib: IB) -> None:
                 f"Check TWS for settlement outcome.")
     if orphans:
         _at_save_state()
+
+    # ── #15: CSP assignment handler ───────────────────────────────────────────
+    # If a short put was assigned, IBKR delivers 100 shares per contract and the
+    # option disappears from portfolio().  The resulting STK position won't match
+    # any at["positions"] entry.  We log the event once per ticker per session
+    # and record it in the decisions log — manual covered-call entry is the next step.
+    _live_stk = {
+        item.contract.symbol: int(item.position)
+        for item in ib.portfolio()
+        if getattr(item.contract, "secType", "") == "STK"
+    }
+    _at_tickers = {
+        info.get("ticker", key.split("_")[0])
+        for key, info in at["positions"].items()
+    }
+    for _stk, _qty in _live_stk.items():
+        _assign_key = f"_assigned_{_stk}"
+        if _stk not in _at_tickers and not at.get(_assign_key):
+            at[_assign_key] = datetime.utcnow().isoformat()
+            _at_log("ASSIGN",
+                    f"{_stk}: {_qty} shares in IBKR portfolio not tracked by AT — "
+                    f"likely CSP assignment. Review in TWS and consider selling a covered call.")
+            _at_save_state()
 
 
 async def _autotrader_roll_coro(ib: IB, item, info: dict, key: str) -> None:
@@ -4453,32 +4525,45 @@ _REAL_EXIT_REASONS = (
     "'profit_target','stop_loss','roll_close',"
     "'roll_max','roll_no_credit','21dte','manual','rotation'"
 )
+# roll_close is always win=0 (buying back the put at a loss is WHY you rolled —
+# it's not a final trade outcome). Exclude it from Kelly calibration so the win
+# rate reflects terminal exits only.
+_KELLY_EXIT_REASONS = (
+    "'profit_target','stop_loss',"
+    "'roll_max','roll_no_credit','21dte','manual','rotation'"
+)
 
 
 def _update_kelly_from_journal() -> None:
-    """EMA-blend actual win rate from real autotrader exits into assumed_win_rate.
+    """EMA-blend actual win rate from final trade exits into assumed_win_rate.
 
-    Only counts trades closed by legitimate exit reasons. Excludes 'orphaned'
-    entries created by cleanup — those aren't real trade outcomes and would
-    collapse Kelly to zero. Requires at least 10 real trades before updating.
+    Uses _KELLY_EXIT_REASONS which excludes 'roll_close'.  roll_close is always
+    win=0 (that's why you rolled — you bought back at a loss) and is NOT a final
+    trade outcome.  Including it systematically underestimates the win rate and
+    produces negative Kelly fractions that block new entries.
+
+    Requires at least 5 final-outcome trades.  Blended rate is floored at 0.50
+    so Kelly never turns negative from statistical noise in a small sample.
     """
     con = sqlite3.connect(JOURNAL_DB_PATH, check_same_thread=False)
     rows = con.execute(
         f"SELECT win FROM trade_journal "
         f"WHERE closed_at IS NOT NULL AND win IS NOT NULL "
-        f"  AND exit_reason IN ({_REAL_EXIT_REASONS})"
+        f"  AND exit_reason IN ({_KELLY_EXIT_REASONS})"
     ).fetchall()
     con.close()
-    if len(rows) < 10:
-        # Not enough real data yet — keep the prior unchanged
+    if len(rows) < 5:
         return
     actual_wr = sum(r[0] for r in rows) / len(rows)
-    old       = state["autotrader"]["config"].get("assumed_win_rate", 0.85)
-    new_wr    = round(0.70 * old + 0.30 * actual_wr, 4)  # slow EMA blend
+    old       = state["autotrader"]["config"].get("assumed_win_rate", 0.80)
+    blended   = round(0.70 * old + 0.30 * actual_wr, 4)
+    new_wr    = max(0.50, blended)   # floor: Kelly must stay positive
     state["autotrader"]["config"]["assumed_win_rate"] = new_wr
     _at_log("LEARN",
             f"Kelly win rate {old:.1%} → {new_wr:.1%} "
-            f"(actual {actual_wr:.1%} over {len(rows)} real trades)")
+            f"(actual {actual_wr:.1%} over {len(rows)} final exits, floor=50%)")
+    _at_save_state()   # persist so the updated rate survives a restart
+
 
 def _retrain_from_journal() -> dict:
     """Retrain XGBoost score model from completed journal trades.
@@ -5609,6 +5694,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+if _technicals_router_ok and technicals_router is not None:
+    app.include_router(technicals_router)   # GET /technicals/{ticker}
+else:
+    import logging as _lg
+    _lg.getLogger("main").warning("ibkr_technicals router failed to load — /technicals/{ticker} unavailable")
 
 
 # ── Pydantic models ────────────────────────────────────────────────────────
@@ -5874,18 +5964,6 @@ async def opra_debug():
     except Exception as e:
         raise HTTPException(503, str(e))
 
-
-@app.get("/market-regime")
-async def market_regime_endpoint():
-    """Current market regime: SPY vs 50-day SMA + VIX level."""
-    try:
-        result = await asyncio.get_event_loop().run_in_executor(
-            None,
-            lambda: _run_in_streaming_loop(_market_regime(), timeout=20),
-        )
-    except (TimeoutError, RuntimeError) as e:
-        raise HTTPException(503, str(e))
-    return result
 
 
 @app.get("/csp/scan")
@@ -6704,6 +6782,43 @@ def watchlist_clear():
     state["watchlist"].clear()
     _watchlist_save()
     return {"ok": True}
+
+
+@app.post("/scanner/trigger-eod-watchlist")
+def scanner_trigger_eod_watchlist():
+    """Write a trigger file that causes the scanner to run the EOD watchlist scan
+    on its next loop iteration (within 3 minutes).
+
+    The scanner checks for this file at the top of each cycle and deletes it after
+    firing, so it is safe to call multiple times — only one scan will fire per file.
+    """
+    trigger = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trigger_eod_watchlist")
+    try:
+        open(trigger, "w").close()
+        return {"ok": True, "message": "Trigger file written — EOD watchlist will fire within 3 min"}
+    except OSError as e:
+        raise HTTPException(500, f"Could not write trigger file: {e}")
+
+
+@app.post("/market/regime/refresh")
+async def market_regime_refresh():
+    """Force-refresh the regime cache immediately, bypassing the 4-hour TTL.
+
+    Called by the breakout scanner at 9:08 ET so the pre-market scan reflects
+    overnight SPY moves rather than yesterday's stale cache.
+    """
+    try:
+        await asyncio.get_event_loop().run_in_executor(None, _update_regime_cache_sync)
+        regime = state["cache"].get("regime", {})
+        return {
+            "ok": True,
+            "spy_above_sma200": regime.get("spy_above_sma200"),
+            "spy_price":        regime.get("spy_price"),
+            "spy_sma200":       regime.get("spy_sma200"),
+            "updated":          regime.get("updated"),
+        }
+    except Exception as e:
+        raise HTTPException(503, str(e))
 
 
 # ── Auto-trader endpoints ──────────────────────────────────────────────────
@@ -8454,7 +8569,7 @@ def tape_block_report(
 
 
 @app.post("/market/history/bulk")
-async def market_history_bulk(tickers: List[str], days: int = Query(5, ge=1, le=30)):
+async def market_history_bulk(tickers: List[str], days: int = Query(5, ge=1, le=365)):
     """Fetch last N trading days of daily OHLCV for multiple tickers via IBKR.
 
     Used by the breakout scanner to refresh its historical cache each cycle.
@@ -8842,4 +8957,4 @@ def _require_connection():
 
 # ── Entry point ────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)
+    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=False)

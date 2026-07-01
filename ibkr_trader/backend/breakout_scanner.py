@@ -414,18 +414,61 @@ def fetch_intraday_pct_b(tickers: list[str]) -> dict[str, float]:
     return result
 
 
-def load_hist_cache(tickers: list[str], batch_size: int = 50) -> None:
+def load_hist_cache(tickers: list[str], batch_size: int = 50, backend_url: str = "") -> None:
     """Download 1 year of daily OHLCV for all tickers at startup.
 
-    This is the one slow call (~20s for 125 tickers).  After this, each
-    scan cycle only needs a tiny 5-day refresh to append the latest bars.
+    Tries the IBKR bulk endpoint first (252 trading days, ~30s); falls back to
+    yfinance if IBKR returns fewer than 80% of tickers.  After this, each scan
+    cycle only needs a tiny 5-day refresh.
     """
     global _hist_cache
-    log.info("Loading historical cache: %d tickers (1yr daily) — takes ~20s…", len(tickers))
+    log.info("Loading historical cache: %d tickers (1yr daily)…", len(tickers))
     t0 = time.monotonic()
+
+    if backend_url:
+        log.info("  Trying IBKR bulk endpoint (252d)…")
+        try:
+            ibkr_data: dict[str, pd.DataFrame] = {}
+            for i in range(0, len(tickers), batch_size):
+                batch = tickers[i : i + batch_size]
+                r = requests.post(
+                    f"{backend_url.rstrip('/')}/market/history/bulk",
+                    json=batch,
+                    params={"days": 252},
+                    timeout=120,
+                )
+                if r.ok:
+                    for tk, bars in r.json().get("data", {}).items():
+                        if not bars:
+                            continue
+                        df = pd.DataFrame(bars)
+                        df["date"] = pd.to_datetime(df["date"])
+                        df.set_index("date", inplace=True)
+                        df.index.name = "Date"
+                        df.rename(columns={"open": "Open", "high": "High",
+                                           "low": "Low", "close": "Close",
+                                           "volume": "Volume"}, inplace=True)
+                        ibkr_data[tk] = df
+                if i + batch_size < len(tickers):
+                    time.sleep(2)  # IBKR pacing between batches
+            if len(ibkr_data) >= 0.8 * len(tickers):
+                _hist_cache = ibkr_data
+                missing = [t for t in tickers if t not in ibkr_data]
+                if missing:
+                    log.info("  yfinance fill for %d tickers IBKR missed", len(missing))
+                    _hist_cache.update(_yf_batch_download(missing, period="1y", batch_size=batch_size))
+                log.info("Historical cache ready via IBKR: %d/%d tickers in %.0fs",
+                         len(_hist_cache), len(tickers), time.monotonic() - t0)
+                return
+            log.warning("IBKR returned only %d/%d tickers — falling back to yfinance",
+                        len(ibkr_data), len(tickers))
+        except Exception as exc:
+            log.warning("IBKR bulk startup load failed: %s — falling back to yfinance", exc)
+
+    log.info("  Falling back to yfinance 1yr download…")
     data = _yf_batch_download(tickers, period="1y", batch_size=batch_size)
     _hist_cache = data
-    log.info("Historical cache ready: %d/%d tickers in %.0fs",
+    log.info("Historical cache ready via yfinance: %d/%d tickers in %.0fs",
              len(_hist_cache), len(tickers), time.monotonic() - t0)
 
 
@@ -1327,6 +1370,43 @@ def run_eod_summary(
                          + (f" — {len(bo_tickers)} breakout, {len(pre_tickers)} pre-breakout" if bo_tickers and pre_tickers else "")
                          + "</i>")
 
+        # ── #11: Same-day alert-to-close performance ─────────────────────────
+        # Query alert_history for first alert price per ticker today, then
+        # compare with _hist_cache EOD close to show intraday return.
+        if total > 0:
+            try:
+                _perf_date = datetime.now(ET).strftime("%Y-%m-%d")
+                _pcon = sqlite3.connect(TAPE_DB, check_same_thread=False)
+                _perf_rows = _pcon.execute(
+                    "SELECT ticker, price FROM alert_history "
+                    "WHERE session_date = ? AND price IS NOT NULL ORDER BY fired_at ASC",
+                    (_perf_date,),
+                ).fetchall()
+                _pcon.close()
+                _alert_prices: dict[str, float] = {}
+                for _ptk, _ppx in _perf_rows:
+                    if _ptk not in _alert_prices and _ppx:
+                        _alert_prices[_ptk] = float(_ppx)
+                _rets, _wins, _losses = [], [], []
+                for _ptk, _entry in _alert_prices.items():
+                    _df = _hist_cache.get(_ptk)
+                    if _df is None or _df.empty or _entry <= 0:
+                        continue
+                    _eod_px = float(_df["Close"].iloc[-1])
+                    _ret = (_eod_px / _entry - 1) * 100
+                    _rets.append(_ret)
+                    (_wins if _ret >= 0 else _losses).append(_ptk)
+                if _rets:
+                    _avg = sum(_rets) / len(_rets)
+                    _wr  = len(_wins) / len(_rets) * 100
+                    lines.append(
+                        f"\n📈 <b>Today's alert performance</b> ({len(_rets)} tracked): "
+                        f"{len(_wins)}W/{len(_losses)}L | "
+                        f"Win rate: {_wr:.0f}% | Avg return: {_avg:+.2f}%"
+                    )
+            except Exception as _pe:
+                log.debug("Same-day performance calc failed: %s", _pe)
+
         lines.append("\n🌙 EOD watchlist incoming at 4:15 ET — setups for tomorrow.")
         send_telegram(token, chat_id, "\n".join(lines))
         log.info("EOD summary sent: %d alerts today (%d BO, %d PRE)",
@@ -1540,8 +1620,9 @@ def _main_loop():
     tickers     = CURATED_TICKERS
 
     # ── Pre-load 1 year of daily history for all tickers at startup ───────────
-    # This runs once (~20s). Every subsequent cycle only refreshes 5 days.
-    load_hist_cache(tickers, batch_size=cfg.get("batch_size", 50))
+    # This runs once (~30s via IBKR or ~20s via yfinance).
+    # Every subsequent cycle only refreshes 5 days.
+    load_hist_cache(tickers, batch_size=cfg.get("batch_size", 50), backend_url=backend_url)
 
     send_telegram(
         token, chat_id,
@@ -1557,7 +1638,49 @@ def _main_loop():
     eod_watch_sent_day:  str = ""
     state_first_scan:    bool = True     # suppress transition alerts on first scan of the day
 
+    # ── #1: Restore alerted_today from today's alert_history ─────────────────
+    # Prevents duplicate alerts and missing EOD summary if the scanner restarts
+    # mid-session.  Latest signal type per ticker wins (ORDER BY fired_at ASC).
+    _today_iso = date.today().isoformat()
+    try:
+        _con = sqlite3.connect(TAPE_DB, check_same_thread=False)
+        _rows = _con.execute(
+            "SELECT ticker, signal_type FROM alert_history "
+            "WHERE session_date = ? ORDER BY fired_at ASC",
+            (_today_iso,),
+        ).fetchall()
+        _con.close()
+        for _tk, _sig in _rows:
+            alerted_today[_tk] = _sig
+        if _rows:
+            log.info("#1 Restored alerted_today: %d ticker(s) from today's alert_history", len(alerted_today))
+    except Exception as _exc:
+        log.warning("Could not restore alerted_today from DB: %s", _exc)
+
+    # ── #13: Restore _ticker_states from today's JSON if scanner restarted ───
+    # Avoids silent first-scan suppression and preserves state machine context.
+    _states_path = os.path.join(SCRIPT_DIR, f"ticker_states_{_today_iso}.json")
+    if os.path.exists(_states_path):
+        try:
+            with open(_states_path, "r", encoding="utf-8") as _sf:
+                _ticker_states.update(json.load(_sf))
+            state_first_scan = False
+            log.info("#13 Restored _ticker_states: %d tickers from %s", len(_ticker_states), _states_path)
+        except Exception as _exc:
+            log.warning("Could not restore _ticker_states: %s", _exc)
+
     while True:
+        # Manual trigger: `touch backend/trigger_eod_watchlist` fires EOD watchlist immediately
+        _trigger_path = os.path.join(SCRIPT_DIR, "trigger_eod_watchlist")
+        if os.path.exists(_trigger_path):
+            try:
+                os.remove(_trigger_path)
+            except OSError:
+                pass
+            log.info("Manual trigger: running EOD watchlist scan now")
+            _regime = fetch_regime(cfg.get("backend_url", ""))
+            run_eod_watchlist_scan(tickers, cfg, token, chat_id, regime=_regime)
+
         if not is_market_open():
             _now_et = datetime.now(ET)
             _today_str = _now_et.strftime("%Y-%m-%d")
@@ -1567,6 +1690,17 @@ def _main_loop():
                     and _now_et.hour == 9 and 10 <= _now_et.minute <= 15
                     and premarket_sent_day != _today_str):
                 premarket_sent_day = _today_str
+                # ── #12: Force-refresh regime before premarket scan ───────────
+                # Overnight SPY gaps won't be reflected in a stale 4-hour cache.
+                if backend_url:
+                    try:
+                        requests.post(
+                            f"{backend_url.rstrip('/')}/market/regime/refresh",
+                            timeout=20,
+                        )
+                        log.info("#12 Regime cache refreshed before premarket scan")
+                    except Exception as _re:
+                        log.warning("Regime refresh failed: %s", _re)
                 run_premarket_scan(tickers, cfg, token, chat_id)
 
             # EOD recap at 4:02-4:12 ET — backward-looking daily summary
@@ -1767,6 +1901,22 @@ def _main_loop():
                 + (f"\n⚠️ Regime gate active: {regime.get('reason')}" if not regime_ok else "")
             )
             send_telegram(token, chat_id, summary)
+
+        # ── #6: Heartbeat — written after every scan so a monitor can detect hangs ──
+        try:
+            _hb = {"ts": datetime.utcnow().isoformat(), "tickers": len(tickers)}
+            with open(os.path.join(SCRIPT_DIR, "scanner_heartbeat.json"), "w", encoding="utf-8") as _hf:
+                json.dump(_hb, _hf)
+        except Exception as _hb_exc:
+            log.debug("Heartbeat write failed: %s", _hb_exc)
+
+        # ── #13: Persist _ticker_states so restarts don't reset the state machine ──
+        try:
+            _sp = os.path.join(SCRIPT_DIR, f"ticker_states_{date.today().isoformat()}.json")
+            with open(_sp, "w", encoding="utf-8") as _tsf:
+                json.dump(_ticker_states, _tsf)
+        except Exception as _ts_exc:
+            log.debug("_ticker_states persist failed: %s", _ts_exc)
 
         # Sleep until next interval
         elapsed = time.monotonic() - scan_start
