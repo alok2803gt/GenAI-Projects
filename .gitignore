@@ -16,10 +16,21 @@ env/
 ibkr_trader/backend/autotrader_state.json
 ibkr_trader/backend/iv_history.json
 ibkr_trader/backend/trade_journal.db
+ibkr_trader/backend/tape_data.db
 ibkr_trader/backend/universe_cache.json
 ibkr_trader/backend/watchlist.json
 ibkr_trader/backend/scanner.log
 ibkr_trader/backend/scanner_err.log
+ibkr_trader/backend/scanner_watchdog.log
+ibkr_trader/backend/backend_watchdog.log
+ibkr_trader/backend/scanner_heartbeat.json
+ibkr_trader/backend/main_last_good.py
+ibkr_trader/backend/ticker_states_*.json
+ibkr_trader/backend/backtest_results/
+# Root-level strays (created outside backend dir by accident)
+scanner.log
+scanner_out.log
+tape_data.db
 
 # Secrets / local config
 .env
