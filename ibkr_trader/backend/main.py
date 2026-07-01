@@ -127,10 +127,12 @@ EARNINGS_BLOCK_DAYS = 14     # Skip CSP/LEAP entirely if earnings within 14 days
                               # through a 2× stop on a short put regardless of strike selection.
 EARNINGS_WARN_DAYS  = 30     # Warn when earnings are within 30 days — the upcoming event
                               # compresses theta and skews the risk/reward even if it won't hit.
-IV_RANK_MIN_CSP     = 50     # Only enter when IV is in the top 50th percentile of its range.
-                              # Tastytrade 200k-trade study: outcomes improve materially above 50%.
-                              # Journal losses averaged IV rank 36.8% — premium was too thin to
-                              # compensate for the downside risk at those entry points.
+IV_RANK_MIN_CSP     = 35     # Lowered from 50: journal losses averaged 36.8% but in low-VIX
+                              # bull markets the universe is empty at 50+. 35 keeps us above the
+                              # historical loss zone while allowing more trades.
+IV_RANK_MIN_CSP_ETF = 20     # ETFs (SPY/QQQ/IWM etc.) have no earnings binary risk; their IV
+                              # is structurally lower than single-name, so a lower bar is correct.
+_CSP_ETF_TICKERS    = frozenset({"SPY", "QQQ", "IWM", "GLD", "XLE", "XLF", "XLK", "XLV", "ARKK"})
 EARNINGS_CACHE_TTL  = 21600  # 6 h — earnings dates don't change intraday
 IV_RANK_CACHE_TTL   = 3600   # 1 h
 REGIME_CACHE_TTL    = 300    # 5 min
@@ -2212,21 +2214,22 @@ def _filter_csp_recommended(candidates: list, log_diag: bool = False) -> list:
         iv_rank = r.get("iv_rank", 0)
         reasons: list[str] = []
 
+        iv_min = IV_RANK_MIN_CSP_ETF if tk in _CSP_ETF_TICKERS else IV_RANK_MIN_CSP
         if _excl(r):
             w = next((w for w in r.get("warnings", []) if "excl. recommended" in w), "screening warning")
             reasons.append(f"warning: {w[:80]}")
         elif r["liquidity_score"] < 50:
             reasons.append(f"liquidity={r['liquidity_score']:.0f} (< 50)")
-        elif iv_rank < IV_RANK_MIN_CSP:
-            reasons.append(f"iv_rank={iv_rank:.0f} (< {IV_RANK_MIN_CSP} — not enough premium)")
+        elif iv_rank < iv_min:
+            reasons.append(f"iv_rank={iv_rank:.0f} (< {iv_min} — not enough premium)")
         elif score < 70:
             reasons.append(f"score={score:.0f} (< 70)")
         elif r.get("above_sma50") is False or r.get("above_sma20") is False or r.get("above_sma200") is False:
             below = [n for n, k in [("SMA20","above_sma20"),("SMA50","above_sma50"),("SMA200","above_sma200")]
                      if r.get(k) is False]
             reasons.append(f"below {'+'.join(below)} — downtrend")
-        elif r.get("earnings_days_out") is not None and r["earnings_days_out"] <= EARNINGS_BLOCK_DAYS * 2:
-            reasons.append(f"earnings in {r['earnings_days_out']}d (block ≤ {EARNINGS_BLOCK_DAYS*2}d)")
+        elif r.get("earnings_days_out") is not None and r["earnings_days_out"] <= EARNINGS_BLOCK_DAYS + 7:
+            reasons.append(f"earnings in {r['earnings_days_out']}d (block ≤ {EARNINGS_BLOCK_DAYS+7}d)")
 
         if reasons:
             if log_diag:
@@ -6645,6 +6648,20 @@ def watchlist_add_alert(req: WatchlistAlertRequest):
         # Fall back to what scanner sent even if neutral
         return req_score, req_label or "NO DATA"
 
+    _today_date = now_et.strftime("%Y-%m-%d")
+
+    def _log_if_new_day(entry_ts: str, sig: str, price: float, resolved_ts, resolved_tl):
+        """Log to alert_history when a carry-over watchlist ticker fires on a new day."""
+        if entry_ts[:10] != _today_date:
+            _alert_history_insert(tk, sig, price,
+                                  req.pct_b, req.rsi, req.vol_ratio,
+                                  resolved_ts, resolved_tl,
+                                  prev_state=req.prev_state,
+                                  mins_in_pre_breakout=req.mins_in_pre_breakout,
+                                  state_path=req.state_path)
+            return True
+        return False
+
     # Don't downgrade BREAKOUT → PRE-BREAKOUT
     if existing and existing["signal_type"] == "BREAKOUT" and req.signal_type == "PRE-BREAKOUT":
         # Still refresh live metrics so pct_b / vol_ratio / tape stay current
@@ -6655,6 +6672,10 @@ def watchlist_add_alert(req: WatchlistAlertRequest):
         existing["tape_score"]     = ts
         existing["tape_label"]     = tl
         existing["tape_confirmed"] = bool(ts is not None and ts > 0.20)
+        if _log_if_new_day(existing.get("added_iso", ""), req.signal_type,
+                           req.price_at_alert, ts, tl):
+            existing["added_iso"]      = now_et.isoformat()
+            existing["price_at_alert"] = round(req.price_at_alert, 2)
         _watchlist_save()
         return {"ok": True, "action": "refreshed"}
 
@@ -6668,6 +6689,10 @@ def watchlist_add_alert(req: WatchlistAlertRequest):
         existing["tape_score"]     = ts
         existing["tape_label"]     = tl
         existing["tape_confirmed"] = bool(ts is not None and ts > 0.20)
+        if _log_if_new_day(existing.get("added_iso", ""), req.signal_type,
+                           req.price_at_alert, ts, tl):
+            existing["added_iso"]      = now_et.isoformat()
+            existing["price_at_alert"] = round(req.price_at_alert, 2)
         _watchlist_save()
         return {"ok": True, "action": "refreshed"}
 
@@ -6688,7 +6713,7 @@ def watchlist_add_alert(req: WatchlistAlertRequest):
     }
     # Persist every new alert to alert_history for backtesting (includes state path context)
     _alert_history_insert(tk, req.signal_type, req.price_at_alert,
-                          req.pct_b, req.rsi, req.vol_ratio, _ts, _tl,
+                          req.pct_b, req.rsi, req.vol_ratio, ts, tl,
                           prev_state=req.prev_state,
                           mins_in_pre_breakout=req.mins_in_pre_breakout,
                           state_path=req.state_path)

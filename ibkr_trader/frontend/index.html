@@ -5266,6 +5266,7 @@ function PerformanceTab() {
   const [showAnalysis, setShowAnalysis] = useState(false);
   const [analysis, setAnalysis]     = useState(null);
   const [analysisLoading, setAnalysisLoading] = useState(false);
+  const [recentDays, setRecentDays] = useState([]);
 
   const loadDay = async (d) => {
     setLoading(true);
@@ -5276,7 +5277,15 @@ function PerformanceTab() {
     finally { setLoading(false); }
   };
 
+  const loadRecentDays = async () => {
+    try {
+      const r = await apiFetch("/performance/summary?days=14");
+      setRecentDays((r.daily || []).slice().reverse().slice(0, 10));
+    } catch(_) {}
+  };
+
   useEffect(() => { loadDay(selDate); }, [selDate]);
+  useEffect(() => { loadRecentDays(); }, []);
 
   const enrich = async () => {
     setEnriching(true);
@@ -5367,6 +5376,30 @@ function PerformanceTab() {
           </button>
         </div>
       </div>
+
+      {recentDays.length > 0 && (
+        <div style={{ marginBottom: 20, overflowX: "auto" }}>
+          <div style={{ ...sans, fontSize: 11, fontWeight: 700, color: C.muted, textTransform: "uppercase", letterSpacing: 1, marginBottom: 8 }}>Recent Days — click to view</div>
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+            {recentDays.map(d => {
+              const isSel = d.date === selDate;
+              const wr = d.win_rate;
+              const wrColor = wr >= 65 ? "#16a34a" : wr >= 45 ? "#d97706" : "#dc2626";
+              return (
+                <button key={d.date} onClick={() => setSelDate(d.date)}
+                  style={{ ...sans, fontSize: 11, padding: "6px 10px", borderRadius: 6, cursor: "pointer",
+                    background: isSel ? C.accent : C.surface,
+                    border: `1px solid ${isSel ? C.accent : C.border}`,
+                    color: isSel ? "#fff" : C.text, textAlign: "left", minWidth: 90 }}>
+                  <div style={{ fontWeight: 700, marginBottom: 2 }}>{d.date.slice(5)}</div>
+                  <div style={{ color: isSel ? "#ffffffcc" : wrColor, fontWeight: 700 }}>{wr}% win</div>
+                  <div style={{ color: isSel ? "#ffffff88" : C.muted, fontSize: 10 }}>{d.count} alerts · {d.avg_return >= 0 ? "+" : ""}{d.avg_return.toFixed(1)}%</div>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      )}
 
       {loading ? (
         <div style={{ color: C.muted, ...sans, fontSize: 13, padding: "40px 0", textAlign: "center" }}>Loading…</div>
