@@ -1884,6 +1884,25 @@ def _main_loop():
                 send_telegram(token, chat_id, msg)
                 time.sleep(0.3)   # Telegram rate limit: ~30 msg/s
 
+                # Direct stock-trader trigger (fast path — bypasses 5-min AT poll)
+                # POST immediately on BREAKOUT so the order lands within seconds,
+                # not at the next autotrader cycle (worst case 5 min later).
+                if sig_type == "BREAKOUT" and backend_url:
+                    try:
+                        requests.post(
+                            f"{backend_url.rstrip('/')}/stock-trader/signal",
+                            json={
+                                "ticker":         tk,
+                                "price":          ind.get("price", 0),
+                                "alert_fired_at": datetime.now(ET).isoformat(),
+                            },
+                            timeout=5,
+                        )
+                        log.info("Stock-trader direct trigger fired: %s @ %.2f",
+                                 tk, ind.get("price", 0))
+                    except Exception as _ste:
+                        log.debug("Stock-trader direct trigger failed (non-fatal): %s", _ste)
+
         # If nothing found, log a quiet pulse every other cycle
         if not candidates and not (len(alerted_today) % 2):
             log.info("No signals this cycle — market quiet")

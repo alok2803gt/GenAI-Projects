@@ -12,3 +12,4 @@ __pycache__/
 dist/
 build/
 .env
+backend/stock_state.json

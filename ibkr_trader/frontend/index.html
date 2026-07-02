@@ -4292,6 +4292,411 @@ function DecisionsTab() {
 }
 
 
+// ── Stock Trader Tab ──────────────────────────────────────────────────────
+function StockTraderTab() {
+  const [status,      setStatus]      = useState(null);
+  const [loading,     setLoading]     = useState(true);
+  const [toggling,    setToggling]    = useState(false);
+  const [showConfig,  setShowConfig]  = useState(false);
+  const [cfgEdit,     setCfgEdit]     = useState({});
+  const [saving,      setSaving]      = useState(false);
+  const [closing,     setClosing]     = useState({});
+  const [histDays,    setHistDays]    = useState(30);
+  const [history,     setHistory]     = useState(null);
+  const [histLoading, setHistLoading] = useState(false);
+
+  const load = async () => {
+    try {
+      const r = await apiFetch("/stock-trader/status");
+      setStatus(r);
+    } catch(_) {}
+    finally { setLoading(false); }
+  };
+
+  useEffect(() => {
+    load();
+    const id = setInterval(load, 10000);
+    return () => clearInterval(id);
+  }, []);
+
+  const toggle = async () => {
+    if (!status) return;
+    setToggling(true);
+    try {
+      const next = !status.enabled;
+      await apiFetch(`/stock-trader/enable?enabled=${next}`, { method: "POST" });
+      await load();
+    } catch(_) {}
+    finally { setToggling(false); }
+  };
+
+  const openConfig = () => {
+    if (!status) return;
+    setCfgEdit({ ...status.config });
+    setShowConfig(true);
+  };
+
+  const saveConfig = async () => {
+    setSaving(true);
+    try {
+      const patch = {};
+      Object.entries(cfgEdit).forEach(([k, v]) => {
+        const n = Number(v);
+        patch[k] = isNaN(n) ? v : n;
+      });
+      await apiFetch("/stock-trader/config", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(patch),
+      });
+      setShowConfig(false);
+      await load();
+    } catch(_) {}
+    finally { setSaving(false); }
+  };
+
+  const closePos = async (ticker) => {
+    setClosing(c => ({ ...c, [ticker]: true }));
+    try {
+      await apiFetch(`/stock-trader/close/${ticker}`, { method: "POST" });
+      await load();
+    } catch(_) {}
+    finally { setClosing(c => ({ ...c, [ticker]: false })); }
+  };
+
+  const loadHistory = async () => {
+    setHistLoading(true);
+    try {
+      const r = await apiFetch(`/stock-trader/history?days=${histDays}`);
+      setHistory(r);
+    } catch(_) {}
+    finally { setHistLoading(false); }
+  };
+
+  const pnlColor = v => v > 0 ? C.bull : v < 0 ? C.bear : C.muted;
+  const phaseLabel = p => p === 0 ? "PENDING" : p === 1 ? "STOP" : p === 2 ? "TRAIL" : "CLOSING";
+  const phaseColor = p => p === 0 ? C.muted : p === 1 ? C.neutral : p === 2 ? C.bull : C.bear;
+  const exitColor  = e => e === "hard_stop" ? C.bear : e === "trail_stop" ? C.neutral : e === "max_hold" ? C.bull : C.muted;
+
+  if (loading) return <div style={{ color: C.muted, padding: 32, textAlign: "center", ...sans }}>Loading…</div>;
+
+  const cfg     = status?.config || {};
+  const pos     = status?.positions || {};
+  const closed  = status?.closed_today || [];
+  const dec     = status?.decisions || [];
+  const summary = status?.summary || {};
+  const enabled = status?.enabled || false;
+
+  const posArr = Object.entries(pos).sort((a, b) => (b[1].entry_date || "").localeCompare(a[1].entry_date || ""));
+
+  return (
+    <div style={{ animation: "fadeIn 0.2s ease" }}>
+      {/* ── Header ────────────────────────────────────────────────────── */}
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start",
+          flexWrap: "wrap", gap: 12, marginBottom: 16 }}>
+        <div>
+          <div style={{ ...mono, fontSize: 10, color: C.accent, letterSpacing: 3,
+              textTransform: "uppercase", marginBottom: 4 }}>
+            Breakout Momentum · Stock Trader
+          </div>
+          <div style={{ ...sans, fontSize: 17, fontWeight: 700, color: C.white }}>
+            Stock Trader
+            <span style={{ ...mono, fontSize: 11, color: C.muted, marginLeft: 12, fontWeight: 400 }}>
+              {summary.open_positions || 0} open · ${(summary.capital_deployed || 0).toLocaleString()} deployed
+            </span>
+          </div>
+          <div style={{ ...sans, fontSize: 12, color: C.muted, marginTop: 3 }}>
+            7% hard stop (d1-5) · 5% IBKR trail (d5-30) · ${cfg.position_size?.toLocaleString()} per trade ·
+            max {cfg.max_positions} positions
+          </div>
+        </div>
+        <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+          {summary.today_pnl !== undefined && (
+            <div style={{ ...mono, fontSize: 13, fontWeight: 700,
+                color: pnlColor(summary.today_pnl),
+                padding: "4px 12px", borderRadius: 16,
+                background: `${pnlColor(summary.today_pnl)}11`,
+                border: `1px solid ${pnlColor(summary.today_pnl)}33` }}>
+              Today {summary.today_pnl >= 0 ? "+" : ""}${summary.today_pnl?.toFixed(2)}
+            </div>
+          )}
+          <button onClick={openConfig} style={{ ...sans, fontSize: 12, padding: "7px 14px",
+              borderRadius: 6, background: C.surface, border: `1px solid ${C.border}`,
+              color: C.text, cursor: "pointer" }}>
+            Config
+          </button>
+          <button onClick={toggle} disabled={toggling} style={{
+              ...sans, fontSize: 13, fontWeight: 700, padding: "7px 20px", borderRadius: 8,
+              cursor: "pointer", border: "none",
+              background: enabled ? "#dc2626" : C.accent,
+              color: "#fff", opacity: toggling ? 0.7 : 1,
+          }}>
+            {toggling ? "…" : enabled ? "● ENABLED" : "○ DISABLED"}
+          </button>
+        </div>
+      </div>
+
+      {/* ── Config Modal ──────────────────────────────────────────────── */}
+      {showConfig && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.45)",
+            zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center" }}>
+          <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 12,
+              padding: 28, minWidth: 380, maxWidth: 480, width: "90vw" }}>
+            <div style={{ ...sans, fontSize: 15, fontWeight: 700, color: C.white, marginBottom: 18 }}>
+              Stock Trader Config
+            </div>
+            {[
+              ["position_size",        "Position Size ($)",        "number"],
+              ["max_positions",        "Max Concurrent Positions", "number"],
+              ["hard_stop_pct",        "Hard Stop % (phase 1)",    "number"],
+              ["trail_pct",            "Trail Stop % (phase 2)",   "number"],
+              ["max_hold_days",        "Max Hold (trading days)",  "number"],
+              ["signal_freshness_min", "Signal Freshness (min)",   "number"],
+              ["limit_buffer_pct",     "Limit Buffer % (0.10)",    "number"],
+            ].map(([k, label]) => (
+              <div key={k} style={{ marginBottom: 12 }}>
+                <div style={{ ...sans, fontSize: 11, color: C.muted, marginBottom: 4 }}>{label}</div>
+                <input
+                  type="number" step="any"
+                  value={cfgEdit[k] ?? ""}
+                  onChange={e => setCfgEdit(c => ({ ...c, [k]: e.target.value }))}
+                  style={{ width: "100%", padding: "7px 10px", borderRadius: 6,
+                    border: `1px solid ${C.border}`, ...mono, fontSize: 13, background: C.bg }}
+                />
+              </div>
+            ))}
+            <div style={{ display: "flex", gap: 8, marginTop: 18, justifyContent: "flex-end" }}>
+              <button onClick={() => setShowConfig(false)} style={{ ...sans, fontSize: 13,
+                  padding: "7px 18px", borderRadius: 6, border: `1px solid ${C.border}`,
+                  background: C.bg, cursor: "pointer", color: C.text }}>
+                Cancel
+              </button>
+              <button onClick={saveConfig} disabled={saving} style={{ ...sans, fontSize: 13,
+                  fontWeight: 700, padding: "7px 20px", borderRadius: 6, border: "none",
+                  background: C.accent, color: "#fff", cursor: "pointer" }}>
+                {saving ? "Saving…" : "Save"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Open Positions ────────────────────────────────────────────── */}
+      <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10,
+          padding: 18, marginBottom: 16 }}>
+        <div style={{ ...sans, fontSize: 13, fontWeight: 700, color: C.white, marginBottom: 12 }}>
+          Open Positions ({posArr.length})
+        </div>
+        {posArr.length === 0 ? (
+          <div style={{ ...sans, fontSize: 13, color: C.muted, padding: "12px 0" }}>
+            No open positions — waiting for BREAKOUT signals{!enabled && " (trader disabled)"}
+          </div>
+        ) : (
+          <div style={{ overflowX: "auto" }}>
+            <table style={{ ...sans, fontSize: 12, minWidth: 720 }}>
+              <thead>
+                <tr style={{ borderBottom: `1px solid ${C.border}` }}>
+                  {["Ticker","Entry","Shares","Cost","Live P&L","Phase","Day","Stop / Trail",""].map(h => (
+                    <th key={h} style={{ ...sans, fontSize: 10, fontWeight: 600, color: C.muted,
+                        textTransform: "uppercase", letterSpacing: 0.5, padding: "4px 10px",
+                        textAlign: "left" }}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {posArr.map(([ticker, p]) => {
+                  const entryPx = p.entry_price || 0;
+                  const cost    = (p.shares || 0) * entryPx;
+                  const stopLbl = p.stop_price ? `$${p.stop_price.toFixed(2)}` : (p.stop_type === "TRAIL" ? `${cfg.trail_pct}% trail` : "—");
+                  return (
+                    <tr key={ticker} style={{ borderBottom: `1px solid ${C.border}33` }}>
+                      <td style={{ padding: "8px 10px", ...mono, fontWeight: 800, fontSize: 13, color: C.accent }}>{ticker}</td>
+                      <td style={{ padding: "8px 10px", ...mono }}>${entryPx.toFixed(2)}</td>
+                      <td style={{ padding: "8px 10px", ...mono }}>{p.shares}</td>
+                      <td style={{ padding: "8px 10px", ...mono }}>${cost.toLocaleString(undefined, {maximumFractionDigits: 0})}</td>
+                      <td style={{ padding: "8px 10px", ...mono, color: C.muted }}>—</td>
+                      <td style={{ padding: "8px 10px" }}>
+                        <span style={{ ...mono, fontSize: 10, fontWeight: 700, color: phaseColor(p.phase),
+                            background: `${phaseColor(p.phase)}15`, padding: "2px 8px", borderRadius: 10 }}>
+                          {phaseLabel(p.phase)}
+                        </span>
+                      </td>
+                      <td style={{ padding: "8px 10px", ...mono, color: C.muted }}>d{p.trading_days_held ?? 0}</td>
+                      <td style={{ padding: "8px 10px", ...mono, fontSize: 11, color: C.muted }}>{stopLbl}</td>
+                      <td style={{ padding: "8px 10px" }}>
+                        <button onClick={() => closePos(ticker)} disabled={!!closing[ticker]}
+                          style={{ ...sans, fontSize: 11, padding: "3px 10px", borderRadius: 5,
+                            border: `1px solid ${C.bear}55`, background: `${C.bear}11`,
+                            color: C.bear, cursor: "pointer", opacity: closing[ticker] ? 0.5 : 1 }}>
+                          {closing[ticker] ? "…" : "Close"}
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      {/* ── Decision Log + Closed Today (side by side) ────────────────── */}
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginBottom: 16 }}>
+
+        {/* Decision Log */}
+        <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, padding: 18 }}>
+          <div style={{ ...sans, fontSize: 13, fontWeight: 700, color: C.white, marginBottom: 10 }}>
+            Decision Log
+          </div>
+          {dec.length === 0 ? (
+            <div style={{ ...sans, fontSize: 12, color: C.muted }}>No decisions yet today</div>
+          ) : (
+            <div style={{ maxHeight: 280, overflowY: "auto" }}>
+              {[...dec].reverse().map((d, i) => {
+                const actionColor = d.action === "ENTERED" || d.action === "FILLED"   ? C.bull
+                                  : d.action === "SKIPPED"                            ? C.muted
+                                  : d.action?.includes("STOP") || d.action === "HARD_STOP" ? C.bear
+                                  : d.action === "PHASE2"                             ? C.accent
+                                  : C.neutral;
+                return (
+                  <div key={i} style={{ borderBottom: `1px solid ${C.border}33`, padding: "6px 0",
+                      display: "flex", gap: 10, alignItems: "flex-start" }}>
+                    <span style={{ ...mono, fontSize: 10, color: C.muted, flexShrink: 0, width: 70 }}>{d.time}</span>
+                    <span style={{ ...mono, fontSize: 10, fontWeight: 700, color: actionColor,
+                        flexShrink: 0, width: 80 }}>{d.action}</span>
+                    <span style={{ ...mono, fontSize: 10, color: C.accent, flexShrink: 0, width: 48 }}>{d.ticker}</span>
+                    <span style={{ ...sans, fontSize: 11, color: C.muted, lineHeight: 1.4 }}>{d.detail}</span>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+
+        {/* Closed Today */}
+        <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, padding: 18 }}>
+          <div style={{ ...sans, fontSize: 13, fontWeight: 700, color: C.white, marginBottom: 10 }}>
+            Closed Today ({closed.length})
+          </div>
+          {closed.length === 0 ? (
+            <div style={{ ...sans, fontSize: 12, color: C.muted }}>No closed trades today</div>
+          ) : (
+            <div style={{ maxHeight: 280, overflowY: "auto" }}>
+              {[...closed].reverse().map((t, i) => (
+                <div key={i} style={{ borderBottom: `1px solid ${C.border}33`, padding: "7px 0",
+                    display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                  <div>
+                    <span style={{ ...mono, fontSize: 13, fontWeight: 700, color: C.accent }}>{t.ticker}</span>
+                    <span style={{ ...mono, fontSize: 11, color: C.muted, marginLeft: 8 }}>
+                      {t.entry_price?.toFixed(2)} → {t.exit_price?.toFixed(2)}
+                    </span>
+                    <span style={{ ...sans, fontSize: 10, color: exitColor(t.exit_type),
+                        marginLeft: 8, padding: "1px 6px", borderRadius: 8,
+                        background: `${exitColor(t.exit_type)}15` }}>
+                      {t.exit_type?.replace("_", " ")} · d{t.days_held}
+                    </span>
+                  </div>
+                  <div style={{ ...mono, fontSize: 13, fontWeight: 700,
+                      color: pnlColor(t.pnl) }}>
+                    {t.pnl >= 0 ? "+" : ""}${t.pnl?.toFixed(2)}
+                    <span style={{ fontSize: 10, marginLeft: 4 }}>({t.pnl_pct >= 0 ? "+" : ""}{t.pnl_pct?.toFixed(2)}%)</span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* ── Trade History ─────────────────────────────────────────────── */}
+      <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, padding: 18 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+          <div style={{ ...sans, fontSize: 13, fontWeight: 700, color: C.white }}>
+            Trade History
+          </div>
+          <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+            {["7","14","30","90"].map(d => (
+              <button key={d} onClick={() => setHistDays(+d)} style={{
+                  ...sans, fontSize: 11, padding: "3px 10px", borderRadius: 12, cursor: "pointer", border: "none",
+                  background: histDays === +d ? C.accent : C.bg, color: histDays === +d ? "#fff" : C.muted }}>
+                {d}d
+              </button>
+            ))}
+            <button onClick={loadHistory} disabled={histLoading} style={{ ...sans, fontSize: 12,
+                padding: "5px 14px", borderRadius: 6, background: "#1e293b",
+                border: `1px solid ${C.border}`, color: C.text, cursor: "pointer" }}>
+              {histLoading ? "…" : "Load"}
+            </button>
+          </div>
+        </div>
+
+        {history === null ? (
+          <div style={{ ...sans, fontSize: 12, color: C.muted }}>Click Load to fetch trade history</div>
+        ) : history.total === 0 ? (
+          <div style={{ ...sans, fontSize: 12, color: C.muted }}>No closed stock trades in the last {histDays} days</div>
+        ) : (
+          <>
+            {/* Summary row */}
+            <div style={{ display: "flex", gap: 24, marginBottom: 14, flexWrap: "wrap" }}>
+              {[
+                { label: "Trades",   val: history.total },
+                { label: "Win Rate", val: `${history.win_rate}%`, color: history.win_rate >= 50 ? C.bull : C.bear },
+                { label: "Total P&L", val: `${history.total_pnl >= 0 ? "+" : ""}$${history.total_pnl?.toFixed(2)}`,
+                  color: pnlColor(history.total_pnl) },
+              ].map(({ label, val, color }) => (
+                <div key={label}>
+                  <div style={{ ...sans, fontSize: 10, color: C.muted, textTransform: "uppercase",
+                      letterSpacing: 0.5, marginBottom: 2 }}>{label}</div>
+                  <div style={{ ...mono, fontSize: 15, fontWeight: 700, color: color || C.white }}>{val}</div>
+                </div>
+              ))}
+            </div>
+            <div style={{ overflowX: "auto" }}>
+              <table style={{ ...sans, fontSize: 12, minWidth: 600 }}>
+                <thead>
+                  <tr style={{ borderBottom: `1px solid ${C.border}` }}>
+                    {["Date","Ticker","Qty","Entry","Exit","P&L","P&L %","Exit Type"].map(h => (
+                      <th key={h} style={{ ...sans, fontSize: 10, fontWeight: 600, color: C.muted,
+                          textTransform: "uppercase", letterSpacing: 0.5, padding: "4px 10px",
+                          textAlign: "left" }}>{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {history.trades.map((t, i) => (
+                    <tr key={i} style={{ borderBottom: `1px solid ${C.border}33` }}>
+                      <td style={{ padding: "6px 10px", ...mono, fontSize: 11, color: C.muted }}>
+                        {t.closed_at?.slice(0, 10)}
+                      </td>
+                      <td style={{ padding: "6px 10px", ...mono, fontWeight: 700, color: C.accent }}>{t.ticker}</td>
+                      <td style={{ padding: "6px 10px", ...mono }}>{t.qty}</td>
+                      <td style={{ padding: "6px 10px", ...mono }}>${t.entry_price?.toFixed(2)}</td>
+                      <td style={{ padding: "6px 10px", ...mono }}>${t.exit_price?.toFixed(2)}</td>
+                      <td style={{ padding: "6px 10px", ...mono, fontWeight: 700, color: pnlColor(t.pnl) }}>
+                        {t.pnl >= 0 ? "+" : ""}${t.pnl?.toFixed(2)}
+                      </td>
+                      <td style={{ padding: "6px 10px", ...mono, color: pnlColor(t.pnl_pct) }}>
+                        {t.pnl_pct >= 0 ? "+" : ""}{t.pnl_pct?.toFixed(2)}%
+                      </td>
+                      <td style={{ padding: "6px 10px" }}>
+                        <span style={{ ...mono, fontSize: 10, color: exitColor(t.exit_reason),
+                            background: `${exitColor(t.exit_reason)}15`, padding: "2px 7px", borderRadius: 8 }}>
+                          {t.exit_reason?.replace("_", " ") || "—"}
+                        </span>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+
 // ── Watchlist Tab (Breakout Scanner) ─────────────────────────────────────
 function WatchlistTab() {
   const [entries,  setEntries]  = useState([]);
@@ -5676,8 +6081,9 @@ function App() {
     { id:"signals",    label:"Signals"     },
     { id:"csp",        label:"CSP Scan"    },
     { id:"leaps",      label:"LEAPs"       },
-    { id:"autotrader", label:"Auto-Trade"  },
-    { id:"backtest",   label:"Backtest"    },
+    { id:"autotrader",   label:"Auto-Trade"    },
+    { id:"stocktrader", label:"Stock Trader" },
+    { id:"backtest",    label:"Backtest"     },
     { id:"0dte",       label:"0DTE / EIV"  },
     { id:"learning",   label:"Learning"    },
     { id:"universe",   label:"Universe"    },
@@ -5735,8 +6141,9 @@ function App() {
         <div style={{display: tab==="signals"    ? "" : "none"}}><SignalsTab    connected={connected} /></div>
         <div style={{display: tab==="csp"        ? "" : "none"}}><CSPTab        connected={connected} /></div>
         <div style={{display: tab==="leaps"      ? "" : "none"}}><LEAPTab       connected={connected} /></div>
-        <div style={{display: tab==="autotrader" ? "" : "none"}}><AutoTraderTab /></div>
-        <div style={{display: tab==="backtest"   ? "" : "none"}}><BacktestTab   connected={connected} /></div>
+        <div style={{display: tab==="autotrader"   ? "" : "none"}}><AutoTraderTab /></div>
+        <div style={{display: tab==="stocktrader" ? "" : "none"}}><StockTraderTab /></div>
+        <div style={{display: tab==="backtest"    ? "" : "none"}}><BacktestTab   connected={connected} /></div>
         <div style={{display: tab==="0dte"       ? "" : "none"}}><ZeroDTETab    connected={connected} /></div>
         <div style={{display: tab==="learning"   ? "" : "none"}}><LearningTab /></div>
         <div style={{display: tab==="universe"   ? "" : "none"}}><UniverseTab /></div>

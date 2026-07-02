@@ -28,7 +28,7 @@ import uvicorn
 import yfinance as yf
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from ib_insync import IB, Index, LimitOrder, Option, Stock, util
+from ib_insync import IB, Index, LimitOrder, Option, Order, Stock, util
 from pydantic import BaseModel
 from xgboost import XGBClassifier
 from sklearn.model_selection import TimeSeriesSplit
@@ -145,6 +145,7 @@ TAPE_DB_PATH        = "tape_data.db"
 JOURNAL_MIN_TRADES  = 20    # trades needed before learned model is reliable
 RETRAIN_EVERY       = 5     # retrain model every N new closed trades
 AT_STATE_PATH       = "autotrader_state.json"  # persisted across restarts
+ST_STATE_PATH       = "stock_state.json"        # stock trader state (persisted)
 UNIVERSE_CACHE_PATH = "universe_cache.json"     # screened universe (refreshed nightly)
 WATCHLIST_PATH      = "watchlist.json"          # breakout scanner watchlist
 
@@ -277,6 +278,22 @@ state: Dict = {
         "premium_collected":  0.0,    # cumulative realized CSP wins
         "leap_pnl":           0.0,    # cumulative realized LEAP P&L (can be negative)
         "leap_budget":        0.0,    # 50% of CSP income + LEAP P&L (net available)
+    },
+    # Stock Trader state (breakout momentum equity trades — separate from CSP/LEAP AT)
+    "stock_trader": {
+        "enabled": False,
+        "config": {
+            "position_size":        3000,    # fixed $ per trade
+            "max_positions":        8,       # concurrent cap (90th pct = 5, 18yr backtest)
+            "hard_stop_pct":        7.0,     # phase 1 GTC stop (days 1-5)
+            "trail_pct":            5.0,     # phase 2 IBKR TRAIL order (days 5-30)
+            "max_hold_days":        30,      # force-close at 30 trading days
+            "signal_freshness_min": 30,      # skip alerts older than this
+            "limit_buffer_pct":     0.10,    # LIMIT = last_price × (1 + buffer/100)
+        },
+        "positions":    {},   # ticker → position dict
+        "closed_today": [],   # list of closed trade summaries (reset each day)
+        "decisions":    [],   # plain-English decision log (last 200)
     },
     # CVD tape sentiment (populated by reqMktData "233,375" subscriptions)
     "tape_sentiment": {},  # ticker → per-ticker CVD state dict
@@ -5635,6 +5652,280 @@ def _run_in_streaming_loop(coro, timeout: int = 180):
         raise
 
 
+# ── Stock Trader helpers ────────────────────────────────────────────────────
+
+def _st_save_state() -> None:
+    st = state["stock_trader"]
+    try:
+        with open(ST_STATE_PATH, "w") as f:
+            json.dump({
+                "enabled":      st["enabled"],
+                "config":       st["config"],
+                "positions":    st["positions"],
+                "closed_today": st.get("closed_today", [])[-100:],
+                "decisions":    st.get("decisions", [])[-200:],
+            }, f, indent=2, default=str)
+    except Exception as e:
+        log.warning("Stock trader state save failed: %s", e)
+
+
+def _st_load_state() -> None:
+    if not os.path.exists(ST_STATE_PATH):
+        return
+    try:
+        with open(ST_STATE_PATH, "r") as f:
+            saved = json.load(f)
+        st = state["stock_trader"]
+        st["enabled"]      = saved.get("enabled", False)
+        st["config"].update(saved.get("config", {}))
+        st["positions"]    = saved.get("positions", {})
+        st["closed_today"] = saved.get("closed_today", [])
+        st["decisions"]    = saved.get("decisions", [])
+        log.info("Stock trader state restored: enabled=%s, positions=%d",
+                 st["enabled"], len(st["positions"]))
+    except Exception as e:
+        log.warning("Stock trader state load failed (starting fresh): %s", e)
+
+
+def _st_log(action: str, ticker: str, detail: str) -> None:
+    from zoneinfo import ZoneInfo
+    et_now = datetime.now(ZoneInfo("America/New_York"))
+    entry  = {
+        "time":   et_now.strftime("%H:%M:%S ET"),
+        "action": action,
+        "ticker": ticker,
+        "detail": detail,
+    }
+    st = state["stock_trader"]
+    st["decisions"].append(entry)
+    st["decisions"] = st["decisions"][-200:]
+    log.info("[StockTrader] %s %s: %s", action, ticker, detail)
+
+
+def _st_trading_days_held(entry_date_str: str) -> int:
+    """Count trading days from entry date up to (not including) today."""
+    try:
+        entry = datetime.fromisoformat(entry_date_str).date()
+        today = date.today()
+        if entry >= today:
+            return 0
+        return int(np.busday_count(entry.isoformat(), today.isoformat()))
+    except Exception:
+        return 0
+
+
+def _close_st_position(ticker: str, pos: dict, exit_px: float,
+                        exit_type: str, pnl: float, days_held: int) -> None:
+    """Record a closed stock trade to closed_today + trade_journal."""
+    st       = state["stock_trader"]
+    entry_px = pos.get("entry_price", exit_px)
+    pnl_pct  = round((exit_px - entry_px) / entry_px * 100, 3) if entry_px else 0.0
+
+    record = {
+        "ticker":     ticker,
+        "entry_date": pos.get("entry_date"),
+        "exit_date":  date.today().isoformat(),
+        "entry_price": round(entry_px, 4),
+        "exit_price":  round(exit_px, 4),
+        "shares":      pos.get("shares", 0),
+        "pnl":         round(pnl, 2),
+        "pnl_pct":     pnl_pct,
+        "exit_type":   exit_type,
+        "days_held":   days_held,
+        "win":         pnl > 0,
+    }
+    st["closed_today"].append(record)
+    st["closed_today"] = st["closed_today"][-100:]
+
+    # Persist to trade_journal for history / stats
+    try:
+        con = sqlite3.connect(JOURNAL_DB_PATH, check_same_thread=False)
+        con.execute("""
+            INSERT INTO trade_journal
+                (opened_at, closed_at, ticker, action, qty,
+                 entry_price, exit_price, pnl, pnl_pct, win,
+                 exit_reason, strategy_type)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            pos.get("entry_date"),
+            date.today().isoformat(),
+            ticker, "BUY", pos.get("shares", 0),
+            round(entry_px, 4), round(exit_px, 4),
+            round(pnl, 2), pnl_pct, 1 if pnl > 0 else 0,
+            exit_type, "STOCK_BREAKOUT",
+        ))
+        con.commit()
+        con.close()
+    except Exception as exc:
+        log.warning("Stock trade journal insert failed: %s", exc)
+
+    _st_log(exit_type.upper(), ticker,
+            f"exit={exit_px:.2f} pnl={'+'if pnl>=0 else''}{pnl:.2f} "
+            f"({pnl_pct:+.2f}%) day {days_held}")
+    _st_save_state()
+
+
+async def _stock_monitor_coro(ib) -> None:
+    """One monitor cycle: detect fills, phase transitions, exits, force closes."""
+    from zoneinfo import ZoneInfo
+    st  = state["stock_trader"]
+    cfg = st["config"]
+
+    if not st["positions"]:
+        return
+
+    open_trades_by_oid = {t.order.orderId: t for t in ib.openTrades()}
+    fills_by_oid: dict = {}
+    for f in ib.fills():
+        oid = getattr(f.execution, "orderId", 0)
+        if oid and oid > 0:
+            fills_by_oid[oid] = f
+
+    to_remove: list[str] = []
+
+    for ticker, pos in list(st["positions"].items()):
+        days_held = _st_trading_days_held(pos.get("entry_date", ""))
+        pos["trading_days_held"] = days_held
+        phase = pos.get("phase", 1)
+
+        # ── Phase 0: waiting for buy fill ─────────────────────────────────
+        if phase == 0:
+            buy_oid = pos.get("buy_order_id")
+            if not buy_oid:
+                continue
+            if buy_oid in open_trades_by_oid:
+                continue  # still pending
+            fill = fills_by_oid.get(buy_oid)
+            if fill:
+                fill_px = round(float(fill.execution.avgPrice), 4)
+                pos["entry_price"] = fill_px
+                pos["phase"] = 1
+                stop_px = round(fill_px * (1 - cfg["hard_stop_pct"] / 100), 2)
+                contract  = Stock(ticker, "SMART", "USD")
+                stop_ord  = Order()
+                stop_ord.orderType      = "STP"
+                stop_ord.action         = "SELL"
+                stop_ord.totalQuantity  = pos["shares"]
+                stop_ord.auxPrice       = stop_px
+                stop_ord.tif            = "GTC"
+                stop_ord.outsideRth     = False
+                trade = ib.placeOrder(contract, stop_ord)
+                await asyncio.sleep(0.5)
+                pos["stop_order_id"] = trade.order.orderId
+                pos["stop_type"]     = "STOP"
+                pos["stop_price"]    = stop_px
+                _st_log("FILLED", ticker,
+                        f"fill={fill_px:.2f} x{pos['shares']}sh stop@{stop_px:.2f} "
+                        f"(stp ord#{trade.order.orderId})")
+                _st_save_state()
+            else:
+                _st_log("BUY_LAPSED", ticker, "buy limit not filled / cancelled — removing")
+                to_remove.append(ticker)
+            continue
+
+        stop_oid = pos.get("stop_order_id")
+
+        # ── Phase 1: hard stop active (days 1-5) ──────────────────────────
+        if phase == 1:
+            if stop_oid and stop_oid not in open_trades_by_oid:
+                fill    = fills_by_oid.get(stop_oid)
+                exit_px = round(float(fill.execution.avgPrice), 4) if fill else pos.get("stop_price", pos["entry_price"])
+                pnl     = round((exit_px - pos["entry_price"]) * pos["shares"], 2)
+                _close_st_position(ticker, pos, exit_px, "hard_stop", pnl, days_held)
+                to_remove.append(ticker)
+                continue
+
+            # Day 5: phase 1 → phase 2 transition
+            if days_held >= 5:
+                contract = Stock(ticker, "SMART", "USD")
+                if stop_oid and stop_oid in open_trades_by_oid:
+                    ib.cancelOrder(open_trades_by_oid[stop_oid].order)
+                    await asyncio.sleep(1)
+                trail_ord = Order()
+                trail_ord.orderType     = "TRAIL"
+                trail_ord.action        = "SELL"
+                trail_ord.totalQuantity = pos["shares"]
+                trail_ord.trailingPercent = cfg["trail_pct"]
+                trail_ord.tif           = "GTC"
+                trail_ord.outsideRth    = False
+                trade = ib.placeOrder(contract, trail_ord)
+                await asyncio.sleep(0.5)
+                pos["stop_order_id"] = trade.order.orderId
+                pos["stop_type"]     = "TRAIL"
+                pos.pop("stop_price", None)
+                pos["phase"] = 2
+                _st_log("PHASE2", ticker,
+                        f"day {days_held}: hard stop cancelled, "
+                        f"TRAIL {cfg['trail_pct']}% placed (ord#{trade.order.orderId})")
+                _st_save_state()
+
+        # ── Phase 2: trailing stop active (days 5-30) ─────────────────────
+        elif phase == 2:
+            if stop_oid and stop_oid not in open_trades_by_oid:
+                fill    = fills_by_oid.get(stop_oid)
+                exit_px = round(float(fill.execution.avgPrice), 4) if fill else pos["entry_price"]
+                pnl     = round((exit_px - pos["entry_price"]) * pos["shares"], 2)
+                _close_st_position(ticker, pos, exit_px, "trail_stop", pnl, days_held)
+                to_remove.append(ticker)
+                continue
+
+            # Day 30: force close
+            if days_held >= cfg["max_hold_days"]:
+                if stop_oid and stop_oid in open_trades_by_oid:
+                    ib.cancelOrder(open_trades_by_oid[stop_oid].order)
+                    await asyncio.sleep(1)
+                contract = Stock(ticker, "SMART", "USD")
+                mkt_ord = Order()
+                mkt_ord.orderType      = "MKT"
+                mkt_ord.action         = "SELL"
+                mkt_ord.totalQuantity  = pos["shares"]
+                mkt_ord.tif            = "DAY"
+                trade = ib.placeOrder(contract, mkt_ord)
+                pos["phase"]          = 3
+                pos["stop_order_id"]  = trade.order.orderId
+                _st_log("FORCE_CLOSE", ticker,
+                        f"day {days_held}: max hold reached, MKT sell placed (ord#{trade.order.orderId})")
+                _st_save_state()
+
+        # ── Phase 3: market force-close in flight ─────────────────────────
+        elif phase == 3:
+            sell_oid = pos.get("stop_order_id")
+            if sell_oid and sell_oid not in open_trades_by_oid:
+                fill    = fills_by_oid.get(sell_oid)
+                exit_px = round(float(fill.execution.avgPrice), 4) if fill else pos["entry_price"]
+                pnl     = round((exit_px - pos["entry_price"]) * pos["shares"], 2)
+                _close_st_position(ticker, pos, exit_px, "max_hold", pnl, days_held)
+                to_remove.append(ticker)
+
+    for ticker in to_remove:
+        st["positions"].pop(ticker, None)
+    if to_remove:
+        _st_save_state()
+
+
+async def _stock_monitor_loop() -> None:
+    """Background task: monitor stock trader positions every 60 seconds."""
+    await asyncio.sleep(25)   # let server finish starting
+    while True:
+        await asyncio.sleep(60)
+        st = state["stock_trader"]
+        if not st["enabled"]:
+            continue
+        if not state.get("connected") or not state.get("ib"):
+            continue
+        ib = state["ib"]
+        if not ib.isConnected():
+            continue
+        loop = asyncio.get_event_loop()
+        try:
+            await loop.run_in_executor(
+                None,
+                lambda: _run_in_streaming_loop(_stock_monitor_coro(ib), timeout=50),
+            )
+        except Exception as exc:
+            log.error("Stock monitor loop error: %s", exc, exc_info=True)
+
+
 # ── FastAPI app ────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -5649,6 +5940,9 @@ async def lifespan(app: FastAPI):
 
     # Restore auto-trader positions + config from last shutdown
     _at_load_state()
+
+    # Restore stock trader state from last shutdown
+    _st_load_state()
 
     # Restore breakout watchlist
     _watchlist_load()
@@ -5672,6 +5966,8 @@ async def lifespan(app: FastAPI):
     log.info("Live streaming thread started")
     asyncio.create_task(_autotrader_background())
     log.info("Auto-trader background task started")
+    asyncio.create_task(_stock_monitor_loop())
+    log.info("Stock trader monitor loop started")
 
     # Run initial universe screen in background (non-blocking)
     async def _initial_screen():
@@ -8963,6 +9259,263 @@ def market_indexes():
             )
 
     return result
+
+
+# ── Stock Trader REST API ──────────────────────────────────────────────────
+
+class StockSignalRequest(BaseModel):
+    ticker:          str
+    price:           float
+    alert_fired_at:  Optional[str] = None   # ISO timestamp from scanner
+
+
+class StockConfigRequest(BaseModel):
+    position_size:        Optional[float] = None
+    max_positions:        Optional[int]   = None
+    hard_stop_pct:        Optional[float] = None
+    trail_pct:            Optional[float] = None
+    max_hold_days:        Optional[int]   = None
+    signal_freshness_min: Optional[int]   = None
+    limit_buffer_pct:     Optional[float] = None
+
+
+@app.post("/stock-trader/signal")
+async def stock_trader_signal(req: StockSignalRequest):
+    """Fast-path entry point called directly by breakout_scanner.py on BREAKOUT.
+
+    Eliminates the 5-minute AT polling delay — scanner fires this immediately,
+    backend places a LIMIT buy within seconds of signal detection.
+    """
+    from zoneinfo import ZoneInfo
+    st  = state["stock_trader"]
+    cfg = st["config"]
+
+    if not st["enabled"]:
+        return {"status": "skipped", "reason": "disabled"}
+
+    # Market hours check (09:30–15:50 ET, leaves 10 min buffer before close)
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+    if now_et.weekday() >= 5:
+        return {"status": "skipped", "reason": "weekend"}
+    mkt_open  = now_et.replace(hour=9,  minute=30, second=0, microsecond=0)
+    mkt_close = now_et.replace(hour=15, minute=50, second=0, microsecond=0)
+    if not (mkt_open <= now_et <= mkt_close):
+        return {"status": "skipped", "reason": "outside_hours"}
+
+    # Signal freshness check
+    if req.alert_fired_at:
+        try:
+            fired_at = datetime.fromisoformat(req.alert_fired_at)
+            # Make both timezone-aware for comparison
+            if fired_at.tzinfo is None:
+                fired_at = fired_at.replace(tzinfo=ZoneInfo("America/New_York"))
+            now_aware = now_et
+            age_min = (now_aware - fired_at).total_seconds() / 60
+            if age_min > cfg["signal_freshness_min"]:
+                _st_log("SKIPPED", req.ticker.upper(),
+                        f"stale signal ({age_min:.0f} min old, limit {cfg['signal_freshness_min']} min)")
+                return {"status": "skipped", "reason": "stale_signal", "age_min": round(age_min, 1)}
+        except Exception:
+            pass
+
+    ticker = req.ticker.upper()
+
+    # Duplicate check
+    if ticker in st["positions"]:
+        _st_log("SKIPPED", ticker, "already have open position")
+        return {"status": "skipped", "reason": "already_open"}
+
+    # Capacity check
+    if len(st["positions"]) >= cfg["max_positions"]:
+        _st_log("SKIPPED", ticker,
+                f"at capacity ({len(st['positions'])}/{cfg['max_positions']} positions)")
+        return {"status": "skipped", "reason": "at_capacity"}
+
+    # IBKR connection check
+    ib = state.get("ib")
+    if not ib or not ib.isConnected():
+        raise HTTPException(503, "IBKR not connected")
+
+    price   = req.price
+    shares  = max(1, int(cfg["position_size"] / price))
+    lmt_px  = round(price * (1 + cfg["limit_buffer_pct"] / 100), 2)
+    cost    = round(shares * price, 2)
+
+    async def _do_buy(ib):
+        contract = Stock(ticker, "SMART", "USD")
+        await ib.qualifyContractsAsync(contract)
+        if not contract.conId:
+            raise ValueError(f"Cannot qualify {ticker}")
+        buy_ord = LimitOrder("BUY", shares, lmt_px)
+        buy_ord.tif = "DAY"
+        trade = ib.placeOrder(contract, buy_ord)
+        await asyncio.sleep(0.5)
+        return trade.order.orderId
+
+    try:
+        loop   = asyncio.get_event_loop()
+        buy_id = await loop.run_in_executor(
+            None,
+            lambda: _run_in_streaming_loop(_do_buy(ib), timeout=15),
+        )
+    except (ValueError, TimeoutError, RuntimeError) as exc:
+        _st_log("ERROR", ticker, f"order placement failed: {exc}")
+        raise HTTPException(500, str(exc))
+
+    # Record pending position (phase 0 = waiting for fill)
+    st["positions"][ticker] = {
+        "entry_date":        date.today().isoformat(),
+        "entry_price":       price,        # will be updated to actual fill price
+        "shares":            shares,
+        "cost":              cost,
+        "buy_order_id":      buy_id,
+        "stop_order_id":     None,
+        "stop_type":         None,
+        "stop_price":        None,
+        "trading_days_held": 0,
+        "phase":             0,
+        "alert_fired_at":    req.alert_fired_at or now_et.isoformat(),
+    }
+    _st_log("ENTERED", ticker,
+            f"LIMIT BUY {shares}sh @ {lmt_px:.2f} (signal={price:.2f} "
+            f"cost=${cost:,.0f} ord#{buy_id})")
+    _st_save_state()
+
+    return {
+        "status":      "ordered",
+        "ticker":      ticker,
+        "shares":      shares,
+        "limit_price": lmt_px,
+        "cost":        cost,
+        "order_id":    buy_id,
+    }
+
+
+@app.get("/stock-trader/status")
+def stock_trader_status():
+    """All positions, config, recent decisions, and today's closed trades."""
+    st  = state["stock_trader"]
+    cfg = st["config"]
+
+    capital_deployed = sum(
+        p.get("shares", 0) * p.get("entry_price", 0)
+        for p in st["positions"].values()
+    )
+    today_pnl = sum(r.get("pnl", 0) for r in st.get("closed_today", []))
+
+    return {
+        "enabled":          st["enabled"],
+        "config":           cfg,
+        "positions":        st["positions"],
+        "closed_today":     st.get("closed_today", []),
+        "decisions":        st.get("decisions", [])[-50:],
+        "summary": {
+            "open_positions":    len(st["positions"]),
+            "capital_deployed":  round(capital_deployed, 2),
+            "today_pnl":         round(today_pnl, 2),
+            "today_trades":      len(st.get("closed_today", [])),
+        },
+    }
+
+
+@app.post("/stock-trader/enable")
+def stock_trader_enable(enabled: bool = True):
+    st = state["stock_trader"]
+    st["enabled"] = enabled
+    _st_log("CONFIG", "—", f"{'enabled' if enabled else 'disabled'} by user")
+    _st_save_state()
+    return {"enabled": st["enabled"]}
+
+
+@app.post("/stock-trader/config")
+def stock_trader_config(req: StockConfigRequest):
+    """Update any stock trader config keys."""
+    st  = state["stock_trader"]
+    cfg = st["config"]
+    updates: dict = req.model_dump(exclude_none=True)
+    cfg.update(updates)
+    _st_log("CONFIG", "—", f"updated: {updates}")
+    _st_save_state()
+    return {"config": cfg}
+
+
+@app.post("/stock-trader/close/{ticker}")
+async def stock_trader_close(ticker: str):
+    """Manually market-close a stock position immediately."""
+    ticker = ticker.upper()
+    st     = state["stock_trader"]
+    pos    = st["positions"].get(ticker)
+    if not pos:
+        raise HTTPException(404, f"{ticker} not in open stock positions")
+
+    ib = state.get("ib")
+    if not ib or not ib.isConnected():
+        raise HTTPException(503, "IBKR not connected")
+
+    stop_oid = pos.get("stop_order_id")
+
+    async def _do_close(ib):
+        open_trades_by_oid = {t.order.orderId: t for t in ib.openTrades()}
+        # Cancel any open stop/trail order first
+        if stop_oid and stop_oid in open_trades_by_oid:
+            ib.cancelOrder(open_trades_by_oid[stop_oid].order)
+            await asyncio.sleep(1)
+        # Place market sell
+        contract = Stock(ticker, "SMART", "USD")
+        mkt_ord = Order()
+        mkt_ord.orderType     = "MKT"
+        mkt_ord.action        = "SELL"
+        mkt_ord.totalQuantity = pos["shares"]
+        mkt_ord.tif           = "DAY"
+        trade = ib.placeOrder(contract, mkt_ord)
+        await asyncio.sleep(0.5)
+        return trade.order.orderId
+
+    loop   = asyncio.get_event_loop()
+    sell_id = await loop.run_in_executor(
+        None,
+        lambda: _run_in_streaming_loop(_do_close(ib), timeout=15),
+    )
+    pos["phase"]         = 3
+    pos["stop_order_id"] = sell_id
+    _st_log("MANUAL_CLOSE", ticker,
+            f"MKT SELL {pos['shares']}sh placed (ord#{sell_id})")
+    _st_save_state()
+
+    return {"status": "closing", "ticker": ticker, "order_id": sell_id}
+
+
+@app.get("/stock-trader/history")
+def stock_trader_history(days: int = Query(30, ge=1, le=365)):
+    """Closed stock breakout trades from trade_journal (STOCK_BREAKOUT strategy)."""
+    try:
+        cutoff = (datetime.utcnow() - timedelta(days=days)).date().isoformat()
+        con = sqlite3.connect(JOURNAL_DB_PATH, check_same_thread=False)
+        con.row_factory = sqlite3.Row
+        rows = con.execute("""
+            SELECT opened_at, closed_at, ticker, qty, entry_price, exit_price,
+                   pnl, pnl_pct, win, exit_reason, strategy_type
+            FROM trade_journal
+            WHERE strategy_type = 'STOCK_BREAKOUT'
+              AND closed_at IS NOT NULL
+              AND closed_at >= ?
+            ORDER BY closed_at DESC
+        """, (cutoff,)).fetchall()
+        con.close()
+        trades = [dict(r) for r in rows]
+        total  = len(trades)
+        wins   = sum(1 for t in trades if t.get("win"))
+        total_pnl = sum(t.get("pnl", 0) or 0 for t in trades)
+        return {
+            "trades":    trades,
+            "total":     total,
+            "wins":      wins,
+            "win_rate":  round(wins / total * 100, 1) if total else 0,
+            "total_pnl": round(total_pnl, 2),
+            "days":      days,
+        }
+    except Exception as exc:
+        raise HTTPException(500, str(exc))
 
 
 # ── Live Tape WebSocket ─────────────────────────────────────────────────────
