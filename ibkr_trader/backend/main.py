@@ -3982,6 +3982,11 @@ def _tape_db_init() -> None:
         )
     """)
     con.execute("CREATE INDEX IF NOT EXISTS idx_st_date ON state_transitions (session_date, ticker)")
+    # Migrate state_transitions — add close_price for intraday return analysis
+    try:
+        con.execute("ALTER TABLE state_transitions ADD COLUMN close_price REAL")
+    except Exception:
+        pass
     # Migrate existing alert_history rows — add new columns if absent (safe for existing DBs)
     for col, typedef in [("prev_state", "TEXT"), ("mins_in_pre_breakout", "INTEGER"), ("state_path", "TEXT")]:
         try:
@@ -8008,6 +8013,215 @@ async def performance_indicators(days: int = Query(30)):
     loop = asyncio.get_event_loop()
     result = await loop.run_in_executor(None, lambda: _compute_indicator_analysis(days))
     return result
+
+
+@app.get("/performance/state-outcomes")
+def performance_state_outcomes(days: int = Query(30)):
+    """Analyze breakout state machine entry/exit outcomes.
+
+    Conversion funnel: how many PRE-BREAKOUT setups convert to BREAKOUT vs fail.
+    Intraday return: when close_price is available at both entry and exit transitions,
+    compute entry→exit return. Historical rows pre-dating the close_price migration
+    will show counts but no return stats.
+    """
+    from collections import defaultdict
+    cutoff = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
+    con = sqlite3.connect(TAPE_DB_PATH, check_same_thread=False)
+    con.row_factory = sqlite3.Row
+    rows = [dict(r) for r in con.execute(
+        """SELECT ticker, session_date, prev_state, new_state, pct_b, rsi,
+                  transition_time_et, mins_in_prev_state, close_price
+           FROM state_transitions WHERE session_date >= ?
+           ORDER BY session_date, ticker, transition_time_et""",
+        (cutoff,)
+    ).fetchall()]
+    # EOD returns for correlation: ticker+date → eod_return_pct
+    eod_map = {}
+    for r in con.execute(
+        "SELECT ticker, session_date, eod_return_pct, is_win FROM alert_performance WHERE session_date >= ?",
+        (cutoff,)
+    ).fetchall():
+        eod_map[(r["ticker"], r["session_date"])] = {
+            "eod_return_pct": r["eod_return_pct"], "is_win": r["is_win"]
+        }
+    con.close()
+
+    _BULLISH = {"PRE-BREAKOUT", "BREAKOUT", "EXTENDED"}
+
+    def _ret_stats(returns):
+        if not returns:
+            return {"win_rate": None, "avg_return": None, "best": None, "worst": None, "with_price_data": 0}
+        wins = sum(1 for r in returns if r > 0)
+        return {
+            "win_rate":       round(wins / len(returns) * 100, 1),
+            "avg_return":     round(sum(returns) / len(returns), 2),
+            "best":           round(max(returns), 2),
+            "worst":          round(min(returns), 2),
+            "with_price_data": len(returns),
+        }
+
+    # Group transitions by (ticker, session_date)
+    by_day: dict = defaultdict(list)
+    for r in rows:
+        by_day[(r["ticker"], r["session_date"])].append(r)
+
+    # ── Setup funnel: non-bullish → PRE-BREAKOUT ──────────────────────────────
+    setup_groups: dict = defaultdict(list)   # key = "PREV→PRE-BREAKOUT"
+    breakout_warm: list = []   # BREAKOUT via PRE-BREAKOUT path
+    breakout_cold: list = []   # BREAKOUT direct from NEUTRAL/WEAKENING
+
+    for (ticker, session_date), trans in by_day.items():
+        trans.sort(key=lambda x: x["transition_time_et"])
+        eod = eod_map.get((ticker, session_date), {})
+
+        for i, t in enumerate(trans):
+            subsequent = trans[i + 1:]
+
+            # ── Setup entry: → PRE-BREAKOUT from non-bullish ──────────────
+            if t["new_state"] == "PRE-BREAKOUT" and t["prev_state"] not in _BULLISH:
+                reached_bo = any(s["new_state"] == "BREAKOUT" for s in subsequent)
+                failed = any(
+                    s["prev_state"] == "PRE-BREAKOUT" and s["new_state"] not in _BULLISH
+                    for s in subsequent
+                )
+                # First exit (BREAKOUT conversion OR fade)
+                exit_t = None
+                for s in subsequent:
+                    if s["new_state"] == "BREAKOUT" or (
+                        s["prev_state"] == "PRE-BREAKOUT" and s["new_state"] not in _BULLISH
+                    ):
+                        exit_t = s
+                        break
+
+                entry_price = t.get("close_price")
+                exit_price  = exit_t.get("close_price") if exit_t else None
+                intra_ret   = round((exit_price - entry_price) / entry_price * 100, 2) \
+                              if (entry_price and exit_price and entry_price > 0) else None
+
+                setup_groups[f"{t['prev_state']}→PRE-BREAKOUT"].append({
+                    "ticker":          ticker,
+                    "session_date":    session_date,
+                    "entry_time":      t["transition_time_et"],
+                    "reached_breakout": reached_bo,
+                    "failed":          failed,
+                    "still_active":    not reached_bo and not failed,
+                    "exit_type":       exit_t["new_state"] if exit_t else None,
+                    "intra_ret":       intra_ret,
+                    "eod_ret":         eod.get("eod_return_pct"),
+                    "is_win":          eod.get("is_win"),
+                })
+
+            # ── Breakout entry ─────────────────────────────────────────────
+            if t["new_state"] == "BREAKOUT":
+                went_ext = any(s["new_state"] == "EXTENDED" for s in subsequent)
+                faded    = any(
+                    s["prev_state"] in {"BREAKOUT", "EXTENDED"} and
+                    s["new_state"] not in _BULLISH
+                    for s in subsequent
+                )
+                exit_t = None
+                for s in subsequent:
+                    if (s["prev_state"] in {"BREAKOUT", "EXTENDED"}
+                            and s["new_state"] not in _BULLISH):
+                        exit_t = s
+                        break
+
+                entry_price = t.get("close_price")
+                exit_price  = exit_t.get("close_price") if exit_t else None
+                intra_ret   = round((exit_price - entry_price) / entry_price * 100, 2) \
+                              if (entry_price and exit_price and entry_price > 0) else None
+
+                rec = {
+                    "ticker":       ticker,
+                    "session_date": session_date,
+                    "prev_state":   t["prev_state"],
+                    "went_extended": went_ext,
+                    "faded":        faded,
+                    "exit_type":    exit_t["new_state"] if exit_t else None,
+                    "intra_ret":    intra_ret,
+                    "eod_ret":      eod.get("eod_return_pct"),
+                    "is_win":       eod.get("is_win"),
+                }
+                if t["prev_state"] == "PRE-BREAKOUT":
+                    breakout_warm.append(rec)
+                else:
+                    breakout_cold.append(rec)
+
+    # ── Build funnel summary ──────────────────────────────────────────────────
+    funnel = []
+    for entry_label, entries in sorted(setup_groups.items(),
+                                        key=lambda x: -len(x[1])):
+        n = len(entries)
+        converted = sum(1 for e in entries if e["reached_breakout"])
+        failed    = sum(1 for e in entries if e["failed"])
+        intra_rets = [e["intra_ret"] for e in entries if e["intra_ret"] is not None]
+        eod_rets   = [e["eod_ret"] for e in entries
+                      if e["eod_ret"] is not None and e["reached_breakout"]]
+        funnel.append({
+            "entry":             entry_label,
+            "count":             n,
+            "pct_converted":     round(converted / n * 100, 1),
+            "pct_failed":        round(failed    / n * 100, 1),
+            "pct_still_active":  round((n - converted - failed) / n * 100, 1),
+            **_ret_stats(intra_rets),
+            "eod_win_rate":      round(sum(1 for r in eod_rets if r > 0) / len(eod_rets) * 100, 1)
+                                 if eod_rets else None,
+            "eod_avg_return":    round(sum(eod_rets) / len(eod_rets), 2) if eod_rets else None,
+        })
+
+    # ── Breakout quality (warm vs cold) ──────────────────────────────────────
+    def _bo_block(entries):
+        n = len(entries)
+        if n == 0:
+            return {"count": 0}
+        went_ext = sum(1 for e in entries if e["went_extended"])
+        faded    = sum(1 for e in entries if e["faded"])
+        intra_rets = [e["intra_ret"] for e in entries if e["intra_ret"] is not None]
+        eod_rets   = [e["eod_ret"]   for e in entries if e["eod_ret"]   is not None]
+        return {
+            "count":          n,
+            "pct_extended":   round(went_ext / n * 100, 1),
+            "pct_faded":      round(faded    / n * 100, 1),
+            "pct_held":       round((n - faded) / n * 100, 1),
+            **_ret_stats(intra_rets),
+            "eod_win_rate":   round(sum(1 for r in eod_rets if r > 0) / len(eod_rets) * 100, 1)
+                              if eod_rets else None,
+            "eod_avg_return": round(sum(eod_rets) / len(eod_rets), 2) if eod_rets else None,
+        }
+
+    # ── Exit type analysis ────────────────────────────────────────────────────
+    exit_buckets: dict = defaultdict(list)
+    for e in list(setup_groups.values())[0:0]:   # just to initialise pattern
+        pass
+    for entries in setup_groups.values():
+        for e in entries:
+            if e["exit_type"]:
+                exit_buckets[e["exit_type"]].append(e)
+    for e in breakout_warm + breakout_cold:
+        if e["exit_type"]:
+            exit_buckets[e["exit_type"]].append(e)
+
+    exit_summary = []
+    for exit_type, entries in sorted(exit_buckets.items()):
+        intra = [e["intra_ret"] for e in entries if e["intra_ret"] is not None]
+        exit_summary.append({
+            "exit_type": exit_type,
+            "count":     len(entries),
+            **_ret_stats(intra),
+        })
+
+    return {
+        "days":               days,
+        "total_transitions":  len(rows),
+        "setup_entries":      sum(len(v) for v in setup_groups.values()),
+        "breakout_entries":   len(breakout_warm) + len(breakout_cold),
+        "funnel":             funnel,
+        "breakout": {
+            "via_pre_breakout": _bo_block(breakout_warm),
+            "cold_jump":        _bo_block(breakout_cold),
+        },
+        "exits": exit_summary,
+    }
 
 
 @app.post("/performance/enrich")

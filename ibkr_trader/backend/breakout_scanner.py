@@ -806,17 +806,17 @@ def _fmt_duration(since: datetime) -> str:
 
 def _persist_state_transition(session_date: str, tk: str, prev_state: str, new_state: str,
                               pct_b: float, rsi: float | None, now: datetime,
-                              mins_in_prev: int) -> None:
+                              mins_in_prev: int, close_price: float | None = None) -> None:
     """Write one state transition row to state_transitions table (fire-and-forget)."""
     try:
         con = sqlite3.connect(TAPE_DB, check_same_thread=False)
         con.execute(
             """INSERT INTO state_transitions
                (session_date, ticker, prev_state, new_state, pct_b, rsi,
-                transition_time_et, mins_in_prev_state)
-               VALUES (?,?,?,?,?,?,?,?)""",
+                transition_time_et, mins_in_prev_state, close_price)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
             (session_date, tk, prev_state, new_state, pct_b,
-             rsi, now.strftime("%H:%M:%S"), mins_in_prev),
+             rsi, now.strftime("%H:%M:%S"), mins_in_prev, close_price),
         )
         con.commit()
         con.close()
@@ -906,6 +906,7 @@ def process_state_transitions(
         _persist_state_transition(
             session_date, tk, prev_state, new_state,
             ind["pct_b"], rsi_val, now, mins_in_prev,
+            close_price=ind.get("price"),
         )
 
         result = _transition_alert(prev_state, new_state)

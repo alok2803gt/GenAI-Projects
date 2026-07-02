@@ -5267,6 +5267,9 @@ function PerformanceTab() {
   const [analysis, setAnalysis]     = useState(null);
   const [analysisLoading, setAnalysisLoading] = useState(false);
   const [recentDays, setRecentDays] = useState([]);
+  const [showStateOutcomes, setShowStateOutcomes] = useState(false);
+  const [stateOutcomes, setStateOutcomes]         = useState(null);
+  const [stateOutcomesLoading, setStateOutcomesLoading] = useState(false);
 
   const loadDay = async (d) => {
     setLoading(true);
@@ -5305,6 +5308,17 @@ function PerformanceTab() {
       setAnalysis(r);
     } catch(_) {}
     finally { setAnalysisLoading(false); }
+  };
+
+  const loadStateOutcomes = async () => {
+    if (stateOutcomes) { setShowStateOutcomes(s => !s); return; }
+    setShowStateOutcomes(true);
+    setStateOutcomesLoading(true);
+    try {
+      const r = await apiFetch("/performance/state-outcomes?days=30");
+      setStateOutcomes(r);
+    } catch(_) {}
+    finally { setStateOutcomesLoading(false); }
   };
 
   const fmtRet = (v) => v == null ? "—" : `${v >= 0 ? "+" : ""}${v.toFixed(2)}%`;
@@ -5463,6 +5477,128 @@ function PerformanceTab() {
               </table>
             </div>
           )}
+
+          <div style={{ border: `1px solid ${C.border}`, borderRadius: 8, overflow: "hidden", marginBottom: 10 }}>
+            <button onClick={loadStateOutcomes} style={{ width: "100%", display: "flex", justifyContent: "space-between", alignItems: "center",
+              padding: "12px 16px", background: C.surface, border: "none", cursor: "pointer", ...sans, fontSize: 13, fontWeight: 600, color: C.white }}>
+              <span>State Machine Outcomes (last 30 days)</span>
+              <span style={{ ...mono, fontSize: 14, color: C.accent }}>{showStateOutcomes ? "▲" : "▼"}</span>
+            </button>
+            {showStateOutcomes && (
+              <div style={{ padding: "16px", borderTop: `1px solid ${C.border}`, background: C.bg }}>
+                {stateOutcomesLoading ? (
+                  <div style={{ color: C.muted, ...sans, fontSize: 13, textAlign: "center", padding: "20px 0" }}>Loading…</div>
+                ) : !stateOutcomes ? (
+                  <div style={{ color: C.muted, ...sans, fontSize: 13 }}>No data</div>
+                ) : (
+                  <>
+                    <div style={{ ...sans, fontSize: 11, color: C.muted, marginBottom: 16 }}>
+                      {stateOutcomes.total_transitions} total transitions · {stateOutcomes.setup_entries} setup entries · {stateOutcomes.breakout_entries} breakout entries
+                      <span style={{ marginLeft: 8, color: "#f59e0b" }}>· Intraday returns available only for transitions recorded after today's update</span>
+                    </div>
+
+                    {/* Conversion Funnel */}
+                    {stateOutcomes.funnel?.length > 0 && (
+                      <div style={{ marginBottom: 20 }}>
+                        <div style={{ ...sans, fontSize: 11, fontWeight: 700, color: C.muted, textTransform: "uppercase", letterSpacing: 1, marginBottom: 6 }}>Setup Funnel — Pre-Breakout Entries</div>
+                        <table style={{ width: "100%", borderCollapse: "collapse", ...sans, fontSize: 12 }}>
+                          <thead>
+                            <tr style={{ borderBottom: `1px solid ${C.border}` }}>
+                              {["Entry Transition","Count","→ BREAKOUT","Failed","Still Active","Intra Win%","Intra Avg Ret","EOD Win%","EOD Avg Ret"].map(h => (
+                                <th key={h} style={{ padding: "5px 8px", textAlign: "left", color: C.muted, fontSize: 10, fontWeight: 600, textTransform: "uppercase" }}>{h}</th>
+                              ))}
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {stateOutcomes.funnel.map((r, i) => (
+                              <tr key={i} style={{ borderBottom: `1px solid ${C.border}33` }}>
+                                <td style={{ padding: "6px 8px", ...mono, fontSize: 11, color: "#f59e0b", fontWeight: 700 }}>{r.entry}</td>
+                                <td style={{ padding: "6px 8px", color: C.muted }}>{r.count}</td>
+                                <td style={{ padding: "6px 8px", color: "#16a34a", fontWeight: 700 }}>{r.pct_converted}%</td>
+                                <td style={{ padding: "6px 8px", color: "#dc2626" }}>{r.pct_failed}%</td>
+                                <td style={{ padding: "6px 8px", color: C.muted }}>{r.pct_still_active}%</td>
+                                <td style={{ padding: "6px 8px", color: r.win_rate != null ? winColor(r.win_rate) : C.muted, fontWeight: 700 }}>{r.win_rate != null ? `${r.win_rate}%` : "—"}</td>
+                                <td style={{ padding: "6px 8px", color: retColor(r.avg_return), fontWeight: 600 }}>{r.avg_return != null ? fmtRet(r.avg_return) : "—"}</td>
+                                <td style={{ padding: "6px 8px", color: r.eod_win_rate != null ? winColor(r.eod_win_rate) : C.muted, fontWeight: 700 }}>{r.eod_win_rate != null ? `${r.eod_win_rate}%` : "—"}</td>
+                                <td style={{ padding: "6px 8px", color: retColor(r.eod_avg_return), fontWeight: 600 }}>{r.eod_avg_return != null ? fmtRet(r.eod_avg_return) : "—"}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
+
+                    {/* Breakout Quality: warm vs cold */}
+                    {stateOutcomes.breakout && (
+                      <div style={{ marginBottom: 20 }}>
+                        <div style={{ ...sans, fontSize: 11, fontWeight: 700, color: C.muted, textTransform: "uppercase", letterSpacing: 1, marginBottom: 6 }}>Breakout Quality — 2-step vs Cold Jump</div>
+                        <table style={{ width: "100%", borderCollapse: "collapse", ...sans, fontSize: 12 }}>
+                          <thead>
+                            <tr style={{ borderBottom: `1px solid ${C.border}` }}>
+                              {["Path","Count","→ Extended","Faded","Held","Intra Win%","Intra Avg Ret","EOD Win%","EOD Avg Ret"].map(h => (
+                                <th key={h} style={{ padding: "5px 8px", textAlign: "left", color: C.muted, fontSize: 10, fontWeight: 600, textTransform: "uppercase" }}>{h}</th>
+                              ))}
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {[
+                              { label: "PRE-BREAKOUT → BREAKOUT", d: stateOutcomes.breakout.via_pre_breakout },
+                              { label: "Cold jump → BREAKOUT",     d: stateOutcomes.breakout.cold_jump },
+                            ].filter(x => x.d?.count > 0).map(({ label, d }, i) => (
+                              <tr key={i} style={{ borderBottom: `1px solid ${C.border}33` }}>
+                                <td style={{ padding: "6px 8px", ...mono, fontSize: 11, color: i === 0 ? "#16a34a" : "#f59e0b", fontWeight: 700 }}>{label}</td>
+                                <td style={{ padding: "6px 8px", color: C.muted }}>{d.count}</td>
+                                <td style={{ padding: "6px 8px", color: "#f59e0b" }}>{d.pct_extended ?? "—"}%</td>
+                                <td style={{ padding: "6px 8px", color: "#dc2626" }}>{d.pct_faded ?? "—"}%</td>
+                                <td style={{ padding: "6px 8px", color: "#16a34a" }}>{d.pct_held ?? "—"}%</td>
+                                <td style={{ padding: "6px 8px", color: d.win_rate != null ? winColor(d.win_rate) : C.muted, fontWeight: 700 }}>{d.win_rate != null ? `${d.win_rate}%` : "—"}</td>
+                                <td style={{ padding: "6px 8px", color: retColor(d.avg_return), fontWeight: 600 }}>{d.avg_return != null ? fmtRet(d.avg_return) : "—"}</td>
+                                <td style={{ padding: "6px 8px", color: d.eod_win_rate != null ? winColor(d.eod_win_rate) : C.muted, fontWeight: 700 }}>{d.eod_win_rate != null ? `${d.eod_win_rate}%` : "—"}</td>
+                                <td style={{ padding: "6px 8px", color: retColor(d.eod_avg_return), fontWeight: 600 }}>{d.eod_avg_return != null ? fmtRet(d.eod_avg_return) : "—"}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
+
+                    {/* Exit analysis */}
+                    {stateOutcomes.exits?.length > 0 && (
+                      <div>
+                        <div style={{ ...sans, fontSize: 11, fontWeight: 700, color: C.muted, textTransform: "uppercase", letterSpacing: 1, marginBottom: 6 }}>Exit Analysis — What Happened at Each Exit State</div>
+                        <table style={{ width: "100%", borderCollapse: "collapse", ...sans, fontSize: 12 }}>
+                          <thead>
+                            <tr style={{ borderBottom: `1px solid ${C.border}` }}>
+                              {["Exit State","Occurrences","With Price Data","Win %","Avg Return at Exit"].map(h => (
+                                <th key={h} style={{ padding: "5px 8px", textAlign: "left", color: C.muted, fontSize: 10, fontWeight: 600, textTransform: "uppercase" }}>{h}</th>
+                              ))}
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {stateOutcomes.exits.map((r, i) => {
+                              const exitColor = r.exit_type === "BREAKOUT" ? "#16a34a"
+                                : r.exit_type === "EXTENDED" ? "#f59e0b"
+                                : r.exit_type === "NEUTRAL" ? C.muted
+                                : "#dc2626";
+                              return (
+                                <tr key={i} style={{ borderBottom: `1px solid ${C.border}33` }}>
+                                  <td style={{ padding: "6px 8px", ...mono, fontSize: 11, color: exitColor, fontWeight: 700 }}>{r.exit_type}</td>
+                                  <td style={{ padding: "6px 8px", color: C.muted }}>{r.count}</td>
+                                  <td style={{ padding: "6px 8px", color: C.muted }}>{r.with_price_data}</td>
+                                  <td style={{ padding: "6px 8px", color: r.win_rate != null ? winColor(r.win_rate) : C.muted, fontWeight: 700 }}>{r.win_rate != null ? `${r.win_rate}%` : "—"}</td>
+                                  <td style={{ padding: "6px 8px", color: retColor(r.avg_return), fontWeight: 600 }}>{r.avg_return != null ? fmtRet(r.avg_return) : "—"}</td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
+                  </>
+                )}
+              </div>
+            )}
+          </div>
 
           <div style={{ border: `1px solid ${C.border}`, borderRadius: 8, overflow: "hidden" }}>
             <button onClick={loadAnalysis} style={{ width: "100%", display: "flex", justifyContent: "space-between", alignItems: "center",
