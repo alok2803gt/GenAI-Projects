@@ -9709,6 +9709,10 @@ def _dt_load_state() -> None:
             tk: pos for tk, pos in saved.get("positions", {}).items()
             if pos.get("entry_date") == today
         }
+        # Clear stale live prices on load — monitor will repopulate them fresh
+        for pos in restored.values():
+            pos.pop("live_price", None)
+            pos.pop("live_pnl", None)
         dt["positions"]    = restored
         dt["closed_today"] = [r for r in saved.get("closed_today", [])
                                if r.get("exit_date") == today]
@@ -9788,31 +9792,47 @@ async def _day_trader_monitor_coro(ib) -> None:
         if oid and oid > 0:
             fills_by_oid[oid] = f
 
-    # Live prices from portfolio
-    try:
-        portfolio_map = {
-            item.contract.symbol: item
-            for item in ib.portfolio()
-            if hasattr(item.contract, "symbol")
-        }
-    except Exception:
-        portfolio_map = {}
+    # Live prices via reqTickersAsync for all phase-1 positions.
+    # We intentionally avoid portfolio.marketPrice — it can bleed in other lots
+    # (e.g., auto-hedge SPY puts showing as SPY price) and is unreliable in paper.
+    ticker_snapshot: dict = {}
+    phase1_tickers = [t for t, p in dt["positions"].items() if p.get("phase", 0) == 1]
+    if phase1_tickers:
+        try:
+            from ib_insync import Stock as IbStock
+            contracts = [IbStock(t, "SMART", "USD") for t in phase1_tickers]
+            tickers = await ib.reqTickersAsync(*contracts)
+            for tk in tickers:
+                sym = tk.contract.symbol
+                mid = None
+                if tk.ask > 0 and tk.bid > 0:
+                    mid = (tk.bid + tk.ask) / 2
+                elif tk.close > 0:
+                    # prefer official EOD close over last (last can be option cross-contamination)
+                    mid = tk.close
+                elif tk.last > 1.0:
+                    # only use last if it's plausibly a stock price (> $1)
+                    mid = tk.last
+                if mid:
+                    ticker_snapshot[sym] = round(mid, 4)
+        except Exception as ex:
+            log.debug("Day trader reqTickers failed: %s", ex)
 
     to_remove: list[str] = []
 
     for ticker, pos in list(dt["positions"].items()):
         phase = pos.get("phase", 0)
 
-        # Refresh live price / pnl from portfolio
-        pi = portfolio_map.get(ticker)
-        if pi is not None:
-            try:
-                mpx = float(pi.marketPrice or 0)
-                if mpx > 0:
-                    pos["live_price"] = round(mpx, 4)
-                    pos["live_pnl"]   = round(float(pi.unrealizedPNL or 0), 2)
-            except Exception:
-                pass
+        # Refresh live price / pnl — portfolio first, then ticker snapshot
+        if ticker in ticker_snapshot:
+            pos["live_price"] = ticker_snapshot[ticker]
+
+        # Always compute P&L from our specific entry and shares — isolates this
+        # day-trade lot from any other lots (hedges, long-term holds) in the account
+        if pos.get("live_price") and pos.get("entry_price"):
+            pos["live_pnl"] = round(
+                (pos["live_price"] - pos["entry_price"]) * pos.get("shares", 0), 2
+            )
 
         # ── Phase 0: waiting for buy fill ─────────────────────────────────
         if phase == 0:
@@ -9849,20 +9869,40 @@ async def _day_trader_monitor_coro(ib) -> None:
                 pos["stop_price"]   = stop_px
                 pos["profit_price"] = profit_px
                 contract = Stock(ticker, "SMART", "USD")
+                oca_group = f"DT_{ticker}_{trade.order.orderId if 'trade' in dir() else buy_oid}"
+
+                # Stop-loss: native STP order — fires immediately at IBKR
                 stop_ord = Order()
                 stop_ord.orderType     = "STP"
                 stop_ord.action        = "SELL"
                 stop_ord.totalQuantity = pos["shares"]
                 stop_ord.auxPrice      = stop_px
-                stop_ord.tif           = "DAY"   # expires at close — day trade
+                stop_ord.tif           = "DAY"
                 stop_ord.outsideRth    = False
-                trade = ib.placeOrder(contract, stop_ord)
+                stop_ord.ocaGroup      = oca_group
+                stop_ord.ocaType       = 1   # cancel remaining on fill
+                stp_trade = ib.placeOrder(contract, stop_ord)
+
+                # Profit target: native LMT order — fires immediately at IBKR
+                # No polling needed; IBKR cancels the STP when this fills
+                lmt_ord = Order()
+                lmt_ord.orderType     = "LMT"
+                lmt_ord.action        = "SELL"
+                lmt_ord.totalQuantity = pos["shares"]
+                lmt_ord.lmtPrice      = profit_px
+                lmt_ord.tif           = "DAY"
+                lmt_ord.outsideRth    = False
+                lmt_ord.ocaGroup      = oca_group
+                lmt_ord.ocaType       = 1
+                lmt_trade = ib.placeOrder(contract, lmt_ord)
+
                 await asyncio.sleep(0.5)
-                pos["stop_order_id"] = trade.order.orderId
+                pos["stop_order_id"]   = stp_trade.order.orderId
+                pos["target_order_id"] = lmt_trade.order.orderId
                 _dt_log("FILLED", ticker,
                         f"fill={fill_px:.2f} x{pos['shares']}sh "
-                        f"stop@{stop_px:.2f} target@{profit_px:.2f} "
-                        f"(stp ord#{trade.order.orderId})")
+                        f"stop@{stop_px:.2f} (ord#{stp_trade.order.orderId}) "
+                        f"target@{profit_px:.2f} (ord#{lmt_trade.order.orderId})")
                 _dt_save_state()
             else:
                 _dt_log("BUY_LAPSED", ticker, "buy limit not filled — removing")
@@ -9882,9 +9922,19 @@ async def _day_trader_monitor_coro(ib) -> None:
             continue
 
         # ── Phase 1: active intraday position ─────────────────────────────
-        stop_oid = pos.get("stop_order_id")
+        stop_oid   = pos.get("stop_order_id")
+        target_oid = pos.get("target_order_id")
 
-        # Stop loss hit?
+        # Profit target LMT filled? (IBKR OCA cancels the STP automatically)
+        if target_oid and target_oid not in open_trades_by_oid:
+            fill    = fills_by_oid.get(target_oid)
+            exit_px = round(float(fill.execution.avgPrice), 4) if fill else pos.get("profit_price", pos["entry_price"])
+            pnl     = round((exit_px - pos["entry_price"]) * pos["shares"], 2)
+            _close_dt_position(ticker, pos, exit_px, "profit_target", pnl)
+            to_remove.append(ticker)
+            continue
+
+        # Stop loss STP filled? (IBKR OCA cancels the LMT automatically)
         if stop_oid and stop_oid not in open_trades_by_oid:
             fill    = fills_by_oid.get(stop_oid)
             exit_px = round(float(fill.execution.avgPrice), 4) if fill else pos.get("stop_price", pos["entry_price"])
@@ -9893,34 +9943,35 @@ async def _day_trader_monitor_coro(ib) -> None:
             to_remove.append(ticker)
             continue
 
-        live_px = pos.get("live_price") or pos.get("entry_price", 0)
-
-        # Profit target reached?
-        if live_px >= pos.get("profit_price", float("inf")):
-            if stop_oid and stop_oid in open_trades_by_oid:
-                ib.cancelOrder(open_trades_by_oid[stop_oid].order)
+        # Fallback poll for positions that pre-date the OCA bracket (no target_order_id).
+        # New positions exit via the native LMT order above; this catches legacy ones.
+        if not target_oid:
+            live_px = pos.get("live_price") or 0
+            if live_px and live_px >= pos.get("profit_price", float("inf")):
+                for oid in (stop_oid,):
+                    if oid and oid in open_trades_by_oid:
+                        ib.cancelOrder(open_trades_by_oid[oid].order)
                 await asyncio.sleep(0.5)
-            contract = Stock(ticker, "SMART", "USD")
-            mkt_ord = Order()
-            mkt_ord.orderType     = "MKT"
-            mkt_ord.action        = "SELL"
-            mkt_ord.totalQuantity = pos["shares"]
-            mkt_ord.tif           = "DAY"
-            trade = ib.placeOrder(contract, mkt_ord)
-            await asyncio.sleep(0.5)
-            pos["phase"]             = 3
-            pos["stop_order_id"]     = trade.order.orderId
-            pos["pending_exit_type"] = "profit_target"
-            _dt_log("PROFIT_TARGET", ticker,
-                    f"live={live_px:.2f} >= target={pos['profit_price']:.2f}, MKT SELL (ord#{trade.order.orderId})")
-            _dt_save_state()
-            continue
+                contract = Stock(ticker, "SMART", "USD")
+                mkt_ord = Order()
+                mkt_ord.orderType = "MKT"; mkt_ord.action = "SELL"
+                mkt_ord.totalQuantity = pos["shares"]; mkt_ord.tif = "DAY"
+                t = ib.placeOrder(contract, mkt_ord)
+                await asyncio.sleep(0.5)
+                pos["phase"] = 3; pos["stop_order_id"] = t.order.orderId
+                pos["pending_exit_type"] = "profit_target"
+                _dt_log("PROFIT_TARGET", ticker,
+                        f"poll: live={live_px:.2f} >= target={pos['profit_price']:.2f} (ord#{t.order.orderId})")
+                _dt_save_state()
+                continue
 
         # Force-close time reached?
         if now_et >= force_close_dt:
-            if stop_oid and stop_oid in open_trades_by_oid:
-                ib.cancelOrder(open_trades_by_oid[stop_oid].order)
-                await asyncio.sleep(0.5)
+            # Cancel both OCA legs before placing MKT override
+            for oid in (stop_oid, target_oid):
+                if oid and oid in open_trades_by_oid:
+                    ib.cancelOrder(open_trades_by_oid[oid].order)
+            await asyncio.sleep(0.5)
             contract = Stock(ticker, "SMART", "USD")
             mkt_ord = Order()
             mkt_ord.orderType     = "MKT"
@@ -10093,22 +10144,75 @@ async def day_trader_signal(req: StockSignalRequest):
 def day_trader_status():
     dt  = state["day_trader"]
     cfg = dt["config"]
+    open_positions = dt["positions"]
+    closed         = dt.get("closed_today", [])
+
     capital_deployed = sum(
         p.get("shares", 0) * p.get("entry_price", 0)
-        for p in dt["positions"].values()
+        for p in open_positions.values()
     )
-    today_pnl = sum(r.get("pnl", 0) for r in dt.get("closed_today", []))
+    closed_pnl = sum(r.get("pnl", 0) for r in closed)
+    open_pnl   = sum(
+        p.get("live_pnl", 0) or 0
+        for p in open_positions.values()
+        if p.get("phase", 0) == 1
+    )
+    today_pnl = closed_pnl + open_pnl
+
+    # EOD stats from closed trades
+    n          = len(closed)
+    wins       = [r for r in closed if r.get("win")]
+    losses     = [r for r in closed if not r.get("win")]
+    gross_profit = sum(r["pnl"] for r in wins)
+    gross_loss   = sum(r["pnl"] for r in losses)
+    avg_ret_pct  = (sum(r.get("pnl_pct", 0) for r in closed) / n) if n else 0
+    avg_win_pct  = (sum(r.get("pnl_pct", 0) for r in wins)   / len(wins))   if wins   else 0
+    avg_loss_pct = (sum(r.get("pnl_pct", 0) for r in losses) / len(losses)) if losses else 0
+    best  = max(closed, key=lambda r: r.get("pnl", 0), default=None)
+    worst = min(closed, key=lambda r: r.get("pnl", 0), default=None)
+    total_capital_traded = sum(
+        r.get("entry_price", 0) * r.get("shares", 0) for r in closed
+    ) + capital_deployed
+    exit_breakdown = {}
+    for r in closed:
+        et = r.get("exit_type", "unknown")
+        exit_breakdown[et] = exit_breakdown.get(et, 0) + 1
+
+    eod_summary = {
+        "total_trades":          n,
+        "wins":                  len(wins),
+        "losses":                len(losses),
+        "win_rate":              round(len(wins) / n * 100, 1) if n else 0,
+        "avg_return_pct":        round(avg_ret_pct, 3),
+        "avg_win_pct":           round(avg_win_pct, 3),
+        "avg_loss_pct":          round(avg_loss_pct, 3),
+        "gross_profit":          round(gross_profit, 2),
+        "gross_loss":            round(gross_loss, 2),
+        "profit_factor":         round(gross_profit / abs(gross_loss), 2) if gross_loss else None,
+        "best_trade":            {"ticker": best["ticker"],  "pnl": best["pnl"],  "pnl_pct": best["pnl_pct"]}  if best  else None,
+        "worst_trade":           {"ticker": worst["ticker"], "pnl": worst["pnl"], "pnl_pct": worst["pnl_pct"]} if worst else None,
+        "total_capital_traded":  round(total_capital_traded, 2),
+        "exit_breakdown":        exit_breakdown,
+        "profit_target_pct":     cfg["profit_target_pct"],
+        "hard_stop_pct":         cfg["hard_stop_pct"],
+        "daily_profit_target":   cfg["daily_profit_target"],
+        "goal_achieved":         today_pnl >= cfg["daily_profit_target"],
+    }
+
     return {
         "enabled":      dt["enabled"],
         "config":       cfg,
-        "positions":    dt["positions"],
-        "closed_today": dt.get("closed_today", []),
+        "positions":    open_positions,
+        "closed_today": closed,
         "decisions":    dt.get("decisions", [])[-50:],
+        "eod_summary":  eod_summary,
         "summary": {
-            "open_positions":   len(dt["positions"]),
+            "open_positions":   len(open_positions),
             "capital_deployed": round(capital_deployed, 2),
+            "closed_pnl":       round(closed_pnl, 2),
+            "open_pnl":         round(open_pnl, 2),
             "today_pnl":        round(today_pnl, 2),
-            "today_trades":     len(dt.get("closed_today", [])),
+            "today_trades":     n,
             "goal_pct":         round(today_pnl / cfg["daily_profit_target"] * 100, 1)
                                 if cfg["daily_profit_target"] > 0 else 0,
         },
@@ -10180,12 +10284,14 @@ async def day_trader_close(ticker: str):
         _dt_save_state()
         return {"status": "cancelled", "ticker": ticker}
 
-    stop_oid = pos.get("stop_order_id")
+    stop_oid   = pos.get("stop_order_id")
+    target_oid = pos.get("target_order_id")
     async def _do_close(ib):
         ot = {t.order.orderId: t for t in ib.openTrades()}
-        if stop_oid and stop_oid in ot:
-            ib.cancelOrder(ot[stop_oid].order)
-            await asyncio.sleep(1)
+        for oid in (stop_oid, target_oid):
+            if oid and oid in ot:
+                ib.cancelOrder(ot[oid].order)
+        await asyncio.sleep(1)
         contract = Stock(ticker, "SMART", "USD")
         mkt_ord = Order()
         mkt_ord.orderType     = "MKT"
@@ -10650,7 +10756,9 @@ async def _spx_monitor_coro(ib) -> None:
         _spx_log("MONITOR", f"spread={sid} live_pnl=${live_pnl:.2f} target=${sp['profit_target']:.2f}")
 
         profit_target = sp["profit_target"]
-        max_loss      = sp.get("max_loss", sp["total_credit"] * float(cfg["stop_loss_mult"]))
+        # Stop loss = stop_loss_mult × credit collected (e.g. 2× = lose back 2× what we took in).
+        # sp["max_loss"] is the theoretical full-width loss — do NOT use it as the stop threshold.
+        stop_threshold = sp["total_credit"] * float(cfg["stop_loss_mult"])
 
         if live_pnl >= profit_target:
             _spx_log("PROFIT_TARGET",
@@ -10658,9 +10766,9 @@ async def _spx_monitor_coro(ib) -> None:
             await _spx_close_spread(ib, sid, "profit_target")
             continue
 
-        if live_pnl <= -max_loss:
+        if live_pnl <= -stop_threshold:
             _spx_log("STOP_LOSS",
-                     f"P&L=${live_pnl:.2f} <= -max_loss=-${max_loss:.2f}", sid)
+                     f"P&L=${live_pnl:.2f} <= -stop=-${stop_threshold:.2f} ({cfg['stop_loss_mult']}× credit)", sid)
             sx["last_stop_time"] = now.isoformat()
             await _spx_close_spread(ib, sid, "stop_loss")
             continue

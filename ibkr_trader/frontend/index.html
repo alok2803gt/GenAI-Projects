@@ -5114,7 +5114,7 @@ function DayTraderTab() {
   if (loading) return <div style={{ color:C.muted, ...sans, fontSize:13 }}>Loading…</div>;
   if (!status) return <div style={{ color:C.muted, ...sans, fontSize:13 }}>Backend unavailable</div>;
 
-  const { config: cfg, summary, positions, closed_today, decisions } = status;
+  const { config: cfg, summary, positions, closed_today, decisions, eod_summary: eod } = status;
   const goalPct = Math.min(100, summary.goal_pct || 0);
 
   return (
@@ -5215,6 +5215,8 @@ function DayTraderTab() {
         {[
           { label:"Open", value:summary.open_positions },
           { label:"Capital Deployed", value:`$${summary.capital_deployed.toLocaleString()}` },
+          { label:"Open P&L", value:`${(summary.open_pnl||0)>=0?"+":""}$${(summary.open_pnl||0).toFixed(2)}`, color:pnlColor(summary.open_pnl||0) },
+          { label:"Closed P&L", value:`${(summary.closed_pnl||0)>=0?"+":""}$${(summary.closed_pnl||0).toFixed(2)}`, color:pnlColor(summary.closed_pnl||0) },
           { label:"Today P&L", value:`${summary.today_pnl>=0?"+":""}$${summary.today_pnl.toFixed(2)}`, color:pnlColor(summary.today_pnl) },
           { label:"Closed Today", value:summary.today_trades },
         ].map(({ label, value, color }) => (
@@ -5235,7 +5237,7 @@ function DayTraderTab() {
           <table style={{ width:"100%", borderCollapse:"collapse", ...sans, fontSize:13 }}>
             <thead>
               <tr style={{ background:"#0f172a" }}>
-                {["Ticker","Phase","Entry $","Target $","Stop $","Current $","P&L","Shares",""].map(h => (
+                {["Ticker","Phase","Entry $","Target $","Stop $","Current $","P&L","P&L %","Shares",""].map(h => (
                   <th key={h} style={{ padding:"7px 10px", textAlign:"left", color:C.muted,
                     fontSize:11, fontWeight:600, textTransform:"uppercase", letterSpacing:0.5,
                     borderBottom:`1px solid ${C.border}` }}>{h}</th>
@@ -5261,6 +5263,13 @@ function DayTraderTab() {
                   </td>
                   <td style={{ padding:"8px 10px", ...mono, fontWeight:700, color:pnlColor(p.live_pnl) }}>
                     {p.live_pnl != null ? `${p.live_pnl>=0?"+":""}$${p.live_pnl.toFixed(2)}` : "—"}
+                  </td>
+                  <td style={{ padding:"8px 10px", ...mono, fontWeight:700,
+                    color: p.live_price && p.entry_price ? pnlColor(p.live_price - p.entry_price) : C.muted }}>
+                    {p.live_price && p.entry_price
+                      ? (() => { const pct = (p.live_price - p.entry_price) / p.entry_price * 100;
+                                 return `${pct>=0?"+":""}${pct.toFixed(2)}%`; })()
+                      : "—"}
                   </td>
                   <td style={{ padding:"8px 10px", color:C.muted }}>{p.shares}</td>
                   <td style={{ padding:"8px 10px" }}>
@@ -5323,6 +5332,125 @@ function DayTraderTab() {
           </div>
         </>
       )}
+
+      {/* EOD Performance Summary */}
+      {eod && eod.total_trades > 0 && (() => {
+        const exitColors = { profit_target:"#4ade80", hard_stop:"#f87171", force_close:"#f59e0b", manual_close:"#94a3b8" };
+        const goalBar = Math.min(100, (summary.today_pnl / eod.daily_profit_target) * 100);
+        const goalColor = goalBar >= 100 ? "#4ade80" : goalBar >= 60 ? "#f59e0b" : "#ef4444";
+        return (
+          <div style={{ marginBottom:20 }}>
+            <div style={{ ...sans, fontSize:13, fontWeight:700, color:C.white, marginBottom:10,
+              display:"flex", alignItems:"center", gap:8 }}>
+              📊 Day Summary
+              {eod.goal_achieved && <span style={{ fontSize:11, padding:"2px 8px", borderRadius:4,
+                background:"#14532d", color:"#4ade80", fontWeight:700 }}>🎯 Goal Achieved</span>}
+            </div>
+
+            {/* Goal progress bar */}
+            <div style={{ marginBottom:14 }}>
+              <div style={{ display:"flex", justifyContent:"space-between", ...sans, fontSize:11,
+                color:C.muted, marginBottom:4 }}>
+                <span>Daily Goal: ${eod.daily_profit_target}</span>
+                <span style={{ color:goalColor }}>{goalBar.toFixed(1)}% complete</span>
+              </div>
+              <div style={{ height:6, background:"#1e293b", borderRadius:3 }}>
+                <div style={{ height:"100%", width:`${goalBar}%`, background:goalColor,
+                  borderRadius:3, transition:"width 0.4s" }} />
+              </div>
+            </div>
+
+            {/* Key stats grid */}
+            <div style={{ display:"grid", gridTemplateColumns:"repeat(4, 1fr)", gap:8, marginBottom:10 }}>
+              {[
+                { label:"Trades", value: eod.total_trades },
+                { label:"Win Rate", value:`${eod.win_rate}%`,
+                  color: eod.win_rate >= 60 ? "#4ade80" : eod.win_rate >= 40 ? "#f59e0b" : "#ef4444" },
+                { label:"Avg Return", value:`${eod.avg_return_pct >= 0?"+":""}${eod.avg_return_pct.toFixed(2)}%`,
+                  color: pnlColor(eod.avg_return_pct) },
+                { label:"Profit Factor",
+                  value: eod.profit_factor != null ? eod.profit_factor.toFixed(2) : "—",
+                  color: eod.profit_factor == null ? C.muted : eod.profit_factor >= 1.5 ? "#4ade80"
+                       : eod.profit_factor >= 1.0 ? "#f59e0b" : "#ef4444" },
+                { label:"Gross Profit", value:`+$${eod.gross_profit.toFixed(2)}`, color:"#4ade80" },
+                { label:"Gross Loss",   value:`-$${Math.abs(eod.gross_loss).toFixed(2)}`, color:"#ef4444" },
+                { label:"Net P&L", value:`${summary.today_pnl>=0?"+":""}$${summary.today_pnl.toFixed(2)}`,
+                  color: pnlColor(summary.today_pnl) },
+                { label:"Capital Used", value:`$${eod.total_capital_traded.toLocaleString(undefined,{maximumFractionDigits:0})}` },
+              ].map(({ label, value, color }) => (
+                <div key={label} style={{ background:"#0f172a", border:`1px solid ${C.border}`,
+                  borderRadius:6, padding:"8px 12px", textAlign:"center" }}>
+                  <div style={{ ...sans, fontSize:10, color:C.muted, marginBottom:3 }}>{label}</div>
+                  <div style={{ ...mono, fontSize:15, fontWeight:700, color: color || C.white }}>{value}</div>
+                </div>
+              ))}
+            </div>
+
+            {/* Avg win/loss + best/worst row */}
+            <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr 1fr", gap:8, marginBottom:10 }}>
+              <div style={{ background:"#0f172a", border:`1px solid ${C.border}`, borderRadius:6, padding:"8px 12px" }}>
+                <div style={{ ...sans, fontSize:10, color:C.muted, marginBottom:2 }}>Avg Win</div>
+                <div style={{ ...mono, fontSize:13, fontWeight:700, color:"#4ade80" }}>
+                  +{eod.avg_win_pct.toFixed(2)}% ({eod.wins}W)
+                </div>
+              </div>
+              <div style={{ background:"#0f172a", border:`1px solid ${C.border}`, borderRadius:6, padding:"8px 12px" }}>
+                <div style={{ ...sans, fontSize:10, color:C.muted, marginBottom:2 }}>Avg Loss</div>
+                <div style={{ ...mono, fontSize:13, fontWeight:700, color:"#ef4444" }}>
+                  {eod.avg_loss_pct.toFixed(2)}% ({eod.losses}L)
+                </div>
+              </div>
+              {eod.best_trade && (
+                <div style={{ background:"#0f172a", border:`1px solid #14532d`, borderRadius:6, padding:"8px 12px" }}>
+                  <div style={{ ...sans, fontSize:10, color:C.muted, marginBottom:2 }}>Best Trade</div>
+                  <div style={{ ...mono, fontSize:13, fontWeight:700, color:"#4ade80" }}>
+                    {eod.best_trade.ticker} +${eod.best_trade.pnl.toFixed(2)} ({eod.best_trade.pnl_pct >= 0?"+":""}{eod.best_trade.pnl_pct.toFixed(2)}%)
+                  </div>
+                </div>
+              )}
+              {eod.worst_trade && (
+                <div style={{ background:"#0f172a", border:`1px solid #450a0a`, borderRadius:6, padding:"8px 12px" }}>
+                  <div style={{ ...sans, fontSize:10, color:C.muted, marginBottom:2 }}>Worst Trade</div>
+                  <div style={{ ...mono, fontSize:13, fontWeight:700, color:"#ef4444" }}>
+                    {eod.worst_trade.ticker} ${eod.worst_trade.pnl.toFixed(2)} ({eod.worst_trade.pnl_pct >= 0?"+":""}{eod.worst_trade.pnl_pct.toFixed(2)}%)
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Strategy settings + exit breakdown */}
+            <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:8 }}>
+              <div style={{ background:"#0f172a", border:`1px solid ${C.border}`, borderRadius:6, padding:"10px 14px" }}>
+                <div style={{ ...sans, fontSize:11, fontWeight:700, color:C.muted, marginBottom:6 }}>STRATEGY SETTINGS</div>
+                {[
+                  ["Profit Target / trade", `+${eod.profit_target_pct}%`],
+                  ["Hard Stop / trade",     `-${eod.hard_stop_pct}%`],
+                  ["Daily Goal",            `$${eod.daily_profit_target}`],
+                  ["Risk/Reward",           `1 : ${(eod.profit_target_pct / eod.hard_stop_pct).toFixed(2)}`],
+                ].map(([k, v]) => (
+                  <div key={k} style={{ display:"flex", justifyContent:"space-between",
+                    ...sans, fontSize:12, padding:"2px 0", borderBottom:`1px solid ${C.border}` }}>
+                    <span style={{ color:C.muted }}>{k}</span>
+                    <span style={{ ...mono, color:C.white }}>{v}</span>
+                  </div>
+                ))}
+              </div>
+              <div style={{ background:"#0f172a", border:`1px solid ${C.border}`, borderRadius:6, padding:"10px 14px" }}>
+                <div style={{ ...sans, fontSize:11, fontWeight:700, color:C.muted, marginBottom:6 }}>EXIT BREAKDOWN</div>
+                {Object.entries(eod.exit_breakdown).map(([type, count]) => (
+                  <div key={type} style={{ display:"flex", justifyContent:"space-between", alignItems:"center",
+                    ...sans, fontSize:12, padding:"2px 0", borderBottom:`1px solid ${C.border}` }}>
+                    <span style={{ color: exitColors[type] || C.muted }}>{type.replace(/_/g," ")}</span>
+                    <span style={{ ...mono, fontWeight:700, color: exitColors[type] || C.white }}>
+                      {count} ({(count/eod.total_trades*100).toFixed(0)}%)
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        );
+      })()}
 
       {/* Recent Decisions */}
       {decisions.length > 0 && (
