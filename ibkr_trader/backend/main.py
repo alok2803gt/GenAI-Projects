@@ -146,6 +146,8 @@ JOURNAL_MIN_TRADES  = 20    # trades needed before learned model is reliable
 RETRAIN_EVERY       = 5     # retrain model every N new closed trades
 AT_STATE_PATH       = "autotrader_state.json"  # persisted across restarts
 ST_STATE_PATH       = "stock_state.json"        # stock trader state (persisted)
+DT_STATE_PATH       = "day_trader_state.json"   # day trader state (persisted)
+SPX_STATE_PATH      = "spx_0dte_state.json"     # SPX 0DTE trader state (persisted)
 UNIVERSE_CACHE_PATH = "universe_cache.json"     # screened universe (refreshed nightly)
 WATCHLIST_PATH      = "watchlist.json"          # breakout scanner watchlist
 
@@ -294,6 +296,46 @@ state: Dict = {
         "positions":    {},   # ticker → position dict
         "closed_today": [],   # list of closed trade summaries (reset each day)
         "decisions":    [],   # plain-English decision log (last 200)
+    },
+    "day_trader": {
+        "enabled": False,
+        "config": {
+            "position_size":        2000,    # fixed $ per trade (smaller for day trades)
+            "max_positions":        10,      # intraday concurrent cap
+            "hard_stop_pct":        7.0,     # intraday stop loss (DAY order)
+            "profit_target_pct":    1.5,     # take profit at +1.5% (intraday)
+            "force_close_time":     "15:45", # force MKT sell all positions at HH:MM ET
+            "signal_freshness_min": 30,      # skip alerts older than this
+            "limit_buffer_pct":     0.10,    # LIMIT entry = last_price × (1 + buffer/100)
+            "daily_profit_target":  500.0,   # $ goal for the day (for goal calculator)
+            "expected_return_pct":  0.8,     # assumed avg win % per trade (for goal math)
+            "win_rate_est":         0.56,    # assumed win rate per trade (for goal math)
+        },
+        "positions":    {},   # ticker → position dict
+        "closed_today": [],   # closed trade summaries (reset each day)
+        "decisions":    [],   # decision log (last 200)
+    },
+    "spx_0dte": {
+        "enabled": False,
+        "config": {
+            "daily_profit_target":   200.0,  # $ daily goal
+            "spread_width":          25,     # points per spread leg (25 = $2500 max risk/contract)
+            "otm_pct":               0.5,    # % OTM for the short strike (~35 pts OTM at SPX 7000)
+            "profit_pct":            50.0,   # close IC when this % of credit is realised
+            "stop_loss_mult":        2.0,    # close when loss = stop_loss_mult × credit
+            "entry_start_time":     "09:45", # earliest IC entry
+            "entry_cutoff_time":    "14:00", # no new entries after this (gamma risk after ~14:00)
+            "force_close_time":     "15:45", # MKT close all legs regardless
+            "max_attempts":          5,      # max IC entries per day
+            "max_margin":        20000.0,    # max notional margin to deploy
+            "min_credit_per_spread": 0.20,   # skip if net credit < this per spread
+        },
+        "spreads":        {},   # spread_id → spread dict
+        "closed_today":   [],
+        "decisions":      [],
+        "attempts_today": 0,
+        "today_pnl":      0.0,
+        "last_stop_time": None,
     },
     # CVD tape sentiment (populated by reqMktData "233,375" subscriptions)
     "tape_sentiment": {},  # ticker → per-ticker CVD state dict
@@ -2583,6 +2625,7 @@ async def _autotrader_monitor_coro(ib: IB) -> None:
         # half to bank the gain, let the other half ride the directional thesis.
         # partial_taken flag prevents re-triggering once the partial is placed.
         if (action == "BUY"
+                and info.get("strategy_type") != "hedge"
                 and not info.get("partial_taken")
                 and upnl >= max_profit
                 and max_profit > 0):
@@ -3754,7 +3797,30 @@ async def _autotrader_hedge_coro(ib: IB) -> None:
 
     _at_log("HEDGE", f"Net portfolio delta = {net_delta:+.1f}  (threshold ±{threshold:.0f},"
             f" IBKR Greeks for {len(live_delta)}/{len(opt_contracts)} positions)")
+    at = state["autotrader"]
+    existing_hedge_key = next(
+        (k for k, p in at["positions"].items() if p.get("strategy_type") == "hedge"),
+        None,
+    )
+
     if abs(net_delta) < threshold:
+        # Delta back in range — close the hedge if one is open
+        if existing_hedge_key:
+            _at_log("HEDGE",
+                    f"Delta normalised ({net_delta:+.1f} inside ±{threshold:.0f}) — "
+                    f"closing hedge {existing_hedge_key}")
+            hedge_info = at["positions"][existing_hedge_key]
+            for item in ib.portfolio():
+                if _at_contract_key(item.contract) == existing_hedge_key:
+                    hedge_info["exit_reason"] = "delta_normalized"
+                    await _autotrader_close_coro(ib, item, hedge_info, existing_hedge_key)
+                    break
+        return
+
+    # Delta still above threshold — skip if a hedge is already open
+    if existing_hedge_key:
+        _at_log("HEDGE",
+                f"Hedge already open ({existing_hedge_key}, delta={net_delta:+.1f}) — skipping new order")
         return
 
     hedge_right  = "P" if net_delta > 0 else "C"
@@ -3790,8 +3856,8 @@ async def _autotrader_hedge_coro(ib: IB) -> None:
             ask_live = _safe_float(best_td.ask, 0.0)
             bid_live = _safe_float(best_td.bid, 0.0)
             mid_live = (bid_live + ask_live) / 2 if ask_live > 0 else 0
-            # Pay slightly above ask to ensure fill (hedge is protective, not premium-seeking)
-            lmt = round(ask_live + (mid_live - ask_live) * 0.20, 2) if ask_live > 0 else None
+            # Pay 1% above ask to ensure fill (hedge is protective, not premium-seeking)
+            lmt = round(ask_live * 1.01, 2) if ask_live > 0 else None
     except ValueError as e:
         log.warning("Hedge: OPRA chain unavailable (%s) — trying yfinance", e)
 
@@ -5794,7 +5860,25 @@ async def _stock_monitor_coro(ib) -> None:
             if not buy_oid:
                 continue
             if buy_oid in open_trades_by_oid:
-                continue  # still pending
+                # Cancel stale limit buys that have been pending too long
+                try:
+                    alert_ts = pos.get("alert_fired_at", "")
+                    at = datetime.fromisoformat(alert_ts) if alert_ts else None
+                    if at is not None:
+                        if at.tzinfo is None:
+                            at = at.replace(tzinfo=ZoneInfo("America/New_York"))
+                        age_min = (datetime.now(ZoneInfo("America/New_York")) - at).total_seconds() / 60
+                    else:
+                        age_min = 0
+                except Exception:
+                    age_min = 0
+                if age_min > cfg.get("signal_freshness_min", 30):
+                    ib.cancelOrder(open_trades_by_oid[buy_oid].order)
+                    await asyncio.sleep(0.5)
+                    _st_log("BUY_CANCELLED", ticker,
+                            f"limit buy stale after {age_min:.0f}min — cancelled, slot freed")
+                    to_remove.append(ticker)
+                continue  # still pending (and not yet stale)
             fill = fills_by_oid.get(buy_oid)
             if fill:
                 fill_px = round(float(fill.execution.avgPrice), 4)
@@ -5897,6 +5981,26 @@ async def _stock_monitor_coro(ib) -> None:
                 _close_st_position(ticker, pos, exit_px, "max_hold", pnl, days_held)
                 to_remove.append(ticker)
 
+    # ── Live price / P&L from IBKR portfolio ──────────────────────────────
+    try:
+        portfolio_map = {
+            item.contract.symbol: item
+            for item in ib.portfolio()
+            if hasattr(item.contract, "symbol")
+        }
+        for ticker, pos in st["positions"].items():
+            pi = portfolio_map.get(ticker)
+            if pi is not None:
+                try:
+                    mpx = float(pi.marketPrice or 0)
+                    if mpx > 0:
+                        pos["live_price"] = round(mpx, 4)
+                        pos["live_pnl"] = round(float(pi.unrealizedPNL or 0), 2)
+                except Exception:
+                    pass
+    except Exception as _lpe:
+        log.debug("Stock trader live price fetch failed: %s", _lpe)
+
     for ticker in to_remove:
         st["positions"].pop(ticker, None)
     if to_remove:
@@ -5944,6 +6048,12 @@ async def lifespan(app: FastAPI):
     # Restore stock trader state from last shutdown
     _st_load_state()
 
+    # Restore day trader state from last shutdown
+    _dt_load_state()
+
+    # Restore SPX 0DTE state from last shutdown
+    _spx_load_state()
+
     # Restore breakout watchlist
     _watchlist_load()
 
@@ -5968,6 +6078,10 @@ async def lifespan(app: FastAPI):
     log.info("Auto-trader background task started")
     asyncio.create_task(_stock_monitor_loop())
     log.info("Stock trader monitor loop started")
+    asyncio.create_task(_day_trader_monitor_loop())
+    log.info("Day trader monitor loop started")
+    asyncio.create_task(_spx_monitor_loop())
+    log.info("SPX 0DTE monitor loop started")
 
     # Run initial universe screen in background (non-blocking)
     async def _initial_screen():
@@ -6904,6 +7018,9 @@ class WatchlistAlertRequest(BaseModel):
     prev_state:           Optional[str]   = None   # state before entering current signal zone
     mins_in_pre_breakout: Optional[int]   = None   # minutes spent in PRE-BREAKOUT before BREAKOUT
     state_path:           Optional[str]   = None   # e.g. "NEUTRAL→PRE-BREAKOUT→BREAKOUT"
+    # S/R levels from scanner (swing-based, 60-bar lookback)
+    sr_resistance:        Optional[float] = None   # nearest swing high above price
+    sr_support:           Optional[float] = None   # nearest swing low below price
 
 
 @app.post("/watchlist/alert")
@@ -6967,8 +7084,10 @@ def watchlist_add_alert(req: WatchlistAlertRequest):
     if existing and existing["signal_type"] == "BREAKOUT" and req.signal_type == "PRE-BREAKOUT":
         # Still refresh live metrics so pct_b / vol_ratio / tape stay current
         existing["pct_b"]      = round(req.pct_b, 1)
-        if req.rsi       is not None: existing["rsi"]       = round(req.rsi, 1)
-        if req.vol_ratio is not None: existing["vol_ratio"] = round(req.vol_ratio, 2)
+        if req.rsi          is not None: existing["rsi"]          = round(req.rsi, 1)
+        if req.vol_ratio    is not None: existing["vol_ratio"]    = round(req.vol_ratio, 2)
+        if req.sr_resistance is not None: existing["sr_resistance"] = round(req.sr_resistance, 2)
+        if req.sr_support    is not None: existing["sr_support"]    = round(req.sr_support, 2)
         ts, tl = _resolve_tape(req.tape_score, req.tape_label)
         existing["tape_score"]     = ts
         existing["tape_label"]     = tl
@@ -6984,8 +7103,10 @@ def watchlist_add_alert(req: WatchlistAlertRequest):
         # Preserve original alert timestamp and price; refresh live scan metrics
         existing["signal_type"] = req.signal_type
         existing["pct_b"]       = round(req.pct_b, 1)
-        if req.rsi       is not None: existing["rsi"]       = round(req.rsi, 1)
-        if req.vol_ratio is not None: existing["vol_ratio"] = round(req.vol_ratio, 2)
+        if req.rsi           is not None: existing["rsi"]          = round(req.rsi, 1)
+        if req.vol_ratio     is not None: existing["vol_ratio"]    = round(req.vol_ratio, 2)
+        if req.sr_resistance is not None: existing["sr_resistance"] = round(req.sr_resistance, 2)
+        if req.sr_support    is not None: existing["sr_support"]    = round(req.sr_support, 2)
         ts, tl = _resolve_tape(req.tape_score, req.tape_label)
         existing["tape_score"]     = ts
         existing["tape_label"]     = tl
@@ -7011,6 +7132,8 @@ def watchlist_add_alert(req: WatchlistAlertRequest):
         "tape_score":     ts,
         "tape_label":     tl,
         "tape_confirmed": bool(ts is not None and ts > 0.20),
+        "sr_resistance":  round(req.sr_resistance, 2) if req.sr_resistance is not None else None,
+        "sr_support":     round(req.sr_support, 2)    if req.sr_support    is not None else None,
     }
     # Persist every new alert to alert_history for backtesting (includes state path context)
     _alert_history_insert(tk, req.signal_type, req.price_at_alert,
@@ -9452,6 +9575,23 @@ async def stock_trader_close(ticker: str):
     if not ib or not ib.isConnected():
         raise HTTPException(503, "IBKR not connected")
 
+    # Phase 0: cancel the pending buy — no stock was purchased, do NOT sell
+    if pos.get("phase", 1) == 0:
+        buy_oid = pos.get("buy_order_id")
+        async def _do_cancel_buy(ib):
+            open_trades = {t.order.orderId: t for t in ib.openTrades()}
+            if buy_oid and buy_oid in open_trades:
+                ib.cancelOrder(open_trades[buy_oid].order)
+                await asyncio.sleep(0.5)
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            None, lambda: _run_in_streaming_loop(_do_cancel_buy(ib), timeout=15)
+        )
+        st["positions"].pop(ticker, None)
+        _st_log("MANUAL_CANCEL", ticker, f"pending buy ord#{buy_oid} cancelled — slot freed")
+        _st_save_state()
+        return {"status": "cancelled", "ticker": ticker, "order_id": buy_oid}
+
     stop_oid = pos.get("stop_order_id")
 
     async def _do_close(ib):
@@ -9516,6 +9656,1137 @@ def stock_trader_history(days: int = Query(30, ge=1, le=365)):
         }
     except Exception as exc:
         raise HTTPException(500, str(exc))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DAY TRADER — intraday breakout positions, force-close by 15:45 ET
+# Same signals as Stock Trader; exits via profit target, hard stop, or EOD close.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _dt_log(action: str, ticker: str, detail: str) -> None:
+    from zoneinfo import ZoneInfo
+    entry = {
+        "time":   datetime.now(ZoneInfo("America/New_York")).strftime("%H:%M:%S ET"),
+        "action": action,
+        "ticker": ticker,
+        "detail": detail,
+    }
+    dt = state["day_trader"]
+    dt["decisions"].append(entry)
+    dt["decisions"] = dt["decisions"][-200:]
+    log.info("[DayTrader] %s %s: %s", action, ticker, detail)
+
+
+def _dt_save_state() -> None:
+    dt = state["day_trader"]
+    try:
+        with open(DT_STATE_PATH, "w") as f:
+            json.dump({
+                "enabled":      dt["enabled"],
+                "config":       dt["config"],
+                "positions":    dt["positions"],
+                "closed_today": dt.get("closed_today", [])[-100:],
+                "decisions":    dt.get("decisions", [])[-200:],
+            }, f, indent=2, default=str)
+    except Exception as e:
+        log.warning("Day trader state save failed: %s", e)
+
+
+def _dt_load_state() -> None:
+    if not os.path.exists(DT_STATE_PATH):
+        return
+    try:
+        with open(DT_STATE_PATH, "r") as f:
+            saved = json.load(f)
+        dt = state["day_trader"]
+        if "config" in saved:
+            dt["config"].update(saved["config"])
+        if "enabled" in saved:
+            dt["enabled"] = saved["enabled"]
+        # Only restore same-day positions to avoid stale overnight entries
+        today = date.today().isoformat()
+        restored = {
+            tk: pos for tk, pos in saved.get("positions", {}).items()
+            if pos.get("entry_date") == today
+        }
+        dt["positions"]    = restored
+        dt["closed_today"] = [r for r in saved.get("closed_today", [])
+                               if r.get("exit_date") == today]
+        dt["decisions"]    = saved.get("decisions", [])
+        log.info("Day trader state restored: %d open, %d closed today",
+                 len(restored), len(dt["closed_today"]))
+    except Exception as exc:
+        log.warning("Day trader state load failed: %s", exc)
+
+
+def _close_dt_position(ticker: str, pos: dict, exit_px: float,
+                        exit_type: str, pnl: float) -> None:
+    """Record a closed day trade to closed_today + trade journal."""
+    dt = state["day_trader"]
+    entry_px = pos.get("entry_price", exit_px)
+    pnl_pct  = round((exit_px - entry_px) / entry_px * 100, 3) if entry_px else 0.0
+    record = {
+        "ticker":      ticker,
+        "entry_date":  pos.get("entry_date"),
+        "exit_date":   date.today().isoformat(),
+        "entry_price": round(entry_px, 4),
+        "exit_price":  round(exit_px, 4),
+        "shares":      pos.get("shares", 0),
+        "pnl":         round(pnl, 2),
+        "pnl_pct":     pnl_pct,
+        "exit_type":   exit_type,
+        "win":         pnl > 0,
+    }
+    dt["closed_today"].append(record)
+    dt["closed_today"] = dt["closed_today"][-100:]
+    try:
+        con = sqlite3.connect(JOURNAL_DB_PATH, check_same_thread=False)
+        con.execute("""
+            INSERT INTO trade_journal
+                (opened_at, closed_at, ticker, action, qty,
+                 entry_price, exit_price, pnl, pnl_pct, win,
+                 exit_reason, strategy_type)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            pos.get("entry_date"), date.today().isoformat(),
+            ticker, "BUY", pos.get("shares", 0),
+            round(entry_px, 4), round(exit_px, 4),
+            round(pnl, 2), pnl_pct, 1 if pnl > 0 else 0,
+            exit_type, "DAY_BREAKOUT",
+        ))
+        con.commit()
+        con.close()
+    except Exception as exc:
+        log.warning("Day trade journal insert failed: %s", exc)
+    _dt_log(exit_type.upper(), ticker,
+            f"exit={exit_px:.2f} pnl={'+'if pnl>=0 else''}{pnl:.2f} ({pnl_pct:+.2f}%)")
+    _dt_save_state()
+
+
+async def _day_trader_monitor_coro(ib) -> None:
+    """One monitor cycle: fill detection, profit target, stop, EOD force-close."""
+    from zoneinfo import ZoneInfo
+    dt  = state["day_trader"]
+    cfg = dt["config"]
+
+    if not dt["positions"]:
+        return
+
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+
+    # Parse force_close_time ("HH:MM") into today's datetime
+    try:
+        fc_h, fc_m = map(int, cfg["force_close_time"].split(":"))
+        force_close_dt = now_et.replace(hour=fc_h, minute=fc_m, second=0, microsecond=0)
+    except Exception:
+        force_close_dt = now_et.replace(hour=15, minute=45, second=0, microsecond=0)
+
+    open_trades_by_oid = {t.order.orderId: t for t in ib.openTrades()}
+    fills_by_oid: dict = {}
+    for f in ib.fills():
+        oid = getattr(f.execution, "orderId", 0)
+        if oid and oid > 0:
+            fills_by_oid[oid] = f
+
+    # Live prices from portfolio
+    try:
+        portfolio_map = {
+            item.contract.symbol: item
+            for item in ib.portfolio()
+            if hasattr(item.contract, "symbol")
+        }
+    except Exception:
+        portfolio_map = {}
+
+    to_remove: list[str] = []
+
+    for ticker, pos in list(dt["positions"].items()):
+        phase = pos.get("phase", 0)
+
+        # Refresh live price / pnl from portfolio
+        pi = portfolio_map.get(ticker)
+        if pi is not None:
+            try:
+                mpx = float(pi.marketPrice or 0)
+                if mpx > 0:
+                    pos["live_price"] = round(mpx, 4)
+                    pos["live_pnl"]   = round(float(pi.unrealizedPNL or 0), 2)
+            except Exception:
+                pass
+
+        # ── Phase 0: waiting for buy fill ─────────────────────────────────
+        if phase == 0:
+            buy_oid = pos.get("buy_order_id")
+            if not buy_oid:
+                continue
+            if buy_oid in open_trades_by_oid:
+                # Cancel stale pending buys
+                try:
+                    alert_ts = pos.get("alert_fired_at", "")
+                    at = datetime.fromisoformat(alert_ts) if alert_ts else None
+                    if at is not None:
+                        if at.tzinfo is None:
+                            at = at.replace(tzinfo=ZoneInfo("America/New_York"))
+                        age_min = (now_et - at).total_seconds() / 60
+                    else:
+                        age_min = 0
+                except Exception:
+                    age_min = 0
+                if age_min > cfg.get("signal_freshness_min", 30):
+                    ib.cancelOrder(open_trades_by_oid[buy_oid].order)
+                    await asyncio.sleep(0.5)
+                    _dt_log("BUY_CANCELLED", ticker,
+                            f"stale after {age_min:.0f}min — cancelled, slot freed")
+                    to_remove.append(ticker)
+                continue
+            fill = fills_by_oid.get(buy_oid)
+            if fill:
+                fill_px = round(float(fill.execution.avgPrice), 4)
+                pos["entry_price"]  = fill_px
+                pos["phase"]        = 1
+                stop_px   = round(fill_px * (1 - cfg["hard_stop_pct"] / 100), 2)
+                profit_px = round(fill_px * (1 + cfg["profit_target_pct"] / 100), 2)
+                pos["stop_price"]   = stop_px
+                pos["profit_price"] = profit_px
+                contract = Stock(ticker, "SMART", "USD")
+                stop_ord = Order()
+                stop_ord.orderType     = "STP"
+                stop_ord.action        = "SELL"
+                stop_ord.totalQuantity = pos["shares"]
+                stop_ord.auxPrice      = stop_px
+                stop_ord.tif           = "DAY"   # expires at close — day trade
+                stop_ord.outsideRth    = False
+                trade = ib.placeOrder(contract, stop_ord)
+                await asyncio.sleep(0.5)
+                pos["stop_order_id"] = trade.order.orderId
+                _dt_log("FILLED", ticker,
+                        f"fill={fill_px:.2f} x{pos['shares']}sh "
+                        f"stop@{stop_px:.2f} target@{profit_px:.2f} "
+                        f"(stp ord#{trade.order.orderId})")
+                _dt_save_state()
+            else:
+                _dt_log("BUY_LAPSED", ticker, "buy limit not filled — removing")
+                to_remove.append(ticker)
+            continue
+
+        # ── Phase 3: MKT sell in flight ────────────────────────────────────
+        if phase == 3:
+            sell_oid = pos.get("stop_order_id")
+            if sell_oid and sell_oid not in open_trades_by_oid:
+                fill    = fills_by_oid.get(sell_oid)
+                exit_px = round(float(fill.execution.avgPrice), 4) if fill else pos.get("entry_price", 0)
+                pnl     = round((exit_px - pos["entry_price"]) * pos["shares"], 2)
+                exit_type = pos.get("pending_exit_type", "force_close")
+                _close_dt_position(ticker, pos, exit_px, exit_type, pnl)
+                to_remove.append(ticker)
+            continue
+
+        # ── Phase 1: active intraday position ─────────────────────────────
+        stop_oid = pos.get("stop_order_id")
+
+        # Stop loss hit?
+        if stop_oid and stop_oid not in open_trades_by_oid:
+            fill    = fills_by_oid.get(stop_oid)
+            exit_px = round(float(fill.execution.avgPrice), 4) if fill else pos.get("stop_price", pos["entry_price"])
+            pnl     = round((exit_px - pos["entry_price"]) * pos["shares"], 2)
+            _close_dt_position(ticker, pos, exit_px, "hard_stop", pnl)
+            to_remove.append(ticker)
+            continue
+
+        live_px = pos.get("live_price") or pos.get("entry_price", 0)
+
+        # Profit target reached?
+        if live_px >= pos.get("profit_price", float("inf")):
+            if stop_oid and stop_oid in open_trades_by_oid:
+                ib.cancelOrder(open_trades_by_oid[stop_oid].order)
+                await asyncio.sleep(0.5)
+            contract = Stock(ticker, "SMART", "USD")
+            mkt_ord = Order()
+            mkt_ord.orderType     = "MKT"
+            mkt_ord.action        = "SELL"
+            mkt_ord.totalQuantity = pos["shares"]
+            mkt_ord.tif           = "DAY"
+            trade = ib.placeOrder(contract, mkt_ord)
+            await asyncio.sleep(0.5)
+            pos["phase"]             = 3
+            pos["stop_order_id"]     = trade.order.orderId
+            pos["pending_exit_type"] = "profit_target"
+            _dt_log("PROFIT_TARGET", ticker,
+                    f"live={live_px:.2f} >= target={pos['profit_price']:.2f}, MKT SELL (ord#{trade.order.orderId})")
+            _dt_save_state()
+            continue
+
+        # Force-close time reached?
+        if now_et >= force_close_dt:
+            if stop_oid and stop_oid in open_trades_by_oid:
+                ib.cancelOrder(open_trades_by_oid[stop_oid].order)
+                await asyncio.sleep(0.5)
+            contract = Stock(ticker, "SMART", "USD")
+            mkt_ord = Order()
+            mkt_ord.orderType     = "MKT"
+            mkt_ord.action        = "SELL"
+            mkt_ord.totalQuantity = pos["shares"]
+            mkt_ord.tif           = "DAY"
+            trade = ib.placeOrder(contract, mkt_ord)
+            await asyncio.sleep(0.5)
+            pos["phase"]             = 3
+            pos["stop_order_id"]     = trade.order.orderId
+            pos["pending_exit_type"] = "force_close"
+            _dt_log("FORCE_CLOSE", ticker,
+                    f"EOD force-close @ {cfg['force_close_time']} ET, MKT SELL (ord#{trade.order.orderId})")
+            _dt_save_state()
+
+    for ticker in to_remove:
+        dt["positions"].pop(ticker, None)
+    if to_remove:
+        _dt_save_state()
+
+
+async def _day_trader_monitor_loop() -> None:
+    """Background task: monitor day trader positions every 30 seconds."""
+    await asyncio.sleep(30)   # let server finish starting
+    while True:
+        await asyncio.sleep(30)
+        dt = state["day_trader"]
+        if not dt["enabled"] or not dt["positions"]:
+            continue
+        if not state.get("connected") or not state.get("ib"):
+            continue
+        from zoneinfo import ZoneInfo
+        now_et = datetime.now(ZoneInfo("America/New_York"))
+        # Only run during market hours + 15 min buffer after close for fill detection
+        if now_et.weekday() >= 5:
+            continue
+        mkt_open  = now_et.replace(hour=9,  minute=25, second=0, microsecond=0)
+        mkt_close = now_et.replace(hour=16, minute=15, second=0, microsecond=0)
+        if not (mkt_open <= now_et <= mkt_close):
+            continue
+        ib = state["ib"]
+        try:
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(
+                None,
+                lambda: _run_in_streaming_loop(_day_trader_monitor_coro(ib), timeout=25),
+            )
+        except Exception as exc:
+            log.warning("Day trader monitor error: %s", exc)
+
+
+# ── Day Trader request models ──────────────────────────────────────────────────
+
+class DayConfigRequest(BaseModel):
+    position_size:        Optional[float] = None
+    max_positions:        Optional[int]   = None
+    hard_stop_pct:        Optional[float] = None
+    profit_target_pct:    Optional[float] = None
+    force_close_time:     Optional[str]   = None   # "HH:MM"
+    signal_freshness_min: Optional[int]   = None
+    limit_buffer_pct:     Optional[float] = None
+    daily_profit_target:  Optional[float] = None
+    expected_return_pct:  Optional[float] = None
+    win_rate_est:         Optional[float] = None
+
+
+# ── Day Trader endpoints ───────────────────────────────────────────────────────
+
+@app.post("/day-trader/signal")
+async def day_trader_signal(req: StockSignalRequest):
+    """Called by breakout_scanner on BREAKOUT — same payload as /stock-trader/signal."""
+    from zoneinfo import ZoneInfo
+    dt  = state["day_trader"]
+    cfg = dt["config"]
+
+    if not dt["enabled"]:
+        return {"status": "skipped", "reason": "disabled"}
+
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+    if now_et.weekday() >= 5:
+        return {"status": "skipped", "reason": "weekend"}
+    mkt_open  = now_et.replace(hour=9,  minute=30, second=0, microsecond=0)
+    # Stop new entries 30 min before force-close so position has time to work
+    try:
+        fc_h, fc_m = map(int, cfg["force_close_time"].split(":"))
+        entry_cutoff = now_et.replace(hour=fc_h, minute=max(0, fc_m - 30),
+                                      second=0, microsecond=0)
+    except Exception:
+        entry_cutoff = now_et.replace(hour=15, minute=15, second=0, microsecond=0)
+    if not (mkt_open <= now_et <= entry_cutoff):
+        return {"status": "skipped", "reason": "outside_hours"}
+
+    if req.alert_fired_at:
+        try:
+            fired_at = datetime.fromisoformat(req.alert_fired_at)
+            if fired_at.tzinfo is None:
+                fired_at = fired_at.replace(tzinfo=ZoneInfo("America/New_York"))
+            age_min = (now_et - fired_at).total_seconds() / 60
+            if age_min > cfg["signal_freshness_min"]:
+                return {"status": "skipped", "reason": "stale_signal", "age_min": round(age_min, 1)}
+        except Exception:
+            pass
+
+    ticker = req.ticker.upper()
+    if ticker in dt["positions"]:
+        _dt_log("SKIPPED", ticker, "already have open position")
+        return {"status": "skipped", "reason": "already_open"}
+    if len(dt["positions"]) >= cfg["max_positions"]:
+        _dt_log("SKIPPED", ticker,
+                f"at capacity ({len(dt['positions'])}/{cfg['max_positions']} positions)")
+        return {"status": "skipped", "reason": "at_capacity"}
+
+    ib = state.get("ib")
+    if not ib or not ib.isConnected():
+        raise HTTPException(503, "IBKR not connected")
+
+    price  = req.price
+    shares = max(1, int(cfg["position_size"] / price))
+    lmt_px = round(price * (1 + cfg["limit_buffer_pct"] / 100), 2)
+    cost   = round(shares * price, 2)
+
+    async def _do_buy(ib):
+        contract = Stock(ticker, "SMART", "USD")
+        await ib.qualifyContractsAsync(contract)
+        if not contract.conId:
+            raise ValueError(f"Cannot qualify {ticker}")
+        buy_ord = LimitOrder("BUY", shares, lmt_px)
+        buy_ord.tif = "DAY"
+        trade = ib.placeOrder(contract, buy_ord)
+        await asyncio.sleep(0.5)
+        return trade.order.orderId
+
+    try:
+        loop   = asyncio.get_event_loop()
+        buy_id = await loop.run_in_executor(
+            None,
+            lambda: _run_in_streaming_loop(_do_buy(ib), timeout=15),
+        )
+    except (ValueError, TimeoutError, RuntimeError) as exc:
+        _dt_log("ERROR", ticker, f"order placement failed: {exc}")
+        raise HTTPException(500, str(exc))
+
+    profit_px = round(price * (1 + cfg["profit_target_pct"] / 100), 2)
+    stop_px   = round(price * (1 - cfg["hard_stop_pct"] / 100), 2)
+
+    dt["positions"][ticker] = {
+        "entry_date":        date.today().isoformat(),
+        "entry_price":       price,
+        "shares":            shares,
+        "cost":              cost,
+        "buy_order_id":      buy_id,
+        "stop_order_id":     None,
+        "stop_price":        stop_px,
+        "profit_price":      profit_px,
+        "phase":             0,
+        "alert_fired_at":    req.alert_fired_at or now_et.isoformat(),
+        "live_price":        None,
+        "live_pnl":          None,
+    }
+    _dt_log("ENTERED", ticker,
+            f"LIMIT BUY {shares}sh @ {lmt_px:.2f} "
+            f"(signal={price:.2f} cost=${cost:,.0f} ord#{buy_id}) "
+            f"target={profit_px:.2f} stop={stop_px:.2f}")
+    _dt_save_state()
+    return {"status": "ordered", "ticker": ticker, "shares": shares,
+            "limit_price": lmt_px, "cost": cost, "order_id": buy_id}
+
+
+@app.get("/day-trader/status")
+def day_trader_status():
+    dt  = state["day_trader"]
+    cfg = dt["config"]
+    capital_deployed = sum(
+        p.get("shares", 0) * p.get("entry_price", 0)
+        for p in dt["positions"].values()
+    )
+    today_pnl = sum(r.get("pnl", 0) for r in dt.get("closed_today", []))
+    return {
+        "enabled":      dt["enabled"],
+        "config":       cfg,
+        "positions":    dt["positions"],
+        "closed_today": dt.get("closed_today", []),
+        "decisions":    dt.get("decisions", [])[-50:],
+        "summary": {
+            "open_positions":   len(dt["positions"]),
+            "capital_deployed": round(capital_deployed, 2),
+            "today_pnl":        round(today_pnl, 2),
+            "today_trades":     len(dt.get("closed_today", [])),
+            "goal_pct":         round(today_pnl / cfg["daily_profit_target"] * 100, 1)
+                                if cfg["daily_profit_target"] > 0 else 0,
+        },
+    }
+
+
+@app.post("/day-trader/enable")
+def day_trader_enable(enabled: bool = True):
+    dt = state["day_trader"]
+    dt["enabled"] = enabled
+    _dt_log("CONFIG", "—", f"{'enabled' if enabled else 'disabled'} by user")
+    _dt_save_state()
+    return {"enabled": dt["enabled"]}
+
+
+@app.post("/day-trader/config")
+def day_trader_config(req: DayConfigRequest):
+    dt  = state["day_trader"]
+    cfg = dt["config"]
+    updates: dict = req.model_dump(exclude_none=True)
+    cfg.update(updates)
+
+    # Retroactively reprice open positions when profit_target_pct changes
+    if "profit_target_pct" in updates:
+        new_pct = updates["profit_target_pct"]
+        repriced = []
+        for ticker, pos in dt["positions"].items():
+            if pos.get("phase", 0) in (0, 1) and pos.get("entry_price"):
+                old_target = pos.get("profit_price")
+                pos["profit_price"] = round(pos["entry_price"] * (1 + new_pct / 100), 2)
+                repriced.append(f"{ticker}: ${old_target}->${pos['profit_price']}")
+        if repriced:
+            _dt_log("REPRICE", "—", f"profit_target→{new_pct}%: {', '.join(repriced)}")
+
+    # Log max_positions change prominently so operator knows new capacity
+    if "max_positions" in updates:
+        open_n = len(dt["positions"])
+        _dt_log("CONFIG", "—",
+                f"max_positions→{updates['max_positions']} (currently {open_n} open)")
+
+    _dt_log("CONFIG", "—", f"updated: {updates}")
+    _dt_save_state()
+    return {"config": cfg}
+
+
+@app.post("/day-trader/close/{ticker}")
+async def day_trader_close(ticker: str):
+    """Manually close a day trader position immediately."""
+    ticker = ticker.upper()
+    dt  = state["day_trader"]
+    pos = dt["positions"].get(ticker)
+    if not pos:
+        raise HTTPException(404, f"{ticker} not in open day trader positions")
+    ib = state.get("ib")
+    if not ib or not ib.isConnected():
+        raise HTTPException(503, "IBKR not connected")
+
+    if pos.get("phase", 0) == 0:
+        buy_oid = pos.get("buy_order_id")
+        async def _cancel_buy(ib):
+            ot = {t.order.orderId: t for t in ib.openTrades()}
+            if buy_oid and buy_oid in ot:
+                ib.cancelOrder(ot[buy_oid].order)
+                await asyncio.sleep(0.5)
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, lambda: _run_in_streaming_loop(_cancel_buy(ib), timeout=15))
+        dt["positions"].pop(ticker, None)
+        _dt_log("MANUAL_CANCEL", ticker, f"pending buy ord#{buy_oid} cancelled")
+        _dt_save_state()
+        return {"status": "cancelled", "ticker": ticker}
+
+    stop_oid = pos.get("stop_order_id")
+    async def _do_close(ib):
+        ot = {t.order.orderId: t for t in ib.openTrades()}
+        if stop_oid and stop_oid in ot:
+            ib.cancelOrder(ot[stop_oid].order)
+            await asyncio.sleep(1)
+        contract = Stock(ticker, "SMART", "USD")
+        mkt_ord = Order()
+        mkt_ord.orderType     = "MKT"
+        mkt_ord.action        = "SELL"
+        mkt_ord.totalQuantity = pos["shares"]
+        mkt_ord.tif           = "DAY"
+        trade = ib.placeOrder(contract, mkt_ord)
+        await asyncio.sleep(0.5)
+        return trade.order.orderId
+
+    loop    = asyncio.get_event_loop()
+    sell_id = await loop.run_in_executor(None, lambda: _run_in_streaming_loop(_do_close(ib), timeout=15))
+    pos["phase"]             = 3
+    pos["stop_order_id"]     = sell_id
+    pos["pending_exit_type"] = "manual_close"
+    _dt_log("MANUAL_CLOSE", ticker, f"MKT SELL {pos['shares']}sh (ord#{sell_id})")
+    _dt_save_state()
+    return {"status": "closing", "ticker": ticker, "order_id": sell_id}
+
+
+@app.get("/day-trader/goal")
+def day_trader_goal():
+    """Calculate capital required to hit the daily profit target."""
+    cfg      = state["day_trader"]["config"]
+    target   = cfg["daily_profit_target"]
+    win_rate = cfg["win_rate_est"]
+    exp_ret  = cfg["expected_return_pct"]
+    pos_size = cfg["position_size"]
+    ev_per   = pos_size * win_rate * (exp_ret / 100)
+    if ev_per <= 0:
+        return {"error": "Invalid win_rate_est or expected_return_pct"}
+    req_pos     = int(np.ceil(target / ev_per))
+    req_capital = round(req_pos * pos_size, 2)
+    today_pnl   = sum(r.get("pnl", 0) for r in state["day_trader"].get("closed_today", []))
+    remaining   = max(0.0, target - today_pnl)
+    req_pos_remaining = int(np.ceil(remaining / ev_per)) if remaining > 0 else 0
+    return {
+        "daily_profit_target":   target,
+        "win_rate_est":          win_rate,
+        "expected_return_pct":   exp_ret,
+        "position_size":         pos_size,
+        "ev_per_position":       round(ev_per, 2),
+        "required_positions":    req_pos,
+        "required_capital":      req_capital,
+        "today_pnl":             round(today_pnl, 2),
+        "remaining_target":      round(remaining, 2),
+        "remaining_positions":   req_pos_remaining,
+        "current_max_positions": cfg["max_positions"],
+        "positions_gap":         max(0, req_pos - cfg["max_positions"]),
+    }
+
+
+# ── SPX 0DTE Trader ──────────────────────────────────────────────────────────
+
+def _spx_log(action: str, detail: str, spread_id: str = "—") -> None:
+    from zoneinfo import ZoneInfo
+    t = datetime.now(ZoneInfo("America/New_York")).strftime("%H:%M:%S ET")
+    entry = {"time": t, "action": action, "spread_id": spread_id, "detail": detail}
+    sx = state["spx_0dte"]
+    sx["decisions"].append(entry)
+    if len(sx["decisions"]) > 200:
+        sx["decisions"] = sx["decisions"][-200:]
+    log.info("SPX0DTE [%s] %s — %s", action, spread_id, detail)
+
+
+def _spx_save_state() -> None:
+    sx = state["spx_0dte"]
+    try:
+        with open(SPX_STATE_PATH, "w") as f:
+            json.dump({
+                "enabled":        sx["enabled"],
+                "config":         sx["config"],
+                "spreads":        sx["spreads"],
+                "closed_today":   sx["closed_today"],
+                "decisions":      sx["decisions"][-50:],
+                "attempts_today": sx["attempts_today"],
+                "today_pnl":      sx["today_pnl"],
+                "last_stop_time": sx.get("last_stop_time"),
+                "date":           date.today().isoformat(),
+            }, f, default=str)
+    except Exception as e:
+        log.warning("SPX 0DTE state save failed: %s", e)
+
+
+def _spx_load_state() -> None:
+    if not os.path.exists(SPX_STATE_PATH):
+        return
+    try:
+        with open(SPX_STATE_PATH, "r") as f:
+            saved = json.load(f)
+        sx    = state["spx_0dte"]
+        today = date.today().isoformat()
+        if "config" in saved:
+            sx["config"].update(saved["config"])
+        sx["enabled"] = saved.get("enabled", False)
+        sx["spreads"]  = {
+            k: v for k, v in saved.get("spreads", {}).items()
+            if v.get("date") == today
+        }
+        sx["closed_today"]   = [r for r in saved.get("closed_today", []) if r.get("date") == today]
+        sx["decisions"]      = saved.get("decisions", [])
+        same_day             = saved.get("date") == today
+        sx["attempts_today"] = saved.get("attempts_today", 0) if same_day else 0
+        sx["today_pnl"]      = saved.get("today_pnl", 0.0)    if same_day else 0.0
+        sx["last_stop_time"] = saved.get("last_stop_time")
+        log.info("SPX 0DTE state restored: %d open spreads, $%.2f P&L today",
+                 len(sx["spreads"]), sx["today_pnl"])
+    except Exception as e:
+        log.warning("SPX 0DTE state load failed: %s", e)
+
+
+async def _spx_get_spot(ib) -> float:
+    """SPX spot: SPY bars × 10 (primary), live reqMktData for SPX index (fallback)."""
+    spy_bars = state["bars"].get("SPY", [])
+    if spy_bars:
+        return round(float(spy_bars[-1]["close"]) * 10, 2)
+    try:
+        from ib_insync import Index
+        spx_c = Index("SPX", "CBOE")
+        await ib.qualifyContractsAsync(spx_c)
+        td = ib.reqMktData(spx_c, "", False, False)
+        await asyncio.sleep(2)
+        px = float(td.last or td.close or 0)
+        ib.cancelMktData(spx_c)
+        if px > 0:
+            return px
+    except Exception as e:
+        log.warning("SPX 0DTE: spot unavailable via IB: %s", e)
+    return 0.0
+
+
+def _spx_round_strike(spot: float, offset_pct: float, right: str, increment: int = 5) -> float:
+    raw = spot * (1 - offset_pct / 100) if right == "P" else spot * (1 + offset_pct / 100)
+    return float(round(raw / increment) * increment)
+
+
+def _spx_safe_px(v) -> float:
+    """Return a positive finite float from an ib_insync tick value, else 0.0."""
+    import math
+    try:
+        f = float(v)
+        return f if (f > 0 and not math.isnan(f) and not math.isinf(f)) else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _spx_mid(td) -> float:
+    """Best-effort mid price from a Ticker: mid → last → 0."""
+    b = _spx_safe_px(td.bid)
+    a = _spx_safe_px(td.ask)
+    if b > 0 and a > 0:
+        return (b + a) / 2
+    # Fall back to last only if it's clearly reasonable (not stale zero)
+    last = _spx_safe_px(td.last)
+    return last
+
+
+async def _spx_quote_vertical(ib, expiry: str, right: str,
+                               short_k: float, long_k: float):
+    """
+    Qualify two SPX option legs and return (net_credit, short_conid, long_conid).
+    Uses mid-price for both legs so stale bids/asks don't invert the spread.
+    net_credit = short_mid - long_mid > 0 means we collect premium.
+    """
+    from ib_insync import Option as IbOpt
+    # tradingClass="SPXW" = PM-settled weekly (0DTE Mon/Wed/Fri). Required by IBKR.
+    sc = IbOpt("SPX", expiry, short_k, right, "SMART", "100", "USD")
+    lc = IbOpt("SPX", expiry, long_k,  right, "SMART", "100", "USD")
+    sc.tradingClass = "SPXW"
+    lc.tradingClass = "SPXW"
+    await ib.qualifyContractsAsync(sc, lc)
+    if not sc.conId or not lc.conId:
+        raise ValueError(f"Cannot qualify SPX {right} {short_k}/{long_k} exp {expiry} (SPXW)")
+
+    td_s = ib.reqMktData(sc, "100,101,106", False, False)
+    td_l = ib.reqMktData(lc, "100,101,106", False, False)
+    await asyncio.sleep(5)          # paper needs extra time for quotes to populate
+
+    s_mid = _spx_mid(td_s)
+    l_mid = _spx_mid(td_l)
+    ib.cancelMktData(sc)
+    ib.cancelMktData(lc)
+
+    if s_mid <= 0 or l_mid <= 0:
+        raise ValueError(
+            f"No market for SPX {right} {short_k}/{long_k}: "
+            f"short_mid={s_mid:.3f} long_mid={l_mid:.3f}"
+        )
+    if s_mid <= l_mid:
+        raise ValueError(
+            f"SPX {right} spread inverted: short@{short_k}={s_mid:.3f} >= long@{long_k}={l_mid:.3f} "
+            f"(strikes too far OTM or bad quotes)"
+        )
+
+    net = round(s_mid - l_mid, 2)
+    return net, sc.conId, lc.conId
+
+
+async def _spx_place_bag(ib, expiry: str, right: str,
+                          short_k: float, long_k: float,
+                          short_conid: int, long_conid: int,
+                          qty: int, credit: float) -> int:
+    """Place a vertical spread as a CBOE BAG (combo) order. Returns orderId."""
+    from ib_insync import Contract as IbCont, ComboLeg
+    bag = IbCont()
+    bag.symbol   = "SPX"
+    bag.secType  = "BAG"
+    bag.exchange = "CBOE"
+    bag.currency = "USD"
+    l1 = ComboLeg(); l1.conId = short_conid; l1.ratio = 1; l1.action = "SELL"; l1.exchange = "CBOE"
+    l2 = ComboLeg(); l2.conId = long_conid;  l2.ratio = 1; l2.action = "BUY";  l2.exchange = "CBOE"
+    bag.comboLegs = [l1, l2]
+    ord_ = LimitOrder("SELL", qty, max(0.01, round(credit, 2)))
+    ord_.tif = "DAY"
+    trade = ib.placeOrder(bag, ord_)
+    await asyncio.sleep(0.5)
+    return trade.order.orderId
+
+
+async def _spx_close_spread(ib, spread_id: str, exit_type: str) -> None:
+    """Market-close all legs of an open IC and record result."""
+    from ib_insync import Option as IbOpt
+    sx = state["spx_0dte"]
+    sp = sx["spreads"].get(spread_id)
+    if not sp:
+        return
+    sp["phase"] = 2
+    qty    = sp["qty"]
+    expiry = sp["expiry"]
+
+    # Cancel pending spread orders
+    open_oids = {t.order.orderId: t for t in ib.openTrades()}
+    for key in ("put_order_id", "call_order_id"):
+        oid = sp.get(key)
+        if oid and oid in open_oids:
+            ib.cancelOrder(open_oids[oid].order)
+    await asyncio.sleep(1)
+
+    # Leg out: cover shorts, sell longs — only for legs that were actually entered
+    legs = []
+    if sp.get("put_conids") and sp.get("put_short_k") is not None:
+        legs += [
+            ("P", sp["put_short_k"], sp["put_conids"][0], "BUY"),
+            ("P", sp["put_long_k"],  sp["put_conids"][1], "SELL"),
+        ]
+    if sp.get("call_conids") and sp.get("call_short_k") is not None:
+        legs += [
+            ("C", sp["call_short_k"], sp["call_conids"][0], "BUY"),
+            ("C", sp["call_long_k"],  sp["call_conids"][1], "SELL"),
+        ]
+    for right, strike, conid, action in legs:
+        try:
+            c = IbOpt("SPX", expiry, strike, right, "SMART", "100", "USD")
+            c.tradingClass = "SPXW"
+            c.conId = conid
+            mkt = Order()
+            mkt.orderType = "MKT"; mkt.action = action
+            mkt.totalQuantity = qty; mkt.tif = "DAY"
+            ib.placeOrder(c, mkt)
+        except Exception as ex:
+            log.warning("SPX 0DTE close leg %s%s failed: %s", right, strike, ex)
+    await asyncio.sleep(1)
+
+    pnl = round(sp.get("live_pnl") or 0, 2)
+    sx["today_pnl"] = round(sx.get("today_pnl", 0) + pnl, 2)
+    credit = sp["total_credit"]
+    strategy = sp.get("strategy", "iron_condor")
+    put_str  = (f"{int(sp['put_short_k'])}/{int(sp['put_long_k'])}P"
+                if sp.get("put_short_k") is not None else "—")
+    call_str = (f"{int(sp['call_short_k'])}/{int(sp['call_long_k'])}C"
+                if sp.get("call_short_k") is not None else "—")
+    sx["closed_today"].append({
+        "spread_id":    spread_id,
+        "strategy":     strategy,
+        "date":         sp["date"],
+        "placed_at":    sp["placed_at"],
+        "put_strikes":  put_str,
+        "call_strikes": call_str,
+        "qty":          qty,
+        "total_credit": credit,
+        "pnl":          pnl,
+        "pnl_pct":      round(pnl / credit * 100, 1) if credit else 0,
+        "exit_type":    exit_type,
+    })
+    sx["spreads"].pop(spread_id, None)
+    _spx_log("CLOSED", f"exit={exit_type}  P&L=${pnl:.2f}  day_total=${sx['today_pnl']:.2f}", spread_id)
+    _spx_save_state()
+
+
+async def _spx_entry_coro(ib) -> None:
+    """Check all conditions and place an Iron Condor if appropriate."""
+    from zoneinfo import ZoneInfo
+    ET  = ZoneInfo("America/New_York")
+    sx  = state["spx_0dte"]
+    cfg = sx["config"]
+    now = datetime.now(ET)
+
+    def _t(hhmm):
+        h, m = map(int, hhmm.split(":"))
+        return now.replace(hour=h, minute=m, second=0, microsecond=0)
+
+    if not (_t(cfg["entry_start_time"]) <= now <= _t(cfg["entry_cutoff_time"])):
+        return
+    if sx["today_pnl"] >= cfg["daily_profit_target"]:
+        return
+    if sx["attempts_today"] >= cfg["max_attempts"]:
+        return
+    if sx["spreads"]:
+        return
+    if sx.get("last_stop_time"):
+        last_stop = datetime.fromisoformat(sx["last_stop_time"])
+        if (now - last_stop).total_seconds() < 30 * 60:
+            return
+
+    spot = await _spx_get_spot(ib)
+    if spot <= 0:
+        _spx_log("SKIP", "SPX spot price unavailable")
+        return
+
+    expiry  = now.strftime("%Y%m%d")
+    otm_pct = float(cfg["otm_pct"])
+    width   = int(cfg["spread_width"])
+
+    put_short_k  = _spx_round_strike(spot, otm_pct, "P")
+    put_long_k   = put_short_k - width
+    call_short_k = _spx_round_strike(spot, otm_pct, "C")
+    call_long_k  = call_short_k + width
+
+    try:
+        p_credit, p_s_cid, p_l_cid = await _spx_quote_vertical(ib, expiry, "P", put_short_k, put_long_k)
+        c_credit, c_s_cid, c_l_cid = await _spx_quote_vertical(ib, expiry, "C", call_short_k, call_long_k)
+    except Exception as e:
+        _spx_log("SKIP", f"Chain unavailable: {e}")
+        return
+
+    min_cred = float(cfg.get("min_credit_per_spread", 0.20))
+
+    # Allow one-sided entry: skip a leg only if its credit is below minimum.
+    # Entering a 25-pt spread for $0.10 risks $2,490 to make $10 — terrible R/R.
+    use_put  = p_credit >= min_cred
+    use_call = c_credit >= min_cred
+
+    if not use_put and not use_call:
+        _spx_log("SKIP",
+                 f"Both legs thin: P={p_credit:.2f} C={c_credit:.2f} min={min_cred:.2f}")
+        return
+
+    strategy      = "iron_condor" if (use_put and use_call) else ("call_spread" if use_call else "put_spread")
+    active_credit = (p_credit if use_put else 0.0) + (c_credit if use_call else 0.0)
+
+    if not use_put:
+        _spx_log("INFO", f"Put leg thin ({p_credit:.2f}) — entering call spread only (C={c_credit:.2f})")
+    elif not use_call:
+        _spx_log("INFO", f"Call leg thin ({c_credit:.2f}) — entering put spread only (P={p_credit:.2f})")
+
+    profit_pct    = float(cfg["profit_pct"]) / 100
+    ev_per_spread = active_credit * 100 * profit_pct
+    remaining     = max(0.0, cfg["daily_profit_target"] - sx["today_pnl"])
+    max_by_margin = max(1, int(cfg["max_margin"] / (width * 100)))
+    qty           = min(max_by_margin, max(1, int(np.ceil(remaining / ev_per_spread))))
+
+    _spx_log("ENTRY",
+             f"SPX {spot:.0f}  strategy={strategy} | "
+             + (f"P {int(put_short_k)}/{int(put_long_k)} cr={p_credit:.2f} | " if use_put else "")
+             + (f"C {int(call_short_k)}/{int(call_long_k)} cr={c_credit:.2f} | " if use_call else "")
+             + f"qty={qty}  total_cr=${qty*active_credit*100:.0f}")
+
+    p_oid = c_oid = None
+    try:
+        if use_put:
+            p_oid = await _spx_place_bag(ib, expiry, "P",
+                                          put_short_k, put_long_k, p_s_cid, p_l_cid, qty, p_credit)
+        if use_call:
+            c_oid = await _spx_place_bag(ib, expiry, "C",
+                                          call_short_k, call_long_k, c_s_cid, c_l_cid, qty, c_credit)
+    except Exception as e:
+        _spx_log("ERROR", f"Order placement failed: {e}")
+        return
+
+    total_credit_dollar = round(qty * active_credit * 100, 2)
+    spread_id = f"{strategy[:2].upper()}_{now.strftime('%H%M')}"
+    sx["spreads"][spread_id] = {
+        "spread_id":     spread_id,
+        "strategy":      strategy,
+        "date":          date.today().isoformat(),
+        "expiry":        expiry,
+        "spot_at_entry": spot,
+        "qty":           qty,
+        "put_short_k":   put_short_k  if use_put  else None,
+        "put_long_k":    put_long_k   if use_put  else None,
+        "call_short_k":  call_short_k if use_call else None,
+        "call_long_k":   call_long_k  if use_call else None,
+        "put_conids":    [p_s_cid, p_l_cid] if use_put  else [],
+        "call_conids":   [c_s_cid, c_l_cid] if use_call else [],
+        "put_order_id":  p_oid,
+        "call_order_id": c_oid,
+        "put_credit":    p_credit  if use_put  else 0.0,
+        "call_credit":   c_credit  if use_call else 0.0,
+        "total_credit":  total_credit_dollar,
+        "profit_target": round(total_credit_dollar * profit_pct, 2),
+        "max_loss":      round(qty * (width - active_credit) * 100, 2),
+        "phase":         1,
+        "live_pnl":      None,
+        "placed_at":     now.strftime("%H:%M ET"),
+    }
+    sx["attempts_today"] += 1
+    _spx_save_state()
+
+
+async def _spx_monitor_coro(ib) -> None:
+    """One cycle: compute live P&L by re-quoting spreads (portfolio.unrealizedPNL is
+    unreliable in paper trading for SPX index options — IBKR marks at 0 if no subscription)."""
+    from zoneinfo import ZoneInfo
+    from ib_insync import Option as IbOpt
+    ET  = ZoneInfo("America/New_York")
+    sx  = state["spx_0dte"]
+    cfg = sx["config"]
+    now = datetime.now(ET)
+
+    def _t(hhmm):
+        h, m = map(int, hhmm.split(":"))
+        return now.replace(hour=h, minute=m, second=0, microsecond=0)
+
+    for sid, sp in list(sx["spreads"].items()):
+        if sp.get("phase", 1) != 1:
+            continue
+
+        qty    = sp["qty"]
+        expiry = sp["expiry"]
+        live_pnl = 0.0
+
+        # Re-quote each live leg: short leg value lost = profit for us
+        legs_to_quote = []
+        if sp.get("put_conids") and sp.get("put_short_k") is not None:
+            legs_to_quote.append(("P", sp["put_short_k"], sp["put_long_k"],
+                                  sp["put_credit"], sp["put_conids"]))
+        if sp.get("call_conids") and sp.get("call_short_k") is not None:
+            legs_to_quote.append(("C", sp["call_short_k"], sp["call_long_k"],
+                                  sp["call_credit"], sp["call_conids"]))
+
+        for right, sk, lk, entry_credit, conids in legs_to_quote:
+            try:
+                sc = IbOpt("SPX", expiry, sk, right, "SMART", "100", "USD")
+                lc = IbOpt("SPX", expiry, lk, right, "SMART", "100", "USD")
+                sc.tradingClass = "SPXW"; sc.conId = conids[0]
+                lc.tradingClass = "SPXW"; lc.conId = conids[1]
+                td_s = ib.reqMktData(sc, "100,101,106", False, False)
+                td_l = ib.reqMktData(lc, "100,101,106", False, False)
+                await asyncio.sleep(4)
+                s_mid = _spx_mid(td_s)
+                l_mid = _spx_mid(td_l)
+                ib.cancelMktData(sc)
+                ib.cancelMktData(lc)
+                if s_mid > 0 and l_mid > 0:
+                    current_credit = round(s_mid - l_mid, 2)
+                    # Profit = credit collected at entry minus current cost to close
+                    live_pnl += (entry_credit - current_credit) * 100 * qty
+            except Exception as ex:
+                log.warning("SPX 0DTE monitor quote failed %s %s/%s: %s", right, sk, lk, ex)
+
+        sp["live_pnl"] = round(live_pnl, 2)
+        _spx_log("MONITOR", f"spread={sid} live_pnl=${live_pnl:.2f} target=${sp['profit_target']:.2f}")
+
+        profit_target = sp["profit_target"]
+        max_loss      = sp.get("max_loss", sp["total_credit"] * float(cfg["stop_loss_mult"]))
+
+        if live_pnl >= profit_target:
+            _spx_log("PROFIT_TARGET",
+                     f"P&L=${live_pnl:.2f} >= target=${profit_target:.2f}", sid)
+            await _spx_close_spread(ib, sid, "profit_target")
+            continue
+
+        if live_pnl <= -max_loss:
+            _spx_log("STOP_LOSS",
+                     f"P&L=${live_pnl:.2f} <= -max_loss=-${max_loss:.2f}", sid)
+            sx["last_stop_time"] = now.isoformat()
+            await _spx_close_spread(ib, sid, "stop_loss")
+            continue
+
+        if now >= _t(cfg["force_close_time"]):
+            _spx_log("FORCE_CLOSE",
+                     f"Force-close at {cfg['force_close_time']} ET  P&L=${live_pnl:.2f}", sid)
+            await _spx_close_spread(ib, sid, "force_close")
+            continue
+
+    _spx_save_state()
+
+
+async def _spx_monitor_loop() -> None:
+    """Background loop: entry + monitor every 30s during market hours (9:25–16:15 ET)."""
+    await asyncio.sleep(40)
+    while True:
+        try:
+            from zoneinfo import ZoneInfo
+            ET  = ZoneInfo("America/New_York")
+            now = datetime.now(ET)
+            if now.weekday() >= 5:
+                await asyncio.sleep(300)
+                continue
+            mkt_open  = now.replace(hour=9,  minute=25, second=0, microsecond=0)
+            mkt_close = now.replace(hour=16, minute=15, second=0, microsecond=0)
+            if not (mkt_open <= now <= mkt_close):
+                await asyncio.sleep(60)
+                continue
+            sx = state["spx_0dte"]
+            if not sx["enabled"]:
+                await asyncio.sleep(30)
+                continue
+            ib = state.get("ib")
+            if not ib or not ib.isConnected():
+                await asyncio.sleep(30)
+                continue
+            loop = asyncio.get_event_loop()
+            if sx["spreads"]:
+                await loop.run_in_executor(
+                    None,
+                    lambda: _run_in_streaming_loop(_spx_monitor_coro(ib), timeout=25))
+            if (not sx["spreads"]
+                    and sx["today_pnl"] < sx["config"]["daily_profit_target"]
+                    and sx["attempts_today"] < sx["config"]["max_attempts"]):
+                await loop.run_in_executor(
+                    None,
+                    lambda: _run_in_streaming_loop(_spx_entry_coro(ib), timeout=35))
+        except Exception as exc:
+            log.warning("SPX 0DTE loop error: %s", exc)
+        await asyncio.sleep(30)
+
+
+# ── SPX 0DTE endpoints ─────────────────────────────────────────────────────────
+
+class SPXConfigRequest(BaseModel):
+    daily_profit_target:   Optional[float] = None
+    spread_width:          Optional[int]   = None
+    otm_pct:               Optional[float] = None
+    profit_pct:            Optional[float] = None
+    stop_loss_mult:        Optional[float] = None
+    entry_start_time:      Optional[str]   = None
+    entry_cutoff_time:     Optional[str]   = None
+    force_close_time:      Optional[str]   = None
+    max_attempts:          Optional[int]   = None
+    max_margin:            Optional[float] = None
+    min_credit_per_spread: Optional[float] = None
+
+
+@app.get("/spx-0dte/status")
+def spx_0dte_status():
+    sx  = state["spx_0dte"]
+    cfg = sx["config"]
+    pnl = round(sx.get("today_pnl", 0.0), 2)
+    return {
+        "enabled":        sx["enabled"],
+        "config":         cfg,
+        "spreads":        sx["spreads"],
+        "closed_today":   sx.get("closed_today", []),
+        "decisions":      sx.get("decisions", [])[-50:],
+        "attempts_today": sx.get("attempts_today", 0),
+        "summary": {
+            "open_spreads":   len(sx["spreads"]),
+            "today_pnl":      pnl,
+            "goal_pct":       round(pnl / cfg["daily_profit_target"] * 100, 1)
+                              if cfg["daily_profit_target"] > 0 else 0,
+            "attempts_today": sx.get("attempts_today", 0),
+            "closed_trades":  len(sx.get("closed_today", [])),
+        },
+    }
+
+
+@app.post("/spx-0dte/enable")
+def spx_0dte_enable(enabled: bool = True):
+    sx = state["spx_0dte"]
+    sx["enabled"] = enabled
+    _spx_log("CONFIG", f"{'enabled' if enabled else 'disabled'} by user")
+    _spx_save_state()
+    return {"enabled": sx["enabled"]}
+
+
+@app.post("/spx-0dte/config")
+def spx_0dte_config(req: SPXConfigRequest):
+    sx  = state["spx_0dte"]
+    cfg = sx["config"]
+    updates = req.model_dump(exclude_none=True)
+    cfg.update(updates)
+    _spx_log("CONFIG", f"updated: {updates}")
+    _spx_save_state()
+    return {"config": cfg}
+
+
+@app.post("/spx-0dte/close/{spread_id}")
+async def spx_0dte_close(spread_id: str):
+    sx = state["spx_0dte"]
+    if spread_id not in sx["spreads"]:
+        raise HTTPException(404, f"{spread_id} not found in open spreads")
+    ib = state.get("ib")
+    if not ib or not ib.isConnected():
+        raise HTTPException(503, "IBKR not connected")
+    _spx_log("MANUAL_CLOSE", "manual close requested", spread_id)
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(
+        None,
+        lambda: _run_in_streaming_loop(_spx_close_spread(ib, spread_id, "manual_close"), timeout=20))
+    return {"status": "closing", "spread_id": spread_id}
 
 
 # ── Live Tape WebSocket ─────────────────────────────────────────────────────

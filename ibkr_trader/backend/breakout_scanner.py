@@ -232,6 +232,8 @@ def post_to_backend_with_tape(backend_url: str, ind: dict, signal_type: str,
         if ind.get("prev_state")           is not None: payload["prev_state"]           = ind["prev_state"]
         if ind.get("mins_in_pre_breakout") is not None: payload["mins_in_pre_breakout"] = ind["mins_in_pre_breakout"]
         if ind.get("state_path")           is not None: payload["state_path"]           = ind["state_path"]
+        if ind.get("sr_resistance")        is not None: payload["sr_resistance"]        = ind["sr_resistance"]
+        if ind.get("sr_support")           is not None: payload["sr_support"]           = ind["sr_support"]
         r = requests.post(
             f"{backend_url.rstrip('/')}/watchlist/alert",
             json=payload,
@@ -311,6 +313,15 @@ def fmt_alert(ind: dict, signal: str, tape: dict | None = None) -> str:
     else:
         score_line = ""
 
+    sr_parts = []
+    if ind.get("sr_resistance"):
+        dist = (ind["sr_resistance"] / ind["price"] - 1) * 100
+        sr_parts.append(f"R ${ind['sr_resistance']:.2f} (+{dist:.1f}%)")
+    if ind.get("sr_support"):
+        dist = (ind["price"] / ind["sr_support"] - 1) * 100
+        sr_parts.append(f"S ${ind['sr_support']:.2f} (-{dist:.1f}%)")
+    sr_line = ("\n\U0001f4d0 S/R: " + "  |  ".join(sr_parts)) if sr_parts else ""
+
     return (
         f"{emoji} <b>{signal}</b> — {ind['ticker']}\n"
         f"💰 Price: ${ind['price']:.2f} ({day_sign}{ind['day_chg_pct']:.1f}%)\n"
@@ -319,6 +330,7 @@ def fmt_alert(ind: dict, signal: str, tape: dict | None = None) -> str:
         f"{intraday_line}"
         f"{quality_line}"
         f"{score_line}"
+        f"{sr_line}"
         f"{tape_line}"
     )
 
@@ -596,6 +608,39 @@ def _compute_adx(high: np.ndarray, low: np.ndarray, close: np.ndarray,
     return float(last[-1]) if len(last) else float("nan")
 
 
+def _sr_quick(highs: np.ndarray, lows: np.ndarray, price: float,
+              n_confirm: int = 5, lookback: int = 60, tol: float = 0.003) -> tuple:
+    """Nearest swing resistance above price and swing support below price.
+    Uses the lookback bars BEFORE the current bar — no lookahead.
+    Returns (resistance, support) — either may be None.
+    """
+    h = highs[-lookback - 1: -1]   # exclude today's bar
+    l = lows[-lookback - 1: -1]
+    n = len(h)
+    raw_res, raw_sup = [], []
+    for i in range(n_confirm, n - n_confirm):
+        if all(h[i] >= h[i-j] for j in range(1, n_confirm+1)) and \
+           all(h[i] >= h[i+j] for j in range(1, n_confirm+1)):
+            if h[i] > price: raw_res.append(float(h[i]))
+        if all(l[i] <= l[i-j] for j in range(1, n_confirm+1)) and \
+           all(l[i] <= l[i+j] for j in range(1, n_confirm+1)):
+            if l[i] < price: raw_sup.append(float(l[i]))
+
+    def _cl(lvls):
+        if not lvls: return []
+        out, grp = [], [sorted(lvls)[0]]
+        for v in sorted(lvls)[1:]:
+            if (v - grp[0]) / grp[0] <= tol: grp.append(v)
+            else: out.append(round(sum(grp)/len(grp), 2)); grp = [v]
+        out.append(round(sum(grp)/len(grp), 2))
+        return out
+
+    res = [v for v in _cl(raw_res) if v > price]
+    sup = [v for v in _cl(raw_sup) if v < price]
+    return (round(min(res), 2) if res else None,
+            round(max(sup), 2) if sup else None)
+
+
 def compute_indicators(ticker: str, hist: pd.DataFrame) -> dict | None:
     """Compute breakout indicators from one year of daily OHLCV data."""
     try:
@@ -703,6 +748,13 @@ def compute_indicators(ticker: str, hist: pd.DataFrame) -> dict | None:
         proj_today = raw_today * scale
         vol_ratio  = round(proj_today / avg_vol, 2) if avg_vol > 0 else None
 
+        # S/R: nearest swing resistance above price and support below (60 bars, excl. today)
+        sr_resistance, sr_support = None, None
+        if len(highs_s) >= 72 and len(lows_s) >= 72:
+            sr_resistance, sr_support = _sr_quick(
+                highs_s.values.astype(float), lows_s.values.astype(float), last_close
+            )
+
         return {
             "ticker":       ticker,
             "price":        round(last_close, 2),
@@ -726,6 +778,9 @@ def compute_indicators(ticker: str, hist: pd.DataFrame) -> dict | None:
             "prior_5d_ret": round(prior_5d_ret, 2),
             "vol_trend":    vol_trend,
             "bb_bwidth":    round(bb_bwidth, 2),
+            # S/R levels (swing-based, 60-bar lookback, excl. today)
+            "sr_resistance": sr_resistance,
+            "sr_support":    sr_support,
         }
     except Exception as exc:
         log.debug("Indicator error for %s: %s", ticker, exc)
@@ -1821,27 +1876,14 @@ def _main_loop():
                 state_ctx = _get_state_context(tk)
                 ind.update(state_ctx)
 
-                # Always sync to backend (includes tape so watchlist shows tape label)
-                response = post_to_backend_with_tape(backend_url, ind, sig_type, tape)
-                action   = response.get("action", "no_backend")
-
-                if action == "blocked":
-                    log.info("Backend gate blocked %s %s: %s",
-                             sig_type, tk, response.get("reason", "—"))
-                    continue
-
-                # Skip Telegram if regime gate is active (F1)
+                # Skip if regime gate is active (F1) or signal type not configured
                 if not regime_ok:
                     continue
-
-                # Skip if this signal type is not in alert_on config
                 if sig_type not in alert_on:
                     continue
 
-                # Skip Telegram after 15:45 ET — scanner runs until 16:15 to catch
-                # late-day closes for watchlist sync, but post-close signals fire on
-                # yesterday's cached technicals and the "breakout price" IS the closing
-                # print. No actionable trade is possible; suppress the alert.
+                # Skip after 15:45 ET — post-close signals fire on yesterday's cached
+                # technicals; no actionable trade is possible.
                 _now_for_alert = datetime.now(ET)
                 if _now_for_alert.hour == 15 and _now_for_alert.minute >= 45:
                     log.info("Post-close suppression: skipping Telegram for %s %s at %s ET",
@@ -1865,6 +1907,16 @@ def _main_loop():
                     n_f9_dropped += 1
                     continue
 
+                # Sync to backend watchlist only after all local filters pass (F1–F9).
+                # This keeps watchlist consistent with Telegram and stock-trader triggers.
+                response = post_to_backend_with_tape(backend_url, ind, sig_type, tape)
+                action   = response.get("action", "no_backend")
+
+                if action == "blocked":
+                    log.info("Backend gate blocked %s %s: %s",
+                             sig_type, tk, response.get("reason", "—"))
+                    continue
+
                 # Dedup: only alert on new or escalated signals
                 prev = alerted_today.get(tk)
                 if prev == sig_type:
@@ -1884,24 +1936,25 @@ def _main_loop():
                 send_telegram(token, chat_id, msg)
                 time.sleep(0.3)   # Telegram rate limit: ~30 msg/s
 
-                # Direct stock-trader trigger (fast path — bypasses 5-min AT poll)
-                # POST immediately on BREAKOUT so the order lands within seconds,
-                # not at the next autotrader cycle (worst case 5 min later).
+                # Direct stock-trader + day-trader triggers (fast path — bypasses 5-min AT poll)
+                # Only fires on first alert per ticker per day, same gate as Telegram.
                 if sig_type == "BREAKOUT" and backend_url:
-                    try:
-                        requests.post(
-                            f"{backend_url.rstrip('/')}/stock-trader/signal",
-                            json={
-                                "ticker":         tk,
-                                "price":          ind.get("price", 0),
-                                "alert_fired_at": datetime.now(ET).isoformat(),
-                            },
-                            timeout=5,
-                        )
-                        log.info("Stock-trader direct trigger fired: %s @ %.2f",
-                                 tk, ind.get("price", 0))
-                    except Exception as _ste:
-                        log.debug("Stock-trader direct trigger failed (non-fatal): %s", _ste)
+                    _signal_payload = {
+                        "ticker":         tk,
+                        "price":          ind.get("price", 0),
+                        "alert_fired_at": datetime.now(ET).isoformat(),
+                    }
+                    for _ep in ("/stock-trader/signal", "/day-trader/signal"):
+                        try:
+                            requests.post(
+                                f"{backend_url.rstrip('/')}{_ep}",
+                                json=_signal_payload,
+                                timeout=5,
+                            )
+                            log.info("%s direct trigger fired: %s @ %.2f",
+                                     _ep, tk, ind.get("price", 0))
+                        except Exception as _ste:
+                            log.debug("%s direct trigger failed (non-fatal): %s", _ep, _ste)
 
         # If nothing found, log a quiet pulse every other cycle
         if not candidates and not (len(alerted_today) % 2):
