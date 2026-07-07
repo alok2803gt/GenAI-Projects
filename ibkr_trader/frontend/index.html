@@ -7164,7 +7164,7 @@ function NewsMonitorTab() {
 
   const fetchStatus = () => {
     setLoading(true);
-    fetch("/news/status", {signal: AbortSignal.timeout(15000)})
+    fetch(API + "/news/status", {signal: AbortSignal.timeout(15000)})
       .then(r => r.json())
       .then(d => { setData(d); setCfg(d.config || {}); })
       .catch(e => setMsg("Fetch error: " + e.message))
@@ -7176,7 +7176,7 @@ function NewsMonitorTab() {
   const runNow = async () => {
     setRunLoad(true); setMsg("");
     try {
-      const r = await fetch("/news/run-now", {method:"POST", signal: AbortSignal.timeout(90000)});
+      const r = await fetch(API + "/news/run-now", {method:"POST", signal: AbortSignal.timeout(90000)});
       const d = await r.json();
       setMsg(`Scan complete`);
       fetchStatus();
@@ -7185,18 +7185,18 @@ function NewsMonitorTab() {
   };
 
   const clearSeen = async () => {
-    await fetch("/news/seen", {method:"DELETE"});
+    await fetch(API + "/news/seen", {method:"DELETE"});
     setMsg("Seen cache cleared");
     fetchStatus();
   };
 
   const toggleEnabled = async val => {
-    await fetch(`/news/enable?enabled=${val}`, {method:"POST"});
+    await fetch(`${API}/news/enable?enabled=${val}`, {method:"POST"});
     setData(prev => prev ? {...prev, enabled: val} : prev);
   };
 
   const saveCfg = async () => {
-    const r = await fetch("/news/config", {method:"POST",
+    const r = await fetch(API + "/news/config", {method:"POST",
       headers:{"Content-Type":"application/json"}, body:JSON.stringify(cfg)});
     const d = await r.json();
     setCfg(d.config); setEditCfg(false); setMsg("Config saved");
@@ -7417,7 +7417,7 @@ function RiskMonitorTab() {
 
   const fetchStatus = () => {
     setLoading(true);
-    fetch("/risk/status", {signal: AbortSignal.timeout(15000)})
+    fetch(API + "/risk/status", {signal: AbortSignal.timeout(15000)})
       .then(r => r.json())
       .then(d => { setData(d); setCfg(d.config || {}); })
       .catch(e => setMsg("Fetch error: " + e.message))
@@ -7433,7 +7433,7 @@ function RiskMonitorTab() {
   const runNow = async () => {
     setRunLoad(true);
     try {
-      const r = await fetch("/risk/run-now", {method:"POST",
+      const r = await fetch(API + "/risk/run-now", {method:"POST",
         signal: AbortSignal.timeout(30000)});
       const d = await r.json();
       setData(prev => prev ? {...prev, violations: d.violations, last_check: d.last_check} : prev);
@@ -7444,7 +7444,7 @@ function RiskMonitorTab() {
 
   const saveConfig = async () => {
     try {
-      const r = await fetch("/risk/config", {method:"POST",
+      const r = await fetch(API + "/risk/config", {method:"POST",
         headers:{"Content-Type":"application/json"},
         body: JSON.stringify(cfg)});
       const d = await r.json();
@@ -7455,7 +7455,7 @@ function RiskMonitorTab() {
   };
 
   const toggleEnabled = async (val) => {
-    await fetch(`/risk/enable?enabled=${val}`, {method:"POST"});
+    await fetch(`${API}/risk/enable?enabled=${val}`, {method:"POST"});
     setData(prev => prev ? {...prev, enabled: val} : prev);
   };
 
