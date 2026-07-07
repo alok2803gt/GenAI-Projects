@@ -373,16 +373,17 @@ state: Dict = {
     "day_trader": {
         "enabled": False,
         "config": {
-            "position_size":        2000,    # fixed $ per trade (smaller for day trades)
-            "max_positions":        10,      # intraday concurrent cap
-            "hard_stop_pct":        7.0,     # intraday stop loss (DAY order)
-            "profit_target_pct":    1.5,     # take profit at +1.5% (intraday)
+            "position_size":        5000,    # fixed $ per trade — 5-yr backtest optimal
+            "max_positions":        10,      # intraday concurrent cap — quality over quantity
+            "hard_stop_pct":        3.0,     # intraday stop loss — 2:1 R/R with 2% target
+            "profit_target_pct":    2.0,     # take profit at +2.0% — 5yr backtest: only config that makes money
             "force_close_time":     "15:45", # force MKT sell all positions at HH:MM ET
             "signal_freshness_min": 30,      # skip alerts older than this
             "limit_buffer_pct":     0.10,    # LIMIT entry = last_price × (1 + buffer/100)
-            "daily_profit_target":  500.0,   # $ goal for the day (for goal calculator)
-            "expected_return_pct":  0.8,     # assumed avg win % per trade (for goal math)
-            "win_rate_est":         0.56,    # assumed win rate per trade (for goal math)
+            "daily_profit_target":  200.0,   # $ goal for the day (for goal calculator)
+            "expected_return_pct":  2.0,     # assumed avg win % per trade (for goal math)
+            "win_rate_est":         0.55,    # assumed win rate per trade (for goal math)
+            "min_composite_score":  75.0,    # skip signals below this score (0 = disabled)
         },
         "positions":    {},   # ticker → position dict
         "closed_today": [],   # closed trade summaries (reset each day)
@@ -409,6 +410,39 @@ state: Dict = {
         "attempts_today": 0,
         "today_pnl":      0.0,
         "last_stop_time": None,
+    },
+    "news_monitor": {
+        "enabled":        True,
+        "config": {
+            "check_interval_s": 120,    # poll every 2 minutes
+            "min_sources":      1,      # sources needed to alert (1=any match, 2=verified only)
+            "alert_all":        False,  # True = alert every story (ignores keyword filter)
+            "quiet_hours":      True,   # silence outside 7am-8pm ET / weekends
+            "max_alerts_cycle": 5,      # cap Telegram alerts per cycle
+        },
+        "seen":           [],           # fingerprint hashes of already-alerted stories
+        "alerts":         [],           # last 200 alerts sent
+        "last_check":     None,
+        "sources_status": {},           # per-source {"last_ok", "count"/"error"}
+    },
+    "risk_monitor": {
+        "enabled": True,
+        "config": {
+            "account_value":      100000.0,  # update to match actual paper balance
+            "csp_stop_mult":      2.0,       # Rule 1: close CSP when loss >= N× premium
+            "csp_warn_mult":      1.5,       # warn at 1.5× before hard stop
+            "leap_max_cost":      3000.0,    # Rule 2: flag LEAPs above this cost basis
+            "vix_threshold":      25.0,      # Rule 3: disable day trader above this VIX
+            "stock_stop_pct":     5.0,       # Rule 4: flag stock positions down >N% after 3d
+            "max_position_pct":   5.0,       # Rule 5: flag any position > N% of account
+            "auto_close_csp":     True,      # auto-close CSPs that breach Rule 1
+            "auto_disable_dt":    True,      # auto-disable day trader when VIX > threshold
+            "check_interval_s":   300,       # check every 5 minutes
+        },
+        "violations":  [],   # current active violations (cleared when resolved)
+        "log":         [],   # permanent audit log (last 200 entries)
+        "last_check":  None,
+        "vix_latest":  None,
     },
     # CVD tape sentiment (populated by reqMktData "233,375" subscriptions)
     "tape_sentiment": {},  # ticker → per-ticker CVD state dict
@@ -2623,6 +2657,11 @@ async def _autotrader_monitor_coro(ib: IB) -> None:
         _k = _at_contract_key(_item.contract)
         if _k in at["positions"]:
             iv_refresh_pairs.append((_k, _item.contract))
+
+    # Computed mid-price P&L for CSP positions — used as fallback when
+    # IBKR paper trading returns unrealizedPNL=0 for short options.
+    _computed_pnl: dict = {}
+
     if iv_refresh_pairs:
         # Build fresh Option contracts with exchange="SMART" to avoid error 321
         # ("Please enter exchange") on portfolio contracts that come back with
@@ -2638,22 +2677,35 @@ async def _autotrader_monitor_coro(ib: IB) -> None:
                 fc.conId = c.conId
             return fc
         _iv_fresh = {_k: _fresh_contract(_c) for _k, _c in iv_refresh_pairs}
-        _iv_tks   = {_k: ib.reqMktData(fc, "106", False, False)
+        # Request bid/ask (100,101) alongside IV (106) so we can compute
+        # mid-price P&L as a fallback for paper accounts where unrealizedPNL=0.
+        _iv_tks   = {_k: ib.reqMktData(fc, "100,101,106", False, False)
                      for _k, fc in _iv_fresh.items()}
         await asyncio.sleep(2)
         _iv_changed = False
         for _k, _c in iv_refresh_pairs:
             _tq = _iv_tks.get(_k)
-            if _tq and _tq.modelGreeks and _tq.modelGreeks.impliedVol:
-                new_iv = round(float(_tq.modelGreeks.impliedVol) * 100, 1)
-                old_iv = float(at["positions"][_k].get("live_iv") or 0)
-                at["positions"][_k]["live_iv"] = new_iv
-                if abs(new_iv - old_iv) >= 3:
-                    _iv_changed = True
-                    _action = at["positions"][_k].get("action", "SELL")
-                    _label  = "LEAP" if _action == "BUY" else "CSP"
-                    _at_log("SYSTEM",
-                            f"{_k}: {_label} IV refreshed {old_iv:.0f}% → {new_iv:.0f}%")
+            if _tq:
+                # Compute mid-price P&L for CSP positions (paper trading fallback)
+                _pos_info = at["positions"].get(_k, {})
+                if _pos_info.get("action", "SELL") == "SELL":
+                    _bid = _safe_float(_tq.bid)
+                    _ask = _safe_float(_tq.ask)
+                    if _bid and _ask and _bid > 0 and _ask > 0:
+                        _mid   = (_bid + _ask) / 2
+                        _entry = float(_pos_info.get("entry_price", 0))
+                        _qty   = int(_pos_info.get("qty", 1))
+                        _computed_pnl[_k] = round((_entry - _mid) * _qty * 100, 2)
+                if _tq.modelGreeks and _tq.modelGreeks.impliedVol:
+                    new_iv = round(float(_tq.modelGreeks.impliedVol) * 100, 1)
+                    old_iv = float(at["positions"][_k].get("live_iv") or 0)
+                    at["positions"][_k]["live_iv"] = new_iv
+                    if abs(new_iv - old_iv) >= 3:
+                        _iv_changed = True
+                        _action = at["positions"][_k].get("action", "SELL")
+                        _label  = "LEAP" if _action == "BUY" else "CSP"
+                        _at_log("SYSTEM",
+                                f"{_k}: {_label} IV refreshed {old_iv:.0f}% → {new_iv:.0f}%")
             ib.cancelMktData(_iv_fresh[_k])
         if _iv_changed:
             _at_save_state()
@@ -2663,13 +2715,18 @@ async def _autotrader_monitor_coro(ib: IB) -> None:
         if key not in at["positions"]:
             continue
         info       = at["positions"][key]
+        action     = info.get("action", "SELL")   # SELL = CSP short put; BUY = LEAP long call
         upnl       = float(item.unrealizedPNL or 0)
         max_profit = info.get("max_profit", 0)
         if max_profit <= 0:
             _at_log("WARN", f"{key}: max_profit is 0 or missing — skipping monitor (data issue?)")
             continue
 
-        action = info.get("action", "SELL")   # SELL = CSP short put; BUY = LEAP long call
+        # Paper trading: IBKR often returns unrealizedPNL=0 for short options.
+        # Fall back to mid-price P&L computed during IV refresh above.
+        if upnl == 0 and action == "SELL" and key in _computed_pnl:
+            upnl = _computed_pnl[key]
+            _at_log("SYSTEM", f"{key}: paper P&L fallback = ${upnl:.2f} (unrealizedPNL was 0)")
 
         # Compute DTE from stored expiry
         # Slice to [:8] because IBKR occasionally stores time-of-day suffix
@@ -6227,6 +6284,449 @@ async def _stock_monitor_loop() -> None:
             log.error("Stock monitor loop error: %s", exc, exc_info=True)
 
 
+# ── News Monitor ──────────────────────────────────────────────────────────────
+
+import re      as _re_news
+import hashlib as _hashlib
+from xml.etree import ElementTree as _ET
+
+_NEWS_SOURCES = [
+    {"id":"yahoo",       "name":"Yahoo Finance",  "url":"https://finance.yahoo.com/news/rssindex"},
+    {"id":"reuters",     "name":"Reuters Biz",    "url":"https://feeds.reuters.com/reuters/businessNews"},
+    {"id":"marketwatch", "name":"MarketWatch",    "url":"https://feeds.marketwatch.com/marketwatch/topstories/"},
+    {"id":"cnbc",        "name":"CNBC Markets",   "url":"https://www.cnbc.com/id/100003114/device/rss/rss.html"},
+    {"id":"benzinga",    "name":"Benzinga",        "url":"https://www.benzinga.com/feed"},
+    {"id":"wsj",         "name":"WSJ Markets",    "url":"https://feeds.a.dj.com/rss/RSSMarketsMain.xml"},
+    {"id":"seeking",     "name":"Seeking Alpha",  "url":"https://seekingalpha.com/market_currents.xml"},
+    {"id":"ft",          "name":"FT Markets",     "url":"https://www.ft.com/markets?format=rss"},
+]
+
+_NEWS_CRITICAL_KW = [
+    "fed rate","rate cut","rate hike","emergency rate","fed pivot","fomc meeting",
+    "bankruptcy","bankrupt","default","seized","fraud charges","sec charges","indicted",
+    "acquisition","merger","takeover","buyout","going private",
+    "circuit breaker","market halt","trading halted","exchange halted",
+    "war declaration","new sanctions","tariff increase","trade war",
+    "market crash","market collapse","recession","financial crisis","bank run",
+    "cpi report","ppi report","jobs report","non-farm payroll","unemployment rate",
+    "gdp report","fed decision","powell speech","rate decision","interest rate",
+    "yellen","treasury secretary","debt ceiling","government shutdown",
+]
+
+_NEWS_HIGH_KW = [
+    "earnings beat","earnings miss","beat estimates","missed estimates","beat consensus",
+    "guidance raised","guidance lowered","guidance cut","raised outlook","cut outlook",
+    "revenue beat","revenue miss","profit warning",
+    "fda approval","fda approved","fda rejected","fda rejection","drug approval",
+    "layoffs","job cuts","mass layoffs","workforce reduction",
+    "ceo resign","ceo fired","cfo resign","cfo fired","executive departure",
+    "investigation","subpoena","lawsuit","settlement","class action","regulatory action",
+    "analyst downgrade","analyst upgrade","price target raised","price target cut",
+    "ipo pricing","going public","direct listing","spac merger",
+    "dividend cut","dividend increase","special dividend","stock buyback","share repurchase",
+    "activist investor","short seller report","short attack",
+    "earnings guidance","quarterly results","annual results",
+    "data breach","cybersecurity incident","ransomware",
+]
+
+
+def _nm_fingerprint(title: str) -> str:
+    words = _re_news.sub(r"[^a-z0-9 ]", "", title.lower()).split()
+    key   = " ".join(words[:7])
+    return _hashlib.md5(key.encode()).hexdigest()[:16]
+
+
+def _nm_severity(title: str, desc: str = "") -> str:
+    text = (title + " " + desc).lower()
+    for kw in _NEWS_CRITICAL_KW:
+        if kw in text:
+            return "CRITICAL"
+    for kw in _NEWS_HIGH_KW:
+        if kw in text:
+            return "HIGH"
+    return "NORMAL"
+
+
+def _nm_extract_tickers(text: str) -> list:
+    text_upper = text.upper()
+    found = []
+    for m in _re_news.finditer(r"\$([A-Z]{1,5})\b", text_upper):
+        t = m.group(1)
+        if t in STOCK_SECTOR_MAP and t not in found:
+            found.append(t)
+    for tk in STOCK_SECTOR_MAP:
+        if len(tk) >= 3 and _re_news.search(r"\b" + tk + r"\b", text_upper) and tk not in found:
+            found.append(tk)
+    return found[:8]
+
+
+def _nm_fetch_source(source: dict) -> list:
+    import requests as _req
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; rv:109.0) Gecko/20100101 Firefox/109.0"}
+    try:
+        resp = _req.get(source["url"], timeout=8, headers=headers)
+        if resp.status_code != 200:
+            return []
+        # Try feedparser if available
+        try:
+            import feedparser as _fp
+            feed = _fp.parse(resp.text)
+            return [{"title": e.get("title",""), "url": e.get("link",""),
+                     "desc": e.get("summary",""), "pub": e.get("published","")}
+                    for e in feed.entries[:25] if e.get("title")]
+        except ImportError:
+            pass
+        # stdlib XML fallback
+        root = _ET.fromstring(resp.content)
+        items = []
+        for item in root.iter("item"):
+            title = (item.findtext("title") or "").strip()
+            link  = (item.findtext("link")  or "").strip()
+            desc  = (item.findtext("description") or "").strip()
+            if title:
+                items.append({"title": title, "url": link, "desc": desc, "pub": ""})
+        return items[:25]
+    except Exception as exc:
+        log.debug("News fetch %s: %s", source["name"], exc)
+        return []
+
+
+async def _news_monitor_coro():
+    from zoneinfo import ZoneInfo
+    nm  = state["news_monitor"]
+    cfg = nm["config"]
+
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+    if cfg.get("quiet_hours"):
+        if not (7 <= now_et.hour < 20) or now_et.weekday() >= 5:
+            return
+
+    nm["last_check"] = now_et.strftime("%Y-%m-%d %H:%M ET")
+    seen_set  = set(nm.get("seen", []))
+    story_map: dict = {}
+    loop = asyncio.get_event_loop()
+
+    for source in _NEWS_SOURCES:
+        try:
+            items = await loop.run_in_executor(None, _nm_fetch_source, source)
+            nm["sources_status"][source["id"]] = {
+                "name": source["name"], "last_ok": now_et.strftime("%H:%M"), "count": len(items)
+            }
+            for item in items:
+                title = item["title"].strip()
+                if not title or len(title) < 10:
+                    continue
+                fp  = _nm_fingerprint(title)
+                sev = _nm_severity(title, item.get("desc", ""))
+                tickers = _nm_extract_tickers(title + " " + item.get("desc", ""))
+                if fp not in story_map:
+                    story_map[fp] = {"title": title, "url": item["url"],
+                                     "sources": [source["name"]], "severity": sev,
+                                     "tickers": tickers, "fp": fp}
+                else:
+                    if source["name"] not in story_map[fp]["sources"]:
+                        story_map[fp]["sources"].append(source["name"])
+                    sev_rank = {"CRITICAL": 2, "HIGH": 1, "NORMAL": 0}
+                    if sev_rank[sev] > sev_rank[story_map[fp]["severity"]]:
+                        story_map[fp]["severity"] = sev
+        except Exception as exc:
+            nm["sources_status"][source["id"]] = {
+                "name": source["name"], "last_ok": None, "error": str(exc)[:80]
+            }
+
+    min_src   = int(cfg.get("min_sources", 1))
+    alert_all = bool(cfg.get("alert_all", False))
+    max_alrt  = int(cfg.get("max_alerts_cycle", 5))
+    sent      = 0
+
+    for fp, story in story_map.items():
+        if fp in seen_set:
+            continue
+        n = len(story["sources"])
+        sev = story["severity"]
+        should_alert = (
+            sev == "CRITICAL" or
+            (sev == "HIGH" and n >= min_src) or
+            (alert_all and n >= min_src) or
+            n >= 2
+        )
+        if not should_alert:
+            continue
+
+        verified   = n >= 2
+        time_str   = now_et.strftime("%H:%M ET")
+        entry = {"ts": time_str, "title": story["title"], "url": story["url"],
+                 "sources": story["sources"], "severity": sev,
+                 "tickers": story["tickers"], "verified": verified}
+        nm["alerts"] = (nm["alerts"] + [entry])[-200:]
+        seen_set.add(fp)
+
+        sev_icon   = {"CRITICAL": "🔴", "HIGH": "🟠", "NORMAL": "⚪"}.get(sev, "⚪")
+        verify_tag = " ✅ VERIFIED" if verified else ""
+        src_str    = ", ".join(story["sources"][:3])
+        if len(story["sources"]) > 3:
+            src_str += f" +{len(story['sources'])-3}"
+        ticker_str = " ".join(f"${t}" for t in story["tickers"]) if story["tickers"] else ""
+
+        msg = f"{sev_icon} BREAKING NEWS{verify_tag}\n{story['title']}\n\n"
+        msg += f"Sources ({n}): {src_str}\n"
+        if ticker_str:
+            msg += f"Tickers: {ticker_str}\n"
+        msg += f"Time: {time_str}"
+        if story["url"]:
+            msg += f"\n{story['url']}"
+
+        _rm_telegram(msg)
+        log.info("NEWS [%s] verified=%s src=%d: %s", sev, verified, n, story["title"][:70])
+        sent += 1
+        if sent >= max_alrt:
+            break
+
+    nm["seen"] = list(seen_set)[-2000:]
+
+
+async def _news_monitor_loop():
+    while True:
+        nm  = state["news_monitor"]
+        cfg = nm["config"]
+        if nm.get("enabled"):
+            try:
+                await _news_monitor_coro()
+            except Exception as exc:
+                log.error("News monitor error: %s", exc)
+        await asyncio.sleep(int(cfg.get("check_interval_s", 120)))
+
+
+# ── Risk Monitor ──────────────────────────────────────────────────────────────
+
+def _rm_log(severity: str, rule: int, position: str, detail: str, action: str = ""):
+    """Append to risk monitor log and active violations list."""
+    rm  = state["risk_monitor"]
+    now = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %H:%M ET")
+    entry = {
+        "ts":       now,
+        "severity": severity,   # CRITICAL / WARNING / INFO
+        "rule":     rule,
+        "position": position,
+        "detail":   detail,
+        "action":   action,
+        "resolved": False,
+    }
+    rm["log"] = (rm["log"] + [entry])[-200:]
+    # Update violations: keep only unresolved; add/update this one
+    rm["violations"] = [v for v in rm["violations"]
+                        if v["position"] != position or v["rule"] != rule]
+    if severity in ("CRITICAL", "WARNING"):
+        rm["violations"].append(entry)
+    log.warning("RISK [Rule %d] %s %s: %s", rule, severity, position, detail)
+
+
+def _rm_resolve(rule: int, position: str):
+    """Mark a violation as resolved (position closed or condition cleared)."""
+    rm = state["risk_monitor"]
+    for v in rm["violations"]:
+        if v["rule"] == rule and v["position"] == position:
+            v["resolved"] = True
+    rm["violations"] = [v for v in rm["violations"] if not v["resolved"]]
+
+
+def _rm_telegram(text: str):
+    token, chat_id = _load_telegram_creds()
+    if token and chat_id:
+        try:
+            asyncio.get_event_loop().run_in_executor(
+                None, _send_telegram_sync, token, chat_id, text
+            )
+        except Exception:
+            pass
+
+
+async def _risk_monitor_coro():
+    """
+    Checks all 5 portfolio rules every 5 minutes during market hours.
+
+    Rule 1: CSP loss >= 2x premium received  -> auto-close + CRITICAL alert
+    Rule 2: LEAP cost basis > $3,000         -> WARNING (prevent blowups)
+    Rule 3: VIX > threshold                  -> disable day trader + WARNING
+    Rule 4: Stock down >5% after 3+ days     -> WARNING (suggest exit)
+    Rule 5: Any position > 5% of account     -> WARNING (concentration risk)
+    """
+    from zoneinfo import ZoneInfo
+    rm  = state["risk_monitor"]
+    cfg = rm["config"]
+
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+    mkt_open  = now_et.replace(hour=9,  minute=30, second=0, microsecond=0)
+    mkt_close = now_et.replace(hour=16, minute=0,  second=0, microsecond=0)
+    if not (mkt_open <= now_et <= mkt_close):
+        return
+    if now_et.weekday() >= 5:
+        return
+
+    rm["last_check"] = now_et.isoformat()
+    ib  = state.get("ib")
+    at  = state.get("autotrader", {})
+    st  = state.get("stock_trader", {})
+    dt  = state.get("day_trader", {})
+    acct_val = float(cfg.get("account_value", 100000.0))
+
+    alerts = []  # collect for single Telegram batch
+
+    # ── Rule 1: CSP 2x stop ───────────────────────────────────────────────
+    for key, pos in list(at.get("positions", {}).items()):
+        if pos.get("action") != "SELL":
+            continue
+        entry_prem = float(pos.get("entry_price", 0))
+        qty        = int(pos.get("qty", 1))
+        max_profit = entry_prem * qty * 100
+        live_pnl   = float(pos.get("live_pnl") or 0)
+        warn_thresh = max_profit * float(cfg.get("csp_warn_mult", 1.5))
+        stop_thresh = max_profit * float(cfg.get("csp_stop_mult", 2.0))
+
+        if live_pnl <= -stop_thresh and stop_thresh > 0:
+            detail = (f"Loss ${abs(live_pnl):.0f} >= {cfg['csp_stop_mult']}x premium "
+                      f"${max_profit:.0f}. CLOSING NOW.")
+            _rm_log("CRITICAL", 1, key, detail, "auto_close")
+            alerts.append(f"RULE 1 CRITICAL - {key}\n{detail}")
+            if cfg.get("auto_close_csp") and ib and ib.isConnected():
+                try:
+                    info = dict(pos)
+                    info["exit_reason"] = "risk_monitor_stop"
+                    portfolio = ib.portfolio()
+                    matching  = next(
+                        (item for item in portfolio
+                         if _at_contract_key(item.contract) == key), None
+                    )
+                    if matching:
+                        await _autotrader_close_coro(ib, matching, info, key)
+                        _rm_resolve(1, key)
+                        alerts[-1] += "\nAuto-closed successfully."
+                    else:
+                        at["positions"].pop(key, None)
+                        _at_save_state()
+                        alerts[-1] += "\nGhost position removed."
+                except Exception as exc:
+                    log.error("Risk monitor auto-close failed for %s: %s", key, exc)
+        elif live_pnl <= -warn_thresh and warn_thresh > 0:
+            detail = (f"Loss ${abs(live_pnl):.0f} approaching {cfg['csp_stop_mult']}x stop "
+                      f"(warn at {cfg['csp_warn_mult']}x = ${warn_thresh:.0f}). "
+                      f"Stop fires at ${stop_thresh:.0f}.")
+            _rm_log("WARNING", 1, key, detail)
+            alerts.append(f"RULE 1 WARNING - {key}\n{detail}")
+        else:
+            _rm_resolve(1, key)
+
+    # ── Rule 2: LEAP cost basis > $3k ────────────────────────────────────
+    leap_max = float(cfg.get("leap_max_cost", 3000.0))
+    for key, pos in at.get("positions", {}).items():
+        if pos.get("action") != "BUY":
+            continue
+        cost = float(pos.get("entry_price", 0)) * int(pos.get("qty", 1)) * 100
+        if cost > leap_max:
+            detail = (f"LEAP cost basis ${cost:,.0f} exceeds max ${leap_max:,.0f}. "
+                      f"Consider trimming to 1 contract or closing.")
+            _rm_log("WARNING", 2, key, detail)
+            # Only alert once per position (don't spam)
+            existing = [v for v in rm["violations"] if v["rule"] == 2 and v["position"] == key]
+            if not existing:
+                alerts.append(f"RULE 2 WARNING - {key}\n{detail}")
+        else:
+            _rm_resolve(2, key)
+
+    # ── Rule 3: VIX > threshold ──────────────────────────────────────────
+    vix_val = None
+    try:
+        import yfinance as _yf
+        vix_df  = _yf.download("^VIX", period="1d", interval="5m",
+                               progress=False, auto_adjust=True)
+        if not vix_df.empty:
+            vix_val = float(vix_df["Close"].iloc[-1])
+            rm["vix_latest"] = round(vix_val, 2)
+    except Exception:
+        pass
+
+    vix_thresh = float(cfg.get("vix_threshold", 25.0))
+    if vix_val and vix_val > vix_thresh:
+        detail = f"VIX={vix_val:.1f} > threshold {vix_thresh:.0f}. Day trader disabled."
+        _rm_log("WARNING", 3, "VIX", detail, "dt_disabled")
+        if cfg.get("auto_disable_dt") and dt.get("enabled"):
+            dt["enabled"] = False
+            _dt_save_state()
+            detail += " (auto-disabled)"
+        existing = [v for v in rm["violations"] if v["rule"] == 3]
+        if not existing:
+            alerts.append(f"RULE 3 WARNING - HIGH VIX\n{detail}")
+    elif vix_val and vix_val <= vix_thresh:
+        _rm_resolve(3, "VIX")
+
+    # ── Rule 4: Stock position red > 5% after 3+ days ────────────────────
+    stop_pct = float(cfg.get("stock_stop_pct", 5.0)) / 100
+    for ticker, pos in st.get("positions", {}).items():
+        days  = int(pos.get("trading_days_held", 0))
+        pnl   = float(pos.get("live_pnl") or 0)
+        cost  = float(pos.get("entry_price", 1)) * int(pos.get("shares", 0) or
+                      pos.get("qty", 0))
+        pnl_pct = pnl / cost if cost else 0
+        if days >= 3 and pnl_pct <= -stop_pct:
+            detail = (f"{ticker}: down {pnl_pct*100:.1f}% (${pnl:.0f}) after {days} days. "
+                      f"Rule: exit positions red > {cfg['stock_stop_pct']:.0f}% after 3d.")
+            _rm_log("WARNING", 4, ticker, detail)
+            existing = [v for v in rm["violations"]
+                        if v["rule"] == 4 and v["position"] == ticker]
+            if not existing:
+                alerts.append(f"RULE 4 WARNING - {ticker}\n{detail}")
+        elif pnl_pct > -stop_pct:
+            _rm_resolve(4, ticker)
+
+    # ── Rule 5: Position concentration > 5% of account ──────────────────
+    max_pct = float(cfg.get("max_position_pct", 5.0)) / 100
+
+    def _check_concentration(key: str, cost: float):
+        pct = cost / acct_val if acct_val else 0
+        if pct > max_pct:
+            detail = (f"${cost:,.0f} = {pct*100:.1f}% of account "
+                      f"(max {cfg['max_position_pct']:.0f}%). Reduce position.")
+            _rm_log("WARNING", 5, key, detail)
+            existing = [v for v in rm["violations"]
+                        if v["rule"] == 5 and v["position"] == key]
+            if not existing:
+                alerts.append(f"RULE 5 WARNING - {key}\n{detail}")
+        else:
+            _rm_resolve(5, key)
+
+    for key, pos in at.get("positions", {}).items():
+        cost = float(pos.get("entry_price", 0)) * int(pos.get("qty", 1)) * 100
+        _check_concentration(key, cost)
+
+    for ticker, pos in st.get("positions", {}).items():
+        cost = float(pos.get("entry_price", 0)) * int(
+            pos.get("shares", 0) or pos.get("qty", 0))
+        _check_concentration(ticker, cost)
+
+    for ticker, pos in dt.get("positions", {}).items():
+        cost = float(pos.get("entry_price", 0)) * int(pos.get("shares", 1))
+        _check_concentration(f"DT:{ticker}", cost)
+
+    # ── Send batched Telegram alert ───────────────────────────────────────
+    if alerts:
+        msg = "RISK MONITOR ALERT\n" + "=" * 30 + "\n" + "\n\n".join(alerts)
+        _rm_telegram(msg)
+
+
+async def _risk_monitor_loop():
+    """Scheduler: runs _risk_monitor_coro every check_interval_s seconds."""
+    while True:
+        rm  = state["risk_monitor"]
+        cfg = rm["config"]
+        if rm.get("enabled"):
+            try:
+                await _risk_monitor_coro()
+            except Exception as exc:
+                log.error("Risk monitor error: %s", exc)
+        interval = int(cfg.get("check_interval_s", 300))
+        await asyncio.sleep(interval)
+
+
 # ── FastAPI app ────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -6279,6 +6779,10 @@ async def lifespan(app: FastAPI):
     log.info("Day trader monitor loop started")
     asyncio.create_task(_spx_monitor_loop())
     log.info("SPX 0DTE monitor loop started")
+    asyncio.create_task(_risk_monitor_loop())
+    log.info("Risk monitor loop started")
+    asyncio.create_task(_news_monitor_loop())
+    log.info("News monitor loop started")
 
     # Run initial universe screen in background (non-blocking)
     async def _initial_screen():
@@ -6314,6 +6818,133 @@ if _technicals_router_ok and technicals_router is not None:
 else:
     import logging as _lg
     _lg.getLogger("main").warning("ibkr_technicals router failed to load — /technicals/{ticker} unavailable")
+
+
+# ── Risk Monitor endpoints ────────────────────────────────────────────────────
+
+class RiskConfigRequest(BaseModel):
+    account_value:    Optional[float] = None
+    csp_stop_mult:    Optional[float] = None
+    csp_warn_mult:    Optional[float] = None
+    leap_max_cost:    Optional[float] = None
+    vix_threshold:    Optional[float] = None
+    stock_stop_pct:   Optional[float] = None
+    max_position_pct: Optional[float] = None
+    auto_close_csp:   Optional[bool]  = None
+    auto_disable_dt:  Optional[bool]  = None
+    check_interval_s: Optional[int]   = None
+
+
+@app.get("/risk/status")
+def risk_status():
+    rm  = state["risk_monitor"]
+    cfg = rm["config"]
+    violations = rm.get("violations", [])
+    critical   = [v for v in violations if v["severity"] == "CRITICAL"]
+    warnings   = [v for v in violations if v["severity"] == "WARNING"]
+    return {
+        "enabled":    rm["enabled"],
+        "last_check": rm.get("last_check"),
+        "vix":        rm.get("vix_latest"),
+        "config":     cfg,
+        "summary": {
+            "total_violations": len(violations),
+            "critical":         len(critical),
+            "warnings":         len(warnings),
+        },
+        "violations": violations,
+        "log":        rm.get("log", [])[-50:],
+    }
+
+
+@app.post("/risk/config")
+def risk_config(req: RiskConfigRequest):
+    rm  = state["risk_monitor"]
+    cfg = rm["config"]
+    cfg.update({k: v for k, v in req.model_dump().items() if v is not None})
+    _rm_log("INFO", 0, "SYSTEM", f"Config updated: {req.model_dump(exclude_none=True)}")
+    return {"config": cfg}
+
+
+@app.post("/risk/enable")
+def risk_enable(enabled: bool = True):
+    state["risk_monitor"]["enabled"] = enabled
+    return {"enabled": enabled}
+
+
+@app.post("/risk/run-now")
+async def risk_run_now():
+    """Trigger an immediate risk check (don't wait for next 5-min cycle)."""
+    try:
+        await _risk_monitor_coro()
+        rm = state["risk_monitor"]
+        return {
+            "ok":         True,
+            "violations": rm.get("violations", []),
+            "last_check": rm.get("last_check"),
+        }
+    except Exception as exc:
+        raise HTTPException(500, str(exc))
+
+
+# ── News Monitor endpoints ────────────────────────────────────────────────────
+
+class NewsConfigRequest(BaseModel):
+    check_interval_s: Optional[int]   = None
+    min_sources:      Optional[int]   = None
+    alert_all:        Optional[bool]  = None
+    quiet_hours:      Optional[bool]  = None
+    max_alerts_cycle: Optional[int]   = None
+
+
+@app.get("/news/status")
+def news_status():
+    nm = state["news_monitor"]
+    return {
+        "enabled":        nm["enabled"],
+        "last_check":     nm.get("last_check"),
+        "config":         nm["config"],
+        "sources_status": nm.get("sources_status", {}),
+        "alerts":         nm.get("alerts", [])[-50:],
+        "total_alerts":   len(nm.get("alerts", [])),
+        "seen_count":     len(nm.get("seen", [])),
+    }
+
+
+@app.post("/news/config")
+def news_config(req: NewsConfigRequest):
+    nm  = state["news_monitor"]
+    cfg = nm["config"]
+    cfg.update({k: v for k, v in req.model_dump().items() if v is not None})
+    return {"config": cfg}
+
+
+@app.post("/news/enable")
+def news_enable(enabled: bool = True):
+    state["news_monitor"]["enabled"] = enabled
+    return {"enabled": enabled}
+
+
+@app.post("/news/run-now")
+async def news_run_now():
+    try:
+        await _news_monitor_coro()
+        nm = state["news_monitor"]
+        return {
+            "ok":         True,
+            "last_check": nm.get("last_check"),
+            "alerts":     nm.get("alerts", [])[-10:],
+        }
+    except Exception as exc:
+        raise HTTPException(500, str(exc))
+
+
+@app.delete("/news/seen")
+def news_clear_seen():
+    nm = state["news_monitor"]
+    count = len(nm.get("seen", []))
+    nm["seen"] = []
+    return {"cleared": count}
 
 
 # ── Pydantic models ────────────────────────────────────────────────────────
@@ -10363,6 +10994,7 @@ class DayConfigRequest(BaseModel):
     daily_profit_target:  Optional[float] = None
     expected_return_pct:  Optional[float] = None
     win_rate_est:         Optional[float] = None
+    min_composite_score:  Optional[float] = None   # 0 = disabled, 75-85 recommended
 
 
 # ── Day Trader endpoints ───────────────────────────────────────────────────────
@@ -10411,6 +11043,17 @@ async def day_trader_signal(req: StockSignalRequest):
                 f"at capacity ({len(dt['positions'])}/{cfg['max_positions']} positions)")
         return {"status": "skipped", "reason": "at_capacity"}
 
+    min_score = float(cfg.get("min_composite_score", 0))
+    if min_score > 0:
+        score = req.composite_score
+        if score is None:
+            _dt_log("SKIPPED", ticker, f"no composite_score in signal — min={min_score:.0f} required")
+            return {"status": "skipped", "reason": "no_score"}
+        if score < min_score:
+            _dt_log("SKIPPED", ticker, f"score={score:.0f} < min={min_score:.0f}")
+            return {"status": "skipped", "reason": "score_below_threshold",
+                    "score": score, "min": min_score}
+
     ib = state.get("ib")
     if not ib or not ib.isConnected():
         raise HTTPException(503, "IBKR not connected")
@@ -10455,13 +11098,15 @@ async def day_trader_signal(req: StockSignalRequest):
         "profit_price":      profit_px,
         "phase":             0,
         "alert_fired_at":    req.alert_fired_at or now_et.isoformat(),
+        "composite_score":   req.composite_score,
         "live_price":        None,
         "live_pnl":          None,
     }
+    score_str = f" score={req.composite_score:.0f}" if req.composite_score is not None else ""
     _dt_log("ENTERED", ticker,
             f"LIMIT BUY {shares}sh @ {lmt_px:.2f} "
             f"(signal={price:.2f} cost=${cost:,.0f} ord#{buy_id}) "
-            f"target={profit_px:.2f} stop={stop_px:.2f}")
+            f"target={profit_px:.2f} stop={stop_px:.2f}{score_str}")
     _dt_save_state()
     return {"status": "ordered", "ticker": ticker, "shares": shares,
             "limit_price": lmt_px, "cost": cost, "order_id": buy_id}
@@ -11119,6 +11764,17 @@ async def _spx_monitor_coro(ib) -> None:
         # Stop loss = stop_loss_mult × credit collected (e.g. 2× = lose back 2× what we took in).
         # sp["max_loss"] is the theoretical full-width loss — do NOT use it as the stop threshold.
         stop_threshold = sp["total_credit"] * float(cfg["stop_loss_mult"])
+
+        # Close early if total day P&L (closed + this unrealized) already hits daily goal.
+        # Avoids holding a profitable spread past the daily target hoping for a higher bar.
+        daily_goal   = float(cfg["daily_profit_target"])
+        combined_pnl = round(sx.get("today_pnl", 0.0) + live_pnl, 2)
+        if live_pnl > 0 and combined_pnl >= daily_goal:
+            _spx_log("PROFIT_TARGET",
+                     f"Daily goal reached: closed=${sx.get('today_pnl',0):.2f} + unrealized=${live_pnl:.2f}"
+                     f" = ${combined_pnl:.2f} >= ${daily_goal:.2f}", sid)
+            await _spx_close_spread(ib, sid, "profit_target")
+            continue
 
         if live_pnl >= profit_target:
             _spx_log("PROFIT_TARGET",
