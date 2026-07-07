@@ -414,16 +414,18 @@ state: Dict = {
     "news_monitor": {
         "enabled":        True,
         "config": {
-            "check_interval_s": 120,    # poll every 2 minutes
-            "min_sources":      1,      # sources needed to alert (1=any match, 2=verified only)
-            "alert_all":        False,  # True = alert every story (ignores keyword filter)
-            "quiet_hours":      True,   # silence outside 7am-8pm ET / weekends
-            "max_alerts_cycle": 5,      # cap Telegram alerts per cycle
+            "check_interval_s": 60,     # poll every 60 seconds
+            "max_age_minutes":  120,    # discard articles older than this (0 = no filter)
+            "min_sources":      1,      # sources needed for Telegram alert
+            "alert_all":        False,  # True = Telegram every story (no keyword filter)
+            "quiet_hours":      False,  # silence Telegram outside 7am-8pm ET / weekends
+            "max_alerts_cycle": 8,      # cap Telegram alerts per cycle
         },
-        "seen":           [],           # fingerprint hashes of already-alerted stories
-        "alerts":         [],           # last 200 alerts sent
+        "seen":           [],           # fingerprints of already Telegram-alerted stories
+        "feed":           [],           # ALL fresh stories for UI display (last 200)
+        "alerts":         [],           # only Telegram-worthy stories (last 200)
         "last_check":     None,
-        "sources_status": {},           # per-source {"last_ok", "count"/"error"}
+        "sources_status": {},
     },
     "risk_monitor": {
         "enabled": True,
@@ -6290,15 +6292,33 @@ import re      as _re_news
 import hashlib as _hashlib
 from xml.etree import ElementTree as _ET
 
+# Google News topic-search RSS aggregates AP, Reuters, Bloomberg, CNBC, FT, WSJ etc.
+# in real time (articles often < 5 minutes old). Five topic buckets cover all
+# US-market-moving categories.
 _NEWS_SOURCES = [
-    {"id":"yahoo",       "name":"Yahoo Finance",  "domain":"finance.yahoo.com",  "url":"https://finance.yahoo.com/news/rssindex"},
-    {"id":"reuters",     "name":"Reuters",        "domain":"reuters.com",         "url":"https://feeds.reuters.com/reuters/businessNews"},
-    {"id":"marketwatch", "name":"MarketWatch",    "domain":"marketwatch.com",     "url":"https://feeds.marketwatch.com/marketwatch/topstories/"},
-    {"id":"cnbc",        "name":"CNBC",           "domain":"cnbc.com",            "url":"https://www.cnbc.com/id/100003114/device/rss/rss.html"},
-    {"id":"benzinga",    "name":"Benzinga",       "domain":"benzinga.com",        "url":"https://www.benzinga.com/feed"},
-    {"id":"wsj",         "name":"WSJ",            "domain":"wsj.com",             "url":"https://feeds.a.dj.com/rss/RSSMarketsMain.xml"},
-    {"id":"seeking",     "name":"Seeking Alpha",  "domain":"seekingalpha.com",    "url":"https://seekingalpha.com/market_currents.xml"},
-    {"id":"ft",          "name":"FT",             "domain":"ft.com",              "url":"https://www.ft.com/markets?format=rss"},
+    {"id":"gn_macro",   "name":"Macro / Fed",    "domain":"news.google.com", "google":True,
+     "url":"https://news.google.com/rss/search?q=federal+reserve+inflation+CPI+GDP+interest+rates+recession+economy&hl=en-US&gl=US&ceid=US:en"},
+    {"id":"gn_markets", "name":"Markets",        "domain":"news.google.com", "google":True,
+     "url":"https://news.google.com/rss/search?q=stock+market+S%26P+500+nasdaq+dow+jones+rally+selloff+crash&hl=en-US&gl=US&ceid=US:en"},
+    {"id":"gn_corp",    "name":"Corporate",      "domain":"news.google.com", "google":True,
+     "url":"https://news.google.com/rss/search?q=earnings+merger+acquisition+layoffs+ipo+bankruptcy+guidance+profit&hl=en-US&gl=US&ceid=US:en"},
+    {"id":"gn_geo",     "name":"Global / Geo",   "domain":"news.google.com", "google":True,
+     "url":"https://news.google.com/rss/search?q=tariff+sanctions+trade+war+oil+price+geopolitical+China+Russia+OPEC&hl=en-US&gl=US&ceid=US:en"},
+    {"id":"gn_rates",   "name":"Bonds / Rates",  "domain":"news.google.com", "google":True,
+     "url":"https://news.google.com/rss/search?q=treasury+yield+bond+market+fed+rate+cut+hike+FOMC+10+year&hl=en-US&gl=US&ceid=US:en"},
+    # Direct wires — fastest primary sources
+    {"id":"ap_biz",     "name":"AP Business",    "domain":"apnews.com",
+     "url":"https://feeds.apnews.com/apnews/business"},
+    {"id":"ap_economy", "name":"AP Economy",     "domain":"apnews.com",
+     "url":"https://feeds.apnews.com/apnews/economy"},
+    {"id":"cnbc_break", "name":"CNBC Breaking",  "domain":"cnbc.com",
+     "url":"https://www.cnbc.com/id/100727362/device/rss/rss.html"},
+    {"id":"reuters",    "name":"Reuters",        "domain":"reuters.com",
+     "url":"https://feeds.reuters.com/reuters/businessNews"},
+    {"id":"marketwatch","name":"MarketWatch",    "domain":"marketwatch.com",
+     "url":"https://feeds.marketwatch.com/marketwatch/topstories/"},
+    {"id":"benzinga",   "name":"Benzinga",       "domain":"benzinga.com",
+     "url":"https://www.benzinga.com/feed"},
 ]
 
 _NEWS_CRITICAL_KW = [
@@ -6383,41 +6403,62 @@ def _nm_extract_tickers(text: str) -> list:
     return found[:8]
 
 
+def _nm_clean_google_title(title: str) -> tuple:
+    """
+    Google News titles look like 'Story headline - Outlet Name'.
+    Returns (clean_title, outlet_name).
+    """
+    m = _re_news.match(r"^(.+?)\s+-\s+([A-Z][^-]{2,40})$", title)
+    if m:
+        return m.group(1).strip(), m.group(2).strip()
+    return title, ""
+
+
 def _nm_fetch_source(source: dict) -> list:
     import requests as _req
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; rv:109.0) Gecko/20100101 Firefox/109.0"}
+    is_google = source.get("google", False)
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; rv:109.0) Gecko/20100101 Firefox/109.0",
+               "Accept": "application/rss+xml, application/xml, text/xml, */*"}
     try:
-        resp = _req.get(source["url"], timeout=8, headers=headers)
+        resp = _req.get(source["url"], timeout=10, headers=headers)
         if resp.status_code != 200:
             return []
-        # Try feedparser if available
-        try:
-            import feedparser as _fp
-            feed = _fp.parse(resp.text)
-            items = []
-            for e in feed.entries[:25]:
-                if not e.get("title"):
-                    continue
-                raw_desc = e.get("summary") or e.get("content", [{}])[0].get("value", "")
-                items.append({
-                    "title": _nm_strip_html(e.get("title", "")),
-                    "url":   e.get("link", ""),
-                    "desc":  _nm_strip_html(raw_desc),
-                    "pub":   e.get("published", "") or e.get("updated", ""),
-                })
-            return items
-        except ImportError:
-            pass
-        # stdlib XML fallback
+
+        # stdlib XML — reliable for both standard RSS and Google News
         root = _ET.fromstring(resp.content)
         items = []
         for item in root.iter("item"):
-            title   = _nm_strip_html(item.findtext("title") or "")
-            link    = (item.findtext("link") or "").strip()
-            desc    = _nm_strip_html(item.findtext("description") or "")
-            pub_raw = (item.findtext("pubDate") or "").strip()
-            if title:
-                items.append({"title": title, "url": link, "desc": desc, "pub": pub_raw})
+            raw_title = _nm_strip_html(item.findtext("title") or "")
+            link      = (item.findtext("link") or "").strip()
+            desc      = _nm_strip_html(item.findtext("description") or "")
+            pub_raw   = (item.findtext("pubDate") or "").strip()
+
+            # Google News: parse <source url="...">Outlet Name</source>
+            outlet_name   = ""
+            outlet_domain = ""
+            src_el = item.find("source")
+            if src_el is not None:
+                outlet_name   = (src_el.text or "").strip()
+                outlet_domain = src_el.get("url", "")
+                # extract bare domain
+                m = _re_news.search(r"https?://(?:www\.)?([^/]+)", outlet_domain)
+                if m:
+                    outlet_domain = m.group(1)
+
+            if is_google and not outlet_name:
+                # fall back to stripping " - Outlet" from title
+                raw_title, outlet_name = _nm_clean_google_title(raw_title)
+
+            if not raw_title:
+                continue
+            items.append({
+                "title":          raw_title,
+                "url":            link,
+                "desc":           desc,
+                "pub":            pub_raw,
+                "outlet_name":    outlet_name,
+                "outlet_domain":  outlet_domain,
+            })
         return items[:25]
     except Exception as exc:
         log.debug("News fetch %s: %s", source["name"], exc)
@@ -6434,51 +6475,73 @@ async def _news_monitor_coro():
         if not (7 <= now_et.hour < 20) or now_et.weekday() >= 5:
             return
 
+    from datetime import timezone as _tz
     nm["last_check"] = now_et.strftime("%Y-%m-%d %H:%M ET")
-    seen_set  = set(nm.get("seen", []))
+    seen_set     = set(nm.get("seen", []))
     story_map: dict = {}
-    loop = asyncio.get_event_loop()
+    loop         = asyncio.get_event_loop()
+    max_age_min  = int(cfg.get("max_age_minutes", 120))
+    now_utc      = datetime.now(_tz.utc)
 
     for source in _NEWS_SOURCES:
         try:
             items = await loop.run_in_executor(None, _nm_fetch_source, source)
-            nm["sources_status"][source["id"]] = {
-                "name": source["name"], "domain": source.get("domain",""),
-                "last_ok": now_et.strftime("%H:%M"), "count": len(items)
-            }
+            fresh_count = 0
             for item in items:
                 title = item["title"].strip()
                 if not title or len(title) < 10:
                     continue
+
+                pub_iso = _nm_parse_pubdate(item.get("pub", ""))
+
+                # Age filter — drop articles older than max_age_minutes
+                if max_age_min > 0 and pub_iso:
+                    try:
+                        pub_dt  = datetime.fromisoformat(pub_iso)
+                        age_min = (now_utc - pub_dt).total_seconds() / 60
+                        if age_min > max_age_min:
+                            continue
+                    except Exception:
+                        pass
+
+                fresh_count += 1
                 fp      = _nm_fingerprint(title)
                 sev     = _nm_severity(title, item.get("desc", ""))
                 tickers = _nm_extract_tickers(title + " " + item.get("desc", ""))
                 excerpt = item.get("desc", "")[:280].strip()
-                pub_iso = _nm_parse_pubdate(item.get("pub", ""))
+
+                # For Google News items, use the real outlet as primary attribution
+                outlet_name   = item.get("outlet_name", "") or source["name"]
+                outlet_domain = item.get("outlet_domain", "") or source.get("domain", "")
+
                 if fp not in story_map:
                     story_map[fp] = {
                         "title":    title,
                         "url":      item["url"],
                         "excerpt":  excerpt,
                         "pub_iso":  pub_iso,
-                        "sources":  [source["name"]],
-                        "domains":  [source["domain"]],
+                        "sources":  [outlet_name],
+                        "domains":  [outlet_domain],
                         "severity": sev,
                         "tickers":  tickers,
                     }
                 else:
-                    if source["name"] not in story_map[fp]["sources"]:
-                        story_map[fp]["sources"].append(source["name"])
-                        story_map[fp]["domains"].append(source["domain"])
-                    # prefer longer excerpt
+                    if outlet_name not in story_map[fp]["sources"]:
+                        story_map[fp]["sources"].append(outlet_name)
+                        story_map[fp]["domains"].append(outlet_domain)
                     if len(excerpt) > len(story_map[fp].get("excerpt", "")):
                         story_map[fp]["excerpt"] = excerpt
-                    # keep earliest pub_iso
                     if pub_iso and not story_map[fp].get("pub_iso"):
                         story_map[fp]["pub_iso"] = pub_iso
                     sev_rank = {"CRITICAL": 2, "HIGH": 1, "NORMAL": 0}
                     if sev_rank[sev] > sev_rank[story_map[fp]["severity"]]:
                         story_map[fp]["severity"] = sev
+
+            nm["sources_status"][source["id"]] = {
+                "name": source["name"], "domain": source.get("domain",""),
+                "last_ok": now_et.strftime("%H:%M"),
+                "count": len(items), "fresh": fresh_count,
+            }
         except Exception as exc:
             nm["sources_status"][source["id"]] = {
                 "name": source["name"], "domain": source.get("domain",""),
@@ -6487,13 +6550,36 @@ async def _news_monitor_coro():
 
     min_src   = int(cfg.get("min_sources", 1))
     alert_all = bool(cfg.get("alert_all", False))
-    max_alrt  = int(cfg.get("max_alerts_cycle", 5))
-    sent      = 0
+    max_alrt  = int(cfg.get("max_alerts_cycle", 8))
+    time_str  = now_et.strftime("%H:%M ET")
 
+    # ── Populate display feed with ALL fresh stories (sorted newest first) ──
+    feed_entries = []
+    for fp, story in story_map.items():
+        n        = len(story["sources"])
+        verified = n >= 2
+        feed_entries.append({
+            "ts":       time_str,
+            "pub_iso":  story.get("pub_iso"),
+            "title":    story["title"],
+            "excerpt":  story.get("excerpt", ""),
+            "url":      story["url"],
+            "sources":  story["sources"],
+            "domains":  story.get("domains", []),
+            "severity": story["severity"],
+            "tickers":  story["tickers"],
+            "verified": verified,
+        })
+    # Sort by pub_iso descending (newest first), unknowns go to end
+    feed_entries.sort(key=lambda e: e.get("pub_iso") or "", reverse=True)
+    nm["feed"] = feed_entries[:200]
+
+    # ── Send Telegram only for significant stories not yet alerted ──────────
+    sent = 0
     for fp, story in story_map.items():
         if fp in seen_set:
             continue
-        n = len(story["sources"])
+        n   = len(story["sources"])
         sev = story["severity"]
         should_alert = (
             sev == "CRITICAL" or
@@ -6504,19 +6590,13 @@ async def _news_monitor_coro():
         if not should_alert:
             continue
 
-        verified   = n >= 2
-        time_str   = now_et.strftime("%H:%M ET")
+        verified = n >= 2
         entry = {
-            "ts":       time_str,
-            "pub_iso":  story.get("pub_iso"),
-            "title":    story["title"],
-            "excerpt":  story.get("excerpt", ""),
-            "url":      story["url"],
-            "sources":  story["sources"],
-            "domains":  story.get("domains", []),
-            "severity": sev,
-            "tickers":  story["tickers"],
-            "verified": verified,
+            "ts": time_str, "pub_iso": story.get("pub_iso"),
+            "title": story["title"], "excerpt": story.get("excerpt", ""),
+            "url": story["url"], "sources": story["sources"],
+            "domains": story.get("domains", []),
+            "severity": sev, "tickers": story["tickers"], "verified": verified,
         }
         nm["alerts"] = (nm["alerts"] + [entry])[-200:]
         seen_set.add(fp)
@@ -6524,8 +6604,8 @@ async def _news_monitor_coro():
         sev_icon   = {"CRITICAL": "🔴", "HIGH": "🟠", "NORMAL": "⚪"}.get(sev, "⚪")
         verify_tag = " ✅ VERIFIED" if verified else ""
         src_str    = ", ".join(story["sources"][:3])
-        if len(story["sources"]) > 3:
-            src_str += f" +{len(story['sources'])-3}"
+        if n > 3:
+            src_str += f" +{n-3}"
         ticker_str = " ".join(f"${t}" for t in story["tickers"]) if story["tickers"] else ""
 
         msg = f"{sev_icon} BREAKING NEWS{verify_tag}\n{story['title']}\n\n"
@@ -6951,6 +7031,7 @@ async def risk_run_now():
 
 class NewsConfigRequest(BaseModel):
     check_interval_s: Optional[int]   = None
+    max_age_minutes:  Optional[int]   = None
     min_sources:      Optional[int]   = None
     alert_all:        Optional[bool]  = None
     quiet_hours:      Optional[bool]  = None
@@ -6965,7 +7046,9 @@ def news_status():
         "last_check":     nm.get("last_check"),
         "config":         nm["config"],
         "sources_status": nm.get("sources_status", {}),
-        "alerts":         nm.get("alerts", [])[-50:],
+        "feed":           nm.get("feed", [])[-100:],      # all fresh stories for UI
+        "alerts":         nm.get("alerts", [])[-50:],     # Telegram-alerted only
+        "total_feed":     len(nm.get("feed", [])),
         "total_alerts":   len(nm.get("alerts", [])),
         "seen_count":     len(nm.get("seen", [])),
     }

@@ -7155,6 +7155,7 @@ function NewsMonitorTab() {
   const [cfg,     setCfg]     = useState({});
   const [editCfg, setEditCfg] = useState(false);
   const [filter,  setFilter]  = useState("ALL");
+  const [view,    setView]    = useState("feed"); // "feed" | "alerts"
   const [, tick]              = useState(0);  // force re-render for live freshness
 
   useEffect(() => {
@@ -7212,8 +7213,10 @@ function NewsMonitorTab() {
   if (!data) return <div style={{...sans, color:C.muted, padding:32}}>
     {loading ? "Loading…" : "No data"}</div>;
 
-  const allAlerts = (data.alerts || []).slice().reverse();
-  const filtered  = allAlerts.filter(a => filter === "ALL" || a.severity === filter);
+  const pool      = view === "feed"
+    ? (data.feed   || []).slice()          // already sorted newest-first by backend
+    : (data.alerts || []).slice().reverse();
+  const filtered  = pool.filter(a => filter === "ALL" || a.severity === filter);
   const sources   = Object.values(data.sources_status || {});
   const srcOk     = sources.filter(s => s.last_ok && !s.error).length;
 
@@ -7243,15 +7246,17 @@ function NewsMonitorTab() {
                 border:`1px solid ${s.error ? "#f87171" : C.border}`,
                 opacity: s.error ? 0.6 : 1}}>
               <SourceLogo domain={s.domain || ""} name={s.name} />
-              {s.count != null && !s.error &&
-                <span style={{...mono, fontSize:9, color:C.muted}}>{s.count}</span>}
+              {s.fresh != null && !s.error &&
+                <span style={{...mono, fontSize:9, color: s.fresh > 0 ? "#4ade80" : C.muted}}>
+                  {s.fresh > 0 ? s.fresh : "—"}
+                </span>}
               {s.error && <span style={{fontSize:9, color:"#f87171"}}>✕</span>}
             </div>
           ))}
         </div>
 
         <span style={{...sans, fontSize:11, color:C.muted, marginLeft:"auto"}}>
-          {data.last_check || "never"} · {data.total_alerts} alerts · {data.seen_count} seen
+          {data.last_check || "never"} · {data.total_feed || 0} fresh · {data.total_alerts} alerted
         </span>
         <button onClick={runNow} disabled={runLoad}
           style={{background:"#3b82f6", color:"#fff", border:"none", borderRadius:4,
@@ -7277,7 +7282,7 @@ function NewsMonitorTab() {
           <div style={{...sans, fontSize:11, color:C.muted, marginBottom:10, fontWeight:600,
             textTransform:"uppercase", letterSpacing:"0.05em"}}>Configuration</div>
           <div style={{display:"flex", gap:14, flexWrap:"wrap", marginBottom:10}}>
-            {[["Poll (s)","check_interval_s",30,60],["Min sources","min_sources",1,1],["Max alerts/cycle","max_alerts_cycle",1,1]].map(([lbl,key,step,min]) => (
+            {[["Poll (s)","check_interval_s",30,30],["Max age (min)","max_age_minutes",30,0],["Min sources","min_sources",1,1],["Max alerts/cycle","max_alerts_cycle",1,1]].map(([lbl,key,step,min]) => (
               <div key={key} style={{display:"flex", flexDirection:"column", gap:3}}>
                 <label style={{...sans, fontSize:10, color:C.muted}}>{lbl}</label>
                 <input type="number" value={cfg[key]??""} step={step} min={min}
@@ -7305,18 +7310,31 @@ function NewsMonitorTab() {
         </div>
       )}
 
-      {/* ── Filter bar ── */}
-      <div style={{display:"flex", gap:6, marginBottom:12, alignItems:"center"}}>
-        {[["ALL","All"],["CRITICAL","🔴 Breaking"],["HIGH","🟠 Alert"]].map(([f,lbl]) => {
-          const cnt = f==="ALL" ? allAlerts.length : allAlerts.filter(a=>a.severity===f).length;
+      {/* ── View + Filter bar ── */}
+      <div style={{display:"flex", gap:6, marginBottom:12, alignItems:"center", flexWrap:"wrap"}}>
+        {/* Feed / Alerts view toggle */}
+        {[["feed","Live Feed"],["alerts","Telegram Alerts"]].map(([v,lbl]) => (
+          <button key={v} onClick={() => setView(v)}
+            style={{background: view===v ? "#3b82f6" : C.surface,
+              color: view===v ? "#fff" : C.muted,
+              border:`1px solid ${view===v ? "#3b82f6" : C.border}`,
+              borderRadius:4, padding:"3px 12px", ...sans, fontSize:12, cursor:"pointer",
+              fontWeight: view===v ? 700 : 400}}>
+            {lbl}
+          </button>
+        ))}
+        <div style={{width:1, height:18, background:C.border, margin:"0 4px"}} />
+        {/* Severity filter */}
+        {[["ALL","All"],["CRITICAL","🔴 Breaking"],["HIGH","🟠 Alert"],["NORMAL","News"]].map(([f,lbl]) => {
+          const cnt = pool.filter(a => f==="ALL" || a.severity===f).length;
           return (
             <button key={f} onClick={() => setFilter(f)}
               style={{background: filter===f ? sevColor(f==="ALL"?"NORMAL":f) : C.surface,
-                color: filter===f ? (f==="ALL"?"#fff":"#000") : C.muted,
+                color: filter===f ? (f==="ALL"||f==="NORMAL"?"#fff":"#000") : C.muted,
                 border:`1px solid ${filter===f ? sevColor(f==="ALL"?"NORMAL":f) : C.border}`,
-                borderRadius:20, padding:"3px 12px", ...sans, fontSize:12, cursor:"pointer",
+                borderRadius:20, padding:"3px 11px", ...sans, fontSize:11, cursor:"pointer",
                 fontWeight: filter===f ? 700 : 400}}>
-              {lbl} <span style={{opacity:0.7, fontSize:10}}>({cnt})</span>
+              {lbl} <span style={{opacity:0.6, fontSize:10}}>({cnt})</span>
             </button>
           );
         })}
@@ -7325,9 +7343,9 @@ function NewsMonitorTab() {
       {/* ── Alert cards ── */}
       {filtered.length === 0 ? (
         <div style={{...sans, fontSize:13, color:C.muted, padding:"32px 0", textAlign:"center"}}>
-          {data.total_alerts === 0
-            ? "No alerts yet — click Scan Now or wait for the next 2-minute poll."
-            : "No alerts match the current filter."}
+          {data.total_feed === 0
+            ? "No fresh stories yet — click Scan Now."
+            : "No stories match the current filter."}
         </div>
       ) : filtered.map((a, i) => {
         const ago      = _newsTimeAgo(a.pub_iso);
