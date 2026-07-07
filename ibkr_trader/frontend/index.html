@@ -7103,14 +7103,64 @@ function PerformanceTab() {
 
 
 // ── News Monitor Tab ──────────────────────────────────────────────────────
+
+function _newsTimeAgo(isoStr) {
+  if (!isoStr) return null;
+  try {
+    const mins = Math.floor((Date.now() - new Date(isoStr)) / 60000);
+    if (mins <  1)  return "just now";
+    if (mins < 60)  return `${mins}m ago`;
+    const hrs = Math.floor(mins / 60);
+    if (hrs  < 24)  return `${hrs}h ago`;
+    return `${Math.floor(hrs / 24)}d ago`;
+  } catch { return null; }
+}
+
+function _newsFreshnessColor(isoStr) {
+  if (!isoStr) return "#475569";
+  try {
+    const mins = (Date.now() - new Date(isoStr)) / 60000;
+    if (mins < 20)  return "#4ade80";   // green  — breaking (< 20 min)
+    if (mins < 90)  return "#fbbf24";   // amber  — recent   (< 90 min)
+    if (mins < 360) return "#94a3b8";   // slate  — today
+    return "#475569";                    // dim    — older
+  } catch { return "#475569"; }
+}
+
+function SourceLogo({ domain, name }) {
+  const [ok, setOk] = React.useState(true);
+  if (!ok) return (
+    <span style={{...sans, fontSize:10, color:C.muted, background:C.surface,
+      borderRadius:3, padding:"1px 4px", border:`1px solid ${C.border}`}}>
+      {name.slice(0,3).toUpperCase()}
+    </span>
+  );
+  return (
+    <img
+      src={`https://www.google.com/s2/favicons?domain=${domain}&sz=16`}
+      title={name}
+      alt={name}
+      onError={() => setOk(false)}
+      style={{width:14, height:14, borderRadius:2, verticalAlign:"middle",
+        imageRendering:"crisp-edges"}}
+    />
+  );
+}
+
 function NewsMonitorTab() {
-  const [data,      setData]    = useState(null);
-  const [loading,   setLoading] = useState(false);
-  const [runLoad,   setRunLoad] = useState(false);
-  const [msg,       setMsg]     = useState("");
-  const [cfg,       setCfg]     = useState({});
-  const [editCfg,   setEditCfg] = useState(false);
-  const [filter,    setFilter]  = useState("ALL");   // ALL / CRITICAL / HIGH
+  const [data,    setData]    = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [runLoad, setRunLoad] = useState(false);
+  const [msg,     setMsg]     = useState("");
+  const [cfg,     setCfg]     = useState({});
+  const [editCfg, setEditCfg] = useState(false);
+  const [filter,  setFilter]  = useState("ALL");
+  const [, tick]              = useState(0);  // force re-render for live freshness
+
+  useEffect(() => {
+    const t = setInterval(() => tick(n => n + 1), 60000);
+    return () => clearInterval(t);
+  }, []);
 
   const fetchStatus = () => {
     setLoading(true);
@@ -7121,21 +7171,14 @@ function NewsMonitorTab() {
       .finally(() => setLoading(false));
   };
 
-  useEffect(() => {
-    fetchStatus();
-    const t = setInterval(fetchStatus, 30000);
-    return () => clearInterval(t);
-  }, []);
+  useEffect(() => { fetchStatus(); const t = setInterval(fetchStatus, 30000); return () => clearInterval(t); }, []);
 
   const runNow = async () => {
-    setRunLoad(true);
-    setMsg("");
+    setRunLoad(true); setMsg("");
     try {
-      const r = await fetch("/news/run-now", {method:"POST",
-        signal: AbortSignal.timeout(60000)});
+      const r = await fetch("/news/run-now", {method:"POST", signal: AbortSignal.timeout(90000)});
       const d = await r.json();
-      setData(prev => prev ? {...prev, alerts: d.alerts, last_check: d.last_check} : prev);
-      setMsg(`Scan complete — ${d.alerts?.length || 0} alert(s) stored`);
+      setMsg(`Scan complete`);
       fetchStatus();
     } catch(e) { setMsg("Error: " + e.message); }
     finally { setRunLoad(false); }
@@ -7143,10 +7186,11 @@ function NewsMonitorTab() {
 
   const clearSeen = async () => {
     await fetch("/news/seen", {method:"DELETE"});
-    setMsg("Seen cache cleared — next scan will re-alert all stories");
+    setMsg("Seen cache cleared");
+    fetchStatus();
   };
 
-  const toggleEnabled = async (val) => {
+  const toggleEnabled = async val => {
     await fetch(`/news/enable?enabled=${val}`, {method:"POST"});
     setData(prev => prev ? {...prev, enabled: val} : prev);
   };
@@ -7155,186 +7199,209 @@ function NewsMonitorTab() {
     const r = await fetch("/news/config", {method:"POST",
       headers:{"Content-Type":"application/json"}, body:JSON.stringify(cfg)});
     const d = await r.json();
-    setCfg(d.config);
-    setEditCfg(false);
-    setMsg("Config saved");
+    setCfg(d.config); setEditCfg(false); setMsg("Config saved");
   };
 
-  const sevColor = s => s==="CRITICAL"?"#f87171":s==="HIGH"?"#fbbf24":"#94a3b8";
-  const sevIcon  = s => s==="CRITICAL"?"🔴":s==="HIGH"?"🟠":"⚪";
+  const sevColor = s => s==="CRITICAL"?"#f87171":s==="HIGH"?"#fbbf24":"#64748b";
+  const sevBg    = s => s==="CRITICAL"?"#f871711a":s==="HIGH"?"#fbbf241a":"transparent";
+  const sevLabel = s => s==="CRITICAL"?"BREAKING":s==="HIGH"?"ALERT":"NEWS";
 
-  const cardStyle = {background:C.card, border:`1px solid ${C.border}`,
-    borderRadius:8, padding:"16px 20px", marginBottom:12};
+  const card = {background:C.card, border:`1px solid ${C.border}`, borderRadius:8,
+    padding:"14px 18px", marginBottom:10};
 
   if (!data) return <div style={{...sans, color:C.muted, padding:32}}>
-    {loading ? "Loading news monitor…" : "No data"}</div>;
+    {loading ? "Loading…" : "No data"}</div>;
 
-  const alerts = (data.alerts || []).slice().reverse().filter(a =>
-    filter === "ALL" || a.severity === filter);
-
-  const sources = Object.values(data.sources_status || {});
-  const srcOk   = sources.filter(s => s.last_ok).length;
+  const allAlerts = (data.alerts || []).slice().reverse();
+  const filtered  = allAlerts.filter(a => filter === "ALL" || a.severity === filter);
+  const sources   = Object.values(data.sources_status || {});
+  const srcOk     = sources.filter(s => s.last_ok && !s.error).length;
 
   return (
-    <div style={{maxWidth:960}}>
-      {/* Header */}
-      <div style={{display:"flex", alignItems:"center", gap:12, marginBottom:20, flexWrap:"wrap"}}>
-        <h2 style={{...mono, color:C.text, margin:0, fontSize:18}}>Breaking News Monitor</h2>
-        <div style={{display:"flex", alignItems:"center", gap:8}}>
-          <span style={{...sans, fontSize:12, color:C.muted}}>Active</span>
-          <div onClick={() => toggleEnabled(!data.enabled)}
-            style={{width:36, height:20, borderRadius:10, cursor:"pointer",
-              background:data.enabled?"#22c55e":C.border, position:"relative",
-              transition:"background 0.2s"}}>
-            <div style={{position:"absolute", top:2, left:data.enabled?18:2,
-              width:16, height:16, borderRadius:"50%", background:"#fff",
-              transition:"left 0.2s"}} />
-          </div>
+    <div style={{maxWidth:900}}>
+
+      {/* ── Toolbar ── */}
+      <div style={{display:"flex", alignItems:"center", gap:10, marginBottom:16, flexWrap:"wrap"}}>
+        <h2 style={{...mono, color:C.text, margin:0, fontSize:17}}>Breaking News</h2>
+
+        {/* Active toggle */}
+        <div onClick={() => toggleEnabled(!data.enabled)}
+          style={{width:34, height:18, borderRadius:9, cursor:"pointer",
+            background:data.enabled?"#22c55e":C.border, position:"relative",
+            transition:"background 0.2s", flexShrink:0}}>
+          <div style={{position:"absolute", top:2, left:data.enabled?17:2,
+            width:14, height:14, borderRadius:"50%", background:"#fff",
+            transition:"left 0.2s"}} />
         </div>
-        <span style={{...sans, fontSize:12, color:C.muted}}>
-          Sources: <b style={{color:srcOk>0?"#4ade80":"#f87171"}}>{srcOk}/{sources.length}</b> OK
-        </span>
-        <span style={{...sans, fontSize:12, color:C.muted}}>
-          Last check: {data.last_check || "never"}
-        </span>
-        <span style={{...sans, fontSize:12, color:C.muted}}>
-          Seen: {data.seen_count} | Total alerts: {data.total_alerts}
+
+        {/* Source health chips */}
+        <div style={{display:"flex", gap:5, flexWrap:"wrap", alignItems:"center"}}>
+          {sources.map((s,i) => (
+            <div key={i} title={s.error || `${s.count} articles`}
+              style={{display:"flex", alignItems:"center", gap:4,
+                background:C.surface, borderRadius:20, padding:"2px 7px",
+                border:`1px solid ${s.error ? "#f87171" : C.border}`,
+                opacity: s.error ? 0.6 : 1}}>
+              <SourceLogo domain={s.domain || ""} name={s.name} />
+              {s.count != null && !s.error &&
+                <span style={{...mono, fontSize:9, color:C.muted}}>{s.count}</span>}
+              {s.error && <span style={{fontSize:9, color:"#f87171"}}>✕</span>}
+            </div>
+          ))}
+        </div>
+
+        <span style={{...sans, fontSize:11, color:C.muted, marginLeft:"auto"}}>
+          {data.last_check || "never"} · {data.total_alerts} alerts · {data.seen_count} seen
         </span>
         <button onClick={runNow} disabled={runLoad}
           style={{background:"#3b82f6", color:"#fff", border:"none", borderRadius:4,
-            padding:"4px 14px", ...sans, fontSize:12, cursor:"pointer"}}>
+            padding:"4px 12px", ...sans, fontSize:12, cursor:"pointer", flexShrink:0}}>
           {runLoad ? "Scanning…" : "Scan Now"}
         </button>
         <button onClick={clearSeen}
           style={{background:C.surface, color:C.muted, border:`1px solid ${C.border}`,
-            borderRadius:4, padding:"4px 10px", ...sans, fontSize:11, cursor:"pointer"}}>
-          Clear Seen
+            borderRadius:4, padding:"4px 8px", ...sans, fontSize:11, cursor:"pointer"}}>
+          Reset
         </button>
         <button onClick={() => setEditCfg(p => !p)}
           style={{background:C.surface, color:C.text, border:`1px solid ${C.border}`,
-            borderRadius:4, padding:"4px 12px", ...sans, fontSize:12, cursor:"pointer"}}>
-          {editCfg ? "Cancel" : "Config"}
+            borderRadius:4, padding:"4px 10px", ...sans, fontSize:11, cursor:"pointer"}}>
+          ⚙
         </button>
-        {msg && <span style={{...sans, fontSize:12, color:"#fbbf24"}}>{msg}</span>}
+        {msg && <span style={{...sans, fontSize:11, color:"#fbbf24"}}>{msg}</span>}
       </div>
 
-      {/* Config editor */}
+      {/* ── Config ── */}
       {editCfg && (
-        <div style={cardStyle}>
-          <div style={{...sans, fontSize:11, color:C.muted, marginBottom:12, fontWeight:600,
+        <div style={{...card, marginBottom:14}}>
+          <div style={{...sans, fontSize:11, color:C.muted, marginBottom:10, fontWeight:600,
             textTransform:"uppercase", letterSpacing:"0.05em"}}>Configuration</div>
-          <div style={{display:"flex", gap:16, flexWrap:"wrap", marginBottom:12}}>
-            {[
-              ["Poll Interval (s)", "check_interval_s", 30, 60],
-              ["Min Sources to Alert", "min_sources", 1, 1],
-              ["Max Alerts / Cycle", "max_alerts_cycle", 1, 1],
-            ].map(([label, key, step, min]) => (
-              <div key={key} style={{display:"flex", flexDirection:"column", gap:4}}>
-                <label style={{...sans, fontSize:11, color:C.muted}}>{label}</label>
+          <div style={{display:"flex", gap:14, flexWrap:"wrap", marginBottom:10}}>
+            {[["Poll (s)","check_interval_s",30,60],["Min sources","min_sources",1,1],["Max alerts/cycle","max_alerts_cycle",1,1]].map(([lbl,key,step,min]) => (
+              <div key={key} style={{display:"flex", flexDirection:"column", gap:3}}>
+                <label style={{...sans, fontSize:10, color:C.muted}}>{lbl}</label>
                 <input type="number" value={cfg[key]??""} step={step} min={min}
                   onChange={e => setCfg(p => ({...p, [key]:parseInt(e.target.value)}))}
                   style={{background:C.surface, border:`1px solid ${C.border}`, borderRadius:4,
-                    color:C.text, padding:"4px 8px", fontSize:13, width:130}} />
+                    color:C.text, padding:"3px 7px", fontSize:12, width:110}} />
               </div>
             ))}
           </div>
-          <div style={{display:"flex", gap:20, marginBottom:12, alignItems:"center", flexWrap:"wrap"}}>
-            {[
-              ["alert_all",    "Alert all stories (ignore keyword filter)"],
-              ["quiet_hours",  "Quiet hours (silence 8pm–7am ET + weekends)"],
-            ].map(([key, label]) => (
+          <div style={{display:"flex", gap:18, marginBottom:10, flexWrap:"wrap"}}>
+            {[["alert_all","Alert all (no keyword filter)"],["quiet_hours","Quiet hours 8pm–7am + weekends"]].map(([key,lbl]) => (
               <label key={key} style={{...sans, fontSize:12, color:C.muted,
-                display:"flex", gap:6, alignItems:"center", cursor:"pointer"}}>
+                display:"flex", gap:5, alignItems:"center", cursor:"pointer"}}>
                 <input type="checkbox" checked={!!cfg[key]}
                   onChange={e => setCfg(p => ({...p, [key]:e.target.checked}))} />
-                {label}
+                {lbl}
               </label>
             ))}
           </div>
           <button onClick={saveCfg}
             style={{background:"#22c55e", color:"#000", border:"none", borderRadius:4,
-              padding:"6px 18px", ...sans, fontSize:12, cursor:"pointer", fontWeight:600}}>
-            Save Config
+              padding:"5px 16px", ...sans, fontSize:12, cursor:"pointer", fontWeight:600}}>
+            Save
           </button>
         </div>
       )}
 
-      {/* Source status row */}
-      <div style={{...cardStyle, padding:"12px 16px"}}>
-        <div style={{...sans, fontSize:11, color:C.muted, marginBottom:8, fontWeight:600,
-          textTransform:"uppercase", letterSpacing:"0.05em"}}>Data Sources</div>
-        <div style={{display:"flex", gap:8, flexWrap:"wrap"}}>
-          {sources.map((s,i) => (
-            <div key={i} style={{background:C.surface, borderRadius:6, padding:"4px 10px",
-              border:`1px solid ${s.last_ok?C.border:"#f87171"}`,
-              display:"flex", gap:6, alignItems:"center"}}>
-              <span style={{fontSize:10}}>{s.last_ok ? "🟢" : "🔴"}</span>
-              <span style={{...sans, fontSize:11, color:C.text}}>{s.name}</span>
-              {s.count != null && <span style={{...mono, fontSize:10, color:C.muted}}>{s.count}</span>}
-              {s.error  && <span style={{...sans, fontSize:10, color:"#f87171"}} title={s.error}>err</span>}
-            </div>
-          ))}
-          {sources.length === 0 && <span style={{...sans, fontSize:12, color:C.muted}}>
-            No scan run yet — click Scan Now</span>}
+      {/* ── Filter bar ── */}
+      <div style={{display:"flex", gap:6, marginBottom:12, alignItems:"center"}}>
+        {[["ALL","All"],["CRITICAL","🔴 Breaking"],["HIGH","🟠 Alert"]].map(([f,lbl]) => {
+          const cnt = f==="ALL" ? allAlerts.length : allAlerts.filter(a=>a.severity===f).length;
+          return (
+            <button key={f} onClick={() => setFilter(f)}
+              style={{background: filter===f ? sevColor(f==="ALL"?"NORMAL":f) : C.surface,
+                color: filter===f ? (f==="ALL"?"#fff":"#000") : C.muted,
+                border:`1px solid ${filter===f ? sevColor(f==="ALL"?"NORMAL":f) : C.border}`,
+                borderRadius:20, padding:"3px 12px", ...sans, fontSize:12, cursor:"pointer",
+                fontWeight: filter===f ? 700 : 400}}>
+              {lbl} <span style={{opacity:0.7, fontSize:10}}>({cnt})</span>
+            </button>
+          );
+        })}
+      </div>
+
+      {/* ── Alert cards ── */}
+      {filtered.length === 0 ? (
+        <div style={{...sans, fontSize:13, color:C.muted, padding:"32px 0", textAlign:"center"}}>
+          {data.total_alerts === 0
+            ? "No alerts yet — click Scan Now or wait for the next 2-minute poll."
+            : "No alerts match the current filter."}
         </div>
-      </div>
+      ) : filtered.map((a, i) => {
+        const ago      = _newsTimeAgo(a.pub_iso);
+        const freshCol = _newsFreshnessColor(a.pub_iso);
+        const domains  = a.domains || [];
+        return (
+          <div key={i} style={{...card, borderLeft:`3px solid ${sevColor(a.severity)}`,
+            background: sevBg(a.severity), padding:"12px 16px 10px 14px"}}>
 
-      {/* Filter tabs */}
-      <div style={{display:"flex", gap:8, marginBottom:12}}>
-        {["ALL","CRITICAL","HIGH"].map(f => (
-          <button key={f} onClick={() => setFilter(f)}
-            style={{background: filter===f ? sevColor(f==="ALL"?"NORMAL":f) : C.surface,
-              color: filter===f ? "#000" : C.muted,
-              border:`1px solid ${C.border}`, borderRadius:4,
-              padding:"4px 14px", ...sans, fontSize:12, cursor:"pointer",
-              fontWeight: filter===f ? 700 : 400}}>
-            {f==="ALL"?"All News":f==="CRITICAL"?"🔴 Critical":"🟠 High"}&nbsp;
-            <span style={{opacity:0.7}}>
-              ({(data.alerts||[]).filter(a => f==="ALL" || a.severity===f).length})
-            </span>
-          </button>
-        ))}
-      </div>
+            {/* Row 1: severity badge · freshness · verified · tickers */}
+            <div style={{display:"flex", gap:6, alignItems:"center", marginBottom:6, flexWrap:"wrap"}}>
+              <span style={{...mono, fontSize:10, fontWeight:700, color:sevColor(a.severity),
+                background:`${sevColor(a.severity)}22`, borderRadius:3, padding:"1px 6px",
+                letterSpacing:"0.06em"}}>
+                {sevLabel(a.severity)}
+              </span>
+              {ago && (
+                <span style={{...mono, fontSize:11, color:freshCol, fontWeight:600}}>
+                  {ago}
+                </span>
+              )}
+              {!ago && a.ts && (
+                <span style={{...sans, fontSize:11, color:C.muted}}>{a.ts}</span>
+              )}
+              {a.verified && (
+                <span style={{...sans, fontSize:10, color:"#4ade80",
+                  background:"#4ade8015", border:"1px solid #4ade8040",
+                  borderRadius:10, padding:"1px 7px"}}>
+                  ✓ verified {a.sources?.length} sources
+                </span>
+              )}
+              {(a.tickers||[]).map(t => (
+                <span key={t} style={{...mono, fontSize:10, color:"#93c5fd",
+                  background:"#93c5fd15", borderRadius:3, padding:"1px 5px"}}>
+                  ${t}
+                </span>
+              ))}
+            </div>
 
-      {/* Alert feed */}
-      <div style={cardStyle}>
-        <div style={{...sans, fontSize:11, color:C.muted, marginBottom:8, fontWeight:600,
-          textTransform:"uppercase", letterSpacing:"0.05em"}}>Alert Feed (newest first)</div>
-        {alerts.length === 0
-          ? <div style={{...sans, fontSize:13, color:C.muted}}>
-              {data.total_alerts === 0 ? "No alerts yet — click Scan Now to fetch headlines." :
-               "No alerts match filter."}
+            {/* Row 2: headline */}
+            <div style={{...sans, fontSize:14, fontWeight:600, color:C.text,
+              lineHeight:1.4, marginBottom:6}}>
+              {a.title}
             </div>
-          : alerts.map((a, i) => (
-            <div key={i} style={{borderLeft:`3px solid ${sevColor(a.severity)}`,
-              paddingLeft:12, marginBottom:14, paddingBottom:8,
-              borderBottom:i<alerts.length-1?`1px solid ${C.border}22`:"none"}}>
-              <div style={{display:"flex", gap:6, alignItems:"center", flexWrap:"wrap", marginBottom:3}}>
-                <span style={{fontSize:14}}>{sevIcon(a.severity)}</span>
-                <span style={{...sans, fontSize:12, fontWeight:700, color:C.text,
-                  flex:1, minWidth:200}}>{a.title}</span>
-                {a.verified && <span style={{...mono, fontSize:10, color:"#4ade80",
-                  background:"#4ade8022", borderRadius:4, padding:"1px 6px"}}>✅ VERIFIED</span>}
+
+            {/* Row 3: excerpt */}
+            {a.excerpt && a.excerpt.length > 20 && (
+              <div style={{...sans, fontSize:12, color:"#94a3b8", lineHeight:1.5,
+                marginBottom:8, paddingLeft:0}}>
+                {a.excerpt.length > 240 ? a.excerpt.slice(0, 240) + "…" : a.excerpt}
               </div>
-              <div style={{display:"flex", gap:10, flexWrap:"wrap", alignItems:"center"}}>
-                <span style={{...sans, fontSize:11, color:C.muted}}>
-                  {a.ts} · {a.sources?.length} source{a.sources?.length!==1?"s":""}: {a.sources?.slice(0,3).join(", ")}
-                  {a.sources?.length>3 ? ` +${a.sources.length-3}`:""}</span>
-                {a.tickers?.length > 0 && (
-                  <span style={{...mono, fontSize:11, color:"#60a5fa"}}>
-                    {a.tickers.map(t=>`$${t}`).join(" ")}</span>
-                )}
-                {a.url && (
-                  <a href={a.url} target="_blank" rel="noopener noreferrer"
-                    style={{...sans, fontSize:11, color:"#60a5fa", textDecoration:"none"}}>
-                    Open ↗
-                  </a>
-                )}
-              </div>
+            )}
+
+            {/* Row 4: source logo chips · read link */}
+            <div style={{display:"flex", gap:6, alignItems:"center", flexWrap:"wrap"}}>
+              {(a.sources||[]).map((name, si) => (
+                <div key={si} style={{display:"flex", alignItems:"center", gap:4,
+                  background:C.surface, borderRadius:20, padding:"2px 8px",
+                  border:`1px solid ${C.border}`}}>
+                  <SourceLogo domain={domains[si] || ""} name={name} />
+                  <span style={{...sans, fontSize:10, color:C.muted}}>{name}</span>
+                </div>
+              ))}
+              {a.url && (
+                <a href={a.url} target="_blank" rel="noopener noreferrer"
+                  style={{...sans, fontSize:11, color:"#60a5fa", textDecoration:"none",
+                    marginLeft:"auto", flexShrink:0}}>
+                  Read ↗
+                </a>
+              )}
             </div>
-          ))
-        }
-      </div>
+          </div>
+        );
+      })}
     </div>
   );
 }

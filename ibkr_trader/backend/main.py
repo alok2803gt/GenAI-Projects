@@ -6291,14 +6291,14 @@ import hashlib as _hashlib
 from xml.etree import ElementTree as _ET
 
 _NEWS_SOURCES = [
-    {"id":"yahoo",       "name":"Yahoo Finance",  "url":"https://finance.yahoo.com/news/rssindex"},
-    {"id":"reuters",     "name":"Reuters Biz",    "url":"https://feeds.reuters.com/reuters/businessNews"},
-    {"id":"marketwatch", "name":"MarketWatch",    "url":"https://feeds.marketwatch.com/marketwatch/topstories/"},
-    {"id":"cnbc",        "name":"CNBC Markets",   "url":"https://www.cnbc.com/id/100003114/device/rss/rss.html"},
-    {"id":"benzinga",    "name":"Benzinga",        "url":"https://www.benzinga.com/feed"},
-    {"id":"wsj",         "name":"WSJ Markets",    "url":"https://feeds.a.dj.com/rss/RSSMarketsMain.xml"},
-    {"id":"seeking",     "name":"Seeking Alpha",  "url":"https://seekingalpha.com/market_currents.xml"},
-    {"id":"ft",          "name":"FT Markets",     "url":"https://www.ft.com/markets?format=rss"},
+    {"id":"yahoo",       "name":"Yahoo Finance",  "domain":"finance.yahoo.com",  "url":"https://finance.yahoo.com/news/rssindex"},
+    {"id":"reuters",     "name":"Reuters",        "domain":"reuters.com",         "url":"https://feeds.reuters.com/reuters/businessNews"},
+    {"id":"marketwatch", "name":"MarketWatch",    "domain":"marketwatch.com",     "url":"https://feeds.marketwatch.com/marketwatch/topstories/"},
+    {"id":"cnbc",        "name":"CNBC",           "domain":"cnbc.com",            "url":"https://www.cnbc.com/id/100003114/device/rss/rss.html"},
+    {"id":"benzinga",    "name":"Benzinga",       "domain":"benzinga.com",        "url":"https://www.benzinga.com/feed"},
+    {"id":"wsj",         "name":"WSJ",            "domain":"wsj.com",             "url":"https://feeds.a.dj.com/rss/RSSMarketsMain.xml"},
+    {"id":"seeking",     "name":"Seeking Alpha",  "domain":"seekingalpha.com",    "url":"https://seekingalpha.com/market_currents.xml"},
+    {"id":"ft",          "name":"FT",             "domain":"ft.com",              "url":"https://www.ft.com/markets?format=rss"},
 ]
 
 _NEWS_CRITICAL_KW = [
@@ -6328,6 +6328,29 @@ _NEWS_HIGH_KW = [
     "earnings guidance","quarterly results","annual results",
     "data breach","cybersecurity incident","ransomware",
 ]
+
+
+def _nm_strip_html(raw: str) -> str:
+    import html as _html_mod
+    text = _html_mod.unescape(raw or "")
+    text = _re_news.sub(r"<[^>]+>", " ", text)
+    text = _re_news.sub(r"\s+", " ", text).strip()
+    return text[:350]
+
+
+def _nm_parse_pubdate(pub_str: str) -> Optional[str]:
+    if not pub_str:
+        return None
+    try:
+        import email.utils
+        dt = email.utils.parsedate_to_datetime(pub_str)
+        return dt.isoformat()
+    except Exception:
+        pass
+    try:
+        return datetime.fromisoformat(pub_str.replace("Z", "+00:00")).isoformat()
+    except Exception:
+        return None
 
 
 def _nm_fingerprint(title: str) -> str:
@@ -6371,20 +6394,30 @@ def _nm_fetch_source(source: dict) -> list:
         try:
             import feedparser as _fp
             feed = _fp.parse(resp.text)
-            return [{"title": e.get("title",""), "url": e.get("link",""),
-                     "desc": e.get("summary",""), "pub": e.get("published","")}
-                    for e in feed.entries[:25] if e.get("title")]
+            items = []
+            for e in feed.entries[:25]:
+                if not e.get("title"):
+                    continue
+                raw_desc = e.get("summary") or e.get("content", [{}])[0].get("value", "")
+                items.append({
+                    "title": _nm_strip_html(e.get("title", "")),
+                    "url":   e.get("link", ""),
+                    "desc":  _nm_strip_html(raw_desc),
+                    "pub":   e.get("published", "") or e.get("updated", ""),
+                })
+            return items
         except ImportError:
             pass
         # stdlib XML fallback
         root = _ET.fromstring(resp.content)
         items = []
         for item in root.iter("item"):
-            title = (item.findtext("title") or "").strip()
-            link  = (item.findtext("link")  or "").strip()
-            desc  = (item.findtext("description") or "").strip()
+            title   = _nm_strip_html(item.findtext("title") or "")
+            link    = (item.findtext("link") or "").strip()
+            desc    = _nm_strip_html(item.findtext("description") or "")
+            pub_raw = (item.findtext("pubDate") or "").strip()
             if title:
-                items.append({"title": title, "url": link, "desc": desc, "pub": ""})
+                items.append({"title": title, "url": link, "desc": desc, "pub": pub_raw})
         return items[:25]
     except Exception as exc:
         log.debug("News fetch %s: %s", source["name"], exc)
@@ -6410,28 +6443,46 @@ async def _news_monitor_coro():
         try:
             items = await loop.run_in_executor(None, _nm_fetch_source, source)
             nm["sources_status"][source["id"]] = {
-                "name": source["name"], "last_ok": now_et.strftime("%H:%M"), "count": len(items)
+                "name": source["name"], "domain": source.get("domain",""),
+                "last_ok": now_et.strftime("%H:%M"), "count": len(items)
             }
             for item in items:
                 title = item["title"].strip()
                 if not title or len(title) < 10:
                     continue
-                fp  = _nm_fingerprint(title)
-                sev = _nm_severity(title, item.get("desc", ""))
+                fp      = _nm_fingerprint(title)
+                sev     = _nm_severity(title, item.get("desc", ""))
                 tickers = _nm_extract_tickers(title + " " + item.get("desc", ""))
+                excerpt = item.get("desc", "")[:280].strip()
+                pub_iso = _nm_parse_pubdate(item.get("pub", ""))
                 if fp not in story_map:
-                    story_map[fp] = {"title": title, "url": item["url"],
-                                     "sources": [source["name"]], "severity": sev,
-                                     "tickers": tickers, "fp": fp}
+                    story_map[fp] = {
+                        "title":    title,
+                        "url":      item["url"],
+                        "excerpt":  excerpt,
+                        "pub_iso":  pub_iso,
+                        "sources":  [source["name"]],
+                        "domains":  [source["domain"]],
+                        "severity": sev,
+                        "tickers":  tickers,
+                    }
                 else:
                     if source["name"] not in story_map[fp]["sources"]:
                         story_map[fp]["sources"].append(source["name"])
+                        story_map[fp]["domains"].append(source["domain"])
+                    # prefer longer excerpt
+                    if len(excerpt) > len(story_map[fp].get("excerpt", "")):
+                        story_map[fp]["excerpt"] = excerpt
+                    # keep earliest pub_iso
+                    if pub_iso and not story_map[fp].get("pub_iso"):
+                        story_map[fp]["pub_iso"] = pub_iso
                     sev_rank = {"CRITICAL": 2, "HIGH": 1, "NORMAL": 0}
                     if sev_rank[sev] > sev_rank[story_map[fp]["severity"]]:
                         story_map[fp]["severity"] = sev
         except Exception as exc:
             nm["sources_status"][source["id"]] = {
-                "name": source["name"], "last_ok": None, "error": str(exc)[:80]
+                "name": source["name"], "domain": source.get("domain",""),
+                "last_ok": None, "error": str(exc)[:80]
             }
 
     min_src   = int(cfg.get("min_sources", 1))
@@ -6455,9 +6506,18 @@ async def _news_monitor_coro():
 
         verified   = n >= 2
         time_str   = now_et.strftime("%H:%M ET")
-        entry = {"ts": time_str, "title": story["title"], "url": story["url"],
-                 "sources": story["sources"], "severity": sev,
-                 "tickers": story["tickers"], "verified": verified}
+        entry = {
+            "ts":       time_str,
+            "pub_iso":  story.get("pub_iso"),
+            "title":    story["title"],
+            "excerpt":  story.get("excerpt", ""),
+            "url":      story["url"],
+            "sources":  story["sources"],
+            "domains":  story.get("domains", []),
+            "severity": sev,
+            "tickers":  story["tickers"],
+            "verified": verified,
+        }
         nm["alerts"] = (nm["alerts"] + [entry])[-200:]
         seen_set.add(fp)
 
