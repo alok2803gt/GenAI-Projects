@@ -11,10 +11,10 @@
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;700;800&display=swap" rel="stylesheet" />
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-    body { background: #f0f4f8; color: #1e293b; font-family: 'Inter', sans-serif; }
+    body { background: #0d1117; color: #e6edf3; font-family: 'Inter', sans-serif; }
     ::-webkit-scrollbar { width: 4px; height: 4px; }
-    ::-webkit-scrollbar-track { background: #e2e8f0; }
-    ::-webkit-scrollbar-thumb { background: #94a3b8; border-radius: 2px; }
+    ::-webkit-scrollbar-track { background: #161b22; }
+    ::-webkit-scrollbar-thumb { background: #30363d; border-radius: 2px; }
     @keyframes blink    { 0%,100%{opacity:1} 50%{opacity:0.3} }
     @keyframes fadeIn   { from{opacity:0;transform:translateY(6px)} to{opacity:1;transform:translateY(0)} }
     @keyframes spin     { to { transform: rotate(360deg); } }
@@ -33,10 +33,19 @@ const { useState, useEffect, useRef, useCallback } = React;
 const API = "http://localhost:8000";
 
 const C = {
-  bg:"#f0f4f8", surface:"#ffffff", card:"#ffffff",
-  border:"#e2e8f0", accent:"#0078d4", bull:"#16a34a",
-  bear:"#dc2626", neutral:"#d97706", text:"#1e293b",
-  muted:"#64748b", white:"#1e293b", dim:"#f1f5f9", orange:"#ea580c",
+  bg:      "#0d1117",
+  surface: "#161b22",
+  card:    "#1c2128",
+  border:  "#30363d",
+  accent:  "#2f81f7",
+  bull:    "#3fb950",
+  bear:    "#f85149",
+  neutral: "#e3b341",
+  text:    "#e6edf3",
+  muted:   "#8b949e",
+  white:   "#e6edf3",
+  dim:     "#1c2128",
+  orange:  "#f0883e",
 };
 const mono = { fontFamily:"'JetBrains Mono', monospace" };
 const sans = { fontFamily:"'Inter', sans-serif" };
@@ -1470,7 +1479,7 @@ function SignalsTab({ connected }) {
   );
 }
 
-// ── Auto-Trader Tab ───────────────────────────────────────────────────────
+// ── CSP-Leap Trader Tab ───────────────────────────────────────────────────
 function AutoTraderTab() {
   const [status,      setStatus]     = useState(null);
   const [saving,      setSaving]     = useState(false);
@@ -1546,7 +1555,7 @@ function AutoTraderTab() {
   };
 
   const clearStalePositions = async () => {
-    if (!window.confirm("This will remove all Inactive-order positions from the tracking dict so the auto-trader can place fresh orders. Proceed?")) return;
+    if (!window.confirm("This will remove all Inactive-order positions from the tracking dict so the CSP-Leap Trader can place fresh orders. Proceed?")) return;
     try {
       const r = await apiFetch("/autotrader/clear-stale-positions", { method: "POST" });
       alert(`Cleared ${r.removed.length} stale positions.\nKept: ${r.kept.length}\n\n${r.message}`);
@@ -1555,7 +1564,7 @@ function AutoTraderTab() {
   };
 
   const cleanupJournal = async () => {
-    if (!window.confirm("Mark all phantom open journal entries (not tracked by auto-trader and older than 24h) as orphaned. These entries will be closed with no P&L and excluded from stats. Proceed?")) return;
+    if (!window.confirm("Mark all phantom open journal entries (not tracked by CSP-Leap Trader and older than 24h) as orphaned. These entries will be closed with no P&L and excluded from stats. Proceed?")) return;
     try {
       const r = await apiFetch("/journal/cleanup", { method: "POST" });
       alert(`Journal cleanup complete.\nOrphaned entries closed: ${r.orphaned}\nActive tracked: ${r.active_tracked}\n\n${r.message}`);
@@ -1570,7 +1579,7 @@ function AutoTraderTab() {
 
   const inp = (extra={}) => ({
     style: { width:"100%", padding:"6px 10px", borderRadius:6,
-      background:"#f8fafc", border:"1px solid #cbd5e1", color:"#1e293b", fontSize:13, ...extra.style },
+      background:C.card, border:`1px solid ${C.border}`, color:C.text, fontSize:13, ...extra.style },
     ...extra,
   });
   const toggleScan = (type, checked) => {
@@ -1615,7 +1624,7 @@ function AutoTraderTab() {
           border:"none", borderRadius:8, padding:"10px 28px", fontWeight:700,
           fontSize:15, cursor:"pointer", opacity: saving ? 0.6 : 1,
         }}>
-          {enabled ? "STOP Auto-Trader" : "START Auto-Trader"}
+          {enabled ? "STOP CSP-Leap" : "START CSP-Leap"}
         </button>
         <button onClick={runNow} disabled={running} style={{
           background:"#2980b9", color:"#fff", border:"none", borderRadius:8,
@@ -1707,7 +1716,7 @@ function AutoTraderTab() {
               { label:"Kelly CSP/Trade", value:`$${kellyCspCapital.toLocaleString()}`, col:"#d97706",
                 sub:{ text:`LEAP: $${kellyLeapCapital.toLocaleString()}/trade`, col:"#64748b" } },
             ].map(s => (
-              <div key={s.label} style={{ background:"#f1f5f9", borderRadius:8, padding:14, textAlign:"center" }}>
+              <div key={s.label} style={{ background:C.card, borderRadius:8, padding:14, textAlign:"center" }}>
                 <div style={{ color:"#64748b", fontSize:11, marginBottom:6 }}>{s.label}</div>
                 <div style={{ color:s.col, fontWeight:700, fontSize:20 }}>{s.value}</div>
                 {s.sub && <div style={{ color:s.sub.col, fontSize:11, marginTop:4 }}>{s.sub.text}</div>}
@@ -1720,44 +1729,44 @@ function AutoTraderTab() {
       {/* Config card */}
       <Card title="Configuration" style={{ marginBottom:20 }}>
         <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fill, minmax(190px, 1fr))", gap:14 }}>
-          <label style={{ display:"flex", flexDirection:"column", gap:4, fontSize:13, color:"#475569" }}>
+          <label style={{ display:"flex", flexDirection:"column", gap:4, fontSize:13, color:C.muted }}>
             Max Positions
             <input type="number" min={1} max={20} value={cfg.max_positions}
               onChange={e => setCfg({ ...cfg, max_positions: +e.target.value })} {...inp()} />
           </label>
-          <label style={{ display:"flex", flexDirection:"column", gap:4, fontSize:13, color:"#475569" }}>
+          <label style={{ display:"flex", flexDirection:"column", gap:4, fontSize:13, color:C.muted }}>
             Profit Target %
             <input type="number" min={10} max={90} step={5}
               value={Math.round((cfg.profit_target_pct ?? 0.50) * 100)}
               onChange={e => setCfg({ ...cfg, profit_target_pct: +e.target.value / 100 })} {...inp()} />
           </label>
-          <label style={{ display:"flex", flexDirection:"column", gap:4, fontSize:13, color:"#475569" }}>
+          <label style={{ display:"flex", flexDirection:"column", gap:4, fontSize:13, color:C.muted }}>
             Stop Loss (× premium, 0=hold-to-expiry)
             <input type="number" min={0} max={10} step={0.5} value={cfg.stop_loss_mult}
               onChange={e => setCfg({ ...cfg, stop_loss_mult: +e.target.value })} {...inp()} />
           </label>
-          <label style={{ display:"flex", flexDirection:"column", gap:4, fontSize:13, color:"#475569" }}>
+          <label style={{ display:"flex", flexDirection:"column", gap:4, fontSize:13, color:C.muted }}>
             Total Capital ($)
             <input type="number" min={10000} step={10000} value={cfg.total_capital}
               onChange={e => setCfg({ ...cfg, total_capital: +e.target.value })} {...inp()} />
             <span style={{ fontSize:10, color:"#94a3b8" }}>Used by Kelly formula for position sizing</span>
           </label>
-          <label style={{ display:"flex", flexDirection:"column", gap:4, fontSize:13, color:"#475569" }}>
+          <label style={{ display:"flex", flexDirection:"column", gap:4, fontSize:13, color:C.muted }}>
             CSP Capital ($)
             <input type="number" min={5000} step={5000} value={cfg.csp_capital}
               onChange={e => setCfg({ ...cfg, csp_capital: +e.target.value })} {...inp()} />
             <span style={{ fontSize:10, color:"#94a3b8" }}>CSP deployment budget · Kelly base for short puts</span>
           </label>
-          <label style={{ display:"flex", flexDirection:"column", gap:4, fontSize:13, color:"#475569" }}>
+          <label style={{ display:"flex", flexDirection:"column", gap:4, fontSize:13, color:C.muted }}>
             LEAP Capital ($)
             <input type="number" min={1000} step={1000} value={cfg.leap_capital}
               onChange={e => setCfg({ ...cfg, leap_capital: +e.target.value })} {...inp()} />
             <span style={{ fontSize:10, color:"#94a3b8" }}>LEAP deployment budget · Kelly base for long calls</span>
           </label>
-          <div style={{ display:"flex", flexDirection:"column", gap:4, fontSize:13, color:"#475569" }}>
+          <div style={{ display:"flex", flexDirection:"column", gap:4, fontSize:13, color:C.muted }}>
             Kelly Win Rate
-            <div style={{ padding:"6px 10px", borderRadius:6, background:"#f1f5f9",
-              border:"1px solid #e2e8f0", fontSize:13, color:"#334155", display:"flex", alignItems:"center", gap:8 }}>
+            <div style={{ padding:"6px 10px", borderRadius:6, background:C.card,
+              border:`1px solid ${C.border}`, fontSize:13, color:C.text, display:"flex", alignItems:"center", gap:8 }}>
               <span style={{ fontWeight:700, color:"#7c3aed" }}>
                 {Math.round(((status?.config?.assumed_win_rate)||0.85)*100)}%
               </span>
@@ -1767,7 +1776,7 @@ function AutoTraderTab() {
               Updates from real closed trades (min 10). Prior: 85% (Tastytrade research).
             </span>
           </div>
-          <label style={{ display:"flex", flexDirection:"column", gap:4, fontSize:13, color:"#475569" }}>
+          <label style={{ display:"flex", flexDirection:"column", gap:4, fontSize:13, color:C.muted }}>
             Hedge Threshold (delta)
             <input type="number" min={25} max={500} step={25} value={cfg.hedge_threshold}
               onChange={e => setCfg({ ...cfg, hedge_threshold: +e.target.value })} {...inp()} />
@@ -1790,11 +1799,11 @@ function AutoTraderTab() {
               <span style={{ color:"#64748b", fontSize:11, marginLeft:22 }}>{t.sub}</span>
             </label>
           ))}
-          <div style={{ display:"flex", flexDirection:"column", gap:4, fontSize:13, color:"#475569" }}>
+          <div style={{ display:"flex", flexDirection:"column", gap:4, fontSize:13, color:C.muted }}>
             Scan Types
             <div style={{ display:"flex", gap:16 }}>
               {["csp","leap"].map(t => (
-                <label key={t} style={{ display:"flex", alignItems:"center", gap:6, color:"#334155", cursor:"pointer" }}>
+                <label key={t} style={{ display:"flex", alignItems:"center", gap:6, color:C.text, cursor:"pointer" }}>
                   <input type="checkbox"
                     checked={(cfg.scan_types||[]).includes(t)}
                     onChange={e => toggleScan(t, e.target.checked)} />
@@ -1813,13 +1822,13 @@ function AutoTraderTab() {
         </button>
 
         {/* Kelly info box */}
-        <div style={{ marginTop:12, padding:"10px 14px", background:"#f1f5f9",
+        <div style={{ marginTop:12, padding:"10px 14px", background:C.card,
           borderRadius:6, fontSize:12, color:"#64748b", lineHeight:1.7 }}>
           <strong style={{color:"#d97706"}}>Half-Kelly sizing:</strong>{" "}
           win rate <strong>{Math.round(((status?.config?.assumed_win_rate)||0.85)*100)}%</strong> (auto-calibrated),
           profit/loss ratio {(cfg.stop_loss_mult ?? 2.0) > 0 ? ((cfg.profit_target_pct??0.50)/(cfg.stop_loss_mult??2.0)).toFixed(3) : "∞ (no stop)"} →
           Kelly fraction {(kellyFrac*100).toFixed(1)}% of CSP budget ${(cfg.csp_capital||20000).toLocaleString()}
-          = <strong style={{color:"#1e293b"}}>${kellyCspCapital.toLocaleString()} per CSP trade</strong>
+          = <strong style={{color:C.text}}>${kellyCspCapital.toLocaleString()} per CSP trade</strong>
           · LEAP: {(kellyFrac*100).toFixed(1)}% of ${(cfg.leap_capital||5000).toLocaleString()} = ${kellyLeapCapital.toLocaleString()}/trade.
           {" "}Exit rules: 50% profit target · IV-adjusted stop · roll at 21 DTE · 48h cooldown.
         </div>
@@ -2043,9 +2052,9 @@ function AutoTraderTab() {
 
       {/* Untracked / manual option positions */}
       {untracked.length > 0 && (
-        <Card style={{ marginBottom:20, border:`1px solid #d97706` + "55", background:"#fffbeb" }}>
+        <Card style={{ marginBottom:20, border:`1px solid #78350f`, background:"#1a1200" }}>
           <div style={{ ...sans, fontSize:11, fontWeight:700, color:"#d97706", marginBottom:10 }}>
-            MANUAL / UNTRACKED POSITIONS ({untracked.length}) — in IBKR portfolio but not entered by Auto-Trader
+            MANUAL / UNTRACKED POSITIONS ({untracked.length}) — in IBKR portfolio but not entered by CSP-Leap Trader
           </div>
           <div style={{ overflowX:"auto" }}>
             <table style={{ width:"100%", borderCollapse:"collapse", fontSize:13 }}>
@@ -2139,7 +2148,7 @@ function AutoTraderTab() {
       <Card title="Activity Log">
         {actLog.length === 0 ? (
           <div style={{ color:"#64748b", fontStyle:"italic" }}>
-            No activity yet. Click "Run Now" or enable the auto-trader.
+            No activity yet. Click "Run Now" or enable the CSP-Leap Trader.
           </div>
         ) : (
           <div style={{ maxHeight:320, overflowY:"auto", fontFamily:"'Fira Mono', monospace", fontSize:12 }}>
@@ -2158,7 +2167,7 @@ function AutoTraderTab() {
                         : e.action==="SKIP"                          ? "#94a3b8"
                         : "#94a3b8";
               return (
-                <div key={i} style={{ padding:"4px 6px", borderBottom:"1px solid #e2e8f0", color:col }}>
+                <div key={i} style={{ padding:"4px 6px", borderBottom:`1px solid ${C.border}`, color:col }}>
                   <span style={{ color:"#64748b" }}>[{e.time}]</span>
                   {" "}<strong>{e.action}</strong>: {e.detail}
                 </div>
@@ -2245,7 +2254,7 @@ function AlertBacktestSection() {
             </div>
             <table style={{ width:"100%", borderCollapse:"collapse", fontSize:11 }}>
               <thead>
-                <tr style={{ background:"#f8fafc" }}>
+                <tr style={{ background:C.card }}>
                   {["Date","Ticker","Signal","Price","%B","RSI","Vol Ratio","Tape"].map(h => (
                     <th key={h} style={TH}>{h}</th>
                   ))}
@@ -2287,7 +2296,7 @@ function AlertBacktestSection() {
                   { label:"BREAKOUT only", data: boOs },
                   { label:"PRE-BREAKOUT only", data: preOs },
                 ].map(({ label, data }) => (
-                  <div key={label} style={{ background:"#f8fafc", borderRadius:8, padding:12,
+                  <div key={label} style={{ background:C.card, borderRadius:8, padding:12,
                                             border:`1px solid ${C.border}` }}>
                     <div style={{ fontSize:11, fontWeight:700, color:C.text, marginBottom:8 }}>{label}</div>
                     {["5d","10d","20d"].map(h => {
@@ -2319,7 +2328,7 @@ function AlertBacktestSection() {
                 <div style={{ overflowX:"auto" }}>
                   <table style={{ width:"100%", borderCollapse:"collapse", fontSize:11 }}>
                     <thead>
-                      <tr style={{ background:"#f8fafc" }}>
+                      <tr style={{ background:C.card }}>
                         {["Date","Ticker","Signal","Alert $","%B","RSI","Tape","Ret 5d","Ret 10d","Ret 20d"].map(h => (
                           <th key={h} style={TH}>{h}</th>
                         ))}
@@ -2367,11 +2376,11 @@ function AlertBacktestSection() {
                     const ls = result.filter_summary[key] || {};
                     return (
                       <div key={key} style={{
-                        flex:"1 1 100px", background: key==="with_stops"?"#f0fdf4":"#f8fafc",
+                        flex:"1 1 100px", background: key==="with_stops"?"#0f2a1a":C.card,
                         border:`1px solid ${key==="with_stops"?"#bbf7d0":C.border}`,
                         borderRadius:8, padding:"8px 6px", textAlign:"center",
                       }}>
-                        <div style={{ fontSize:9, fontWeight:800, color:"#475569",
+                        <div style={{ fontSize:9, fontWeight:800, color:C.muted,
                                       textTransform:"uppercase", letterSpacing:1, marginBottom:2 }}>{label}</div>
                         <div style={{ fontSize:16, fontWeight:800, color:wrCol(ls.win_rate_10d) }}>
                           {fmt(ls.win_rate_10d)}
@@ -2391,13 +2400,13 @@ function AlertBacktestSection() {
                 <div style={{ overflowX:"auto" }}>
                   <table style={{ width:"100%", borderCollapse:"collapse", fontSize:11 }}>
                     <thead>
-                      <tr style={{ background:"#f8fafc" }}>
+                      <tr style={{ background:C.card }}>
                         <th style={{ ...TH, minWidth:55 }}>Ticker</th>
                         {LAYER_META.map(({ key, label }) => (
                           <th key={key} style={{ ...TH, textAlign:"center" }} colSpan={2}>{label}</th>
                         ))}
                       </tr>
-                      <tr style={{ background:"#f8fafc" }}>
+                      <tr style={{ background:C.card }}>
                         <th style={TH}></th>
                         {LAYER_META.map(({ key }) => (
                           <React.Fragment key={key}>
@@ -2470,31 +2479,31 @@ function BacktestTab({ connected }) {
   };
 
   const pnlCol = v => v > 0 ? "#27ae60" : v < 0 ? "#e74c3c" : "#888";
-  const tdS = { padding:"6px 10px", borderBottom:"1px solid #e2e8f0" };
+  const tdS = { padding:"6px 10px", borderBottom:`1px solid ${C.border}` };
 
   return (
     <div style={{ padding:"16px 0" }}>
       <Card title="Backtest Settings" style={{ marginBottom:20 }}>
         <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr 1fr", gap:12, marginBottom:14 }}>
-          <label style={{ display:"flex", flexDirection:"column", gap:4, fontSize:13, color:"#475569" }}>
+          <label style={{ display:"flex", flexDirection:"column", gap:4, fontSize:13, color:C.muted }}>
             Tickers (comma-sep, max 8)
             <input value={tickers} onChange={e=>setTickers(e.target.value)}
-              style={{ padding:"7px 10px", background:"#f8fafc", border:"1px solid #cbd5e1", color:"#1e293b", borderRadius:6, fontSize:13 }} />
+              style={{ padding:"7px 10px", background:C.card, border:`1px solid ${C.border}`, color:C.text, borderRadius:6, fontSize:13 }} />
           </label>
-          <label style={{ display:"flex", flexDirection:"column", gap:4, fontSize:13, color:"#475569" }}>
+          <label style={{ display:"flex", flexDirection:"column", gap:4, fontSize:13, color:C.muted }}>
             Lookback Weeks
             <input type="number" min={4} max={104} value={weeks} onChange={e=>setWeeks(+e.target.value)}
-              style={{ padding:"7px 10px", background:"#f8fafc", border:"1px solid #cbd5e1", color:"#1e293b", borderRadius:6, fontSize:13 }} />
+              style={{ padding:"7px 10px", background:C.card, border:`1px solid ${C.border}`, color:C.text, borderRadius:6, fontSize:13 }} />
           </label>
-          <label style={{ display:"flex", flexDirection:"column", gap:4, fontSize:13, color:"#475569" }}>
+          <label style={{ display:"flex", flexDirection:"column", gap:4, fontSize:13, color:C.muted }}>
             Profit Target %
             <input type="number" min={10} max={90} step={5} value={ptPct} onChange={e=>setPt(+e.target.value)}
-              style={{ padding:"7px 10px", background:"#f8fafc", border:"1px solid #cbd5e1", color:"#1e293b", borderRadius:6, fontSize:13 }} />
+              style={{ padding:"7px 10px", background:C.card, border:`1px solid ${C.border}`, color:C.text, borderRadius:6, fontSize:13 }} />
           </label>
-          <label style={{ display:"flex", flexDirection:"column", gap:4, fontSize:13, color:"#475569" }}>
+          <label style={{ display:"flex", flexDirection:"column", gap:4, fontSize:13, color:C.muted }}>
             Stop Loss (× premium, 0=hold-to-expiry)
             <input type="number" min={0} max={10} step={0.5} value={slMult} onChange={e=>setSl(+e.target.value)}
-              style={{ padding:"7px 10px", background:"#f8fafc", border:"1px solid #cbd5e1", color:"#1e293b", borderRadius:6, fontSize:13 }} />
+              style={{ padding:"7px 10px", background:C.card, border:`1px solid ${C.border}`, color:C.text, borderRadius:6, fontSize:13 }} />
           </label>
         </div>
         <button onClick={run} disabled={loading} style={{
@@ -2518,7 +2527,7 @@ function BacktestTab({ connected }) {
               { label:"Avg Sharpe",    value:result.summary.avg_sharpe,           col:"#f1c40f" },
               { label:"Total P&L",     value:`$${result.summary.total_pnl}`,      col:pnlCol(result.summary.total_pnl) },
             ].map(s => (
-              <div key={s.label} style={{ background:"#f1f5f9", borderRadius:8, padding:14, textAlign:"center" }}>
+              <div key={s.label} style={{ background:C.card, borderRadius:8, padding:14, textAlign:"center" }}>
                 <div style={{ color:"#64748b", fontSize:11, marginBottom:6 }}>{s.label}</div>
                 <div style={{ color:s.col, fontWeight:700, fontSize:22 }}>{s.value}</div>
               </div>
@@ -2536,7 +2545,7 @@ function BacktestTab({ connected }) {
                   { label:"Avg Loss",     value:`$${r.avg_loss}`,      col:"#e74c3c" },
                   { label:"Max Drawdown", value:`$${r.max_drawdown}`,  col:"#e74c3c" },
                 ].map(s => (
-                  <div key={s.label} style={{ background:"#f1f5f9", borderRadius:6, padding:10 }}>
+                  <div key={s.label} style={{ background:C.card, borderRadius:6, padding:10 }}>
                     <div style={{ color:"#64748b", fontSize:10 }}>{s.label}</div>
                     <div style={{ color:s.col, fontWeight:700, fontSize:15 }}>{s.value}</div>
                   </div>
@@ -2545,7 +2554,7 @@ function BacktestTab({ connected }) {
               <div style={{ overflowX:"auto" }}>
                 <table style={{ width:"100%", borderCollapse:"collapse", fontSize:12 }}>
                   <thead>
-                    <tr style={{ color:"#64748b", borderBottom:"1px solid #e2e8f0" }}>
+                    <tr style={{ color:"#64748b", borderBottom:`1px solid ${C.border}` }}>
                       {["Date","Spot","Strike","IV%","Premium","P&L","Result"].map(h =>
                         <th key={h} style={{ ...tdS, fontWeight:600, textAlign:"left" }}>{h}</th>)}
                     </tr>
@@ -2658,7 +2667,7 @@ function BreakoutBacktest() {
                 { label:"Avg Ret 10d",  value: fmtR(s.avg_ret_10d), col: retCol(s.avg_ret_10d) },
                 { label:"Avg Ret 20d",  value: fmtR(s.avg_ret_20d), col: retCol(s.avg_ret_20d) },
               ].map(stat => (
-                <div key={stat.label} style={{ background:"#f1f5f9", borderRadius:8, padding:"10px 8px", textAlign:"center" }}>
+                <div key={stat.label} style={{ background:C.card, borderRadius:8, padding:"10px 8px", textAlign:"center" }}>
                   <div style={{ color:C.muted, fontSize:10, marginBottom:4 }}>{stat.label}</div>
                   <div style={{ color:stat.col, fontWeight:700, fontSize:16 }}>{stat.value ?? "—"}</div>
                 </div>
@@ -2667,7 +2676,7 @@ function BreakoutBacktest() {
             <div style={{ overflowX:"auto" }}>
               <table style={{ width:"100%", borderCollapse:"collapse", fontSize:12 }}>
                 <thead>
-                  <tr style={{ background:"#f8fafc" }}>
+                  <tr style={{ background:C.card }}>
                     {["Ticker","Signals","Vol 90pct","WR 5d","WR 10d","WR 20d","Avg Ret 5d","Avg Ret 10d","Avg Ret 20d","Recent Signals"].map(h => (
                       <th key={h} style={TH}>{h}</th>
                     ))}
@@ -2719,7 +2728,7 @@ function BreakoutBacktest() {
                     border:`1px solid ${key==="with_stops" ? "#bbf7d0" : C.border}`,
                     borderRadius:10, padding:"10px 8px", textAlign:"center",
                   }}>
-                    <div style={{ fontSize:9, fontWeight:800, color:"#475569", textTransform:"uppercase",
+                    <div style={{ fontSize:9, fontWeight:800, color:C.muted, textTransform:"uppercase",
                                   letterSpacing:1, marginBottom:2 }}>{label}</div>
                     <div style={{ fontSize:9, color:C.muted, marginBottom:6 }}>{desc}</div>
                     <div style={{ fontSize:18, fontWeight:800, color:wrCol(ls.win_rate_10d) }}>
@@ -2743,13 +2752,13 @@ function BreakoutBacktest() {
             <div style={{ overflowX:"auto" }}>
               <table style={{ width:"100%", borderCollapse:"collapse", fontSize:11 }}>
                 <thead>
-                  <tr style={{ background:"#f8fafc" }}>
+                  <tr style={{ background:C.card }}>
                     <th style={{ ...TH, minWidth:60 }}>Ticker</th>
                     {LAYER_META.map(({ key, label }) => (
                       <th key={key} style={{ ...TH, textAlign:"center" }} colSpan={3}>{label}</th>
                     ))}
                   </tr>
-                  <tr style={{ background:"#f8fafc" }}>
+                  <tr style={{ background:C.card }}>
                     <th style={TH}></th>
                     {LAYER_META.map(({ key }) => (
                       <React.Fragment key={key}>
@@ -2793,7 +2802,7 @@ function BreakoutBacktest() {
             </div>
 
             {/* Filter legend */}
-            <div style={{ marginTop:16, padding:12, background:"#f8fafc", borderRadius:8,
+            <div style={{ marginTop:16, padding:12, background:C.card, borderRadius:8,
                           fontSize:11, color:C.muted, lineHeight:1.8 }}>
               <b style={{ color:C.text }}>Filter definitions:</b><br/>
               {(filteredResult.meta?.filters || []).map((f,i) => (
@@ -2834,8 +2843,8 @@ function ZeroDTETab({ connected }) {
     finally { setEivLoad(false); }
   };
 
-  const thS = { padding:"7px 10px", textAlign:"left", fontWeight:600, color:"#64748b", borderBottom:"1px solid #e2e8f0" };
-  const tdS = { padding:"7px 10px", borderBottom:"1px solid #e2e8f0" };
+  const thS = { padding:"7px 10px", textAlign:"left", fontWeight:600, color:"#64748b", borderBottom:`1px solid ${C.border}` };
+  const tdS = { padding:"7px 10px", borderBottom:`1px solid ${C.border}` };
 
   return (
     <div style={{ padding:"16px 0" }}>
@@ -2863,7 +2872,7 @@ function ZeroDTETab({ connected }) {
                 </thead>
                 <tbody>
                   {result.candidates.map((r,i) => (
-                    <tr key={i} style={{ background: i%2===0?"#f8fafc":"transparent" }}>
+                    <tr key={i} style={{ background: i%2===0?C.card:"transparent" }}>
                       <td style={{ ...tdS, fontWeight:700 }}>{r.ticker}</td>
                       <td style={tdS}>{r.expiry_display}</td>
                       <td style={{ ...tdS, color:r.dte===0?"#e74c3c":"#f1c40f" }}>{r.dte}d</td>
@@ -2913,7 +2922,7 @@ function ZeroDTETab({ connected }) {
                 </thead>
                 <tbody>
                   {eivRes.candidates.map((r,i) => (
-                    <tr key={i} style={{ background: i%2===0?"#f8fafc":"transparent" }}>
+                    <tr key={i} style={{ background: i%2===0?C.card:"transparent" }}>
                       <td style={{ ...tdS, fontWeight:700 }}>{r.ticker}</td>
                       <td style={tdS}>{r.expiry_display}</td>
                       <td style={tdS}>{r.dte}d</td>
@@ -2974,14 +2983,14 @@ function LearningTab() {
   };
 
   const pnlCol = v => v > 0 ? "#27ae60" : v < 0 ? "#e74c3c" : "#888";
-  const thS = { padding:"7px 10px", textAlign:"left", color:"#64748b", borderBottom:"1px solid #e2e8f0", fontWeight:600 };
-  const tdS = { padding:"7px 10px", borderBottom:"1px solid #e2e8f0", fontSize:12 };
+  const thS = { padding:"7px 10px", textAlign:"left", color:"#64748b", borderBottom:`1px solid ${C.border}`, fontWeight:600 };
+  const tdS = { padding:"7px 10px", borderBottom:`1px solid ${C.border}`, fontSize:12 };
 
   // Feature importance bar chart
   const FeatureBar = ({ name, val, max }) => (
     <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom:6 }}>
-      <div style={{ width:130, fontSize:12, color:"#475569", textAlign:"right" }}>{name}</div>
-      <div style={{ flex:1, background:"#f1f5f9", borderRadius:4, height:16, position:"relative" }}>
+      <div style={{ width:130, fontSize:12, color:C.muted, textAlign:"right" }}>{name}</div>
+      <div style={{ flex:1, background:C.card, borderRadius:4, height:16, position:"relative" }}>
         <div style={{ width:`${(val/max)*100}%`, background:"#3498db", borderRadius:4, height:"100%",
           minWidth:2, transition:"width 0.3s" }} />
       </div>
@@ -3009,7 +3018,7 @@ function LearningTab() {
             { label:"Model Version",   value: `v${stats.model_version}`,   col:"#f1c40f" },
             { label:"Kelly Win Rate",  value: stats.assumed_win_rate ? `${(stats.assumed_win_rate*100).toFixed(1)}%` : "—", col:"#9b59b6" },
           ].map(s => (
-            <div key={s.label} style={{ background:"#f1f5f9", borderRadius:8, padding:14, textAlign:"center" }}>
+            <div key={s.label} style={{ background:C.card, borderRadius:8, padding:14, textAlign:"center" }}>
               <div style={{ color:"#64748b", fontSize:11, marginBottom:6 }}>{s.label}</div>
               <div style={{ color:s.col, fontWeight:700, fontSize:19 }}>{s.value}</div>
             </div>
@@ -3026,7 +3035,7 @@ function LearningTab() {
             const stLabel = st === "leap" ? "LEAP Calls" : "CSP Puts";
             const stColor = st === "leap" ? "#3b82f6" : "#d97706";
             return (
-              <div key={st} style={{ background:"#f1f5f9", borderRadius:8, padding:"12px 20px",
+              <div key={st} style={{ background:C.card, borderRadius:8, padding:"12px 20px",
                 display:"flex", flexDirection:"column", gap:4, minWidth:160 }}>
                 <div style={{ color:stColor, fontWeight:700, fontSize:12 }}>{stLabel}</div>
                 <div style={{ display:"flex", gap:20 }}>
@@ -3056,7 +3065,7 @@ function LearningTab() {
           {!importances ? (
             <div style={{ color:"#64748b", fontStyle:"italic" }}>
               Need {20} completed trades to train first model.
-              <br/>Run the auto-trader and come back after 20 closes.
+              <br/>Run the CSP-Leap Trader and come back after 20 closes.
             </div>
           ) : (
             <>
@@ -3086,8 +3095,8 @@ function LearningTab() {
                 const col = reason.includes("profit") || reason.includes("trailing") ? "#27ae60" : "#e74c3c";
                 return (
                   <div key={reason} style={{ display:"flex", justifyContent:"space-between",
-                    padding:"8px 0", borderBottom:"1px solid #e2e8f0" }}>
-                    <span style={{ color:"#334155", fontSize:13 }}>{reason}</span>
+                    padding:"8px 0", borderBottom:`1px solid ${C.border}` }}>
+                    <span style={{ color:C.text, fontSize:13 }}>{reason}</span>
                     <span style={{ color:"#64748b", fontSize:12 }}>{d.total} trades</span>
                     <span style={{ color:col, fontWeight:700, fontSize:13 }}>{wr}% win</span>
                   </div>
@@ -3137,13 +3146,13 @@ function LearningTab() {
       <Card title={`Trade Journal (last ${journal?.trades?.length || 0})`}>
         {!journal?.trades?.length ? (
           <div style={{ color:"#64748b", fontStyle:"italic" }}>
-            No trades recorded yet. Trades placed by the auto-trader appear here.
+            No trades recorded yet. Trades placed by the CSP-Leap Trader appear here.
           </div>
         ) : (
           <div style={{ overflowX:"auto" }}>
             <table style={{ width:"100%", borderCollapse:"collapse", fontSize:11 }}>
               <thead>
-                <tr style={{ color:"#64748b", borderBottom:"1px solid #e2e8f0" }}>
+                <tr style={{ color:"#64748b", borderBottom:`1px solid ${C.border}` }}>
                   {["#","Ticker","Type","Strike","Expiry","Hold","Entry","Exit","P&L","Win","Exit Reason",
                     "IV Rank","IV Exit","Regime","Score","Opened"].map(h =>
                     <th key={h} style={{ padding:"6px 8px", textAlign:"left", fontWeight:600 }}>{h}</th>)}
@@ -3162,7 +3171,7 @@ function LearningTab() {
                   return (
                   <tr key={i} style={{
                     background: t.win === 1 ? "#f0fdf4" : t.win === 0 ? "#fef2f2" : "transparent",
-                    borderBottom:"1px solid #e2e8f0",
+                    borderBottom:`1px solid ${C.border}`,
                   }}>
                     <td style={{ padding:"5px 8px", color:"#64748b" }}>{t.id}</td>
                     <td style={{ padding:"5px 8px", fontWeight:700 }}>{t.ticker}</td>
@@ -3312,7 +3321,7 @@ function UniverseTab() {
               >×</span>
             </span>
           ))}
-          {!data && <span style={{ color:"#475569" }}>Loading…</span>}
+          {!data && <span style={{ color:C.muted }}>Loading…</span>}
         </div>
         {/* Add custom ticker */}
         <div style={{ display:"flex", gap:8, alignItems:"center" }}>
@@ -3384,7 +3393,7 @@ function UniverseTab() {
                       opacity: inUniverse ? 1 : 0.45,
                       background: inUniverse && i < 30 ? "#0f4c8108" : "transparent",
                     }}>
-                      <td style={{ ...tdS, color:"#475569" }}>{i+1}</td>
+                      <td style={{ ...tdS, color:C.muted }}>{i+1}</td>
                       <td style={{ ...tdS, ...mono, fontWeight:700, color: inUniverse ? "#93c5fd" : "#64748b" }}>
                         {row.ticker}
                       </td>
@@ -3423,7 +3432,7 @@ function UniverseTab() {
                       <td style={{ ...tdS, textAlign:"center" }}>
                         {inUniverse
                           ? <span style={{color:"#27ae60", fontWeight:700}}>✓</span>
-                          : <span style={{color:"#334155"}}>—</span>}
+                          : <span style={{color:C.text}}>—</span>}
                       </td>
                     </tr>
                   );
@@ -3918,7 +3927,7 @@ function TechnicalsTab() {
             onKeyDown={e => e.key === "Enter" && analyze()}
             placeholder="Ticker symbol (e.g. AAPL)"
             style={{ ...sans, flex:1, padding:"8px 12px", borderRadius:8, border:`1px solid ${C.border}`,
-                     fontSize:13, color:C.text, background:"#f8fafc", outline:"none" }}
+                     fontSize:13, color:C.text, background:C.card, outline:"none" }}
           />
           <button
             onClick={analyze}
@@ -4372,7 +4381,7 @@ function DecisionsTab() {
       {!loading && filtered.length === 0 && (
         <Card>
           <div style={{ color:"#64748b", ...sans, fontSize:13 }}>
-            No decisions recorded yet. The auto-trader logs a plain-English explanation
+            No decisions recorded yet. The CSP-Leap Trader logs a plain-English explanation
             every time it enters, rolls, or exits a trade.
           </div>
         </Card>
@@ -4394,7 +4403,7 @@ function DecisionsTab() {
                 <span style={{ flex:1, ...sans, fontSize:13, color:"#cbd5e1" }}>
                   {d.headline}
                 </span>
-                <span style={{ ...mono, fontSize:11, color:"#475569", whiteSpace:"nowrap" }}>
+                <span style={{ ...mono, fontSize:11, color:C.muted, whiteSpace:"nowrap" }}>
                   {d.time}
                 </span>
               </div>
@@ -5195,9 +5204,11 @@ function SPX0DTETab() {
 function DayTraderTab() {
   const [status,   setStatus]   = useState(null);
   const [goal,     setGoal]     = useState(null);
+  const [history,  setHistory]  = useState(null);
   const [loading,  setLoading]  = useState(true);
   const [targetIn, setTargetIn] = useState("");
   const [saving,   setSaving]   = useState(false);
+  const [histDays, setHistDays] = useState(30);
 
   const load = async () => {
     try {
@@ -5212,7 +5223,19 @@ function DayTraderTab() {
     finally { setLoading(false); }
   };
 
-  useEffect(() => { load(); const id = setInterval(load, 15000); return () => clearInterval(id); }, []);
+  const loadHistory = async (d) => {
+    try {
+      const h = await apiFetch(`/day-trader/history?days=${d}`);
+      setHistory(h);
+    } catch(_) {}
+  };
+
+  useEffect(() => {
+    load();
+    loadHistory(30);
+    const id = setInterval(load, 15000);
+    return () => clearInterval(id);
+  }, []);
 
   const toggle = async () => {
     await apiFetch(`/day-trader/enable?enabled=${!status.enabled}`, { method:"POST" });
@@ -5608,6 +5631,93 @@ function DayTraderTab() {
           </div>
         </>
       )}
+
+      {/* Trade History */}
+      <div style={{ marginTop:24 }}>
+        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:10 }}>
+          <div style={{ ...sans, fontSize:13, fontWeight:700, color:C.white }}>Trade History</div>
+          <div style={{ display:"flex", gap:6, alignItems:"center" }}>
+            {[7, 30, 90].map(d => (
+              <button key={d} onClick={() => { setHistDays(d); loadHistory(d); }} style={{
+                ...sans, fontSize:11, padding:"3px 10px", borderRadius:4, cursor:"pointer",
+                background: histDays === d ? "#1e3a5f" : "#1e293b",
+                border: `1px solid ${histDays === d ? "#2563eb" : C.border}`,
+                color: histDays === d ? "#93c5fd" : C.muted,
+              }}>{d}d</button>
+            ))}
+          </div>
+        </div>
+
+        {history && history.total > 0 ? (
+          <>
+            {/* Summary stats */}
+            <div style={{ display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:8, marginBottom:12 }}>
+              {[
+                { label:"Trades", value: history.total, color: C.white },
+                { label:"Win Rate", value:`${history.win_rate}%`,
+                  color: history.win_rate >= 60 ? "#4ade80" : history.win_rate >= 40 ? "#f59e0b" : "#ef4444" },
+                { label:"Total P&L", value:`${history.total_pnl >= 0 ? "+" : ""}$${history.total_pnl.toFixed(2)}`,
+                  color: pnlColor(history.total_pnl) },
+                { label:"Wins / Losses", value:`${history.wins}W / ${history.total - history.wins}L`, color: C.muted },
+              ].map(({ label, value, color }) => (
+                <div key={label} style={{ background:"#0f172a", border:`1px solid ${C.border}`,
+                  borderRadius:6, padding:"8px 12px", textAlign:"center" }}>
+                  <div style={{ ...sans, fontSize:10, color:C.muted, marginBottom:3 }}>{label}</div>
+                  <div style={{ ...mono, fontSize:14, fontWeight:700, color }}>{value}</div>
+                </div>
+              ))}
+            </div>
+
+            {/* Trades table */}
+            <div style={{ overflowX:"auto" }}>
+              <table style={{ width:"100%", borderCollapse:"collapse", ...sans, fontSize:12 }}>
+                <thead>
+                  <tr style={{ background:"#0f172a" }}>
+                    {["Date","Ticker","Entry $","Exit $","Shares","P&L","P&L %","Exit Type"].map(h => (
+                      <th key={h} style={{ padding:"6px 10px", textAlign:"left", color:C.muted,
+                        fontSize:11, fontWeight:600, textTransform:"uppercase", letterSpacing:0.5,
+                        borderBottom:`1px solid ${C.border}` }}>{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {history.trades.map((t, i) => {
+                    const exitColor = t.exit_reason === "profit_target" ? "#4ade80"
+                                    : t.exit_reason === "hard_stop"     ? "#f87171"
+                                    : t.exit_reason === "force_close"   ? "#f59e0b" : C.muted;
+                    return (
+                      <tr key={i} style={{ borderBottom:`1px solid ${C.border}`,
+                        background: i % 2 === 0 ? "transparent" : "#0f172a22" }}>
+                        <td style={{ padding:"7px 10px", color:C.muted }}>{t.closed_at}</td>
+                        <td style={{ padding:"7px 10px", fontWeight:700, fontFamily:"monospace", color:C.white }}>{t.ticker}</td>
+                        <td style={{ padding:"7px 10px", ...mono }}>${(t.entry_price||0).toFixed(2)}</td>
+                        <td style={{ padding:"7px 10px", ...mono }}>${(t.exit_price||0).toFixed(2)}</td>
+                        <td style={{ padding:"7px 10px", color:C.muted }}>{t.qty}</td>
+                        <td style={{ padding:"7px 10px", ...mono, fontWeight:700, color:pnlColor(t.pnl) }}>
+                          {t.pnl >= 0 ? "+" : ""}${(t.pnl||0).toFixed(2)}
+                        </td>
+                        <td style={{ padding:"7px 10px", ...mono, color:pnlColor(t.pnl_pct) }}>
+                          {t.pnl_pct >= 0 ? "+" : ""}{(t.pnl_pct||0).toFixed(2)}%
+                        </td>
+                        <td style={{ padding:"7px 10px" }}>
+                          <span style={{ fontSize:11, padding:"2px 7px", borderRadius:4, fontWeight:700,
+                            color: exitColor, background: `${exitColor}22` }}>
+                            {(t.exit_reason||"").replace(/_/g," ")}
+                          </span>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </>
+        ) : (
+          <div style={{ color:C.muted, ...sans, fontSize:13, padding:"16px 0" }}>
+            {history ? `No day trades in the last ${histDays} days` : "Loading history…"}
+          </div>
+        )}
+      </div>
     </div>
   );
 }
@@ -7007,7 +7117,6 @@ function App() {
     return () => clearInterval(iv);
   }, []);
 
-  // Refresh portfolio delta every 60s when connected
   useEffect(() => {
     if (!connected) return;
     const load = async () => {
@@ -7018,110 +7127,150 @@ function App() {
     return () => clearInterval(iv);
   }, [connected]);
 
-  const tabs = [
-    { id:"pnl",        label:"P&L"         },
-    { id:"signals",    label:"Signals"     },
-    { id:"csp",        label:"CSP Scan"    },
-    { id:"leaps",      label:"LEAPs"       },
-    { id:"autotrader",   label:"Auto-Trade"    },
-    { id:"stocktrader", label:"Stock Trader" },
-    { id:"daytrader",  label:"Day Trader ⚡" },
-    { id:"spx0dte",   label:"SPX 0DTE 🎯"  },
-    { id:"backtest",    label:"Backtest"     },
-    { id:"0dte",       label:"0DTE / EIV"  },
-    { id:"learning",   label:"Learning"    },
-    { id:"universe",   label:"Universe"    },
-    { id:"decisions",  label:"Decisions"   },
-    { id:"technicals", label:"Technicals"  },
-    { id:"watchlist",  label:"Watchlist 📡"   },
-    { id:"tape",        label:"Live Tape 📈"   },
-    { id:"instflow",   label:"Inst. Flow 🏦"  },
-    { id:"performance", label:"Performance 📊" },
+  const tabGroups = [
+    { id:"live",     label:"Live Trading", tabs: [
+      { id:"pnl",         label:"P&L"          },
+      { id:"autotrader",  label:"CSP-Leap"      },
+      { id:"stocktrader", label:"Stock Trader"  },
+      { id:"daytrader",   label:"Day Trader"    },
+      { id:"spx0dte",     label:"SPX 0DTE"      },
+    ]},
+    { id:"research", label:"Research", tabs: [
+      { id:"signals",   label:"Signals"    },
+      { id:"csp",       label:"CSP Scan"   },
+      { id:"leaps",     label:"LEAPs"      },
+      { id:"backtest",  label:"Backtest"   },
+      { id:"0dte",      label:"0DTE / EIV" },
+    ]},
+    { id:"market",   label:"Market Data", tabs: [
+      { id:"watchlist",  label:"Watchlist"  },
+      { id:"tape",       label:"Live Tape"  },
+      { id:"instflow",   label:"Inst. Flow" },
+      { id:"technicals", label:"Technicals" },
+    ]},
+    { id:"analytics",label:"Analytics", tabs: [
+      { id:"universe",    label:"Universe"     },
+      { id:"learning",    label:"Learning"     },
+      { id:"performance", label:"Performance"  },
+      { id:"decisions",   label:"Decisions"    },
+    ]},
   ];
 
+  const activeGroup = tabGroups.find(g => g.tabs.some(t => t.id === tab)) || tabGroups[0];
   const deltaCol = netDelta == null ? C.muted : netDelta >= 0 ? C.bull : C.bear;
 
+  const switchGroup = (g) => { setTab(g.tabs[0].id); };
+
   return (
-    <div style={{ minHeight:"100vh", background:C.bg, paddingTop: 56, paddingRight: 16, paddingBottom: 20, paddingLeft: 16 }}>
+    <div style={{ minHeight:"100vh", background:C.bg }}>
       <IndexBanner />
-      <div style={{ maxWidth:1200, margin:"0 auto" }}>
 
-        {/* Header */}
-        <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", flexWrap:"wrap", gap:10, marginBottom:20 }}>
-          <div>
-            <div style={{ ...mono, fontSize:10, color:C.accent, letterSpacing:3, textTransform:"uppercase", marginBottom:4 }}>
-              XGBoost · IBKR Algo Trading · v6
+      {/* ── Fixed top navbar (sits below the 40px IndexBanner ticker) ── */}
+      <div style={{
+        position:"fixed", top:40, left:0, right:0, zIndex:200,
+        background:C.surface, borderBottom:`1px solid ${C.border}`,
+        height:48, display:"flex", alignItems:"center",
+        padding:"0 24px", gap:16,
+      }}>
+        <div style={{ flex:1 }}>
+          <span style={{ ...mono, fontSize:11, fontWeight:700, color:C.accent, letterSpacing:2, textTransform:"uppercase" }}>
+            IBKR Algo
+          </span>
+          <span style={{ ...sans, fontSize:12, color:C.muted, marginLeft:10 }}>
+            CSP · LEAP · Stock · Day · SPX 0DTE
+          </span>
+        </div>
+        <div style={{ display:"flex", gap:12, alignItems:"center" }}>
+          {netDelta != null && (
+            <div style={{ ...mono, fontSize:12, fontWeight:700, color:deltaCol,
+              padding:"3px 10px", borderRadius:12, background:`${deltaCol}18`, border:`1px solid ${deltaCol}40` }}>
+              Net Δ {netDelta >= 0 ? "+" : ""}{netDelta}
             </div>
-            <h1 style={{ ...sans, fontSize:20, fontWeight:800, color:C.white, letterSpacing:-0.5 }}>
-              Options Strategy Engine — CSP + LEAP + Delta
-            </h1>
-          </div>
-          <div style={{ display:"flex", gap:10, alignItems:"center", flexWrap:"wrap" }}>
-            {netDelta != null && (
-              <div style={{ ...mono, fontSize:13, fontWeight:700, color:deltaCol,
-                padding:"4px 12px", borderRadius:16, background:`${deltaCol}11`, border:`1px solid ${deltaCol}33` }}>
-                Net Δ {netDelta >= 0 ? "+" : ""}{netDelta}
-              </div>
-            )}
-            <StatusPill connected={connected} />
-          </div>
+          )}
+          <StatusPill connected={connected} />
+        </div>
+      </div>
+
+      <div style={{ maxWidth:1280, margin:"0 auto", padding:"104px 20px 32px" }}>
+
+        {/* ── Group row ── */}
+        <div style={{ display:"flex", gap:2, marginBottom:0, borderBottom:`1px solid ${C.border}` }}>
+          {tabGroups.map(g => {
+            const isActive = g.id === activeGroup.id;
+            return (
+              <button key={g.id} onClick={() => switchGroup(g)} style={{
+                ...sans, fontSize:12, fontWeight:700, padding:"7px 18px", cursor:"pointer",
+                background: isActive ? C.accent : "transparent",
+                border:"none", borderRadius:"6px 6px 0 0",
+                color: isActive ? "#fff" : C.muted,
+                letterSpacing:0.3, transition:"all 0.15s",
+              }}>{g.label}</button>
+            );
+          })}
         </div>
 
-        {/* Nav tabs */}
-        <div style={{ display:"flex", gap:4, marginBottom:20, borderBottom:`1px solid ${C.border}`, paddingBottom:0 }}>
-          {tabs.map(t => (
-            <button key={t.id} onClick={() => setTab(t.id)} style={{
-              ...sans, fontSize:13, fontWeight:600, padding:"8px 20px", cursor:"pointer",
-              background:"transparent", border:"none",
-              color: tab===t.id ? C.accent : C.muted,
-              borderBottom: tab===t.id ? `2px solid ${C.accent}` : "2px solid transparent",
-              marginBottom:-1, transition:"all 0.15s",
-            }}>{t.label}</button>
-          ))}
-        </div>
-
-        {/* Tab content — always mounted so state (scan results, params) survives tab switches */}
-        <div style={{display: tab==="pnl"        ? "" : "none"}}><PnLTab /></div>
-        <div style={{display: tab==="signals"    ? "" : "none"}}><SignalsTab    connected={connected} /></div>
-        <div style={{display: tab==="csp"        ? "" : "none"}}><CSPTab        connected={connected} /></div>
-        <div style={{display: tab==="leaps"      ? "" : "none"}}><LEAPTab       connected={connected} /></div>
-        <div style={{display: tab==="autotrader"   ? "" : "none"}}><AutoTraderTab /></div>
-        <div style={{display: tab==="stocktrader" ? "" : "none"}}><StockTraderTab /></div>
-        <div style={{display: tab==="daytrader"  ? "" : "none"}}><DayTraderTab /></div>
-        <div style={{display: tab==="spx0dte"   ? "" : "none"}}><SPX0DTETab /></div>
-        <div style={{display: tab==="backtest"    ? "" : "none"}}><BacktestTab   connected={connected} /></div>
-        <div style={{display: tab==="0dte"       ? "" : "none"}}><ZeroDTETab    connected={connected} /></div>
-        <div style={{display: tab==="learning"   ? "" : "none"}}><LearningTab /></div>
-        <div style={{display: tab==="universe"   ? "" : "none"}}><UniverseTab /></div>
-        <div style={{display: tab==="decisions"  ? "" : "none"}}><DecisionsTab /></div>
-        <div style={{display: tab==="technicals" ? "" : "none"}}><TechnicalsTab /></div>
-        <div style={{display: tab==="watchlist"  ? "" : "none"}}><WatchlistTab /></div>
-        <div style={{display: tab==="tape"       ? "" : "none"}}><TapeTab /></div>
-        <div style={{display: tab==="instflow"    ? "" : "none"}}><InstFlowTab /></div>
-        <div style={{display: tab==="performance" ? "" : "none"}}><PerformanceTab /></div>
-
-        <div style={{ marginTop:20, ...sans, fontSize:11, color:C.muted, lineHeight:1.7 }}>
-          Auto-trader: Kelly sizing · 50% profit target · IV-adjusted stops · 21 DTE roll · 48h cooldown. Backtest: 2-yr simulation with BS pricing.
-          0DTE: SPY/QQQ/IWM 0–7 DTE puts. Earnings IV: pre-earnings premium plays. Live account: LIVE (7496) button.
-        </div>
-
-        {/* ── Disclaimer ────────────────────────────────────────────── */}
+        {/* ── Tab row (shows tabs of active group) ── */}
         <div style={{
-          marginTop: 24, padding: "12px 16px",
-          background: "#fffbeb", border: "1px solid #fcd34d", borderRadius: 8,
+          display:"flex", gap:0, marginBottom:20,
+          background:C.surface, borderBottom:`1px solid ${C.border}`,
+          borderRadius:"0 0 0 0", padding:"0 4px",
+        }}>
+          {activeGroup.tabs.map(t => {
+            const isActive = t.id === tab;
+            return (
+              <button key={t.id} onClick={() => setTab(t.id)} style={{
+                ...sans, fontSize:13, fontWeight:600, padding:"9px 18px", cursor:"pointer",
+                background:"transparent", border:"none",
+                color: isActive ? C.white : C.muted,
+                borderBottom: isActive ? `2px solid ${C.accent}` : "2px solid transparent",
+                marginBottom:-1, transition:"color 0.15s",
+              }}>{t.label}</button>
+            );
+          })}
+        </div>
+
+        {/* ── Tab content — always mounted so scan state survives tab switches ── */}
+        <div style={{display: tab==="pnl"         ? "" : "none"}}><PnLTab /></div>
+        <div style={{display: tab==="signals"      ? "" : "none"}}><SignalsTab    connected={connected} /></div>
+        <div style={{display: tab==="csp"          ? "" : "none"}}><CSPTab        connected={connected} /></div>
+        <div style={{display: tab==="leaps"        ? "" : "none"}}><LEAPTab       connected={connected} /></div>
+        <div style={{display: tab==="autotrader"   ? "" : "none"}}><AutoTraderTab /></div>
+        <div style={{display: tab==="stocktrader"  ? "" : "none"}}><StockTraderTab /></div>
+        <div style={{display: tab==="daytrader"    ? "" : "none"}}><DayTraderTab /></div>
+        <div style={{display: tab==="spx0dte"      ? "" : "none"}}><SPX0DTETab /></div>
+        <div style={{display: tab==="backtest"     ? "" : "none"}}><BacktestTab   connected={connected} /></div>
+        <div style={{display: tab==="0dte"         ? "" : "none"}}><ZeroDTETab    connected={connected} /></div>
+        <div style={{display: tab==="learning"     ? "" : "none"}}><LearningTab /></div>
+        <div style={{display: tab==="universe"     ? "" : "none"}}><UniverseTab /></div>
+        <div style={{display: tab==="decisions"    ? "" : "none"}}><DecisionsTab /></div>
+        <div style={{display: tab==="technicals"   ? "" : "none"}}><TechnicalsTab /></div>
+        <div style={{display: tab==="watchlist"    ? "" : "none"}}><WatchlistTab /></div>
+        <div style={{display: tab==="tape"         ? "" : "none"}}><TapeTab /></div>
+        <div style={{display: tab==="instflow"     ? "" : "none"}}><InstFlowTab /></div>
+        <div style={{display: tab==="performance"  ? "" : "none"}}><PerformanceTab /></div>
+
+        {/* ── Footer ── */}
+        <div style={{ marginTop:32, paddingTop:16, borderTop:`1px solid ${C.border}`,
+          display:"flex", justifyContent:"space-between", flexWrap:"wrap", gap:8 }}>
+          <span style={{ ...sans, fontSize:11, color:C.muted }}>
+            CSP-Leap: Kelly sizing · 50% target · IV-adjusted stops · 21 DTE roll · 48h cooldown
+          </span>
+          <span style={{ ...sans, fontSize:11, color:C.muted }}>
+            IBKR Algo Trading · v6
+          </span>
+        </div>
+
+        {/* ── Disclaimer ── */}
+        <div style={{
+          marginTop: 16, padding: "12px 16px",
+          background: "#1a1200", border: "1px solid #78350f", borderRadius: 8,
           display: "flex", alignItems: "flex-start", gap: 10,
         }}>
-          <span style={{ fontSize: 18, flexShrink: 0 }}>⚠️</span>
-          <div style={{ ...sans, fontSize: 11, color: "#78350f", lineHeight: 1.7 }}>
-            <b>Disclaimer — Not Financial or Investment Advice.</b>{" "}
-            This tool is for <b>informational and educational purposes only</b>.
-            All signals, scores, backtests, and auto-trader suggestions are generated by
-            algorithms and carry no guarantee of accuracy or profitability.
-            Past performance does not predict future results. Options trading involves
-            substantial risk of loss. You are solely responsible for all trading decisions.
-            This software does not constitute financial advice, investment advice, or a
-            solicitation to buy or sell any security. Always consult a qualified financial
-            advisor before making investment decisions.{" "}
+          <span style={{ fontSize: 16, flexShrink: 0 }}>⚠️</span>
+          <div style={{ ...sans, fontSize: 11, color: "#fbbf24", lineHeight: 1.7 }}>
+            <b>Not Financial or Investment Advice.</b>{" "}
+            For informational and educational purposes only. Algorithms carry no guarantee of accuracy or profitability.
+            Options trading involves substantial risk of loss. You are solely responsible for all trading decisions.{" "}
             <b>Use at your own risk.</b>
           </div>
         </div>

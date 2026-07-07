@@ -7565,8 +7565,8 @@ def autotrader_status():
                         "qty":        abs(int(item.position or 0)),
                         "live_pnl":   round(upnl_raw, 2) if upnl_raw is not None else None,
                         "live_price": live_price,
-                        "market_value": round(float(item.marketValue or 0), 2),
-                        "avg_cost":   round(float(item.averageCost or 0), 4),
+                        "market_value": _safe_float(item.marketValue, 0.0),
+                        "avg_cost":   _safe_float(item.averageCost, 0.0),
                     })
         except Exception:
             pass
@@ -7662,9 +7662,9 @@ def autotrader_status():
         "stopped_out":          dict(at.get("stopped_out", {})),
         "log":                  list(at["log"]),
         "last_run":             at.get("last_run"),
-        "premium_collected":    at.get("premium_collected", 0.0),
-        "leap_pnl":             at.get("leap_pnl", 0.0),
-        "leap_budget":          at.get("leap_budget", 0.0),
+        "premium_collected":    _safe_float(at.get("premium_collected"), 0.0),
+        "leap_pnl":             _safe_float(at.get("leap_pnl"), 0.0),
+        "leap_budget":          _safe_float(at.get("leap_budget"), 0.0),
     }
 
 
@@ -10669,6 +10669,39 @@ def day_trader_goal():
         "current_max_positions": cfg["max_positions"],
         "positions_gap":         max(0, req_pos - cfg["max_positions"]),
     }
+
+
+@app.get("/day-trader/history")
+def day_trader_history(days: int = Query(30, ge=1, le=365)):
+    """Closed day trades from trade_journal (DAY_BREAKOUT strategy)."""
+    try:
+        cutoff = (datetime.utcnow() - timedelta(days=days)).date().isoformat()
+        con = sqlite3.connect(JOURNAL_DB_PATH, check_same_thread=False)
+        con.row_factory = sqlite3.Row
+        rows = con.execute("""
+            SELECT opened_at, closed_at, ticker, qty, entry_price, exit_price,
+                   pnl, pnl_pct, win, exit_reason, strategy_type
+            FROM trade_journal
+            WHERE strategy_type = 'DAY_BREAKOUT'
+              AND closed_at IS NOT NULL
+              AND closed_at >= ?
+            ORDER BY closed_at DESC
+        """, (cutoff,)).fetchall()
+        con.close()
+        trades = [dict(r) for r in rows]
+        total     = len(trades)
+        wins      = sum(1 for t in trades if t.get("win"))
+        total_pnl = sum(t.get("pnl", 0) or 0 for t in trades)
+        return {
+            "trades":    trades,
+            "total":     total,
+            "wins":      wins,
+            "win_rate":  round(wins / total * 100, 1) if total else 0,
+            "total_pnl": round(total_pnl, 2),
+            "days":      days,
+        }
+    except Exception as exc:
+        raise HTTPException(500, str(exc))
 
 
 # ── SPX 0DTE Trader ──────────────────────────────────────────────────────────
