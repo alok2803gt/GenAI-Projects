@@ -1940,9 +1940,10 @@ def _main_loop():
                 # Only fires on first alert per ticker per day, same gate as Telegram.
                 if sig_type == "BREAKOUT" and backend_url:
                     _signal_payload = {
-                        "ticker":         tk,
-                        "price":          ind.get("price", 0),
-                        "alert_fired_at": datetime.now(ET).isoformat(),
+                        "ticker":          tk,
+                        "price":           ind.get("price", 0),
+                        "alert_fired_at":  datetime.now(ET).isoformat(),
+                        "composite_score": sig.get("composite_score"),
                     }
                     for _ep in ("/stock-trader/signal", "/day-trader/signal"):
                         try:

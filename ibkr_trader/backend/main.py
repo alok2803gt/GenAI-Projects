@@ -212,6 +212,77 @@ CANDIDATE_POOL: List[str] = [
     "SHOP", "SQ", "PYPL", "SNAP", "PINS",
 ]
 
+# ── Stock sector mapping for rotation sector guard ─────────────────────────
+STOCK_SECTOR_MAP: Dict[str, str] = {
+    # Technology
+    "AAPL":"Technology","MSFT":"Technology","NVDA":"Technology","AMD":"Technology",
+    "INTC":"Technology","QCOM":"Technology","CRM":"Technology","NOW":"Technology",
+    "ADBE":"Technology","ORCL":"Technology","SNOW":"Technology","PANW":"Technology",
+    "CRWD":"Technology","ZS":"Technology","DDOG":"Technology","NET":"Technology",
+    "AVGO":"Technology","TXN":"Technology","MU":"Technology","AMAT":"Technology",
+    "LRCX":"Technology","KLAC":"Technology","MRVL":"Technology","PLTR":"Technology",
+    "IBM":"Technology","CSCO":"Technology","INTU":"Technology","SMCI":"Technology",
+    "ON":"Technology","MPWR":"Technology",
+    # Consumer Discretionary
+    "NKE":"Consumer Discretionary","HD":"Consumer Discretionary",
+    "SBUX":"Consumer Discretionary","LOW":"Consumer Discretionary",
+    "TGT":"Consumer Discretionary","MCD":"Consumer Discretionary",
+    "BKNG":"Consumer Discretionary","LULU":"Consumer Discretionary",
+    "RIVN":"Consumer Discretionary","RBLX":"Consumer Discretionary",
+    "UBER":"Consumer Discretionary","ABNB":"Consumer Discretionary",
+    "RCL":"Consumer Discretionary","ROKU":"Consumer Discretionary",
+    "TSLA":"Consumer Discretionary","AMZN":"Consumer Discretionary",
+    "CMG":"Consumer Discretionary","SHOP":"Consumer Discretionary",
+    # Healthcare
+    "JNJ":"Healthcare","UNH":"Healthcare","LLY":"Healthcare","PFE":"Healthcare",
+    "ABBV":"Healthcare","MRK":"Healthcare","TMO":"Healthcare","DHR":"Healthcare",
+    "ISRG":"Healthcare","VRTX":"Healthcare","GILD":"Healthcare","BMY":"Healthcare",
+    "AMGN":"Healthcare","ELV":"Healthcare","HUM":"Healthcare","CI":"Healthcare",
+    "REGN":"Healthcare",
+    # Financials
+    "JPM":"Financials","BAC":"Financials","WFC":"Financials","GS":"Financials",
+    "MS":"Financials","C":"Financials","BLK":"Financials","SCHW":"Financials",
+    "V":"Financials","MA":"Financials","AXP":"Financials","TFC":"Financials",
+    "COIN":"Financials","HOOD":"Financials","SOFI":"Financials","PYPL":"Financials",
+    "COF":"Financials","USB":"Financials","PNC":"Financials","SPGI":"Financials",
+    "MCO":"Financials","SQ":"Financials",
+    # Consumer Staples
+    "PG":"Consumer Staples","KO":"Consumer Staples","PEP":"Consumer Staples",
+    "WMT":"Consumer Staples","COST":"Consumer Staples","PM":"Consumer Staples",
+    "MO":"Consumer Staples","MDLZ":"Consumer Staples","CL":"Consumer Staples",
+    # Energy
+    "XOM":"Energy","CVX":"Energy","COP":"Energy","SLB":"Energy",
+    "MPC":"Energy","VLO":"Energy","OXY":"Energy","EOG":"Energy","PSX":"Energy",
+    # Industrials
+    "BA":"Industrials","GE":"Industrials","CAT":"Industrials","HON":"Industrials",
+    "RTX":"Industrials","LMT":"Industrials","FDX":"Industrials","UPS":"Industrials",
+    "DE":"Industrials","UAL":"Industrials","NOC":"Industrials","GD":"Industrials",
+    "ETN":"Industrials","EMR":"Industrials",
+    # Communication Services
+    "DIS":"Communication Services","CMCSA":"Communication Services",
+    "VZ":"Communication Services","T":"Communication Services",
+    "META":"Communication Services","NFLX":"Communication Services",
+    "GOOGL":"Communication Services","SPOT":"Communication Services",
+    "SNAP":"Communication Services","PINS":"Communication Services",
+    # Real Estate
+    "AMT":"Real Estate","PLD":"Real Estate","EQIX":"Real Estate",
+    # High-beta
+    "MARA":"High Beta","RIOT":"High Beta",
+    # ── ETFs (granular mapping — sector guard active) ──────────────────────
+    "SPY":"Broad Market","IWM":"Small Cap","DIA":"Large Cap Value",
+    "QQQ":"Technology","XLK":"Technology",
+    "XLF":"Financials","XLE":"Energy","XLI":"Industrials",
+    "XLV":"Healthcare","XLY":"Consumer Discretionary",
+    "XLP":"Consumer Staples","XLC":"Communication Services",
+    "XLRE":"Real Estate","XLU":"Utilities","XLB":"Materials",
+    "GLD":"Gold","SLV":"Silver","USO":"Oil",
+    "TLT":"Treasury Bonds","IEF":"Intermediate Treasuries",
+    "SHY":"Short Treasuries","LQD":"Investment Grade Bonds","HYG":"High Yield Bonds",
+    "EFA":"Developed Markets","EEM":"Emerging Markets","FXI":"China","EWJ":"Japan",
+    "ARKK":"Innovation","SMH":"Semiconductors","SOXX":"Semiconductors",
+    "IBB":"Biotechnology","KRE":"Regional Banks","XBI":"Biotechnology",
+}
+
 # ── Global state ───────────────────────────────────────────────────────────
 state: Dict = {
     # Bar streaming
@@ -292,10 +363,12 @@ state: Dict = {
             "max_hold_days":        30,      # force-close at 30 trading days
             "signal_freshness_min": 30,      # skip alerts older than this
             "limit_buffer_pct":     0.10,    # LIMIT = last_price × (1 + buffer/100)
+            "rotation_enabled":     False,   # auto-rotate weak positions on new breakout
         },
         "positions":    {},   # ticker → position dict
         "closed_today": [],   # list of closed trade summaries (reset each day)
         "decisions":    [],   # plain-English decision log (last 200)
+        "rotation_log": [],   # outcome-tracking for rotation decisions
     },
     "day_trader": {
         "enabled": False,
@@ -5730,6 +5803,7 @@ def _st_save_state() -> None:
                 "positions":    st["positions"],
                 "closed_today": st.get("closed_today", [])[-100:],
                 "decisions":    st.get("decisions", [])[-200:],
+                "rotation_log": st.get("rotation_log", [])[-50:],
             }, f, indent=2, default=str)
     except Exception as e:
         log.warning("Stock trader state save failed: %s", e)
@@ -5742,11 +5816,12 @@ def _st_load_state() -> None:
         with open(ST_STATE_PATH, "r") as f:
             saved = json.load(f)
         st = state["stock_trader"]
-        st["enabled"]      = saved.get("enabled", False)
+        st["enabled"]       = saved.get("enabled", False)
         st["config"].update(saved.get("config", {}))
-        st["positions"]    = saved.get("positions", {})
-        st["closed_today"] = saved.get("closed_today", [])
-        st["decisions"]    = saved.get("decisions", [])
+        st["positions"]     = saved.get("positions", {})
+        st["closed_today"]  = saved.get("closed_today", [])
+        st["decisions"]     = saved.get("decisions", [])
+        st["rotation_log"]  = saved.get("rotation_log", [])
         log.info("Stock trader state restored: enabled=%s, positions=%d",
                  st["enabled"], len(st["positions"]))
     except Exception as e:
@@ -5829,6 +5904,85 @@ def _close_st_position(ticker: str, pos: dict, exit_px: float,
             f"exit={exit_px:.2f} pnl={'+'if pnl>=0 else''}{pnl:.2f} "
             f"({pnl_pct:+.2f}%) day {days_held}")
     _st_save_state()
+
+
+def _st_avg_score(st: dict) -> float:
+    """Average composite_score across all active (phase 1|2) positions. Returns 50 if unknown."""
+    scores = [
+        pos["composite_score"]
+        for pos in st["positions"].values()
+        if pos.get("phase", 0) in (1, 2) and pos.get("composite_score") is not None
+    ]
+    return round(sum(scores) / len(scores), 1) if scores else 50.0
+
+
+def _st_find_rotation_candidate(new_ticker: str, new_score: float, st: dict):
+    """
+    Find the weakest incumbent position eligible for eviction.
+
+    Rules (all must pass):
+    - Phase 1 or 2 (active, not pending or closing)
+    - trading_days_held >= 3
+    - live_pnl < 0 (only evict losers, never winners)
+    - new_score >= 70 AND > portfolio average score
+    - Sector of candidate != sector of new_ticker (sector guard)
+
+    Returns (ticker, reason_str) or (None, skip_reason).
+    """
+    MIN_SCORE_FLOOR   = 70.0
+    MIN_DAYS_HELD     = 3
+
+    # Score gate: new signal must be strong enough
+    avg_score = _st_avg_score(st)
+    if new_score < MIN_SCORE_FLOOR:
+        return None, f"score {new_score:.0f} below floor {MIN_SCORE_FLOOR:.0f}"
+    if new_score <= avg_score:
+        return None, f"score {new_score:.0f} not above portfolio avg {avg_score:.0f}"
+
+    new_sector = STOCK_SECTOR_MAP.get(new_ticker, "Unknown")
+
+    best_ticker   = None
+    best_pnl_pct  = 0.0   # only candidates with pnl_pct < 0 qualify
+    best_detail   = ""
+    sector_blocked = 0
+
+    for ticker, pos in st["positions"].items():
+        if ticker == new_ticker:
+            continue
+        if pos.get("phase", 0) not in (1, 2):
+            continue
+        days_held = pos.get("trading_days_held", 0) or _st_trading_days_held(pos.get("entry_date", ""))
+        if days_held < MIN_DAYS_HELD:
+            continue
+        live_pnl = pos.get("live_pnl", 0) or 0
+        if live_pnl >= 0:
+            continue   # never evict a profitable position
+
+        # Sector guard
+        cand_sector = STOCK_SECTOR_MAP.get(ticker, "Unknown")
+        if cand_sector != "Unknown" and new_sector != "Unknown" and cand_sector == new_sector:
+            sector_blocked += 1
+            continue
+
+        entry_price = pos.get("entry_price") or 0
+        shares      = pos.get("shares") or 0
+        cost        = entry_price * shares
+        pnl_pct     = (live_pnl / cost * 100) if cost > 0 else 0.0
+
+        if pnl_pct < best_pnl_pct:
+            best_pnl_pct  = pnl_pct
+            best_ticker   = ticker
+            best_detail   = (
+                f"held {days_held}d, P&L ${live_pnl:+.2f} ({pnl_pct:.1f}%), "
+                f"sector={cand_sector}, deepest loser among eligible candidates"
+            )
+
+    if best_ticker is None:
+        if sector_blocked > 0 and best_pnl_pct == 0.0:
+            return None, f"sector guard blocked all {sector_blocked} eligible loser(s) — {new_sector} overlap"
+        return None, "no losing positions held >= 3d in a different sector"
+
+    return best_ticker, best_detail
 
 
 async def _stock_monitor_coro(ib) -> None:
@@ -6004,6 +6158,49 @@ async def _stock_monitor_coro(ib) -> None:
     for ticker in to_remove:
         st["positions"].pop(ticker, None)
     if to_remove:
+        _st_save_state()
+
+    # ── Rotation log outcome enrichment ───────────────────────────────────
+    rot_log = st.get("rotation_log", [])
+    enriched = False
+    for rot in rot_log:
+        if rot.get("outcome_5d") is not None:
+            continue
+        try:
+            ts = datetime.fromisoformat(rot["ts"])
+            days_since = int(np.busday_count(ts.date().isoformat(), date.today().isoformat()))
+        except Exception:
+            continue
+        if days_since < 5:
+            continue
+        incoming = rot.get("incoming")
+        if not incoming:
+            continue
+        # Look up current price from IBKR portfolio or live_price in open positions
+        incoming_pos = st["positions"].get(incoming)
+        cur_price = None
+        if incoming_pos and incoming_pos.get("live_price"):
+            cur_price = incoming_pos["live_price"]
+        if cur_price is None:
+            try:
+                pi = next((i for i in ib.portfolio() if i.contract.symbol == incoming), None)
+                if pi and pi.marketPrice:
+                    cur_price = float(pi.marketPrice)
+            except Exception:
+                pass
+        if cur_price and rot.get("evicted_entry_price"):
+            entry_px = next(
+                (p["entry_price"] for t, p in st["positions"].items() if t == incoming),
+                rot.get("evicted_entry_price")
+            )
+            incoming_entry = next(
+                (p["entry_price"] for t, p in st["positions"].items() if t == incoming),
+                None
+            )
+            if incoming_entry:
+                rot["outcome_5d"] = round((cur_price - incoming_entry) / incoming_entry * 100, 2)
+                enriched = True
+    if enriched:
         _st_save_state()
 
 
@@ -9389,7 +9586,8 @@ def market_indexes():
 class StockSignalRequest(BaseModel):
     ticker:          str
     price:           float
-    alert_fired_at:  Optional[str] = None   # ISO timestamp from scanner
+    alert_fired_at:  Optional[str]   = None   # ISO timestamp from scanner
+    composite_score: Optional[float] = None   # 0-100 percentile from breakout scanner
 
 
 class StockConfigRequest(BaseModel):
@@ -9400,6 +9598,7 @@ class StockConfigRequest(BaseModel):
     max_hold_days:        Optional[int]   = None
     signal_freshness_min: Optional[int]   = None
     limit_buffer_pct:     Optional[float] = None
+    rotation_enabled:     Optional[bool]  = None
 
 
 @app.post("/stock-trader/signal")
@@ -9448,11 +9647,86 @@ async def stock_trader_signal(req: StockSignalRequest):
         _st_log("SKIPPED", ticker, "already have open position")
         return {"status": "skipped", "reason": "already_open"}
 
-    # Capacity check
+    # Capacity check — with optional rotation
     if len(st["positions"]) >= cfg["max_positions"]:
-        _st_log("SKIPPED", ticker,
-                f"at capacity ({len(st['positions'])}/{cfg['max_positions']} positions)")
-        return {"status": "skipped", "reason": "at_capacity"}
+        score = req.composite_score
+        if cfg.get("rotation_enabled") and score is not None:
+            candidate, reason = _st_find_rotation_candidate(ticker, score, st)
+            if candidate:
+                cand_pos   = st["positions"][candidate]
+                evict_pnl  = cand_pos.get("live_pnl", 0) or 0
+                evict_days = cand_pos.get("trading_days_held", 0) or _st_trading_days_held(cand_pos.get("entry_date", ""))
+                evict_sec  = STOCK_SECTOR_MAP.get(candidate, "Unknown")
+                new_sec    = STOCK_SECTOR_MAP.get(ticker, "Unknown")
+                avg_score  = _st_avg_score(st)
+
+                # Place MKT sell for evicted position (reuse close endpoint logic)
+                _ib = state.get("ib")
+                if _ib and _ib.isConnected():
+                    stop_oid = cand_pos.get("stop_order_id")
+                    async def _do_evict(_ib=_ib, _ticker=candidate, _pos=cand_pos, _stop=stop_oid):
+                        open_by_oid = {t.order.orderId: t for t in _ib.openTrades()}
+                        if _stop and _stop in open_by_oid:
+                            _ib.cancelOrder(open_by_oid[_stop].order)
+                            await asyncio.sleep(1)
+                        if _pos.get("phase", 1) > 0:
+                            contract = Stock(_ticker, "SMART", "USD")
+                            mkt_ord = Order()
+                            mkt_ord.orderType     = "MKT"
+                            mkt_ord.action        = "SELL"
+                            mkt_ord.totalQuantity = _pos["shares"]
+                            mkt_ord.tif           = "DAY"
+                            trade = _ib.placeOrder(contract, mkt_ord)
+                            await asyncio.sleep(0.5)
+                            return trade.order.orderId
+                        return None
+                    try:
+                        loop = asyncio.get_event_loop()
+                        sell_oid = await loop.run_in_executor(
+                            None,
+                            lambda: _run_in_streaming_loop(_do_evict(), timeout=15),
+                        )
+                        cand_pos["phase"] = 3
+                        if sell_oid:
+                            cand_pos["stop_order_id"] = sell_oid
+                    except Exception as _exc:
+                        _st_log("ERROR", candidate, f"rotation evict order failed: {_exc}")
+                        return {"status": "skipped", "reason": "rotation_evict_failed"}
+
+                decision_note = (
+                    f"Evicted {candidate} ({reason}) "
+                    f"→ {ticker} score={score:.0f} (portfolio avg={avg_score:.0f}, sector={new_sec})"
+                )
+                _st_log("ROTATION", ticker, decision_note)
+
+                # Record rotation for outcome tracking
+                rot_entry = {
+                    "ts":                           now_et.isoformat(),
+                    "evicted":                      candidate,
+                    "evicted_entry_price":          cand_pos.get("entry_price"),
+                    "evicted_pnl_at_rotation":      evict_pnl,
+                    "evicted_days_held":            evict_days,
+                    "evicted_sector":               evict_sec,
+                    "incoming":                     ticker,
+                    "incoming_score":               score,
+                    "incoming_sector":              new_sec,
+                    "portfolio_avg_score_at_rotation": avg_score,
+                    "outcome_5d":                   None,
+                }
+                st.setdefault("rotation_log", []).append(rot_entry)
+                st["rotation_log"] = st["rotation_log"][-50:]
+
+                st["positions"].pop(candidate, None)
+                _st_save_state()
+                # fall through to normal entry below
+            else:
+                _st_log("SKIPPED", ticker,
+                        f"at capacity, rotation blocked: {reason}")
+                return {"status": "skipped", "reason": f"rotation_blocked: {reason}"}
+        else:
+            _st_log("SKIPPED", ticker,
+                    f"at capacity ({len(st['positions'])}/{cfg['max_positions']} positions)")
+            return {"status": "skipped", "reason": "at_capacity"}
 
     # IBKR connection check
     ib = state.get("ib")
@@ -9498,10 +9772,12 @@ async def stock_trader_signal(req: StockSignalRequest):
         "trading_days_held": 0,
         "phase":             0,
         "alert_fired_at":    req.alert_fired_at or now_et.isoformat(),
+        "composite_score":   req.composite_score,
     }
+    score_str = f" score={req.composite_score:.0f}" if req.composite_score is not None else ""
     _st_log("ENTERED", ticker,
             f"LIMIT BUY {shares}sh @ {lmt_px:.2f} (signal={price:.2f} "
-            f"cost=${cost:,.0f} ord#{buy_id})")
+            f"cost=${cost:,.0f} ord#{buy_id}){score_str}")
     _st_save_state()
 
     return {
@@ -9519,24 +9795,75 @@ def stock_trader_status():
     """All positions, config, recent decisions, and today's closed trades."""
     st  = state["stock_trader"]
     cfg = st["config"]
+    closed = st.get("closed_today", [])
 
     capital_deployed = sum(
         p.get("shares", 0) * p.get("entry_price", 0)
         for p in st["positions"].values()
     )
-    today_pnl = sum(r.get("pnl", 0) for r in st.get("closed_today", []))
+    open_pnl = sum(
+        p.get("live_pnl", 0) or 0
+        for p in st["positions"].values()
+        if p.get("phase", 0) >= 1
+    )
+    closed_pnl = sum(r.get("pnl", 0) for r in closed)
+    today_pnl  = closed_pnl + open_pnl
+
+    n            = len(closed)
+    wins         = [r for r in closed if r.get("win")]
+    losses       = [r for r in closed if not r.get("win")]
+    gross_profit = sum(r["pnl"] for r in wins)
+    gross_loss   = sum(r["pnl"] for r in losses)
+    avg_ret_pct  = (sum(r.get("pnl_pct", 0) for r in closed) / n) if n else 0
+    avg_win_pct  = (sum(r.get("pnl_pct", 0) for r in wins)   / len(wins))   if wins   else 0
+    avg_loss_pct = (sum(r.get("pnl_pct", 0) for r in losses) / len(losses)) if losses else 0
+    best  = max(closed, key=lambda r: r.get("pnl", 0), default=None)
+    worst = min(closed, key=lambda r: r.get("pnl", 0), default=None)
+    avg_days = (sum(r.get("days_held", 0) for r in closed) / n) if n else 0
+    total_capital_traded = sum(
+        r.get("entry_price", 0) * r.get("shares", 0) for r in closed
+    ) + capital_deployed
+    exit_breakdown = {}
+    for r in closed:
+        et = r.get("exit_type", "unknown")
+        exit_breakdown[et] = exit_breakdown.get(et, 0) + 1
+
+    eod_summary = {
+        "total_trades":         n,
+        "wins":                 len(wins),
+        "losses":               len(losses),
+        "win_rate":             round(len(wins) / n * 100, 1) if n else 0,
+        "avg_return_pct":       round(avg_ret_pct, 3),
+        "avg_win_pct":          round(avg_win_pct, 3),
+        "avg_loss_pct":         round(avg_loss_pct, 3),
+        "avg_days_held":        round(avg_days, 1),
+        "gross_profit":         round(gross_profit, 2),
+        "gross_loss":           round(gross_loss, 2),
+        "profit_factor":        round(gross_profit / abs(gross_loss), 2) if gross_loss else None,
+        "best_trade":           {"ticker": best["ticker"],  "pnl": best["pnl"],  "pnl_pct": best["pnl_pct"]}  if best  else None,
+        "worst_trade":          {"ticker": worst["ticker"], "pnl": worst["pnl"], "pnl_pct": worst["pnl_pct"]} if worst else None,
+        "total_capital_traded": round(total_capital_traded, 2),
+        "open_pnl":             round(open_pnl, 2),
+        "closed_pnl":           round(closed_pnl, 2),
+        "exit_breakdown":       exit_breakdown,
+        "hard_stop_pct":        cfg.get("hard_stop_pct", 7.0),
+        "trail_pct":            cfg.get("trail_pct", 5.0),
+        "position_size":        cfg.get("position_size", 2000),
+    }
 
     return {
         "enabled":          st["enabled"],
         "config":           cfg,
         "positions":        st["positions"],
-        "closed_today":     st.get("closed_today", []),
+        "closed_today":     closed,
         "decisions":        st.get("decisions", [])[-50:],
+        "eod_summary":      eod_summary,
+        "rotation_log":     list(reversed(st.get("rotation_log", [])))[:10],
         "summary": {
             "open_positions":    len(st["positions"]),
             "capital_deployed":  round(capital_deployed, 2),
             "today_pnl":         round(today_pnl, 2),
-            "today_trades":      len(st.get("closed_today", [])),
+            "today_trades":      n,
         },
     }
 

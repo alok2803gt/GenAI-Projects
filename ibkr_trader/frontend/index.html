@@ -4457,8 +4457,10 @@ function StockTraderTab() {
   const saveConfig = async () => {
     setSaving(true);
     try {
+      const boolFields = new Set(["rotation_enabled"]);
       const patch = {};
       Object.entries(cfgEdit).forEach(([k, v]) => {
+        if (boolFields.has(k)) { patch[k] = Boolean(v); return; }
         const n = Number(v);
         patch[k] = isNaN(n) ? v : n;
       });
@@ -4583,6 +4585,21 @@ function StockTraderTab() {
                 />
               </div>
             ))}
+            <div style={{ marginBottom: 12, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+              <div>
+                <div style={{ ...sans, fontSize: 13, fontWeight: 600, color: C.text }}>Auto-Rotate Weak Positions</div>
+                <div style={{ ...sans, fontSize: 11, color: C.muted, marginTop: 2 }}>
+                  When full, evict the deepest loser (≥3d held) if a stronger signal arrives in a different sector
+                </div>
+              </div>
+              <div
+                onClick={() => setCfgEdit(c => ({ ...c, rotation_enabled: !c.rotation_enabled }))}
+                style={{ width: 44, height: 24, borderRadius: 12, cursor: "pointer", flexShrink: 0, marginLeft: 16,
+                  background: cfgEdit.rotation_enabled ? C.accent : C.border, position: "relative", transition: "background 0.2s" }}>
+                <div style={{ position: "absolute", top: 3, left: cfgEdit.rotation_enabled ? 23 : 3,
+                    width: 18, height: 18, borderRadius: "50%", background: "#fff", transition: "left 0.2s" }} />
+              </div>
+            </div>
             <div style={{ display: "flex", gap: 8, marginTop: 18, justifyContent: "flex-end" }}>
               <button onClick={() => setShowConfig(false)} style={{ ...sans, fontSize: 13,
                   padding: "7px 18px", borderRadius: 6, border: `1px solid ${C.border}`,
@@ -4679,19 +4696,25 @@ function StockTraderTab() {
           ) : (
             <div style={{ maxHeight: 280, overflowY: "auto" }}>
               {[...dec].reverse().map((d, i) => {
-                const actionColor = d.action === "ENTERED" || d.action === "FILLED"   ? C.bull
+                const isRotation = d.action === "ROTATION";
+                const actionColor = isRotation                                         ? "#f59e0b"
+                                  : d.action === "ENTERED" || d.action === "FILLED"   ? C.bull
                                   : d.action === "SKIPPED"                            ? C.muted
                                   : d.action?.includes("STOP") || d.action === "HARD_STOP" ? C.bear
                                   : d.action === "PHASE2"                             ? C.accent
                                   : C.neutral;
                 return (
-                  <div key={i} style={{ borderBottom: `1px solid ${C.border}33`, padding: "6px 0",
-                      display: "flex", gap: 10, alignItems: "flex-start" }}>
+                  <div key={i} style={{ borderBottom: `1px solid ${C.border}33`,
+                      padding: "6px 0", display: "flex", gap: 10, alignItems: "flex-start",
+                      background: isRotation ? "#78350f18" : "transparent", borderRadius: isRotation ? 4 : 0 }}>
                     <span style={{ ...mono, fontSize: 10, color: C.muted, flexShrink: 0, width: 70 }}>{d.time}</span>
                     <span style={{ ...mono, fontSize: 10, fontWeight: 700, color: actionColor,
-                        flexShrink: 0, width: 80 }}>{d.action}</span>
+                        flexShrink: 0, width: 80,
+                        ...(isRotation ? { background: "#78350f", padding: "1px 5px", borderRadius: 3 } : {}) }}>
+                      {d.action}
+                    </span>
                     <span style={{ ...mono, fontSize: 10, color: C.accent, flexShrink: 0, width: 48 }}>{d.ticker}</span>
-                    <span style={{ ...sans, fontSize: 11, color: C.muted, lineHeight: 1.4 }}>{d.detail}</span>
+                    <span style={{ ...sans, fontSize: 11, color: isRotation ? "#fcd34d" : C.muted, lineHeight: 1.4 }}>{d.detail}</span>
                   </div>
                 );
               })}
@@ -4733,6 +4756,119 @@ function StockTraderTab() {
           )}
         </div>
       </div>
+
+      {/* ── EOD Summary ───────────────────────────────────────────────── */}
+      {(() => {
+        const eod = status?.eod_summary;
+        if (!eod || eod.total_trades === 0) return null;
+        const exitColors = { hard_stop:"#f87171", trail_stop:"#f59e0b", max_hold:"#4ade80", manual_close:"#94a3b8" };
+        return (
+          <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10,
+              padding: 18, marginBottom: 16 }}>
+            <div style={{ ...sans, fontSize: 13, fontWeight: 700, color: C.white, marginBottom: 12,
+                display: "flex", alignItems: "center", gap: 8 }}>
+              📊 Today's Summary
+              {eod.profit_factor >= 1.5 && <span style={{ fontSize: 11, padding: "2px 8px", borderRadius: 4,
+                background: "#14532d", color: "#4ade80", fontWeight: 700 }}>Strong Edge</span>}
+            </div>
+
+            {/* Key stats */}
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 8, marginBottom: 10 }}>
+              {[
+                { label: "Trades",        value: eod.total_trades },
+                { label: "Win Rate",      value: `${eod.win_rate}%`,
+                  color: eod.win_rate >= 60 ? "#4ade80" : eod.win_rate >= 40 ? "#f59e0b" : "#ef4444" },
+                { label: "Avg Return",    value: `${eod.avg_return_pct >= 0 ? "+" : ""}${eod.avg_return_pct.toFixed(2)}%`,
+                  color: pnlColor(eod.avg_return_pct) },
+                { label: "Profit Factor", value: eod.profit_factor != null ? eod.profit_factor.toFixed(2) : "—",
+                  color: eod.profit_factor == null ? C.muted : eod.profit_factor >= 1.5 ? "#4ade80"
+                       : eod.profit_factor >= 1.0 ? "#f59e0b" : "#ef4444" },
+                { label: "Gross Profit",  value: `+$${eod.gross_profit.toFixed(2)}`, color: "#4ade80" },
+                { label: "Gross Loss",    value: `-$${Math.abs(eod.gross_loss).toFixed(2)}`, color: "#ef4444" },
+                { label: "Net P&L",       value: `${summary.today_pnl >= 0 ? "+" : ""}$${summary.today_pnl?.toFixed(2)}`,
+                  color: pnlColor(summary.today_pnl) },
+                { label: "Avg Hold",      value: `${eod.avg_days_held.toFixed(1)}d` },
+              ].map(({ label, value, color }) => (
+                <div key={label} style={{ background: "#0f172a", border: `1px solid ${C.border}`,
+                    borderRadius: 6, padding: "8px 12px", textAlign: "center" }}>
+                  <div style={{ ...sans, fontSize: 10, color: C.muted, marginBottom: 3 }}>{label}</div>
+                  <div style={{ ...mono, fontSize: 15, fontWeight: 700, color: color || C.white }}>{value}</div>
+                </div>
+              ))}
+            </div>
+
+            {/* Win/loss detail + best/worst */}
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 8, marginBottom: 10 }}>
+              <div style={{ background: "#0f172a", border: `1px solid ${C.border}`, borderRadius: 6, padding: "8px 12px" }}>
+                <div style={{ ...sans, fontSize: 10, color: C.muted, marginBottom: 2 }}>Avg Win</div>
+                <div style={{ ...mono, fontSize: 13, fontWeight: 700, color: "#4ade80" }}>
+                  +{eod.avg_win_pct.toFixed(2)}% ({eod.wins}W)
+                </div>
+              </div>
+              <div style={{ background: "#0f172a", border: `1px solid ${C.border}`, borderRadius: 6, padding: "8px 12px" }}>
+                <div style={{ ...sans, fontSize: 10, color: C.muted, marginBottom: 2 }}>Avg Loss</div>
+                <div style={{ ...mono, fontSize: 13, fontWeight: 700, color: "#ef4444" }}>
+                  {eod.avg_loss_pct.toFixed(2)}% ({eod.losses}L)
+                </div>
+              </div>
+              {eod.best_trade && (
+                <div style={{ background: "#0f172a", border: `1px solid #14532d`, borderRadius: 6, padding: "8px 12px" }}>
+                  <div style={{ ...sans, fontSize: 10, color: C.muted, marginBottom: 2 }}>Best Trade</div>
+                  <div style={{ ...mono, fontSize: 13, fontWeight: 700, color: "#4ade80" }}>
+                    {eod.best_trade.ticker} +${eod.best_trade.pnl.toFixed(2)} ({eod.best_trade.pnl_pct >= 0 ? "+" : ""}{eod.best_trade.pnl_pct.toFixed(2)}%)
+                  </div>
+                </div>
+              )}
+              {eod.worst_trade && (
+                <div style={{ background: "#0f172a", border: `1px solid #450a0a`, borderRadius: 6, padding: "8px 12px" }}>
+                  <div style={{ ...sans, fontSize: 10, color: C.muted, marginBottom: 2 }}>Worst Trade</div>
+                  <div style={{ ...mono, fontSize: 13, fontWeight: 700, color: "#ef4444" }}>
+                    {eod.worst_trade.ticker} ${eod.worst_trade.pnl.toFixed(2)} ({eod.worst_trade.pnl_pct >= 0 ? "+" : ""}{eod.worst_trade.pnl_pct.toFixed(2)}%)
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Strategy settings + exit breakdown */}
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+              <div style={{ background: "#0f172a", border: `1px solid ${C.border}`, borderRadius: 6, padding: "10px 14px" }}>
+                <div style={{ ...sans, fontSize: 11, fontWeight: 700, color: C.muted, marginBottom: 6 }}>STRATEGY SETTINGS</div>
+                {[
+                  ["Position Size",   `$${eod.position_size?.toLocaleString()}`],
+                  ["Hard Stop (d1-5)", `-${eod.hard_stop_pct}%`],
+                  ["Trail Stop (d5+)", `-${eod.trail_pct}%`],
+                  ["Capital Used",     `$${eod.total_capital_traded.toLocaleString(undefined, { maximumFractionDigits: 0 })}`],
+                ].map(([k, v]) => (
+                  <div key={k} style={{ display: "flex", justifyContent: "space-between",
+                      ...sans, fontSize: 12, padding: "2px 0", borderBottom: `1px solid ${C.border}` }}>
+                    <span style={{ color: C.muted }}>{k}</span>
+                    <span style={{ ...mono, color: C.white }}>{v}</span>
+                  </div>
+                ))}
+              </div>
+              <div style={{ background: "#0f172a", border: `1px solid ${C.border}`, borderRadius: 6, padding: "10px 14px" }}>
+                <div style={{ ...sans, fontSize: 11, fontWeight: 700, color: C.muted, marginBottom: 6 }}>EXIT BREAKDOWN</div>
+                {Object.entries(eod.exit_breakdown).map(([type, count]) => (
+                  <div key={type} style={{ display: "flex", justifyContent: "space-between", alignItems: "center",
+                      ...sans, fontSize: 12, padding: "2px 0", borderBottom: `1px solid ${C.border}` }}>
+                    <span style={{ color: exitColors[type] || C.muted }}>{type.replace(/_/g, " ")}</span>
+                    <span style={{ ...mono, fontWeight: 700, color: exitColors[type] || C.white }}>
+                      {count} ({(count / eod.total_trades * 100).toFixed(0)}%)
+                    </span>
+                  </div>
+                ))}
+                {eod.open_pnl !== 0 && (
+                  <div style={{ marginTop: 8, ...sans, fontSize: 12, color: C.muted }}>
+                    Open unrealised: <span style={{ ...mono, color: pnlColor(eod.open_pnl) }}>
+                      {eod.open_pnl >= 0 ? "+" : ""}${eod.open_pnl.toFixed(2)}
+                    </span>
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        );
+      })()}
 
       {/* ── Trade History ─────────────────────────────────────────────── */}
       <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, padding: 18 }}>
