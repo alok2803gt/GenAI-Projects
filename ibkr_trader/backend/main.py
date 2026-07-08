@@ -4645,6 +4645,10 @@ def _journal_init() -> None:
         con.execute("ALTER TABLE trade_journal ADD COLUMN live_iv_exit REAL")
     except Exception:
         pass   # Column already exists — ALTER TABLE fails if column is present
+    try:
+        con.execute("ALTER TABLE trade_journal ADD COLUMN vol_ratio REAL")
+    except Exception:
+        pass
     con.execute("""
         CREATE TABLE IF NOT EXISTS model_log (
             id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -10363,6 +10367,7 @@ class StockSignalRequest(BaseModel):
     price:           float
     alert_fired_at:  Optional[str]   = None   # ISO timestamp from scanner
     composite_score: Optional[float] = None   # 0-100 percentile from breakout scanner
+    vol_ratio:       Optional[float] = None   # options vol / OI ratio for Vol/OI gate backtest
 
 
 class StockConfigRequest(BaseModel):
@@ -10523,7 +10528,9 @@ async def stock_trader_signal(req: StockSignalRequest):
 
     price   = req.price
     shares  = max(1, int(cfg["position_size"] / price))
-    lmt_px  = round(price * (1 + cfg["limit_buffer_pct"] / 100), 2)
+    # Widen limit buffer during 9:30-9:45 opening volatility window (spreads $0.20-0.80)
+    buf_pct = 0.50 if (now_et.hour == 9 and now_et.minute < 45) else cfg["limit_buffer_pct"]
+    lmt_px  = round(price * (1 + buf_pct / 100), 2)
     cost    = round(shares * price, 2)
 
     async def _do_buy(ib):
@@ -10864,14 +10871,15 @@ def _close_dt_position(ticker: str, pos: dict, exit_px: float,
             INSERT INTO trade_journal
                 (opened_at, closed_at, ticker, action, qty,
                  entry_price, exit_price, pnl, pnl_pct, win,
-                 exit_reason, strategy_type)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                 exit_reason, strategy_type, score, vol_ratio)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             pos.get("entry_date"), date.today().isoformat(),
             ticker, "BUY", pos.get("shares", 0),
             round(entry_px, 4), round(exit_px, 4),
             round(pnl, 2), pnl_pct, 1 if pnl > 0 else 0,
             exit_type, "DAY_BREAKOUT",
+            pos.get("composite_score"), pos.get("vol_ratio"),
         ))
         con.commit()
         con.close()
@@ -11217,7 +11225,9 @@ async def day_trader_signal(req: StockSignalRequest):
 
     price  = req.price
     shares = max(1, int(cfg["position_size"] / price))
-    lmt_px = round(price * (1 + cfg["limit_buffer_pct"] / 100), 2)
+    # Widen limit buffer during 9:30-9:45 opening volatility window (spreads $0.20-0.80)
+    buf_pct = 0.50 if (now_et.hour == 9 and now_et.minute < 45) else cfg["limit_buffer_pct"]
+    lmt_px = round(price * (1 + buf_pct / 100), 2)
     cost   = round(shares * price, 2)
 
     async def _do_buy(ib):
@@ -11256,6 +11266,7 @@ async def day_trader_signal(req: StockSignalRequest):
         "phase":             0,
         "alert_fired_at":    req.alert_fired_at or now_et.isoformat(),
         "composite_score":   req.composite_score,
+        "vol_ratio":         req.vol_ratio,
         "live_price":        None,
         "live_pnl":          None,
     }
