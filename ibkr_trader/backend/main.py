@@ -11762,7 +11762,8 @@ async def _spx_close_spread(ib, spread_id: str, exit_type: str) -> None:
                 if sp.get("put_short_k") is not None else "—")
     call_str = (f"{int(sp['call_short_k'])}/{int(sp['call_long_k'])}C"
                 if sp.get("call_short_k") is not None else "—")
-    sx["closed_today"].append({
+    pnl_pct = round(pnl / credit * 100, 1) if credit else 0
+    closed_rec = {
         "spread_id":    spread_id,
         "strategy":     strategy,
         "date":         sp["date"],
@@ -11772,9 +11773,33 @@ async def _spx_close_spread(ib, spread_id: str, exit_type: str) -> None:
         "qty":          qty,
         "total_credit": credit,
         "pnl":          pnl,
-        "pnl_pct":      round(pnl / credit * 100, 1) if credit else 0,
+        "pnl_pct":      pnl_pct,
         "exit_type":    exit_type,
-    })
+    }
+    sx["closed_today"].append(closed_rec)
+
+    # Persist to trade_journal for multi-day history
+    try:
+        con = sqlite3.connect(JOURNAL_DB_PATH, check_same_thread=False)
+        con.execute("""
+            INSERT INTO trade_journal
+                (opened_at, closed_at, ticker, action, qty,
+                 entry_price, exit_price, pnl, pnl_pct, win,
+                 exit_reason, strategy_type, spot_price)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            sp["date"], date.today().isoformat(),
+            "SPX", "SELL", qty,
+            credit, round(credit - pnl, 2),
+            pnl, pnl_pct, 1 if pnl > 0 else 0,
+            exit_type, "SPX_0DTE",
+            sp.get("spot_at_entry"),
+        ))
+        con.commit()
+        con.close()
+    except Exception as exc:
+        log.warning("SPX 0DTE journal insert failed: %s", exc)
+
     sx["spreads"].pop(spread_id, None)
     _spx_log("CLOSED", f"exit={exit_type}  P&L=${pnl:.2f}  day_total=${sx['today_pnl']:.2f}", spread_id)
     _spx_save_state()
@@ -12069,6 +12094,37 @@ def spx_0dte_status():
             "closed_trades":  len(sx.get("closed_today", [])),
         },
     }
+
+
+@app.get("/spx-0dte/history")
+def spx_0dte_history(limit: int = 50):
+    """All closed SPX 0DTE spreads from trade_journal, newest first."""
+    try:
+        con  = sqlite3.connect(JOURNAL_DB_PATH, check_same_thread=False)
+        rows = con.execute("""
+            SELECT opened_at, closed_at, qty, entry_price, exit_price,
+                   pnl, pnl_pct, win, exit_reason, spot_price
+            FROM trade_journal
+            WHERE strategy_type = 'SPX_0DTE'
+            ORDER BY id DESC LIMIT ?
+        """, (limit,)).fetchall()
+        con.close()
+        return {"history": [
+            {
+                "date":         r[0],
+                "closed_at":    r[1],
+                "qty":          r[2],
+                "total_credit": round(r[3], 2) if r[3] else None,
+                "exit_price":   round(r[4], 2) if r[4] else None,
+                "pnl":          round(r[5], 2) if r[5] else None,
+                "pnl_pct":      round(r[6], 1) if r[6] else None,
+                "win":          bool(r[7]),
+                "exit_type":    r[8],
+                "spot":         round(r[9], 0) if r[9] else None,
+            } for r in rows
+        ]}
+    except Exception as exc:
+        return {"history": [], "error": str(exc)}
 
 
 @app.post("/spx-0dte/enable")

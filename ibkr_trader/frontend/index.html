@@ -4969,11 +4969,18 @@ function StockTraderTab() {
 // ── SPX 0DTE Tab ──────────────────────────────────────────────────────────────
 function SPX0DTETab() {
   const [status,  setStatus]  = useState(null);
+  const [history, setHistory] = useState([]);
   const [loading, setLoading] = useState(true);
 
   const load = async () => {
-    try { setStatus(await apiFetch("/spx-0dte/status")); }
-    catch(_) {}
+    try {
+      const [s, h] = await Promise.all([
+        apiFetch("/spx-0dte/status"),
+        apiFetch("/spx-0dte/history?limit=50"),
+      ]);
+      setStatus(s);
+      setHistory(h.history || []);
+    } catch(_) {}
     finally { setLoading(false); }
   };
 
@@ -5190,6 +5197,58 @@ function SPX0DTETab() {
                 {" "}<span style={{color:C.muted}}>{d.detail}</span>
               </div>
             ))}
+          </div>
+        </>
+      )}
+
+      {/* Trade History (from journal DB — persists across sessions) */}
+      {history.length > 0 && (
+        <>
+          <div style={{...sans, fontSize:13, fontWeight:700, color:C.white, marginBottom:8, marginTop:20}}>
+            Trade History
+            <span style={{...sans, fontSize:11, fontWeight:400, color:C.muted, marginLeft:8}}>
+              {history.length} trades · {history.filter(r=>r.win).length}W / {history.filter(r=>!r.win).length}L ·{" "}
+              P&L: <span style={{color: history.reduce((s,r)=>s+(r.pnl||0),0) >= 0 ? "#22c55e" : "#ef4444"}}>
+                ${history.reduce((s,r)=>s+(r.pnl||0),0).toFixed(2)}
+              </span>
+            </span>
+          </div>
+          <div style={{overflowX:"auto", marginBottom:20}}>
+            <table style={{width:"100%", borderCollapse:"collapse", ...sans, fontSize:12}}>
+              <thead>
+                <tr style={{background:"#0f172a"}}>
+                  {["Date","Qty","Credit","P&L","P&L%","SPX @","Exit"].map(h=>(
+                    <th key={h} style={{padding:"6px 10px", textAlign:"left", color:C.muted,
+                      fontSize:11, fontWeight:600, textTransform:"uppercase",
+                      borderBottom:`1px solid ${C.border}`}}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {history.map((r,i)=>(
+                  <tr key={i} style={{borderBottom:`1px solid ${C.border}`}}>
+                    <td style={{padding:"7px 10px", color:C.muted, fontSize:11}}>{r.date}</td>
+                    <td style={{padding:"7px 10px", ...mono, color:C.muted}}>{r.qty}</td>
+                    <td style={{padding:"7px 10px", ...mono}}>${r.total_credit?.toFixed(2)}</td>
+                    <td style={{padding:"7px 10px", ...mono, fontWeight:700,
+                      color:r.pnl >= 0 ? "#22c55e" : "#ef4444"}}>
+                      {r.pnl >= 0 ? "+" : ""}${r.pnl?.toFixed(2)}
+                    </td>
+                    <td style={{padding:"7px 10px", ...mono,
+                      color:r.pnl_pct >= 0 ? "#22c55e" : "#ef4444"}}>
+                      {r.pnl_pct >= 0 ? "+" : ""}{r.pnl_pct?.toFixed(1)}%
+                    </td>
+                    <td style={{padding:"7px 10px", ...mono, color:C.muted}}>{r.spot || "—"}</td>
+                    <td style={{padding:"7px 10px"}}>
+                      <span style={{fontSize:11, padding:"2px 7px", borderRadius:4, fontWeight:700,
+                        color: exitColor(r.exit_type), background:`${exitColor(r.exit_type)}22`}}>
+                        {r.exit_type?.replace(/_/g," ")}
+                      </span>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           </div>
         </>
       )}
