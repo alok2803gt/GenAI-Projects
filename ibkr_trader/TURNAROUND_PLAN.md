@@ -382,3 +382,15 @@ Vol/OI ≥ 2.0  AND  OTM strike  AND  expiry ≤ 10 trading days  AND  last ≥ 
 - Only add this if 11.1 is implemented and the false-positive rate from non-sweep prints is measurably hurting results
 
 **Activation criteria:** Options flow module (11.1) live and running for 30+ days; evidence that non-sweep aggressive lifts are generating bad signals at a rate that justifies the subscription cost.
+
+---
+
+### 11.3 Backend Auto-Restart Watchdog (Task Scheduler)
+
+**What it is:** The breakout scanner already has a PowerShell watchdog (`run_scanner.ps1`) registered in Windows Task Scheduler that auto-restarts it on crash. The backend (`main.py`) has no equivalent — if it crashes it stays down until manually restarted.
+
+**What's needed:** Register `run_backend.ps1` in Task Scheduler the same way `run_scanner.ps1` is registered (trigger: at logon, run hidden, restart on failure). The script already exists and includes a syntax-check pre-flight — it just isn't scheduled.
+
+**Why it's parked:** Low urgency during paper trading. Backend crashes are rare and recoverable manually. Becomes more important before going live on a real account where a missed restart = missed trades = real money.
+
+**Activation criteria:** Before switching from paper to live trading.
