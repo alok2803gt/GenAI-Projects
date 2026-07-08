@@ -132,7 +132,7 @@ IV_RANK_MIN_CSP     = 35     # Lowered from 50: journal losses averaged 36.8% bu
                               # historical loss zone while allowing more trades.
 IV_RANK_MIN_CSP_ETF = 20     # ETFs (SPY/QQQ/IWM etc.) have no earnings binary risk; their IV
                               # is structurally lower than single-name, so a lower bar is correct.
-_CSP_ETF_TICKERS    = frozenset({"SPY", "QQQ", "IWM", "GLD", "XLE", "XLF", "XLK", "XLV", "ARKK"})
+_CSP_ETF_TICKERS    = frozenset({"SPY", "QQQ", "IWM", "GLD", "XLE", "XLF", "XLK", "XLV", "ARKK", "XBI", "KRE", "SMH"})
 EARNINGS_CACHE_TTL  = 21600  # 6 h — earnings dates don't change intraday
 IV_RANK_CACHE_TTL   = 3600   # 1 h
 REGIME_CACHE_TTL    = 300    # 5 min
@@ -164,8 +164,8 @@ CSP_UNIVERSE: List[str] = [
     "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META",
     # Financials
     "JPM", "GS", "V", "MA",
-    # ETFs — wide market, very liquid
-    "SPY", "QQQ",
+    # ETFs — turnaround plan primary targets (IWM/XBI/KRE viable at $50k; SPY/QQQ margin ~$11k each)
+    "IWM", "XBI", "KRE",
     # Semis
     "AMD", "MU", "AVGO",
     # Consumer / Healthcare
@@ -206,7 +206,7 @@ CANDIDATE_POOL: List[str] = [
     # ── Real Estate / Infrastructure ─────────────────────────────────────
     "AMT", "PLD", "EQIX",
     # ── ETFs ─────────────────────────────────────────────────────────────
-    "SPY", "QQQ", "IWM", "GLD", "XLE", "XLF", "XLK", "XLV", "ARKK",
+    "SPY", "QQQ", "IWM", "GLD", "XLE", "XLF", "XLK", "XLV", "ARKK", "XBI", "KRE",
     # ── High-vol / options-active ─────────────────────────────────────────
     "COIN", "HOOD", "SOFI", "RBLX", "MARA", "RIOT",
     "SHOP", "SQ", "PYPL", "SNAP", "PINS",
@@ -327,7 +327,7 @@ state: Dict = {
     "autotrader": {
         "enabled": False,
         "config": {
-            "max_positions":     5,
+            "max_positions":     7,      # 2× IWM + 2× XBI + 3× KRE per turnaround plan
             "profit_target_pct": 0.50,   # 50% of max — research-optimal (Tastytrade 200k-trade study)
             "stop_loss_mult":    2.0,    # 2× premium received (industry-standard 200% rule)
             "scan_types":        ["csp"],
@@ -335,7 +335,7 @@ state: Dict = {
             "leap_capital":      5000.0,
             # Kelly criterion
             "use_kelly":         True,
-            "total_capital":     100000.0,
+            "total_capital":     50000.0,  # actual paper account balance
             "assumed_win_rate":  0.85,
             # Auto-hedge
             "auto_hedge":        False,
@@ -430,7 +430,7 @@ state: Dict = {
     "risk_monitor": {
         "enabled": True,
         "config": {
-            "account_value":      100000.0,  # update to match actual paper balance
+            "account_value":      50000.0,   # actual paper account balance
             "csp_stop_mult":      2.0,       # Rule 1: close CSP when loss >= N× premium
             "csp_warn_mult":      1.5,       # warn at 1.5× before hard stop
             "leap_max_cost":      3000.0,    # Rule 2: flag LEAPs above this cost basis

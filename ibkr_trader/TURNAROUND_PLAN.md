@@ -80,26 +80,58 @@ DE, C, NKE, XYZ, HD, LOW — all positions down $67–$121, candidates to exit.
 
 ### 3.1 CSP-Leap Trader — New Rules (Non-Negotiable)
 
-**Universe:** ETFs and mega-cap only (SPY, QQQ, IWM, AAPL, MSFT, NVDA, AMZN, GOOGL, META, JPM, GS)  
-**Capital allocated:** $15,000 (30% of $50k account) — enough margin for 2–3 ETF CSPs simultaneously  
-**Max positions:** 3 simultaneous CSPs  
+**Prices verified:** July 8, 2026
+
+**Universe:** IWM, XBI, KRE only — everything else is too expensive at current prices (see below)  
+**Capital allocated:** $20,000 (40% of $50k account)  
+**Max positions:** 7 contracts across 3 ETFs  
 **Stop loss:** 2× premium received — no exceptions, no rolls past this point  
 **Warn level:** 1.5× premium received (alert sent, prepare to close)  
 
-> **Why $15k, not $8k:** IBKR Reg-T margin for one ETF CSP is roughly 20% of the strike price.
-> SPY at $547 requires ~$10,400 margin per contract. IWM at $210 requires ~$4,000. With only $8k
-> you are limited to 2× IWM-level positions ($300–500/month income). At $15k you can run
-> 1× SPY/QQQ + 1× IWM + 1× small ETF = $600–900/month ($30–45/day passive baseline).
-> The 2× stop rule is unchanged — it limits your loss per trade, not how much you allocate.
+**Full margin map — why most ETFs are now off the table:**
 
-**Margin requirements by ETF (approximate IBKR Reg-T):**
+IBKR Reg-T margin formula: `20% × price × 100 − OTM_amount`
 
-| ETF | Price | 5% OTM Strike | Margin/contract | 30-DTE premium | Monthly income/contract |
+| ETF | Current Price | 5% OTM Strike | OTM Amount | Reg-T Margin | Status |
 |---|---|---|---|---|---|
-| SPY | ~$547 | ~$520 | ~$10,400 | $3–5 | $300–500 |
-| QQQ | ~$480 | ~$456 | ~$9,100 | $3–5 | $300–500 |
-| IWM | ~$210 | ~$200 | ~$4,000 | $1.50–2.50 | $150–250 |
-| XBI | ~$100 | ~$95 | ~$1,900 | $1–2 | $100–200 |
+| SPY | $751 | $713 | $3,800 | **$11,220** | ❌ Off table — 22% of account |
+| QQQ | $722 | $686 | $3,600 | **$10,840** | ❌ Off table — 21% of account |
+| SMH | $604 | $574 | $3,000 | **$9,080** | ❌ Off table — 18% of account |
+| IWM | $295 | $280 | $1,500 | **$4,400** | ✅ Primary — 8.8% of account |
+| XBI | $160 | $152 | $800 | **$2,400** | ✅ Secondary — 4.8% of account |
+| KRE | $75 | $71 | $375 | **$1,125** | ✅ Fill — 2.3% of account |
+
+**Key change since last plan:** QQQ has run from ~$530 → $722 (+36%) and SMH from ~$260 → $604 (+132%). Both are now nearly as expensive as SPY to run CSPs on. They are off the table until the account reaches $100k+.
+
+**Recommended portfolio — $50k account, $20k budget (July 2026 prices):**
+
+| Position | ETF | Contracts | Margin each | Total Margin | 30-DTE Premium (5% OTM) | Monthly Income |
+|---|---|---|---|---|---|---|
+| 1 | IWM | 2 | $4,400 | $8,800 | $2.50–4.00 | $500–800 |
+| 2 | XBI | 2 | $2,400 | $4,800 | $3.00–4.00 | $600–800 |
+| 3 | KRE | 3 | $1,125 | $3,375 | $0.70–1.00 | $210–300 |
+| **Total** | | **7 contracts** | | **$16,975** | | **$1,310–1,900/month** |
+
+**Buffer:** $3,025 ($20k − $16,975) — covers margin expansion if market drops 5–8%
+
+**Why IWM + XBI + KRE:**
+- **IWM** (Russell 2000): broadest small-cap exposure, high options liquidity, margin is manageable
+- **XBI** (Biotech): highest IV among liquid ETFs → best premium-to-margin ratio (10–13% monthly ROI on margin vs 6–8% for IWM)
+- **KRE** (Regional Banks): cheap per-contract, sector diversification from IWM/XBI, fills slots efficiently; 3× KRE = only $3,375 margin
+
+**Monthly income ÷ 21 trading days = $62–90/day passive baseline** — much better than the prior $30–45/day estimate (larger universe, more contracts).
+
+**Account scaling path (prices as of July 8, 2026):**
+
+| Account Size | CSP Budget | Portfolio | Monthly Income | Daily baseline |
+|---|---|---|---|---|
+| **$50k (now)** | **$20k** | **2× IWM + 2× XBI + 3× KRE** | **$1,310–1,900** | **$62–90** |
+| $75k | $28k | 3× IWM + 3× XBI + 4× KRE | $1,900–2,700 | $90–130 |
+| $100k | $35k | 3× IWM + 3× XBI + 4× KRE + 1× QQQ | $2,500–3,600 | $120–170 |
+| $150k | $50k | 1× SPY + 1× QQQ + 4× IWM + 4× XBI + 4× KRE | $4,000–5,500 | $190–260 |
+
+> SPY re-enters the portfolio at $100k (1 contract = 11% of account); QQQ re-enters at $100k as well.
+> At $150k, the combination of all four ETFs makes $200/day achievable from CSPs alone on many days.
 
 **LEAPs:** Paused until CSP strategy is consistently profitable.  
 When resumed:
@@ -195,19 +227,18 @@ Breaking news is why stops exist. A sudden Fed statement or geopolitical event c
 - On goal-hit days (28–35% of days): $200+ from day trading alone
 - Remaining days: smaller gains or small losses offset by other strategies
 
-**CSP contribution:**
-- 2–3 ETF CSPs at $15,000 total margin allocation
-- Typical premium: 1.5–2.5% of strike per month (30 DTE, 5% OTM)
-- Monthly income target: $600–$900 (1× SPY + 1× IWM + 1× XBI)
-- Daily equivalent: ~$30–45 per day (passive baseline, non-directional)
+**CSP contribution (July 2026 prices — 7 contracts across IWM/XBI/KRE):**
+- 2× IWM + 2× XBI + 3× KRE at $16,975 total margin
+- Monthly income: $1,310–$1,900/month
+- Daily equivalent: **$62–90/day passive baseline** (non-directional, theta decay)
 
 **Combined target:**
 | Source | Conservative daily | Good day |
 |---|---|---|
 | Day Trader | $0–$50 | $100–$300 |
-| CSP (amortized daily) | $30–45 | $30–45 |
+| CSP (amortized daily) | $62–90 | $62–90 |
 | Stock Trader | $0–$20 | $50–$100 |
-| **Total** | **$30–$115** | **$180–$445** |
+| **Total** | **$62–$160** | **$212–$490** |
 
 ### 5.2 Realistic Expectation
 
@@ -276,3 +307,21 @@ These are encoded in the Risk Monitor and enforced automatically. They also appl
 - **Do not override the Risk Monitor auto-close.** If Rule 1 fires, the position closes. Do not re-enter the same day.
 - **Do not use day trader on high-VIX days.** The backtest only works in normal volatility regimes.
 - **Do not hold stock positions red for more than 3 days without re-evaluating.** NKE, HD, LOW sat red for weeks.
+
+---
+
+## 10. Working Principles (How Analysis Is Done)
+
+These rules govern how Claude approaches any trade calculation or budget analysis in this project:
+
+### 10.1 Always use live prices for budget calculations
+
+**Rule:** Before computing any CSP/LEAP margin, position sizing, or budget allocation, fetch the current market price of the underlying via web search. Never use a price from memory, a previous session, or an estimate.
+
+**Why this matters:** ETF prices can drift significantly between sessions. In this project, QQQ ran from ~$530 → $722 (+36%) and SMH from ~$260 → $604 (+132%) in the span of months. Using stale prices leads to margin calculations that are off by thousands of dollars per contract — budget plans that appear feasible become impossible, or vice versa.
+
+**How to apply:**
+1. When asked for a CSP budget plan, search for each ETF's current price first.
+2. Label every price with the date fetched: e.g., `$295 (July 8, 2026)`.
+3. If a price cannot be confirmed, state that explicitly and flag the calculation as an estimate.
+4. Re-verify prices whenever more than 1 week has passed since the last quote was fetched.
