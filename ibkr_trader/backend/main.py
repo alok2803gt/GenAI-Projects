@@ -6354,6 +6354,27 @@ _NEWS_HIGH_KW = [
     "data breach","cybersecurity incident","ransomware",
 ]
 
+# Headline patterns that are never market-relevant — filtered before ingestion.
+# Lower-cased substring matches; any match drops the article entirely.
+_NEWS_NOISE_BLOCKLIST = [
+    # Quizzes and tests
+    "can you ace", "ace this", "financial literacy test", "financial-literacy test",
+    "how well do you know", "quiz:", "money quiz", "take the quiz", "test yourself",
+    "can you pass", "can you answer", "how much do you know",
+    # Survey / clickbait statistics about ordinary people
+    "% of adults can", "% of americans can", "% of u.s. adults",
+    "% of workers can", "% of people can",
+    # Personal finance tips (no market signal)
+    "how to improve your credit", "how to save for", "how to build an emergency",
+    "money mistake", "money habit", "money tip", "budget tip", "budgeting tip",
+    "retirement tip", "here's how to pay off", "ways to save", "ways to pay",
+    "signs you're", "signs you are", "reasons you should", "reasons to start",
+    # Evergreen listicles with no event
+    "things you didn't know", "things to know about your", "things everyone should know",
+    "best credit cards", "best savings account", "best mortgage rate",
+    "how to negotiate", "how to ask for a raise",
+]
+
 
 def _nm_strip_html(raw: str) -> str:
     import html as _html_mod
@@ -6495,6 +6516,11 @@ async def _news_monitor_coro():
             for item in items:
                 title = item["title"].strip()
                 if not title or len(title) < 10:
+                    continue
+
+                # Drop personal-finance noise and clickbait — never market-relevant
+                title_lc = title.lower()
+                if any(pat in title_lc for pat in _NEWS_NOISE_BLOCKLIST):
                     continue
 
                 pub_iso = _nm_parse_pubdate(item.get("pub", ""))
