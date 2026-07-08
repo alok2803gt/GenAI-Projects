@@ -81,10 +81,25 @@ DE, C, NKE, XYZ, HD, LOW — all positions down $67–$121, candidates to exit.
 ### 3.1 CSP-Leap Trader — New Rules (Non-Negotiable)
 
 **Universe:** ETFs and mega-cap only (SPY, QQQ, IWM, AAPL, MSFT, NVDA, AMZN, GOOGL, META, JPM, GS)  
-**Capital:** Maximum $8,000 total across all CSP positions  
+**Capital allocated:** $15,000 (30% of $50k account) — enough margin for 2–3 ETF CSPs simultaneously  
 **Max positions:** 3 simultaneous CSPs  
 **Stop loss:** 2× premium received — no exceptions, no rolls past this point  
 **Warn level:** 1.5× premium received (alert sent, prepare to close)  
+
+> **Why $15k, not $8k:** IBKR Reg-T margin for one ETF CSP is roughly 20% of the strike price.
+> SPY at $547 requires ~$10,400 margin per contract. IWM at $210 requires ~$4,000. With only $8k
+> you are limited to 2× IWM-level positions ($300–500/month income). At $15k you can run
+> 1× SPY/QQQ + 1× IWM + 1× small ETF = $600–900/month ($30–45/day passive baseline).
+> The 2× stop rule is unchanged — it limits your loss per trade, not how much you allocate.
+
+**Margin requirements by ETF (approximate IBKR Reg-T):**
+
+| ETF | Price | 5% OTM Strike | Margin/contract | 30-DTE premium | Monthly income/contract |
+|---|---|---|---|---|---|
+| SPY | ~$547 | ~$520 | ~$10,400 | $3–5 | $300–500 |
+| QQQ | ~$480 | ~$456 | ~$9,100 | $3–5 | $300–500 |
+| IWM | ~$210 | ~$200 | ~$4,000 | $1.50–2.50 | $150–250 |
+| XBI | ~$100 | ~$95 | ~$1,900 | $1–2 | $100–200 |
 
 **LEAPs:** Paused until CSP strategy is consistently profitable.  
 When resumed:
@@ -181,18 +196,18 @@ Breaking news is why stops exist. A sudden Fed statement or geopolitical event c
 - Remaining days: smaller gains or small losses offset by other strategies
 
 **CSP contribution:**
-- 3 CSPs at $8,000 total capital
-- Typical premium: 1.5–2.5% of strike per month on ETFs
-- Monthly income target: $160–$200 ($8k × 2%)
-- Daily equivalent: ~$8–10 per day (passive)
+- 2–3 ETF CSPs at $15,000 total margin allocation
+- Typical premium: 1.5–2.5% of strike per month (30 DTE, 5% OTM)
+- Monthly income target: $600–$900 (1× SPY + 1× IWM + 1× XBI)
+- Daily equivalent: ~$30–45 per day (passive baseline, non-directional)
 
 **Combined target:**
 | Source | Conservative daily | Good day |
 |---|---|---|
 | Day Trader | $0–$50 | $100–$300 |
-| CSP (amortized) | $8–10 | $8–10 |
+| CSP (amortized daily) | $30–45 | $30–45 |
 | Stock Trader | $0–$20 | $50–$100 |
-| **Total** | **$8–$80** | **$158–$410** |
+| **Total** | **$30–$115** | **$180–$445** |
 
 ### 5.2 Realistic Expectation
 
