@@ -325,3 +325,60 @@ These rules govern how Claude approaches any trade calculation or budget analysi
 2. Label every price with the date fetched: e.g., `$295 (July 8, 2026)`.
 3. If a price cannot be confirmed, state that explicitly and flag the calculation as an estimate.
 4. Re-verify prices whenever more than 1 week has passed since the last quote was fetched.
+
+---
+
+## 11. Parking Lot — Consider Next If Plan Doesn't Work
+
+These are enhancements that are technically feasible with IBKR but deliberately deferred. Activate them only if the current turnaround plan (Sections 3–6) is not producing results after 30–60 days of clean operation.
+
+---
+
+### 11.1 Options Flow Enrichment (post-breakout signal gate)
+
+**What it does:** After the breakout scanner fires on a ticker (equity pct_b + vol_ratio threshold met), pull that ticker's OTM near-dated options and check for unusual institutional flow before passing the signal to the day/stock trader.
+
+**The filter:**
+```
+Vol/OI ≥ 2.0  AND  OTM strike  AND  expiry ≤ 10 trading days  AND  last ≥ ask (aggressive lift)
+```
+
+**Why it improves signal quality:**
+- High equity vol_ratio alone = unusual share volume, direction unknown
+- OTM calls ≤ 10 DTE at the ask = buyer expects the move to happen *soon*, not a hedge
+- Combining both filters removes a large portion of false breakout signals (dealer hedging flow, institutional rolls, noise prints)
+
+**Why it's parked:**
+- We just started collecting `vol_ratio` and `composite_score` per trade (July 2026). Need 50–100 DAY_BREAKOUT trades to backtest whether the equity vol_ratio gate alone is sufficient.
+- Building the options chain pull first would add complexity before we have evidence it's needed.
+- If equity Vol/OI gate improves win rate to 65%+ and avg return to > $15/trade, the options flow layer may be unnecessary.
+
+**What IBKR provides (confirmed feasible):**
+- `reqSecDefOptParams` → full chain (strikes + expiries) — free call
+- `reqMktData` snapshot → bid, ask, last, volume, open interest (prior day OI) — uses ~10–20 subscription slots for ~2 seconds then releases
+- Aggressor side: `last >= ask * 0.995` approximates "buyer lifted the ask" — not a true multi-exchange sweep tag but good enough for retail use
+
+**Implementation estimate:** ~150 lines in a new `options_flow.py`, called reactively from the breakout scanner signal path. Adds ~2–3 seconds of latency before signal reaches the trader endpoints.
+
+**Activation criteria:**
+- After 50–100 DAY_BREAKOUT trades logged with `vol_ratio` and `score`
+- Backtest shows equity Vol/OI gate alone is not sufficient (win rate still < 60% or avg loss > avg win)
+
+---
+
+### 11.2 True Multi-Exchange Sweep Detection (OPRA full feed)
+
+**What it does:** Tags each options print as a "sweep" — the same order aggressively lifted the ask across 3+ exchanges simultaneously, indicating institutional urgency.
+
+**Why equity-only aggressor side isn't enough:** `last >= ask` on a single exchange snapshot tells you the *last* print was aggressive, but a single large print at the ask could be a market maker crossing the spread or an automated roll. A true sweep is the same order hitting CBOE, AMEX, PHLX, and ISE within milliseconds — that's the "smart money buying before a move" signal that Unusual Whales is actually selling.
+
+**What's needed:** OPRA (Options Price Reporting Authority) full consolidated tape. Not available via IBKR TWS API. Requires:
+- Unusual Whales API (~$50/month) — provides pre-tagged sweep alerts
+- Or direct OPRA feed via a market data vendor (Polygon.io, Cboe DataShop) — more expensive, requires parsing
+
+**Why it's parked:**
+- Requires paid external data subscription
+- The `last >= ask` approximation in 11.1 captures the majority of the signal (aggressive lift still means directional bet)
+- Only add this if 11.1 is implemented and the false-positive rate from non-sweep prints is measurably hurting results
+
+**Activation criteria:** Options flow module (11.1) live and running for 30+ days; evidence that non-sweep aggressive lifts are generating bad signals at a rate that justifies the subscription cost.
