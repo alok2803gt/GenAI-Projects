@@ -1713,8 +1713,6 @@ function AutoTraderTab() {
               { label:"Premium Collected", value:`$${(status?.premium_collected||0).toFixed(0)}`, col:"#27ae60", sub:null },
               { label:"LEAP Budget (net)", value:`$${(status?.leap_budget||0).toFixed(0)}`, col:"#3498db",
                 sub: leapPnl !== 0 ? { text:`LEAP P&L: ${leapPnl>=0?"+":""}$${leapPnl.toFixed(0)}`, col:leapPnlCol } : null },
-              { label:"Kelly CSP/Trade", value:`$${kellyCspCapital.toLocaleString()}`, col:"#d97706",
-                sub:{ text:`LEAP: $${kellyLeapCapital.toLocaleString()}/trade`, col:"#64748b" } },
             ].map(s => (
               <div key={s.label} style={{ background:C.card, borderRadius:8, padding:14, textAlign:"center" }}>
                 <div style={{ color:"#64748b", fontSize:11, marginBottom:6 }}>{s.label}</div>

@@ -394,3 +394,35 @@ Vol/OI ≥ 2.0  AND  OTM strike  AND  expiry ≤ 10 trading days  AND  last ≥ 
 **Why it's parked:** Low urgency during paper trading. Backend crashes are rare and recoverable manually. Becomes more important before going live on a real account where a missed restart = missed trades = real money.
 
 **Activation criteria:** Before switching from paper to live trading.
+
+---
+
+### 11.4 Kelly-Based Dynamic Position Sizing (Stock Trader + Day Trader)
+
+**What it does:** Replaces the fixed `position_size` config with a Kelly-derived position size that automatically scales up when the strategy is working and scales down when it isn't.
+
+**Formula:**
+```
+b            = avg_win_$ / avg_loss_$          (win/loss dollar ratio)
+kelly_frac   = (win_rate × (b + 1) − 1) / b   (raw Kelly)
+half_kelly   = kelly_frac × 0.5               (half-Kelly — standard risk management)
+position_$   = half_kelly × account_capital
+```
+
+**Example at day trader backtest config (2% target / 3% stop, 60% win rate):**
+- b = 2/3 = 0.67, Kelly = (0.60 × 1.67 − 1) / 0.67 ≈ 10% → half-Kelly = 5%
+- Position size = 5% × $50,000 = **$2,500** (scales up to $5,000 at 65% win rate, shrinks below minimum at <55%)
+
+**Why it's better than a fixed size:**
+- Good stretch (win rate > 60%) → larger positions, capturing more of the momentum
+- Bad stretch (win rate drops below break-even) → Kelly goes negative, system floors to minimum bet or pauses sizing
+- No manual intervention needed — the journal win rate drives position size automatically
+
+**Why it's parked:**
+- The journal needs strategy-specific win rates: Kelly for the day trader must be computed from `DAY_BREAKOUT` trades only, not the mixed CSP/LEAP/stock history that currently pollutes `assumed_win_rate`
+- We just started collecting `score` and `vol_ratio` per trade (July 2026) — need 50–100 clean `DAY_BREAKOUT` trades before the win rate signal is statistically meaningful
+- Fixed sizing is safer while the strategy is still being validated
+
+**Note:** Kelly does NOT apply to CSPs. CSP contracts have a fixed minimum margin ($1,125–$4,400) so position sizing is discrete (1 contract or 0), not continuous. The Kelly display was removed from the CSP-LEAP tab for this reason.
+
+**Activation criteria:** 50+ `DAY_BREAKOUT` trades and 50+ `STOCK_BREAKOUT` trades in the journal with clean win/loss data; compute strategy-specific win rates before enabling.
