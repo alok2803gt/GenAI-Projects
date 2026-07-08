@@ -356,11 +356,12 @@ state: Dict = {
     "stock_trader": {
         "enabled": False,
         "config": {
-            "position_size":        3000,    # fixed $ per trade
-            "max_positions":        8,       # concurrent cap (90th pct = 5, 18yr backtest)
-            "hard_stop_pct":        7.0,     # phase 1 GTC stop (days 1-5)
-            "trail_pct":            5.0,     # phase 2 IBKR TRAIL order (days 5-30)
-            "max_hold_days":        30,      # force-close at 30 trading days
+            "position_size":        2500,    # fixed $ per trade — 5% of $50k account (concentration limit)
+            "max_positions":        8,       # concurrent cap
+            "hard_stop_pct":        5.0,     # phase 1 GTC stop — turnaround rule: exit if down >5%
+            "trail_pct":            5.0,     # phase 2 IBKR TRAIL order
+            "max_hold_days":        5,       # force-close at 5 trading days — turnaround rule (was 30, caused NKE/HD/LOW losses)
+            "min_composite_score":  70.0,    # skip signals below this — top ~30% of universe only
             "signal_freshness_min": 30,      # skip alerts older than this
             "limit_buffer_pct":     0.10,    # LIMIT = last_price × (1 + buffer/100)
             "rotation_enabled":     False,   # auto-rotate weak positions on new breakout
@@ -10370,6 +10371,7 @@ class StockConfigRequest(BaseModel):
     hard_stop_pct:        Optional[float] = None
     trail_pct:            Optional[float] = None
     max_hold_days:        Optional[int]   = None
+    min_composite_score:  Optional[float] = None
     signal_freshness_min: Optional[int]   = None
     limit_buffer_pct:     Optional[float] = None
     rotation_enabled:     Optional[bool]  = None
@@ -10420,6 +10422,18 @@ async def stock_trader_signal(req: StockSignalRequest):
     if ticker in st["positions"]:
         _st_log("SKIPPED", ticker, "already have open position")
         return {"status": "skipped", "reason": "already_open"}
+
+    # Composite score filter — only enter top-quality signals
+    min_score = float(cfg.get("min_composite_score", 0))
+    if min_score > 0:
+        score = req.composite_score
+        if score is None:
+            _st_log("SKIPPED", ticker, f"no composite_score in signal — min={min_score:.0f} required")
+            return {"status": "skipped", "reason": "no_score"}
+        if score < min_score:
+            _st_log("SKIPPED", ticker, f"score={score:.0f} < min={min_score:.0f}")
+            return {"status": "skipped", "reason": "score_below_threshold",
+                    "score": score, "min": min_score}
 
     # Capacity check — with optional rotation
     if len(st["positions"]) >= cfg["max_positions"]:
