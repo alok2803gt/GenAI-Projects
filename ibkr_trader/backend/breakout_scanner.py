@@ -104,7 +104,7 @@ DEFAULT_CONFIG = {
     "vol_threshold_pct":      0.75,
     "backend_url":            "http://localhost:8000",
     "use_ibkr_hist":          True,   # refresh cache via backend IBKR endpoint; falls back to yfinance
-    "pre_bo_grace_minutes":   15,     # F9: allow BREAKOUT if PRE-BREAKOUT was seen within this window
+    "pre_bo_grace_minutes":   15,     # retired — kept for config compat; no longer used by F9
 }
 
 
@@ -1918,14 +1918,19 @@ def _main_loop():
                 # Backtest: instant jumps (0d in PRE-BO) → 52.9% win rate, -0.03% avg 5d.
                 # 2-step path (via PRE-BO)              → 62.0% win rate, +1.31% avg 5d.
                 # Pass-through when prev_state is None (no intraday history yet — first scan).
-                # Grace window: a single scan cycle dipping briefly below PRE-BREAKOUT threshold
-                # (e.g., one 3-min bar where %B touches 74) should not disqualify the setup.
-                # Allow BREAKOUT if PRE-BREAKOUT was active within pre_bo_grace_minutes.
-                _grace_mins = cfg.get("pre_bo_grace_minutes", 15)
-                _mins_since = ind.get("mins_since_pre_breakout")
+                #
+                # Two valid paths:
+                #   1. Daily direct:  prev_state == PRE-BREAKOUT (daily scan, PRE-BO → BREAKOUT)
+                #   2. Intraday:      daily state IS currently PRE-BREAKOUT while 15m fires BREAKOUT
+                #      (intraday signals don't update _ticker_states, so prev_state reflects the
+                #       last daily transition — not the preceding scan cycle)
+                #
+                # Stocks that skip PRE-BREAKOUT entirely (NEUTRAL → BREAKOUT) are dropped;
+                # requiring re-confirmation removes news-spike chasing.
+                _curr_daily_state = _ticker_states.get(tk, {}).get("state")
                 _came_via_pre = (
                     ind.get("prev_state") == "PRE-BREAKOUT"
-                    or (_mins_since is not None and _mins_since <= _grace_mins)
+                    or _curr_daily_state == "PRE-BREAKOUT"
                 )
                 if (sig_type == "BREAKOUT"
                         and cfg.get("require_2step_breakout", True)
@@ -1933,16 +1938,15 @@ def _main_loop():
                         and not _came_via_pre):
                     log.info(
                         "F9 path-gate dropped %s: BREAKOUT jumped from %s "
-                        "(PRE-BREAKOUT last seen: %s)",
-                        tk, ind["prev_state"],
-                        f"{_mins_since}m ago" if _mins_since is not None else "never",
+                        "(daily state: %s)",
+                        tk, ind.get("prev_state"), _curr_daily_state,
                     )
                     n_f9_dropped += 1
                     continue
-                if sig_type == "BREAKOUT" and _mins_since is not None and _mins_since > 0:
+                if sig_type == "BREAKOUT" and _curr_daily_state == "PRE-BREAKOUT":
                     log.info(
-                        "F9 grace pass %s: PRE-BREAKOUT last seen %dm ago (within %dm window)",
-                        tk, _mins_since, _grace_mins,
+                        "F9 intraday pass %s: daily state IS PRE-BREAKOUT (15m fired BREAKOUT)",
+                        tk,
                     )
 
                 # Sync to backend watchlist only after all local filters pass (F1–F9).
