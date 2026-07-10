@@ -1943,7 +1943,7 @@ def _main_loop():
                         "ticker":          tk,
                         "price":           ind.get("price", 0),
                         "alert_fired_at":  datetime.now(ET).isoformat(),
-                        "composite_score": sig.get("composite_score"),
+                        "composite_score": ind.get("composite_score"),
                         "vol_ratio":       ind.get("vol_ratio"),
                     }
                     for _ep in ("/stock-trader/signal", "/day-trader/signal"):

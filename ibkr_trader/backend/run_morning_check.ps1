@@ -115,12 +115,14 @@ try {
     [void]$checks.Add("[WARN] Day trader: status check failed")
 }
 
-# 6. Stock trader enabled
+# 6. Stock trader enabled + tickers
 try {
     $st = Invoke-RestMethod -Uri "$BackendUrl/stock-trader/status" -Method Get -TimeoutSec 5
     if ($st.enabled -eq $true) {
-        $stPos = ($st.positions.PSObject.Properties | Measure-Object).Count
-        [void]$checks.Add("[OK] Stock trader: enabled ($stPos open positions)")
+        $stTickers = ($st.positions.PSObject.Properties.Name) -join ", "
+        $stPos     = ($st.positions.PSObject.Properties | Measure-Object).Count
+        $stMax     = $st.config.max_positions
+        [void]$checks.Add("[OK] Stock trader: enabled ($stPos/$stMax positions: $stTickers)")
     } else {
         [void]$checks.Add("[WARN] Stock trader: disabled")
     }
@@ -128,15 +130,48 @@ try {
     [void]$checks.Add("[WARN] Stock trader: status check failed")
 }
 
+# 7. SPX 0DTE
+try {
+    $spx = Invoke-RestMethod -Uri "$BackendUrl/spx-0dte/status" -Method Get -TimeoutSec 5
+    $spxPnl     = $spx.summary.today_pnl
+    $spxNext    = $spx.summary.next_target
+    $spxFloor   = $spx.config.daily_floor_pnl
+    $spxTiers   = ($spx.config.stop_loss_tiers -join "/") + "x"
+    $spxAttempt = $spx.attempts_today
+    if ($spx.enabled -eq $true) {
+        [void]$checks.Add("[OK] SPX 0DTE: enabled | attempts=$spxAttempt | day_pnl=`$$spxPnl | next_target=`$$spxNext | stops=$spxTiers | floor=`$$spxFloor")
+    } else {
+        [void]$checks.Add("[WARN] SPX 0DTE: disabled")
+        [void]$issues.Add("SPX 0DTE is disabled -- enable before market open if trading today")
+    }
+} catch {
+    [void]$checks.Add("[WARN] SPX 0DTE: status check failed")
+}
+
+# 8. EVC (Earnings Vol Crush)
+try {
+    $evc = Invoke-RestMethod -Uri "$BackendUrl/earnings-vol-crush/status" -Method Get -TimeoutSec 5
+    $evcPos    = ($evc.positions.PSObject.Properties | Measure-Object).Count
+    $evcScan   = if ($evc.scan_date) { $evc.scan_date } else { "fresh (scans at $($evc.config.entry_start))" }
+    $evcWindow = "$($evc.config.entry_start)-$($evc.config.entry_cutoff)"
+    if ($evc.enabled -eq $true) {
+        [void]$checks.Add("[OK] EVC: enabled | positions=$evcPos | scan=$evcScan | window=$evcWindow ET")
+    } else {
+        [void]$checks.Add("[WARN] EVC: disabled")
+    }
+} catch {
+    [void]$checks.Add("[WARN] EVC: status check failed")
+}
+
 # Build and send Telegram summary
 $header = if ($issues.Count -eq 0) {
-    "<b>Morning check PASSED -- $ET_TIME</b>"
+    "&#x2705; <b>Morning check PASSED</b> -- $ET_TIME"
 } else {
-    "<b>Morning check: $($issues.Count) issue(s) -- $ET_TIME</b>"
+    "&#x26A0;&#xFE0F; <b>Morning check: $($issues.Count) issue(s)</b> -- $ET_TIME"
 }
 
 $issueBlock = if ($issues.Count -gt 0) {
-    "`n" + (($issues | ForEach-Object { "ISSUE: $_" }) -join "`n")
+    "`n`n" + (($issues | ForEach-Object { "&#x1F6A8; $_" }) -join "`n")
 } else { "" }
 
 $message = "$header`n`n" + ($checks -join "`n") + $issueBlock

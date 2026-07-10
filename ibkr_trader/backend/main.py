@@ -94,11 +94,13 @@ TAPE_BLOCK_MIN_SHARES      = 5000 # CVD-callback block threshold for real-time c
 
 # ── Market index banner ────────────────────────────────────────────────────
 INDEX_CONFIG = [
-    {"sym": "SPY",  "name": "S&P 500"},
-    {"sym": "QQQ",  "name": "Nasdaq"},
-    {"sym": "DIA",  "name": "Dow"},
-    {"sym": "IWM",  "name": "Russell"},
-    {"sym": "VIX",  "name": "VIX"},
+    {"sym": "SPX",  "name": "SPX",     "yf_sym": "^GSPC", "etf_proxy": "SPY", "proxy_mult": None},
+    {"sym": "NDX",  "name": "NDX",     "yf_sym": "^NDX",  "etf_proxy": "QQQ", "proxy_mult": None},
+    {"sym": "SPY",  "name": "S&P 500", "yf_sym": "SPY"},
+    {"sym": "QQQ",  "name": "Nasdaq",  "yf_sym": "QQQ"},
+    {"sym": "DIA",  "name": "Dow",     "yf_sym": "DIA"},
+    {"sym": "IWM",  "name": "Russell", "yf_sym": "IWM"},
+    {"sym": "VIX",  "name": "VIX",     "yf_sym": "^VIX"},
 ]
 # These four ETFs are always subscribed (before universe/watchlist candidates)
 # so the index banner has live IBKR prices from market open.
@@ -148,6 +150,7 @@ AT_STATE_PATH       = "autotrader_state.json"  # persisted across restarts
 ST_STATE_PATH       = "stock_state.json"        # stock trader state (persisted)
 DT_STATE_PATH       = "day_trader_state.json"   # day trader state (persisted)
 SPX_STATE_PATH      = "spx_0dte_state.json"     # SPX 0DTE trader state (persisted)
+EVC_STATE_PATH      = "earnings_vol_crush_state.json"  # Earnings Vol Crush state (persisted)
 UNIVERSE_CACHE_PATH = "universe_cache.json"     # screened universe (refreshed nightly)
 WATCHLIST_PATH      = "watchlist.json"          # breakout scanner watchlist
 
@@ -181,35 +184,69 @@ CANDIDATE_POOL: List[str] = [
     "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "ORCL", "IBM", "CSCO",
     # ── Semiconductors ───────────────────────────────────────────────────
     "AMD", "INTC", "QCOM", "TXN", "AVGO", "MU", "AMAT", "LRCX", "KLAC",
-    "MRVL", "SMCI", "ON", "MPWR",
+    "MRVL", "SMCI", "ON", "MPWR", "MCHP", "ASML", "TER", "ENTG",
     # ── Software / Cloud / AI ────────────────────────────────────────────
     "NOW", "CRM", "ADBE", "INTU", "SNOW", "PLTR", "UBER", "ABNB",
-    "NET", "DDOG", "ZS", "CRWD", "PANW",
-    # ── Financials ───────────────────────────────────────────────────────
+    "NET", "DDOG", "ZS", "CRWD", "PANW", "FTNT", "OKTA", "S",
+    "TEAM", "HUBS", "MDB", "GTLB", "ZM", "TWLO",
+    # ── Financials — Money-center banks ──────────────────────────────────
     "JPM", "BAC", "WFC", "GS", "MS", "BLK", "C", "AXP", "V", "MA",
     "SCHW", "COF", "USB", "PNC", "TFC", "SPGI", "MCO",
-    # ── Healthcare ───────────────────────────────────────────────────────
+    # ── Financials — Regional banks ──────────────────────────────────────
+    "FITB", "RF", "KEY", "HBAN", "CMA", "ZION", "WAL", "EWBC",
+    # ── Financials — Insurance ───────────────────────────────────────────
+    "PGR", "ALL", "TRV", "CB", "MET", "PRU", "AFL", "AIG", "HIG", "L",
+    # ── Financials — Fintech / Payments ──────────────────────────────────
+    "FISV", "FIS", "AFRM", "UPST", "NU", "SQ", "PYPL",
+    # ── Healthcare — Pharma / Biotech ────────────────────────────────────
     "UNH", "JNJ", "PFE", "MRK", "ABBV", "BMY", "AMGN", "GILD",
     "LLY", "TMO", "DHR", "ELV", "HUM", "CI", "ISRG", "VRTX", "REGN",
-    # ── Energy ───────────────────────────────────────────────────────────
+    "MRNA", "BIIB", "ILMN", "EXAS", "DXCM", "PODD",
+    # ── Healthcare — Equipment / MedTech ─────────────────────────────────
+    "SYK", "BSX", "EW", "HOLX", "ALGN", "MDT", "ZBH", "GEHC",
+    # ── Energy — Integrated / E&P ────────────────────────────────────────
     "XOM", "CVX", "COP", "SLB", "EOG", "OXY", "PSX", "MPC", "VLO",
-    # ── Consumer Discretionary ───────────────────────────────────────────
-    "WMT", "COST", "TGT", "HD", "LOW", "MCD", "SBUX", "NKE",
-    "BKNG", "LULU", "CMG",
+    "DVN", "FANG", "HES", "HAL", "BKR",
+    # ── Materials / Chemicals / Mining ───────────────────────────────────
+    "FCX", "NEM", "DOW", "LYB", "ALB", "NUE", "CF", "SHW", "PPG",
+    "ECL", "APD", "AA", "CLF", "MOS", "MP",
+    # ── Utilities ────────────────────────────────────────────────────────
+    "NEE", "D", "SO", "DUK", "AEP", "EXC", "XEL", "PCG", "ED",
+    # ── Consumer Discretionary — Retail ──────────────────────────────────
+    "WMT", "COST", "TGT", "HD", "LOW", "TJX", "ROST", "ULTA",
+    "BBY", "DLTR", "DG", "M", "KSS",
+    # ── Consumer Discretionary — Auto ────────────────────────────────────
+    "F", "GM", "RIVN", "STLA",
+    # ── Consumer Discretionary — Restaurants / Travel ────────────────────
+    "MCD", "SBUX", "CMG", "YUM", "DPZ", "QSR",
+    "BKNG", "EXPE", "MAR", "HLT", "H",
+    # ── Consumer Discretionary — Luxury / Apparel ────────────────────────
+    "NKE", "LULU", "RL", "TPR", "PVH", "VFC",
+    # ── Consumer Discretionary — Gaming / Entertainment ──────────────────
+    "WYNN", "MGM", "LVS", "PENN", "DKNG",
+    "EA", "TTWO", "RBLX",
     # ── Consumer Staples ─────────────────────────────────────────────────
     "PG", "KO", "PEP", "PM", "MO", "MDLZ", "CL",
-    # ── Industrials / Defense ────────────────────────────────────────────
+    "TSN", "K", "GIS", "SJM", "CAG", "HRL",
+    # ── Industrials / Aerospace / Defense ────────────────────────────────
     "CAT", "DE", "BA", "HON", "GE", "LMT", "RTX", "NOC", "GD",
-    "UPS", "FDX", "ETN", "EMR",
-    # ── Comm / Media ─────────────────────────────────────────────────────
+    "UPS", "FDX", "ETN", "EMR", "ITW", "PH", "ROK", "MMM",
+    "TDG", "AXON", "LHX", "HII", "LDOS", "FAST", "GWW",
+    # ── Airlines / Transportation ────────────────────────────────────────
+    "DAL", "UAL", "AAL", "LUV", "ALK",
+    "JBLU", "HA", "SAVE",
+    # ── Comm / Media / Streaming ─────────────────────────────────────────
     "NFLX", "DIS", "CMCSA", "T", "VZ", "ROKU", "SPOT",
-    # ── Real Estate / Infrastructure ─────────────────────────────────────
-    "AMT", "PLD", "EQIX",
+    "WBD", "PARA", "LYV", "IMAX", "MTCH",
+    # ── Real Estate / REITs ──────────────────────────────────────────────
+    "AMT", "PLD", "EQIX", "SPG", "O", "CCI", "WELL", "AVB", "VICI",
+    # ── Chinese ADRs (high IV around earnings) ───────────────────────────
+    "BABA", "JD", "PDD", "BIDU", "NIO", "XPEV", "LI", "TCOM",
     # ── ETFs ─────────────────────────────────────────────────────────────
     "SPY", "QQQ", "IWM", "GLD", "XLE", "XLF", "XLK", "XLV", "ARKK", "XBI", "KRE",
     # ── High-vol / options-active ─────────────────────────────────────────
-    "COIN", "HOOD", "SOFI", "RBLX", "MARA", "RIOT",
-    "SHOP", "SQ", "PYPL", "SNAP", "PINS",
+    "COIN", "HOOD", "SOFI", "MARA", "RIOT",
+    "SHOP", "SNAP", "PINS", "MSTR",
 ]
 
 # ── Stock sector mapping for rotation sector guard ─────────────────────────
@@ -393,15 +430,18 @@ state: Dict = {
     "spx_0dte": {
         "enabled": False,
         "config": {
-            "daily_profit_target":   200.0,  # $ daily goal
+            "daily_profit_target":   200.0,  # $ daily goal (used as fallback if trade_targets not set)
+            "trade_targets":  [200, 150, 100, 50],  # per-trade profit targets ($); one entry per allowed trade
             "spread_width":          25,     # points per spread leg (25 = $2500 max risk/contract)
             "otm_pct":               0.5,    # % OTM for the short strike (~35 pts OTM at SPX 7000)
-            "profit_pct":            50.0,   # close IC when this % of credit is realised
-            "stop_loss_mult":        2.0,    # close when loss = stop_loss_mult × credit
+            "profit_pct":            50.0,   # % of credit collected used to size qty toward tier target
+            "stop_loss_mult":        2.0,    # fallback if stop_loss_tiers not set
+            "stop_loss_tiers":  [2.0, 1.5, 1.0, 1.0],  # per-attempt stop mult: trade1=2×, trade2=1.5×, trade3+=1×
+            "daily_floor_pnl":       200.0,  # protect this $ profit once earned; new entry sized so stop can't breach floor
             "entry_start_time":     "09:45", # earliest IC entry
             "entry_cutoff_time":    "14:00", # no new entries after this (gamma risk after ~14:00)
             "force_close_time":     "15:45", # MKT close all legs regardless
-            "max_attempts":          5,      # max IC entries per day
+            "max_attempts":          5,      # hard cap on IC entries per day (overrides trade_targets length)
             "max_margin":        20000.0,    # max notional margin to deploy
             "min_credit_per_spread": 0.20,   # skip if net credit < this per spread
         },
@@ -411,6 +451,25 @@ state: Dict = {
         "attempts_today": 0,
         "today_pnl":      0.0,
         "last_stop_time": None,
+        "eod_notified":   None,
+    },
+    "evc": {
+        "enabled": False,
+        "config": {
+            "max_positions":  3,
+            "min_credit":     0.50,   # min net condor credit per spread ($)
+            "wing_mult":      1.5,    # wing width = wing_mult x expected_move
+            "entry_start":    "15:30",
+            "entry_cutoff":   "15:50",
+            "exit_start":     "09:31",
+            "exit_cutoff":    "09:35",
+            "max_loss_pct":   50,     # close if loss > X% of credit received
+        },
+        "positions":    {},   # pos_id -> position dict
+        "closed_today": [],   # closed positions (reset daily)
+        "decisions":    [],   # decision log (last 200)
+        "scan_date":    None, # date of last universe scan (avoid rescanning same day)
+        "scanning":     False,# guard against concurrent scan+entry
     },
     "news_monitor": {
         "enabled":        True,
@@ -4475,6 +4534,18 @@ def _send_telegram_sync(token: str, chat_id: str, text: str) -> bool:
         return False
 
 
+def _spx_notify(text: str) -> None:
+    """Fire-and-forget Telegram push for SPX 0DTE trade events."""
+    import threading
+    token, chat_id = _load_telegram_creds()
+    if token and chat_id:
+        threading.Thread(
+            target=_send_telegram_sync,
+            args=(token, chat_id, text),
+            daemon=True,
+        ).start()
+
+
 def _format_eod_performance_digest(session_date: str) -> str | None:
     con = sqlite3.connect(TAPE_DB_PATH, check_same_thread=False)
     con.row_factory = sqlite3.Row
@@ -6922,6 +6993,9 @@ async def lifespan(app: FastAPI):
     # Restore SPX 0DTE state from last shutdown
     _spx_load_state()
 
+    # Restore Earnings Vol Crush state from last shutdown
+    _evc_load_state()
+
     # Restore breakout watchlist
     _watchlist_load()
 
@@ -6950,6 +7024,8 @@ async def lifespan(app: FastAPI):
     log.info("Day trader monitor loop started")
     asyncio.create_task(_spx_monitor_loop())
     log.info("SPX 0DTE monitor loop started")
+    asyncio.create_task(_evc_monitor_loop())
+    log.info("Earnings Vol Crush monitor loop started")
     asyncio.create_task(_risk_monitor_loop())
     log.info("Risk monitor loop started")
     asyncio.create_task(_news_monitor_loop())
@@ -9836,6 +9912,35 @@ def pnl_dashboard():
         except Exception:
             pass
 
+    # ── Per-strategy today breakdown ─────────────────────────────────────────
+    strategy_today: dict = {}
+    for t in real_closed:
+        if (t.get("closed_at") or "")[:10] != today_str:
+            continue
+        if t.get("pnl") is None:
+            continue
+        key = t.get("strategy_type") or "OTHER"
+        if key not in strategy_today:
+            strategy_today[key] = {"pnl": 0.0, "trades": 0, "wins": 0, "losses": 0}
+        strategy_today[key]["pnl"]    = round(strategy_today[key]["pnl"] + t["pnl"], 2)
+        strategy_today[key]["trades"] += 1
+        if t.get("win") == 1:
+            strategy_today[key]["wins"] += 1
+        else:
+            strategy_today[key]["losses"] += 1
+    # Merge live SPX 0DTE today_pnl (includes trades not yet in journal from this session)
+    spx_live = state.get("spx_0dte", {})
+    if spx_live.get("today_pnl") and "SPX_0DTE" not in strategy_today:
+        strategy_today["SPX_0DTE"] = {
+            "pnl":    round(float(spx_live["today_pnl"]), 2),
+            "trades": spx_live.get("attempts_today", 0),
+            "wins":   sum(1 for t in spx_live.get("closed_today", []) if t.get("exit_type") == "profit_target"),
+            "losses": sum(1 for t in spx_live.get("closed_today", []) if t.get("exit_type") == "stop_loss"),
+        }
+    elif spx_live.get("today_pnl") and "SPX_0DTE" in strategy_today:
+        # Prefer live state over journal (more up-to-date intraday)
+        strategy_today["SPX_0DTE"]["pnl"] = round(float(spx_live["today_pnl"]), 2)
+
     total_realized   = round(sum(closed_pnls), 2) if closed_pnls else 0.0
     total_unrealized = round(float(acct.get("unrealized_pnl") or 0), 2)
 
@@ -9959,11 +10064,12 @@ def pnl_dashboard():
             "best_trade":           round(max(closed_pnls), 2) if closed_pnls else 0,
             "worst_trade":          round(min(closed_pnls), 2) if closed_pnls else 0,
         },
-        "open_positions": visible_open[-20:],
-        "closed_trades":  real_closed[:30],
-        "daily_pnl":      daily_pnl,
-        "portfolio":      portfolio_items,
-        "exit_breakdown": exit_breakdown,
+        "open_positions":   visible_open[-20:],
+        "closed_trades":   real_closed[:30],
+        "daily_pnl":       daily_pnl,
+        "portfolio":       portfolio_items,
+        "exit_breakdown":  exit_breakdown,
+        "strategy_today":  strategy_today,
     }
 
 
@@ -10343,7 +10449,7 @@ def market_indexes():
                 "change_pct": None,
                 "is_live":    False,
             }
-            yf_sym = "^VIX" if cfg["sym"] == "VIX" else cfg["sym"]
+            yf_sym = cfg.get("yf_sym", cfg["sym"])
             try:
                 fi = yf.Ticker(yf_sym).fast_info
                 lp = getattr(fi, "last_price",    None)
@@ -10356,10 +10462,14 @@ def market_indexes():
         _index_cache["data"] = fresh
         _index_cache["ts"]   = now
 
+    # Build a quick lookup of cached prev_close by sym (needed for proxy ratio)
+    cached_by_sym = {e["sym"]: e for e in _index_cache["data"]}
+
     # Deep-copy cached data then overlay live IBKR prices
     result = copy.deepcopy(_index_cache["data"])
     for entry in result:
         sym = entry["sym"]
+        cfg = next((c for c in INDEX_CONFIG if c["sym"] == sym), {})
 
         if sym == "VIX":
             # VIX from dedicated Index contract subscription
@@ -10369,6 +10479,25 @@ def market_indexes():
                 entry["is_live"] = True
             if vl.get("prev_close") and not entry["prev_close"]:
                 entry["prev_close"] = vl["prev_close"]
+
+        elif cfg.get("etf_proxy"):
+            # SPX / NDX: derive live price from ETF proxy tape
+            proxy    = cfg["etf_proxy"]
+            mult     = cfg.get("proxy_mult")       # fixed multiplier (SPX = SPY×10)
+            sent     = state["tape_sentiment"].get(proxy)
+            if sent and sent.get("last_price") and _tape_is_fresh(sent):
+                etf_live = float(sent["last_price"])
+                if mult:
+                    entry["price"] = round(etf_live * mult, 2)
+                else:
+                    # Dynamic ratio: index_prev_close / etf_prev_close (stable intraday)
+                    idx_pc  = (entry.get("prev_close") or 0)
+                    etf_pc  = (cached_by_sym.get(proxy) or {}).get("prev_close") or 0
+                    if idx_pc and etf_pc:
+                        entry["price"] = round(etf_live * (idx_pc / etf_pc), 2)
+                if entry["price"]:
+                    entry["is_live"] = True
+
         else:
             # ETF from tape_sentiment (last_price field populated by CVD callback)
             sent = state["tape_sentiment"].get(sym)
@@ -11602,6 +11731,78 @@ def _spx_load_state() -> None:
         log.warning("SPX 0DTE state load failed: %s", e)
 
 
+# ── Earnings Volatility Crush — helpers ───────────────────────────────────────
+
+# ETFs in CANDIDATE_POOL that have no earnings; exclude from EVC scan
+_EVC_ETF_SET = frozenset([
+    "SPY","QQQ","IWM","GLD","XLE","XLF","XLK","XLV","ARKK","XBI","KRE",
+])
+
+
+def _evc_log(action: str, ticker: str, detail: str) -> None:
+    from zoneinfo import ZoneInfo
+    t = datetime.now(ZoneInfo("America/New_York")).strftime("%H:%M:%S ET")
+    entry = {"time": t, "action": action, "ticker": ticker, "detail": detail}
+    ev = state["evc"]
+    ev["decisions"].append(entry)
+    if len(ev["decisions"]) > 200:
+        ev["decisions"] = ev["decisions"][-200:]
+    log.info("EVC [%s] %s — %s", action, ticker, detail)
+
+
+def _evc_save_state() -> None:
+    ev = state["evc"]
+    try:
+        with open(EVC_STATE_PATH, "w") as f:
+            json.dump({
+                "enabled":      ev["enabled"],
+                "config":       ev["config"],
+                "positions":    ev["positions"],
+                "closed_today": ev["closed_today"],
+                "decisions":    ev["decisions"][-50:],
+                "scan_date":    ev["scan_date"],
+                "date":         date.today().isoformat(),
+            }, f, default=str)
+    except Exception as e:
+        log.warning("EVC state save failed: %s", e)
+
+
+def _evc_load_state() -> None:
+    if not os.path.exists(EVC_STATE_PATH):
+        return
+    try:
+        with open(EVC_STATE_PATH, "r") as f:
+            saved = json.load(f)
+        ev    = state["evc"]
+        today = date.today().isoformat()
+        if "config" in saved:
+            ev["config"].update(saved["config"])
+        ev["enabled"]      = saved.get("enabled", False)
+        ev["decisions"]    = saved.get("decisions", [])
+        # Restore positions only if from today and still open
+        ev["positions"]    = {
+            k: v for k, v in saved.get("positions", {}).items()
+            if v.get("date") == today and v.get("phase") == "open"
+        }
+        ev["closed_today"] = [r for r in saved.get("closed_today", []) if r.get("date") == today]
+        ev["scan_date"]    = saved.get("scan_date") if saved.get("date") == today else None
+        log.info("EVC state restored: %d open positions", len(ev["positions"]))
+    except Exception as e:
+        log.warning("EVC state load failed: %s", e)
+
+
+def _evc_round_strike(price: float, step: float = 0.0) -> float:
+    """Round price to nearest option strike increment (dynamic by price level)."""
+    if step == 0.0:
+        if price < 50:
+            step = 1.0
+        elif price < 200:
+            step = 2.5
+        else:
+            step = 5.0
+    return float(round(price / step) * step)
+
+
 async def _spx_get_spot(ib) -> float:
     """SPX spot: SPY bars × 10 (primary), live reqMktData for SPX index (fallback)."""
     spy_bars = state["bars"].get("SPY", [])
@@ -11767,6 +11968,7 @@ async def _spx_close_spread(ib, spread_id: str, exit_type: str) -> None:
         "spread_id":    spread_id,
         "strategy":     strategy,
         "date":         sp["date"],
+        "expiry":       expiry,
         "placed_at":    sp["placed_at"],
         "put_strikes":  put_str,
         "call_strikes": call_str,
@@ -11783,13 +11985,13 @@ async def _spx_close_spread(ib, spread_id: str, exit_type: str) -> None:
         con = sqlite3.connect(JOURNAL_DB_PATH, check_same_thread=False)
         con.execute("""
             INSERT INTO trade_journal
-                (opened_at, closed_at, ticker, action, qty,
+                (opened_at, closed_at, ticker, expiry, action, qty,
                  entry_price, exit_price, pnl, pnl_pct, win,
                  exit_reason, strategy_type, spot_price)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             sp["date"], date.today().isoformat(),
-            "SPX", "SELL", qty,
+            "SPX", expiry, "SELL", qty,
             credit, round(credit - pnl, 2),
             pnl, pnl_pct, 1 if pnl > 0 else 0,
             exit_type, "SPX_0DTE",
@@ -11802,6 +12004,19 @@ async def _spx_close_spread(ib, spread_id: str, exit_type: str) -> None:
 
     sx["spreads"].pop(spread_id, None)
     _spx_log("CLOSED", f"exit={exit_type}  P&L=${pnl:.2f}  day_total=${sx['today_pnl']:.2f}", spread_id)
+
+    # Telegram trade notification
+    _emoji = {"profit_target": "✅", "stop_loss": "🛑", "force_close": "⏰", "manual_close": "🔧"}
+    _label = {"profit_target": "PROFIT TARGET", "stop_loss": "STOP LOSS",
+              "force_close": "FORCE CLOSE",   "manual_close": "MANUAL CLOSE"}
+    attempt_n = sx.get("attempts_today", 1)
+    _spx_notify(
+        f"{_emoji.get(exit_type,'📋')} <b>SPX 0DTE {_label.get(exit_type, exit_type.upper())}</b>\n"
+        f"P&amp;L: <b>${pnl:+.0f}</b>  ({pnl_pct:+.1f}%)   trade #{attempt_n}\n"
+        f"Day total: <b>${sx['today_pnl']:+.0f}</b>  |  {strategy}  {put_str} / {call_str}\n"
+        f"Credit: ${credit:.0f}   Qty: {qty}   Stop was {sp.get('stop_mult', 2.0)}×"
+    )
+
     _spx_save_state()
 
 
@@ -11819,9 +12034,8 @@ async def _spx_entry_coro(ib) -> None:
 
     if not (_t(cfg["entry_start_time"]) <= now <= _t(cfg["entry_cutoff_time"])):
         return
-    if sx["today_pnl"] >= cfg["daily_profit_target"]:
-        return
-    if sx["attempts_today"] >= cfg["max_attempts"]:
+    targets = cfg.get("trade_targets") or [cfg["daily_profit_target"]]
+    if sx["attempts_today"] >= min(len(targets), int(cfg["max_attempts"])):
         return
     if sx["spreads"]:
         return
@@ -11871,17 +12085,41 @@ async def _spx_entry_coro(ib) -> None:
     elif not use_call:
         _spx_log("INFO", f"Call leg thin ({c_credit:.2f}) — entering put spread only (P={p_credit:.2f})")
 
+    attempt       = sx["attempts_today"]
+    tier_target   = float(targets[attempt])
     profit_pct    = float(cfg["profit_pct"]) / 100
     ev_per_spread = active_credit * 100 * profit_pct
-    remaining     = max(0.0, cfg["daily_profit_target"] - sx["today_pnl"])
     max_by_margin = max(1, int(cfg["max_margin"] / (width * 100)))
-    qty           = min(max_by_margin, max(1, int(np.ceil(remaining / ev_per_spread))))
+    qty           = min(max_by_margin, max(1, int(np.ceil(tier_target / ev_per_spread))))
+
+    # ── Tiered stop loss: tighter on later attempts ───────────────────────
+    tiers     = cfg.get("stop_loss_tiers") or [cfg.get("stop_loss_mult", 2.0)]
+    stop_mult = float(tiers[min(attempt, len(tiers) - 1)])
+
+    # ── Daily floor protection: size qty so a full stop can't breach floor ─
+    floor     = float(cfg.get("daily_floor_pnl", 0.0))
+    day_pnl   = float(sx.get("today_pnl", 0.0))
+    if floor > 0 and day_pnl >= floor:
+        headroom           = day_pnl - floor          # $ we can afford to lose
+        stop_per_contract  = active_credit * 100 * stop_mult
+        floor_qty          = int(headroom / stop_per_contract) if stop_per_contract > 0 else 0
+        if floor_qty == 0:
+            _spx_log("SKIP_FLOOR",
+                     f"day_pnl=${day_pnl:.0f} floor=${floor:.0f} "
+                     f"headroom=${headroom:.0f} < stop/contract=${stop_per_contract:.0f} "
+                     f"(attempt {attempt+1}, stop={stop_mult}×)")
+            return
+        if floor_qty < qty:
+            _spx_log("INFO",
+                     f"Floor protection: qty {qty}→{floor_qty} "
+                     f"(headroom=${headroom:.0f} / stop/contract=${stop_per_contract:.0f})")
+            qty = floor_qty
 
     _spx_log("ENTRY",
-             f"SPX {spot:.0f}  strategy={strategy} | "
+             f"SPX {spot:.0f}  strategy={strategy}  attempt={attempt+1}  stop={stop_mult}× | "
              + (f"P {int(put_short_k)}/{int(put_long_k)} cr={p_credit:.2f} | " if use_put else "")
              + (f"C {int(call_short_k)}/{int(call_long_k)} cr={c_credit:.2f} | " if use_call else "")
-             + f"qty={qty}  total_cr=${qty*active_credit*100:.0f}")
+             + f"qty={qty}  total_cr=${qty*active_credit*100:.0f}  floor=${floor:.0f}")
 
     p_oid = c_oid = None
     try:
@@ -11915,13 +12153,24 @@ async def _spx_entry_coro(ib) -> None:
         "put_credit":    p_credit  if use_put  else 0.0,
         "call_credit":   c_credit  if use_call else 0.0,
         "total_credit":  total_credit_dollar,
-        "profit_target": round(total_credit_dollar * profit_pct, 2),
+        "profit_target": tier_target,
+        "stop_mult":     stop_mult,
         "max_loss":      round(qty * (width - active_credit) * 100, 2),
         "phase":         1,
         "live_pnl":      None,
         "placed_at":     now.strftime("%H:%M ET"),
     }
     sx["attempts_today"] += 1
+
+    # Telegram entry notification
+    _spx_notify(
+        f"📈 <b>SPX 0DTE ENTRY</b> — trade #{sx['attempts_today']}  ({strategy})\n"
+        f"SPX: {spot:.0f}   Target: <b>${tier_target:.0f}</b>   Stop: {stop_mult}×   Qty: {qty}\n"
+        + (f"PUT  {int(put_short_k)}/{int(put_long_k)}  cr={p_credit:.2f}\n" if use_put else "")
+        + (f"CALL {int(call_short_k)}/{int(call_long_k)}  cr={c_credit:.2f}\n" if use_call else "")
+        + f"Total credit: ${qty*active_credit*100:.0f}   Floor: ${floor:.0f}"
+    )
+
     _spx_save_state()
 
 
@@ -11980,20 +12229,10 @@ async def _spx_monitor_coro(ib) -> None:
         _spx_log("MONITOR", f"spread={sid} live_pnl=${live_pnl:.2f} target=${sp['profit_target']:.2f}")
 
         profit_target = sp["profit_target"]
-        # Stop loss = stop_loss_mult × credit collected (e.g. 2× = lose back 2× what we took in).
-        # sp["max_loss"] is the theoretical full-width loss — do NOT use it as the stop threshold.
-        stop_threshold = sp["total_credit"] * float(cfg["stop_loss_mult"])
-
-        # Close early if total day P&L (closed + this unrealized) already hits daily goal.
-        # Avoids holding a profitable spread past the daily target hoping for a higher bar.
-        daily_goal   = float(cfg["daily_profit_target"])
-        combined_pnl = round(sx.get("today_pnl", 0.0) + live_pnl, 2)
-        if live_pnl > 0 and combined_pnl >= daily_goal:
-            _spx_log("PROFIT_TARGET",
-                     f"Daily goal reached: closed=${sx.get('today_pnl',0):.2f} + unrealized=${live_pnl:.2f}"
-                     f" = ${combined_pnl:.2f} >= ${daily_goal:.2f}", sid)
-            await _spx_close_spread(ib, sid, "profit_target")
-            continue
+        # Per-spread stop_mult set at entry (tiered: 2× / 1.5× / 1×).
+        # Falls back to global stop_loss_mult for spreads opened before this change.
+        sp_stop_mult   = float(sp.get("stop_mult") or cfg.get("stop_loss_mult", 2.0))
+        stop_threshold = sp["total_credit"] * sp_stop_mult
 
         if live_pnl >= profit_target:
             _spx_log("PROFIT_TARGET",
@@ -12003,7 +12242,7 @@ async def _spx_monitor_coro(ib) -> None:
 
         if live_pnl <= -stop_threshold:
             _spx_log("STOP_LOSS",
-                     f"P&L=${live_pnl:.2f} <= -stop=-${stop_threshold:.2f} ({cfg['stop_loss_mult']}× credit)", sid)
+                     f"P&L=${live_pnl:.2f} <= -stop=-${stop_threshold:.2f} ({sp_stop_mult}× credit)", sid)
             sx["last_stop_time"] = now.isoformat()
             await _spx_close_spread(ib, sid, "stop_loss")
             continue
@@ -12046,31 +12285,517 @@ async def _spx_monitor_loop() -> None:
                 await loop.run_in_executor(
                     None,
                     lambda: _run_in_streaming_loop(_spx_monitor_coro(ib), timeout=25))
+            _targets = sx["config"].get("trade_targets") or [sx["config"]["daily_profit_target"]]
             if (not sx["spreads"]
-                    and sx["today_pnl"] < sx["config"]["daily_profit_target"]
-                    and sx["attempts_today"] < sx["config"]["max_attempts"]):
+                    and sx["attempts_today"] < min(len(_targets), int(sx["config"]["max_attempts"]))):
                 await loop.run_in_executor(
                     None,
                     lambda: _run_in_streaming_loop(_spx_entry_coro(ib), timeout=35))
+            # EOD summary — fire once after force_close_time when no spreads remain
+            cfg       = sx["config"]
+            today_str = now.strftime("%Y-%m-%d")
+            fc_h, fc_m = map(int, cfg["force_close_time"].split(":"))
+            force_dt  = now.replace(hour=fc_h, minute=fc_m, second=0, microsecond=0)
+            if (now > force_dt
+                    and not sx["spreads"]
+                    and sx.get("eod_notified") != today_str
+                    and sx.get("attempts_today", 0) > 0):
+                sx["eod_notified"] = today_str
+                closed  = sx.get("closed_today", [])
+                wins    = sum(1 for t in closed if t.get("exit_type") == "profit_target")
+                losses  = sum(1 for t in closed if t.get("exit_type") == "stop_loss")
+                skipped = sx["attempts_today"] - len(closed)
+                _spx_notify(
+                    f"📊 <b>SPX 0DTE Daily Summary</b> — {today_str}\n"
+                    f"Day P&amp;L: <b>${sx['today_pnl']:+.0f}</b>\n"
+                    f"Trades: {len(closed)}   ✅ {wins} wins   🛑 {losses} stops"
+                    + (f"   ⏭ {skipped} skipped" if skipped else "") + "\n"
+                    + "\n".join(
+                        f"  #{i+1}  {t.get('strategy',''):<12}  "
+                        f"{'✅' if t.get('exit_type')=='profit_target' else '🛑' if t.get('exit_type')=='stop_loss' else '⏰'}  "
+                        f"${t.get('pnl',0):+.0f}"
+                        for i, t in enumerate(closed)
+                    )
+                )
         except Exception as exc:
             log.warning("SPX 0DTE loop error: %s", exc)
+        await asyncio.sleep(30)
+
+
+# ── Earnings Volatility Crush — core async functions ──────────────────────────
+
+async def _evc_scan_universe(ib) -> list:
+    """Return CANDIDATE_POOL tickers (excluding ETFs) with earnings tonight (days_out==0)."""
+    ev    = state["evc"]
+    today = date.today().isoformat()
+    if ev.get("scan_date") == today:
+        # Already scanned today — return tickers already identified
+        return [p["ticker"] for p in ev["positions"].values()]
+    candidates = []
+    universe   = [t for t in CANDIDATE_POOL if t not in _EVC_ETF_SET]
+    _evc_log("SCAN", "universe", f"checking {len(universe)} tickers for tonight's earnings")
+    for ticker in universe:
+        try:
+            days = await _earnings_days_out(ticker)
+            # days==0: earnings today AH (announce tonight)
+            # days==1: earnings tomorrow — catch BMO reporters (8 AM before open)
+            #          IV crush still happens next morning for both cases
+            if days in (0, 1):
+                label = "earnings tonight (AH)" if days == 0 else "earnings tomorrow (BMO/AH)"
+                candidates.append(ticker)
+                _evc_log("CANDIDATE", ticker, label)
+        except Exception as exc:
+            log.debug("EVC earnings check %s: %s", ticker, exc)
+    ev["scan_date"] = today
+    _evc_log("SCAN_DONE", "universe", f"found {len(candidates)} earnings tonight: {candidates}")
+    _evc_save_state()
+    return candidates
+
+
+async def _evc_get_stock_price(ib, ticker: str) -> float:
+    """Get current stock price via reqMktData."""
+    from ib_insync import Stock as IbStock
+    c = IbStock(ticker, "SMART", "USD")
+    await ib.qualifyContractsAsync(c)
+    td = ib.reqMktData(c, "", False, False)
+    await asyncio.sleep(3)
+    px = _spx_safe_px(td.last) or _spx_safe_px(td.close)
+    ib.cancelMktData(c)
+    return px
+
+
+async def _evc_get_chain_params(ib, ticker: str) -> tuple[str, list[float]]:
+    """
+    Return (nearest_expiry_YYYYMMDD, sorted_strikes) using real option chain data.
+    Uses reqSecDefOptParamsAsync — same pattern as IV refresh — so the expiry and
+    strikes we compute are guaranteed to exist in IBKR's chain (no phantom probing).
+    """
+    from ib_insync import Stock as IbStock
+    from datetime import timedelta
+
+    stk = IbStock(ticker, "SMART", "USD")
+    await ib.qualifyContractsAsync(stk)
+    if not stk.conId:
+        raise ValueError(f"cannot qualify stock contract for {ticker}")
+
+    chains = await ib.reqSecDefOptParamsAsync(ticker, "", "STK", stk.conId)
+    if not chains:
+        raise ValueError(f"no option chain params for {ticker}")
+    chain = next((c for c in chains if c.exchange == "SMART"), chains[0])
+
+    tomorrow_str = (date.today() + timedelta(days=1)).strftime("%Y%m%d")
+    future_expiries = sorted(e for e in chain.expirations if e >= tomorrow_str)
+    if not future_expiries:
+        raise ValueError(f"no future expiries in option chain for {ticker}")
+
+    return future_expiries[0], sorted(chain.strikes)
+
+
+async def _evc_quote_condor(ib, ticker: str) -> dict:
+    """
+    Build iron condor quote for ticker.
+    Returns dict with all strike/credit data, or raises ValueError if no valid trade.
+    """
+    from ib_insync import Option as IbOpt
+    ev  = state["evc"]
+    cfg = ev["config"]
+
+    # 1. Stock price
+    spot = await _evc_get_stock_price(ib, ticker)
+    if spot <= 0:
+        raise ValueError(f"no stock price for {ticker}")
+
+    # 2. Expiry + real strikes from chain (avoids qualifying phantom strikes)
+    expiry, real_strikes = await _evc_get_chain_params(ib, ticker)
+    if not real_strikes:
+        raise ValueError(f"empty strike list for {ticker}")
+
+    def _nearest(target: float) -> float:
+        return min(real_strikes, key=lambda s: abs(s - target))
+
+    # 3. ATM strike from real chain
+    atm = _nearest(spot)
+
+    # 4. Quote ATM call + put to get expected move
+    atm_call = IbOpt(ticker, expiry, atm, "C", "SMART", "100", "USD")
+    atm_put  = IbOpt(ticker, expiry, atm, "P", "SMART", "100", "USD")
+    await ib.qualifyContractsAsync(atm_call, atm_put)
+    if not atm_call.conId or not atm_put.conId:
+        raise ValueError(f"cannot qualify ATM options for {ticker} exp {expiry}")
+
+    td_c = ib.reqMktData(atm_call, "100,101,106", False, False)
+    td_p = ib.reqMktData(atm_put,  "100,101,106", False, False)
+    await asyncio.sleep(5)
+    call_mid = _spx_mid(td_c)
+    put_mid  = _spx_mid(td_p)
+    ib.cancelMktData(atm_call)
+    ib.cancelMktData(atm_put)
+
+    if call_mid <= 0 or put_mid <= 0:
+        raise ValueError(f"no ATM option quotes for {ticker}: call={call_mid} put={put_mid}")
+
+    expected_move = round(call_mid + put_mid, 2)
+    if expected_move < 1.0:
+        raise ValueError(f"expected move too small ({expected_move:.2f}) for {ticker}")
+    if expected_move / spot > 0.25:
+        raise ValueError(f"expected move implausibly large ({expected_move:.2f}/{spot:.2f}) for {ticker}")
+
+    # 5. Condor strikes — nearest real strike to each target
+    short_put  = _nearest(spot - expected_move)
+    short_call = _nearest(spot + expected_move)
+    long_put   = _nearest(spot - cfg["wing_mult"] * expected_move)
+    long_call  = _nearest(spot + cfg["wing_mult"] * expected_move)
+
+    if long_put >= short_put or short_call >= long_call:
+        raise ValueError(f"invalid condor strikes: {long_put}/{short_put}/{short_call}/{long_call}")
+
+    # 6. Quote the 4 OTM legs
+    c_lp = IbOpt(ticker, expiry, long_put,   "P", "SMART", "100", "USD")
+    c_sp = IbOpt(ticker, expiry, short_put,  "P", "SMART", "100", "USD")
+    c_sc = IbOpt(ticker, expiry, short_call, "C", "SMART", "100", "USD")
+    c_lc = IbOpt(ticker, expiry, long_call,  "C", "SMART", "100", "USD")
+    await ib.qualifyContractsAsync(c_lp, c_sp, c_sc, c_lc)
+    if not all([c_lp.conId, c_sp.conId, c_sc.conId, c_lc.conId]):
+        raise ValueError(f"cannot qualify condor legs for {ticker}")
+
+    td_lp = ib.reqMktData(c_lp, "100,101,106", False, False)
+    td_sp = ib.reqMktData(c_sp, "100,101,106", False, False)
+    td_sc = ib.reqMktData(c_sc, "100,101,106", False, False)
+    td_lc = ib.reqMktData(c_lc, "100,101,106", False, False)
+    await asyncio.sleep(5)
+
+    lp_mid = _spx_mid(td_lp)
+    sp_mid = _spx_mid(td_sp)
+    sc_mid = _spx_mid(td_sc)
+    lc_mid = _spx_mid(td_lc)
+    for c_ in [c_lp, c_sp, c_sc, c_lc]:
+        ib.cancelMktData(c_)
+
+    if any(v <= 0 for v in [sp_mid, sc_mid]):
+        raise ValueError(f"no quotes on short legs for {ticker}: sp={sp_mid} sc={sc_mid}")
+
+    net_credit = round(sp_mid + sc_mid - lp_mid - lc_mid, 2)
+    if net_credit < cfg["min_credit"]:
+        raise ValueError(f"net credit {net_credit:.2f} below minimum {cfg['min_credit']:.2f}")
+
+    return {
+        "ticker":         ticker,
+        "expiry":         expiry,
+        "spot":           spot,
+        "expected_move":  expected_move,
+        "atm":            atm,
+        "long_put":       long_put,
+        "short_put":      short_put,
+        "short_call":     short_call,
+        "long_call":      long_call,
+        "long_put_conid":   c_lp.conId,
+        "short_put_conid":  c_sp.conId,
+        "short_call_conid": c_sc.conId,
+        "long_call_conid":  c_lc.conId,
+        "net_credit":     net_credit,
+    }
+
+
+async def _evc_place_condor(ib, quote: dict) -> bool:
+    """Place the iron condor as a 4-leg BAG order. Returns True on success."""
+    from ib_insync import Contract as IbCont, ComboLeg
+    ticker = quote["ticker"]
+    ev     = state["evc"]
+
+    bag = IbCont()
+    bag.symbol   = ticker
+    bag.secType  = "BAG"
+    bag.exchange = "SMART"
+    bag.currency = "USD"
+
+    l1 = ComboLeg(); l1.conId = quote["long_put_conid"];   l1.ratio = 1; l1.action = "BUY";  l1.exchange = "SMART"
+    l2 = ComboLeg(); l2.conId = quote["short_put_conid"];  l2.ratio = 1; l2.action = "SELL"; l2.exchange = "SMART"
+    l3 = ComboLeg(); l3.conId = quote["short_call_conid"]; l3.ratio = 1; l3.action = "SELL"; l3.exchange = "SMART"
+    l4 = ComboLeg(); l4.conId = quote["long_call_conid"];  l4.ratio = 1; l4.action = "BUY";  l4.exchange = "SMART"
+    bag.comboLegs = [l1, l2, l3, l4]
+
+    credit = max(0.01, round(quote["net_credit"], 2))
+    ord_   = LimitOrder("SELL", 1, credit)
+    ord_.tif = "DAY"
+
+    trade  = ib.placeOrder(bag, ord_)
+    await asyncio.sleep(1)
+    order_id = trade.order.orderId
+
+    # Wait up to 30s for fill
+    for _ in range(30):
+        await asyncio.sleep(1)
+        if trade.orderStatus.status in ("Filled", "Submitted"):
+            break
+
+    filled_credit = float(trade.orderStatus.avgFillPrice or credit)
+    pos_id = f"{ticker}_{date.today().strftime('%Y%m%d')}"
+    pos = {
+        "pos_id":        pos_id,
+        "ticker":        ticker,
+        "date":          date.today().isoformat(),
+        "expiry":        quote["expiry"],
+        "spot_at_entry": quote["spot"],
+        "expected_move": quote["expected_move"],
+        "short_put":     quote["short_put"],
+        "short_call":    quote["short_call"],
+        "long_put":      quote["long_put"],
+        "long_call":     quote["long_call"],
+        "qty":           1,
+        "conids": {
+            "long_put":   quote["long_put_conid"],
+            "short_put":  quote["short_put_conid"],
+            "short_call": quote["short_call_conid"],
+            "long_call":  quote["long_call_conid"],
+        },
+        "order_id":   order_id,
+        "net_credit": round(filled_credit, 2),
+        "phase":      "open",
+        "live_pnl":   0.0,
+    }
+    ev["positions"][pos_id] = pos
+    _evc_log("ENTERED", ticker,
+             f"condor {quote['long_put']}/{quote['short_put']}P | "
+             f"{quote['short_call']}/{quote['long_call']}C  "
+             f"EM={quote['expected_move']:.2f}  credit={filled_credit:.2f}  "
+             f"order={order_id}")
+    # Journal insert
+    try:
+        con = sqlite3.connect(JOURNAL_DB_PATH, check_same_thread=False)
+        con.execute("""
+            INSERT INTO trade_journal
+                (opened_at, ticker, action, qty, entry_price, strategy_type, spot_price)
+            VALUES (?,?,?,?,?,?,?)
+        """, (date.today().isoformat(), ticker, "SELL_CONDOR", 1,
+              filled_credit, "earnings_vol_crush", quote["spot"]))
+        con.commit()
+        con.close()
+    except Exception as exc:
+        log.warning("EVC journal insert failed: %s", exc)
+    _evc_save_state()
+    return True
+
+
+async def _evc_close_position(ib, pos_id: str, reason: str) -> None:
+    """Market-close all 4 legs of the condor and record result."""
+    from ib_insync import Option as IbOpt
+    ev  = state["evc"]
+    pos = ev["positions"].get(pos_id)
+    if not pos or pos["phase"] != "open":
+        return
+    pos["phase"] = "closing"
+    ticker = pos["ticker"]
+    expiry = pos["expiry"]
+    qty    = pos["qty"]
+
+    # Close condor by buying it back (reverse of entry): BUY short legs, SELL long legs
+    leg_defs = [
+        (pos["long_put"],   "P", pos["conids"]["long_put"],   "SELL"),
+        (pos["short_put"],  "P", pos["conids"]["short_put"],  "BUY"),
+        (pos["short_call"], "C", pos["conids"]["short_call"], "BUY"),
+        (pos["long_call"],  "C", pos["conids"]["long_call"],  "SELL"),
+    ]
+    close_fills = []
+    for strike, right, conid, action in leg_defs:
+        try:
+            c = IbOpt(ticker, expiry, strike, right, "SMART", "100", "USD")
+            c.conId = conid
+            mkt = Order()
+            mkt.orderType = "MKT"; mkt.action = action
+            mkt.totalQuantity = qty; mkt.tif = "DAY"
+            trade = ib.placeOrder(c, mkt)
+            await asyncio.sleep(0.5)
+            close_fills.append(float(trade.orderStatus.avgFillPrice or 0))
+        except Exception as exc:
+            log.warning("EVC close leg %s%s failed: %s", right, strike, exc)
+    await asyncio.sleep(2)
+
+    close_cost = sum(close_fills)
+    net_credit = pos["net_credit"]
+    pnl        = round((net_credit - close_cost) * qty * 100, 2)
+    pnl_pct    = round(pnl / (net_credit * qty * 100) * 100, 1) if net_credit else 0
+    win        = 1 if pnl > 0 else 0
+
+    closed_rec = {
+        "pos_id":        pos_id,
+        "ticker":        ticker,
+        "date":          pos["date"],
+        "expiry":        expiry,
+        "expected_move": pos["expected_move"],
+        "short_put":     pos["short_put"],
+        "short_call":    pos["short_call"],
+        "net_credit":    net_credit,
+        "close_cost":    round(close_cost, 2),
+        "pnl":           pnl,
+        "pnl_pct":       pnl_pct,
+        "win":           win,
+        "exit_reason":   reason,
+    }
+    ev["closed_today"].append(closed_rec)
+    ev["positions"].pop(pos_id, None)
+
+    # Journal update
+    try:
+        con = sqlite3.connect(JOURNAL_DB_PATH, check_same_thread=False)
+        con.execute("""
+            UPDATE trade_journal
+            SET closed_at=?, exit_price=?, pnl=?, pnl_pct=?, win=?, exit_reason=?
+            WHERE ticker=? AND strategy_type='earnings_vol_crush' AND closed_at IS NULL
+            ORDER BY id DESC LIMIT 1
+        """, (date.today().isoformat(), round(close_cost, 2),
+              pnl, pnl_pct, win, reason, ticker))
+        con.commit()
+        con.close()
+    except Exception as exc:
+        log.warning("EVC journal update failed: %s", exc)
+
+    _evc_log("CLOSED", ticker, f"exit={reason}  P&L=${pnl:.2f} ({pnl_pct:.1f}%)")
+    _evc_save_state()
+
+
+async def _evc_entry_coro(ib) -> None:
+    """Scan universe and enter condors for tonight's earnings reporters."""
+    ev  = state["evc"]
+    cfg = ev["config"]
+    if ev["scanning"]:
+        return
+    if len(ev["positions"]) >= cfg["max_positions"]:
+        return
+    ev["scanning"] = True
+    try:
+        candidates = await _evc_scan_universe(ib)
+        for ticker in candidates:
+            if len(ev["positions"]) >= cfg["max_positions"]:
+                break
+            if ticker in ev["positions"] or any(p["ticker"] == ticker for p in ev["positions"].values()):
+                continue
+            try:
+                _evc_log("QUOTING", ticker, "requesting condor quote")
+                quote = await _evc_quote_condor(ib, ticker)
+                _evc_log("QUOTE_OK", ticker,
+                         f"EM={quote['expected_move']:.2f}  credit={quote['net_credit']:.2f}  "
+                         f"strikes={quote['long_put']}/{quote['short_put']}P | "
+                         f"{quote['short_call']}/{quote['long_call']}C")
+                await _evc_place_condor(ib, quote)
+            except ValueError as ve:
+                _evc_log("SKIPPED", ticker, str(ve))
+            except Exception as exc:
+                _evc_log("ERROR", ticker, str(exc))
+                log.warning("EVC entry error %s: %s", ticker, exc)
+    finally:
+        ev["scanning"] = False
+
+
+async def _evc_exit_coro(ib) -> None:
+    """Close all open EVC positions (IV crush exit at morning open)."""
+    ev = state["evc"]
+    for pos_id in list(ev["positions"].keys()):
+        pos = ev["positions"].get(pos_id)
+        if pos and pos["phase"] == "open":
+            await _evc_close_position(ib, pos_id, "iv_crush_exit")
+
+
+async def _evc_monitor_loop() -> None:
+    """Background loop: handles EVC entry (3:30-3:50 PM) and exit (9:31-9:35 AM) windows."""
+    await asyncio.sleep(50)
+    while True:
+        try:
+            from zoneinfo import ZoneInfo
+            ET  = ZoneInfo("America/New_York")
+            now = datetime.now(ET)
+            if now.weekday() >= 5:
+                await asyncio.sleep(300)
+                continue
+            ev  = state["evc"]
+            if not ev["enabled"]:
+                await asyncio.sleep(30)
+                continue
+            ib = state.get("ib")
+            if not ib or not ib.isConnected():
+                await asyncio.sleep(30)
+                continue
+
+            def _t(hhmm):
+                h, m = map(int, hhmm.split(":"))
+                return now.replace(hour=h, minute=m, second=0, microsecond=0)
+
+            cfg = ev["config"]
+            loop = asyncio.get_event_loop()
+
+            # EXIT: morning IV crush close (highest priority)
+            if _t(cfg["exit_start"]) <= now <= _t(cfg["exit_cutoff"]):
+                if ev["positions"]:
+                    await loop.run_in_executor(
+                        None,
+                        lambda: _run_in_streaming_loop(_evc_exit_coro(ib), timeout=120))
+
+            # ENTRY: afternoon pre-earnings window
+            elif _t(cfg["entry_start"]) <= now <= _t(cfg["entry_cutoff"]):
+                if len(ev["positions"]) < cfg["max_positions"] and not ev["scanning"]:
+                    await loop.run_in_executor(
+                        None,
+                        lambda: _run_in_streaming_loop(_evc_entry_coro(ib), timeout=300))
+
+            # LIVE P&L + intraday stop check (any time positions are open)
+            if ev["positions"]:
+                from ib_insync import Option as IbOpt
+                for pos_id, pos in list(ev["positions"].items()):
+                    if pos["phase"] != "open":
+                        continue
+                    try:
+                        net_credit = pos["net_credit"]
+                        ticker     = pos["ticker"]
+                        expiry     = pos["expiry"]
+                        # Quote each leg and compute current condor value (cost to buy back)
+                        conids = pos["conids"]
+                        leg_map = [
+                            (pos["short_put"],  "P", conids["short_put"]),
+                            (pos["short_call"], "C", conids["short_call"]),
+                        ]
+                        current_cost = 0.0
+                        for strike, right, conid in leg_map:
+                            c = IbOpt(ticker, expiry, strike, right, "SMART", "100", "USD")
+                            c.conId = conid
+                            td = ib.reqMktData(c, "100,101,106", False, False)
+                            await asyncio.sleep(2)
+                            current_cost += _spx_mid(td)
+                            ib.cancelMktData(c)
+                        live_pnl = round((net_credit - current_cost) * pos["qty"] * 100, 2)
+                        pos["live_pnl"] = live_pnl
+                        # Intraday stop
+                        max_loss = -(net_credit * pos["qty"] * 100 * cfg["max_loss_pct"] / 100)
+                        if live_pnl < max_loss:
+                            _evc_log("STOP", ticker, f"live_pnl=${live_pnl:.2f} < max_loss=${max_loss:.2f}")
+                            await loop.run_in_executor(
+                                None,
+                                lambda pid=pos_id: _run_in_streaming_loop(
+                                    _evc_close_position(ib, pid, "max_loss_stop"), timeout=60))
+                    except Exception as exc:
+                        log.debug("EVC P&L update %s: %s", pos_id, exc)
+                _evc_save_state()
+
+        except Exception as exc:
+            log.warning("EVC monitor loop error: %s", exc)
         await asyncio.sleep(30)
 
 
 # ── SPX 0DTE endpoints ─────────────────────────────────────────────────────────
 
 class SPXConfigRequest(BaseModel):
-    daily_profit_target:   Optional[float] = None
-    spread_width:          Optional[int]   = None
-    otm_pct:               Optional[float] = None
-    profit_pct:            Optional[float] = None
-    stop_loss_mult:        Optional[float] = None
-    entry_start_time:      Optional[str]   = None
-    entry_cutoff_time:     Optional[str]   = None
-    force_close_time:      Optional[str]   = None
-    max_attempts:          Optional[int]   = None
-    max_margin:            Optional[float] = None
-    min_credit_per_spread: Optional[float] = None
+    daily_profit_target:   Optional[float]      = None
+    trade_targets:         Optional[list[float]] = None
+    spread_width:          Optional[int]         = None
+    otm_pct:               Optional[float]       = None
+    profit_pct:            Optional[float]       = None
+    stop_loss_mult:        Optional[float]       = None
+    stop_loss_tiers:       Optional[list[float]] = None
+    daily_floor_pnl:       Optional[float]       = None
+    entry_start_time:      Optional[str]         = None
+    entry_cutoff_time:     Optional[str]         = None
+    force_close_time:      Optional[str]         = None
+    max_attempts:          Optional[int]         = None
+    max_margin:            Optional[float]       = None
+    min_credit_per_spread: Optional[float]       = None
 
 
 @app.get("/spx-0dte/status")
@@ -12088,10 +12813,11 @@ def spx_0dte_status():
         "summary": {
             "open_spreads":   len(sx["spreads"]),
             "today_pnl":      pnl,
-            "goal_pct":       round(pnl / cfg["daily_profit_target"] * 100, 1)
-                              if cfg["daily_profit_target"] > 0 else 0,
             "attempts_today": sx.get("attempts_today", 0),
             "closed_trades":  len(sx.get("closed_today", [])),
+            "trade_targets":  cfg.get("trade_targets") or [cfg["daily_profit_target"]],
+            "next_target":    (cfg.get("trade_targets") or [cfg["daily_profit_target"]])[sx.get("attempts_today", 0)]
+                              if sx.get("attempts_today", 0) < len(cfg.get("trade_targets") or [cfg["daily_profit_target"]]) else None,
         },
     }
 
@@ -12102,7 +12828,7 @@ def spx_0dte_history(limit: int = 50):
     try:
         con  = sqlite3.connect(JOURNAL_DB_PATH, check_same_thread=False)
         rows = con.execute("""
-            SELECT opened_at, closed_at, qty, entry_price, exit_price,
+            SELECT opened_at, closed_at, expiry, qty, entry_price, exit_price,
                    pnl, pnl_pct, win, exit_reason, spot_price
             FROM trade_journal
             WHERE strategy_type = 'SPX_0DTE'
@@ -12113,14 +12839,15 @@ def spx_0dte_history(limit: int = 50):
             {
                 "date":         r[0],
                 "closed_at":    r[1],
-                "qty":          r[2],
-                "total_credit": round(r[3], 2) if r[3] else None,
-                "exit_price":   round(r[4], 2) if r[4] else None,
-                "pnl":          round(r[5], 2) if r[5] else None,
-                "pnl_pct":      round(r[6], 1) if r[6] else None,
-                "win":          bool(r[7]),
-                "exit_type":    r[8],
-                "spot":         round(r[9], 0) if r[9] else None,
+                "expiry":       r[2],
+                "qty":          r[3],
+                "total_credit": round(r[4], 2) if r[4] else None,
+                "exit_price":   round(r[5], 2) if r[5] else None,
+                "pnl":          round(r[6], 2) if r[6] else None,
+                "pnl_pct":      round(r[7], 1) if r[7] else None,
+                "win":          bool(r[8]),
+                "exit_type":    r[9],
+                "spot":         round(r[10], 0) if r[10] else None,
             } for r in rows
         ]}
     except Exception as exc:
@@ -12161,6 +12888,107 @@ async def spx_0dte_close(spread_id: str):
         None,
         lambda: _run_in_streaming_loop(_spx_close_spread(ib, spread_id, "manual_close"), timeout=20))
     return {"status": "closing", "spread_id": spread_id}
+
+
+# ── Earnings Volatility Crush endpoints ────────────────────────────────────────
+
+class EVCConfigRequest(BaseModel):
+    max_positions: Optional[int]   = None
+    min_credit:    Optional[float] = None
+    wing_mult:     Optional[float] = None
+    entry_start:   Optional[str]   = None
+    entry_cutoff:  Optional[str]   = None
+    exit_start:    Optional[str]   = None
+    exit_cutoff:   Optional[str]   = None
+    max_loss_pct:  Optional[float] = None
+
+
+@app.get("/earnings-vol-crush/status")
+def evc_status():
+    ev  = state["evc"]
+    cfg = ev["config"]
+    closed = ev.get("closed_today", [])
+    today_pnl = round(sum(r.get("pnl", 0) for r in closed), 2)
+    return {
+        "enabled":      ev["enabled"],
+        "config":       cfg,
+        "positions":    ev["positions"],
+        "closed_today": closed,
+        "decisions":    ev.get("decisions", [])[-50:],
+        "summary": {
+            "open_positions":   len(ev["positions"]),
+            "closed_today":     len(closed),
+            "today_pnl":        today_pnl,
+            "scan_date":        ev.get("scan_date"),
+        },
+    }
+
+
+@app.get("/earnings-vol-crush/history")
+def evc_history(limit: int = 50):
+    try:
+        con  = sqlite3.connect(JOURNAL_DB_PATH, check_same_thread=False)
+        rows = con.execute("""
+            SELECT opened_at, closed_at, ticker, qty, entry_price, exit_price,
+                   pnl, pnl_pct, win, exit_reason, spot_price
+            FROM trade_journal
+            WHERE strategy_type = 'earnings_vol_crush'
+            ORDER BY id DESC LIMIT ?
+        """, (limit,)).fetchall()
+        con.close()
+        return {"history": [
+            {
+                "date":        r[0],
+                "closed_at":   r[1],
+                "ticker":      r[2],
+                "qty":         r[3],
+                "net_credit":  round(r[4], 2) if r[4] else None,
+                "close_cost":  round(r[5], 2) if r[5] else None,
+                "pnl":         round(r[6], 2) if r[6] else None,
+                "pnl_pct":     round(r[7], 1) if r[7] else None,
+                "win":         bool(r[8]),
+                "exit_reason": r[9],
+                "spot":        round(r[10], 2) if r[10] else None,
+            } for r in rows
+        ]}
+    except Exception as exc:
+        return {"history": [], "error": str(exc)}
+
+
+@app.post("/earnings-vol-crush/enable")
+def evc_enable(enabled: bool = True):
+    ev = state["evc"]
+    ev["enabled"] = enabled
+    _evc_log("CONFIG", "system", f"{'enabled' if enabled else 'disabled'} by user")
+    _evc_save_state()
+    return {"enabled": ev["enabled"]}
+
+
+@app.post("/earnings-vol-crush/config")
+def evc_config(req: EVCConfigRequest):
+    ev  = state["evc"]
+    cfg = ev["config"]
+    updates = req.model_dump(exclude_none=True)
+    cfg.update(updates)
+    _evc_log("CONFIG", "system", f"updated: {updates}")
+    _evc_save_state()
+    return {"config": cfg}
+
+
+@app.post("/earnings-vol-crush/close/{pos_id}")
+async def evc_close(pos_id: str):
+    ev = state["evc"]
+    if pos_id not in ev["positions"]:
+        raise HTTPException(404, f"{pos_id} not found in open positions")
+    ib = state.get("ib")
+    if not ib or not ib.isConnected():
+        raise HTTPException(503, "IBKR not connected")
+    _evc_log("MANUAL_CLOSE", ev["positions"][pos_id]["ticker"], f"manual close requested for {pos_id}")
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(
+        None,
+        lambda: _run_in_streaming_loop(_evc_close_position(ib, pos_id, "manual_close"), timeout=60))
+    return {"status": "closing", "pos_id": pos_id}
 
 
 # ── Live Tape WebSocket ─────────────────────────────────────────────────────
