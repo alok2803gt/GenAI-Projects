@@ -430,20 +430,33 @@ state: Dict = {
     "spx_0dte": {
         "enabled": False,
         "config": {
-            "daily_profit_target":   200.0,  # $ daily goal (used as fallback if trade_targets not set)
-            "trade_targets":  [200, 150, 100, 50],  # per-trade profit targets ($); one entry per allowed trade
-            "spread_width":          25,     # points per spread leg (25 = $2500 max risk/contract)
-            "otm_pct":               0.5,    # % OTM for the short strike (~35 pts OTM at SPX 7000)
-            "profit_pct":            50.0,   # % of credit collected used to size qty toward tier target
-            "stop_loss_mult":        2.0,    # fallback if stop_loss_tiers not set
-            "stop_loss_tiers":  [2.0, 1.5, 1.0, 1.0],  # per-attempt stop mult: trade1=2×, trade2=1.5×, trade3+=1×
-            "daily_floor_pnl":       200.0,  # protect this $ profit once earned; new entry sized so stop can't breach floor
-            "entry_start_time":     "09:45", # earliest IC entry
-            "entry_cutoff_time":    "14:00", # no new entries after this (gamma risk after ~14:00)
-            "force_close_time":     "15:45", # MKT close all legs regardless
-            "max_attempts":          5,      # hard cap on IC entries per day (overrides trade_targets length)
-            "max_margin":        20000.0,    # max notional margin to deploy
-            "min_credit_per_spread": 0.20,   # skip if net credit < this per spread
+            # ── Morning IC phase (9:45–12:00): standard iron condor ────────────
+            "entry_start_time":       "09:45",
+            "morning_entry_cutoff":   "12:00",
+            "profit_pct_morning":      50.0,  # % of credit to target as profit (50% of ~$900 = ~$450)
+            "stop_loss_tiers":  [2.0, 1.5, 1.0, 1.0],  # per morning-attempt stop mult
+            # ── Afternoon theta phase (13:30–14:30): pure time-decay play ──────
+            "afternoon_entry_start":  "13:30",
+            "afternoon_entry_cutoff": "14:30",
+            "profit_pct_afternoon":    80.0,  # grab most of remaining premium; theta fast after 1 PM
+            "stop_mult_afternoon":      1.0,  # tight stop — big move this late = get out fast
+            "max_afternoon_attempts":   1,    # one afternoon play per day
+            # ── VIX filters: high vol = skip entry ────────────────────────────
+            "vix_max_morning":         25.0,  # skip morning IC if VIX > this (volatile open)
+            "vix_max_afternoon":       18.0,  # skip afternoon play if VIX > this (decay unreliable)
+            # ── Shared ────────────────────────────────────────────────────────
+            "spread_width":            25,    # points per spread leg ($2500 max risk/contract)
+            "otm_pct":                  0.5,  # % OTM for short strike (~35 pts OTM at SPX 7000)
+            "daily_floor_pnl":        200.0,  # protect this $ profit; size so stop can't breach floor
+            "force_close_time":       "15:45",
+            "max_attempts":             5,    # hard cap across both phases
+            "max_margin":           20000.0,
+            "min_credit_per_spread":    0.20,
+            "skip_dates":              [],    # ["YYYY-MM-DD"] — FOMC, CPI, NFP days to skip entirely
+            # ── Legacy (kept for display / backward compat) ───────────────────
+            "daily_profit_target":    200.0,
+            "profit_pct":              50.0,
+            "stop_loss_mult":           2.0,
         },
         "spreads":        {},   # spread_id → spread dict
         "closed_today":   [],
@@ -12020,8 +12033,32 @@ async def _spx_close_spread(ib, spread_id: str, exit_type: str) -> None:
     _spx_save_state()
 
 
+async def _spx_get_vix(ib) -> float:
+    """Return current VIX level via IBKR. Returns 0.0 if unavailable."""
+    try:
+        from ib_insync import Index
+        vix_contract = Index("VIX", "CBOE", "USD")
+        td = ib.reqMktData(vix_contract, "100,101", False, False)
+        await asyncio.sleep(3)
+        mid = _spx_mid(td)
+        ib.cancelMktData(vix_contract)
+        if mid > 0:
+            return round(mid, 2)
+        last = float(td.last) if td.last and td.last > 0 else 0.0
+        return last
+    except Exception as e:
+        log.warning("VIX fetch failed: %s", e)
+        return 0.0
+
+
 async def _spx_entry_coro(ib) -> None:
-    """Check all conditions and place an Iron Condor if appropriate."""
+    """Check all conditions and place an Iron Condor if appropriate.
+
+    Two phases per day:
+      Morning  (entry_start_time – morning_entry_cutoff):  50% of credit target, 2× stop
+      Afternoon (afternoon_entry_start – afternoon_entry_cutoff): 80% of credit target, 1× stop
+    VIX filter and skip_dates prevent entry on high-vol / macro days.
+    """
     from zoneinfo import ZoneInfo
     ET  = ZoneInfo("America/New_York")
     sx  = state["spx_0dte"]
@@ -12032,18 +12069,52 @@ async def _spx_entry_coro(ib) -> None:
         h, m = map(int, hhmm.split(":"))
         return now.replace(hour=h, minute=m, second=0, microsecond=0)
 
-    if not (_t(cfg["entry_start_time"]) <= now <= _t(cfg["entry_cutoff_time"])):
-        return
-    targets = cfg.get("trade_targets") or [cfg["daily_profit_target"]]
-    if sx["attempts_today"] >= min(len(targets), int(cfg["max_attempts"])):
-        return
+    # ── Hard gates ────────────────────────────────────────────────────────────
     if sx["spreads"]:
         return
+    if sx["attempts_today"] >= int(cfg.get("max_attempts", 5)):
+        return
+
+    # ── Determine which phase window we're in ────────────────────────────────
+    in_morning   = _t(cfg["entry_start_time"]) <= now <= _t(cfg.get("morning_entry_cutoff", "12:00"))
+    in_afternoon = _t(cfg.get("afternoon_entry_start", "13:30")) <= now <= _t(cfg.get("afternoon_entry_cutoff", "14:30"))
+
+    if not (in_morning or in_afternoon):
+        return
+
+    trade_phase = "morning" if in_morning else "afternoon"
+
+    # ── Afternoon cap: max 1 afternoon trade per day ─────────────────────────
+    if trade_phase == "afternoon":
+        afternoon_done = sum(
+            1 for s in sx.get("closed_today", []) if s.get("trade_phase") == "afternoon"
+        ) + sum(
+            1 for s in sx["spreads"].values() if s.get("trade_phase") == "afternoon"
+        )
+        if afternoon_done >= int(cfg.get("max_afternoon_attempts", 1)):
+            return
+
+    # ── Skip dates: FOMC, CPI, NFP etc. ──────────────────────────────────────
+    today_iso = date.today().isoformat()
+    if today_iso in cfg.get("skip_dates", []):
+        _spx_log("SKIP", f"{today_iso} is in skip_dates (macro/Fed day) — no entry")
+        return
+
+    # ── Cooldown after a stop loss (30 min) ──────────────────────────────────
     if sx.get("last_stop_time"):
         last_stop = datetime.fromisoformat(sx["last_stop_time"])
         if (now - last_stop).total_seconds() < 30 * 60:
             return
 
+    # ── VIX filter ────────────────────────────────────────────────────────────
+    vix_max = float(cfg.get(f"vix_max_{trade_phase}", 25.0 if in_morning else 18.0))
+    vix_val = await _spx_get_vix(ib)
+    if vix_val > 0 and vix_val > vix_max:
+        _spx_log("SKIP", f"VIX {vix_val:.1f} > {vix_max:.1f} max ({trade_phase} filter) — no entry")
+        return
+    vix_note = f"VIX={vix_val:.1f}" if vix_val > 0 else "VIX=n/a"
+
+    # ── Get SPX spot ──────────────────────────────────────────────────────────
     spot = await _spx_get_spot(ib)
     if spot <= 0:
         _spx_log("SKIP", "SPX spot price unavailable")
@@ -12066,60 +12137,65 @@ async def _spx_entry_coro(ib) -> None:
         return
 
     min_cred = float(cfg.get("min_credit_per_spread", 0.20))
-
-    # Allow one-sided entry: skip a leg only if its credit is below minimum.
-    # Entering a 25-pt spread for $0.10 risks $2,490 to make $10 — terrible R/R.
     use_put  = p_credit >= min_cred
     use_call = c_credit >= min_cred
 
     if not use_put and not use_call:
-        _spx_log("SKIP",
-                 f"Both legs thin: P={p_credit:.2f} C={c_credit:.2f} min={min_cred:.2f}")
+        _spx_log("SKIP", f"Both legs thin: P={p_credit:.2f} C={c_credit:.2f} min={min_cred:.2f}")
         return
+
+    if not use_put:
+        _spx_log("INFO", f"Put leg thin ({p_credit:.2f}) — call spread only (C={c_credit:.2f})")
+    elif not use_call:
+        _spx_log("INFO", f"Call leg thin ({c_credit:.2f}) — put spread only (P={p_credit:.2f})")
 
     strategy      = "iron_condor" if (use_put and use_call) else ("call_spread" if use_call else "put_spread")
     active_credit = (p_credit if use_put else 0.0) + (c_credit if use_call else 0.0)
 
-    if not use_put:
-        _spx_log("INFO", f"Put leg thin ({p_credit:.2f}) — entering call spread only (C={c_credit:.2f})")
-    elif not use_call:
-        _spx_log("INFO", f"Call leg thin ({c_credit:.2f}) — entering put spread only (P={p_credit:.2f})")
+    # ── Phase-specific profit % and stop multiplier ───────────────────────────
+    profit_pct_key = "profit_pct_morning" if in_morning else "profit_pct_afternoon"
+    profit_pct     = float(cfg.get(profit_pct_key, 50.0)) / 100.0
 
-    attempt       = sx["attempts_today"]
-    tier_target   = float(targets[attempt])
-    profit_pct    = float(cfg["profit_pct"]) / 100
-    ev_per_spread = active_credit * 100 * profit_pct
+    if in_morning:
+        # Tiered stop: tighter on each successive morning attempt
+        morning_attempt = sum(
+            1 for s in sx.get("closed_today", []) if s.get("trade_phase") == "morning"
+        )
+        tiers     = cfg.get("stop_loss_tiers") or [cfg.get("stop_loss_mult", 2.0)]
+        stop_mult = float(tiers[min(morning_attempt, len(tiers) - 1)])
+    else:
+        stop_mult = float(cfg.get("stop_mult_afternoon", 1.0))
+
+    # ── Qty sizing: qty=1 unless margin cap forces higher ─────────────────────
     max_by_margin = max(1, int(cfg["max_margin"] / (width * 100)))
-    qty           = min(max_by_margin, max(1, int(np.ceil(tier_target / ev_per_spread))))
+    qty           = min(max_by_margin, 1)   # one contract default; scale up if margin allows
 
-    # ── Tiered stop loss: tighter on later attempts ───────────────────────
-    tiers     = cfg.get("stop_loss_tiers") or [cfg.get("stop_loss_mult", 2.0)]
-    stop_mult = float(tiers[min(attempt, len(tiers) - 1)])
-
-    # ── Daily floor protection: size qty so a full stop can't breach floor ─
-    floor     = float(cfg.get("daily_floor_pnl", 0.0))
-    day_pnl   = float(sx.get("today_pnl", 0.0))
+    # ── Daily floor protection: size qty so a full stop can't breach floor ────
+    floor   = float(cfg.get("daily_floor_pnl", 0.0))
+    day_pnl = float(sx.get("today_pnl", 0.0))
     if floor > 0 and day_pnl >= floor:
-        headroom           = day_pnl - floor          # $ we can afford to lose
-        stop_per_contract  = active_credit * 100 * stop_mult
-        floor_qty          = int(headroom / stop_per_contract) if stop_per_contract > 0 else 0
+        headroom          = day_pnl - floor
+        stop_per_contract = active_credit * 100 * stop_mult
+        floor_qty         = int(headroom / stop_per_contract) if stop_per_contract > 0 else 0
         if floor_qty == 0:
             _spx_log("SKIP_FLOOR",
                      f"day_pnl=${day_pnl:.0f} floor=${floor:.0f} "
-                     f"headroom=${headroom:.0f} < stop/contract=${stop_per_contract:.0f} "
-                     f"(attempt {attempt+1}, stop={stop_mult}×)")
+                     f"headroom=${headroom:.0f} < stop/contract=${stop_per_contract:.0f}")
             return
         if floor_qty < qty:
-            _spx_log("INFO",
-                     f"Floor protection: qty {qty}→{floor_qty} "
-                     f"(headroom=${headroom:.0f} / stop/contract=${stop_per_contract:.0f})")
+            _spx_log("INFO", f"Floor protection: qty {qty}→{floor_qty}")
             qty = floor_qty
 
+    total_credit_dollar  = round(qty * active_credit * 100, 2)
+    profit_target_dollar = round(total_credit_dollar * profit_pct, 2)
+
     _spx_log("ENTRY",
-             f"SPX {spot:.0f}  strategy={strategy}  attempt={attempt+1}  stop={stop_mult}× | "
+             f"SPX {spot:.0f}  [{trade_phase.upper()}]  strategy={strategy}  "
+             f"attempt={sx['attempts_today']+1}  {vix_note}  stop={stop_mult}× | "
              + (f"P {int(put_short_k)}/{int(put_long_k)} cr={p_credit:.2f} | " if use_put else "")
              + (f"C {int(call_short_k)}/{int(call_long_k)} cr={c_credit:.2f} | " if use_call else "")
-             + f"qty={qty}  total_cr=${qty*active_credit*100:.0f}  floor=${floor:.0f}")
+             + f"qty={qty}  total_cr=${total_credit_dollar:.0f}  "
+             + f"target=${profit_target_dollar:.0f} ({profit_pct*100:.0f}%)  floor=${floor:.0f}")
 
     p_oid = c_oid = None
     try:
@@ -12133,42 +12209,44 @@ async def _spx_entry_coro(ib) -> None:
         _spx_log("ERROR", f"Order placement failed: {e}")
         return
 
-    total_credit_dollar = round(qty * active_credit * 100, 2)
     spread_id = f"{strategy[:2].upper()}_{now.strftime('%H%M')}"
     sx["spreads"][spread_id] = {
-        "spread_id":     spread_id,
-        "strategy":      strategy,
-        "date":          date.today().isoformat(),
-        "expiry":        expiry,
-        "spot_at_entry": spot,
-        "qty":           qty,
-        "put_short_k":   put_short_k  if use_put  else None,
-        "put_long_k":    put_long_k   if use_put  else None,
-        "call_short_k":  call_short_k if use_call else None,
-        "call_long_k":   call_long_k  if use_call else None,
-        "put_conids":    [p_s_cid, p_l_cid] if use_put  else [],
-        "call_conids":   [c_s_cid, c_l_cid] if use_call else [],
-        "put_order_id":  p_oid,
-        "call_order_id": c_oid,
-        "put_credit":    p_credit  if use_put  else 0.0,
-        "call_credit":   c_credit  if use_call else 0.0,
-        "total_credit":  total_credit_dollar,
-        "profit_target": tier_target,
-        "stop_mult":     stop_mult,
-        "max_loss":      round(qty * (width - active_credit) * 100, 2),
-        "phase":         1,
-        "live_pnl":      None,
-        "placed_at":     now.strftime("%H:%M ET"),
+        "spread_id":      spread_id,
+        "strategy":       strategy,
+        "trade_phase":    trade_phase,
+        "date":           today_iso,
+        "expiry":         expiry,
+        "spot_at_entry":  spot,
+        "qty":            qty,
+        "put_short_k":    put_short_k  if use_put  else None,
+        "put_long_k":     put_long_k   if use_put  else None,
+        "call_short_k":   call_short_k if use_call else None,
+        "call_long_k":    call_long_k  if use_call else None,
+        "put_conids":     [p_s_cid, p_l_cid] if use_put  else [],
+        "call_conids":    [c_s_cid, c_l_cid] if use_call else [],
+        "put_order_id":   p_oid,
+        "call_order_id":  c_oid,
+        "put_credit":     p_credit  if use_put  else 0.0,
+        "call_credit":    c_credit  if use_call else 0.0,
+        "total_credit":   total_credit_dollar,
+        "profit_target":  profit_target_dollar,
+        "profit_pct":     round(profit_pct * 100, 1),
+        "stop_mult":      stop_mult,
+        "max_loss":       round(qty * (width - active_credit) * 100, 2),
+        "vix_at_entry":   vix_val,
+        "phase":          1,
+        "live_pnl":       None,
+        "placed_at":      now.strftime("%H:%M ET"),
     }
     sx["attempts_today"] += 1
 
-    # Telegram entry notification
+    phase_emoji = "🌅" if in_morning else "🌆"
     _spx_notify(
-        f"📈 <b>SPX 0DTE ENTRY</b> — trade #{sx['attempts_today']}  ({strategy})\n"
-        f"SPX: {spot:.0f}   Target: <b>${tier_target:.0f}</b>   Stop: {stop_mult}×   Qty: {qty}\n"
+        f"📈 <b>SPX 0DTE ENTRY</b> {phase_emoji} {trade_phase.upper()} — trade #{sx['attempts_today']}  ({strategy})\n"
+        f"SPX: {spot:.0f}   {vix_note}   Target: <b>${profit_target_dollar:.0f}</b> ({profit_pct*100:.0f}% of cr)   Stop: {stop_mult}×   Qty: {qty}\n"
         + (f"PUT  {int(put_short_k)}/{int(put_long_k)}  cr={p_credit:.2f}\n" if use_put else "")
         + (f"CALL {int(call_short_k)}/{int(call_long_k)}  cr={c_credit:.2f}\n" if use_call else "")
-        + f"Total credit: ${qty*active_credit*100:.0f}   Floor: ${floor:.0f}"
+        + f"Total credit: ${total_credit_dollar:.0f}   Floor: ${floor:.0f}"
     )
 
     _spx_save_state()
@@ -12285,12 +12363,11 @@ async def _spx_monitor_loop() -> None:
                 await loop.run_in_executor(
                     None,
                     lambda: _run_in_streaming_loop(_spx_monitor_coro(ib), timeout=25))
-            _targets = sx["config"].get("trade_targets") or [sx["config"]["daily_profit_target"]]
             if (not sx["spreads"]
-                    and sx["attempts_today"] < min(len(_targets), int(sx["config"]["max_attempts"]))):
+                    and sx["attempts_today"] < int(sx["config"].get("max_attempts", 5))):
                 await loop.run_in_executor(
                     None,
-                    lambda: _run_in_streaming_loop(_spx_entry_coro(ib), timeout=35))
+                    lambda: _run_in_streaming_loop(_spx_entry_coro(ib), timeout=45))
             # EOD summary — fire once after force_close_time when no spreads remain
             cfg       = sx["config"]
             today_str = now.strftime("%Y-%m-%d")
@@ -12782,20 +12859,34 @@ async def _evc_monitor_loop() -> None:
 # ── SPX 0DTE endpoints ─────────────────────────────────────────────────────────
 
 class SPXConfigRequest(BaseModel):
-    daily_profit_target:   Optional[float]      = None
-    trade_targets:         Optional[list[float]] = None
-    spread_width:          Optional[int]         = None
-    otm_pct:               Optional[float]       = None
-    profit_pct:            Optional[float]       = None
-    stop_loss_mult:        Optional[float]       = None
-    stop_loss_tiers:       Optional[list[float]] = None
-    daily_floor_pnl:       Optional[float]       = None
-    entry_start_time:      Optional[str]         = None
-    entry_cutoff_time:     Optional[str]         = None
-    force_close_time:      Optional[str]         = None
-    max_attempts:          Optional[int]         = None
-    max_margin:            Optional[float]       = None
-    min_credit_per_spread: Optional[float]       = None
+    # Morning phase
+    entry_start_time:        Optional[str]         = None
+    morning_entry_cutoff:    Optional[str]         = None
+    profit_pct_morning:      Optional[float]       = None
+    stop_loss_tiers:         Optional[list[float]] = None
+    vix_max_morning:         Optional[float]       = None
+    # Afternoon theta phase
+    afternoon_entry_start:   Optional[str]         = None
+    afternoon_entry_cutoff:  Optional[str]         = None
+    profit_pct_afternoon:    Optional[float]       = None
+    stop_mult_afternoon:     Optional[float]       = None
+    max_afternoon_attempts:  Optional[int]         = None
+    vix_max_afternoon:       Optional[float]       = None
+    # Shared
+    spread_width:            Optional[int]         = None
+    otm_pct:                 Optional[float]       = None
+    daily_floor_pnl:         Optional[float]       = None
+    force_close_time:        Optional[str]         = None
+    max_attempts:            Optional[int]         = None
+    max_margin:              Optional[float]       = None
+    min_credit_per_spread:   Optional[float]       = None
+    skip_dates:              Optional[list[str]]   = None
+    # Legacy (kept for backward compat)
+    daily_profit_target:     Optional[float]       = None
+    trade_targets:           Optional[list[float]] = None
+    profit_pct:              Optional[float]       = None
+    stop_loss_mult:          Optional[float]       = None
+    entry_cutoff_time:       Optional[str]         = None
 
 
 @app.get("/spx-0dte/status")
