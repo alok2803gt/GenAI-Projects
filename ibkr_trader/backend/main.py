@@ -11687,10 +11687,11 @@ def day_trader_history(days: int = Query(30, ge=1, le=365)):
 
 # ── SPX 0DTE Trader ──────────────────────────────────────────────────────────
 
-# FOMC announcement dates (second day of each 2-day meeting = rate decision day).
-# Update each January when the Fed publishes the new year's schedule.
+# FOMC announcement dates — hardcoded fallback (second day of each 2-day meeting).
+# Online fetch from federalreserve.gov runs daily and overrides these.
+# Update annually in January as a backup in case the Fed site is unreachable.
 # Source: https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm
-_FOMC_DATES: dict[int, list[str]] = {
+_FOMC_DATES_FALLBACK: dict[int, list[str]] = {
     2025: [
         "2025-01-29", "2025-03-19", "2025-05-07", "2025-06-18",
         "2025-07-30", "2025-09-17", "2025-10-29", "2025-12-10",
@@ -11701,11 +11702,19 @@ _FOMC_DATES: dict[int, list[str]] = {
     ],
 }
 
+# Daily-refreshed cache: {date_iso: reason}
+_macro_cache: dict = {
+    "dates":          {},      # populated by _refresh_macro_calendar()
+    "last_refreshed": None,    # date object
+    "fomc_source":    None,    # "online" | "fallback"
+    "nfp_source":     None,    # "online" | "calculated"
+}
+
 
 def _nfp_dates(year: int) -> list[str]:
-    """First Friday of each month = NFP release day.
-    Holiday adjustments (e.g. Jan 1 landing on Friday) shift NFP to following Friday —
-    those edge cases are rare and handled via manual skip_dates override in config.
+    """First Friday of each month = NFP release day (calculated fallback).
+    Holiday shifts (e.g. Jan 1 on Friday) push NFP to the following Friday —
+    the online BLS fetch handles those edge cases correctly.
     """
     result = []
     for month in range(1, 13):
@@ -11717,23 +11726,176 @@ def _nfp_dates(year: int) -> list[str]:
     return result
 
 
-def _spx_macro_skip_dates(year: int | None = None) -> dict[str, str]:
-    """Return {date_iso: reason} for all FOMC + NFP days in the given year.
-
-    Checked dynamically at entry time so no restart is needed when the year rolls over.
-    User can still override / extend via config skip_dates (manual list).
+def _fetch_fomc_dates_online(year: int) -> list[str] | None:
+    """Scrape FOMC announcement dates from federalreserve.gov for the given year.
+    Returns list of ISO date strings, or None if fetch/parse fails.
     """
-    if year is None:
-        year = date.today().year
+    import re
+    try:
+        import requests as _req
+        r = _req.get(
+            "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm",
+            timeout=10,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; IBKRTrader/1.0)"},
+        )
+        r.raise_for_status()
+        html = r.text
+
+        _MONTH_NUM = {
+            "January": 1, "February": 2, "March": 3, "April": 4,
+            "May": 5, "June": 6, "July": 7, "August": 8,
+            "September": 9, "October": 10, "November": 11, "December": 12,
+        }
+
+        # Isolate the section for the target year.
+        # The page uses <h4>YYYY</h4> or similar markers.
+        year_match = re.search(
+            rf'(?s)(?:{year})(.+?)(?:{year + 1}|$)', html
+        )
+        if not year_match:
+            log.warning("FOMC online: year %d section not found in page", year)
+            return None
+        section = year_match.group(1)
+
+        dates: list[str] = []
+        # Match patterns like "January 28-29" or "January 29" (single day)
+        # The page sometimes includes asterisks for unscheduled / tentative
+        for m in re.finditer(
+            r'(January|February|March|April|May|June|July|August'
+            r'|September|October|November|December)[^0-9]{0,10}(\d{1,2})(?:\s*[-–]\s*(\d{1,2}))?',
+            section,
+        ):
+            month_name = m.group(1)
+            start_day  = int(m.group(2))
+            end_day    = int(m.group(3)) if m.group(3) else start_day
+            try:
+                ann_date = date(year, _MONTH_NUM[month_name], end_day)
+                dates.append(ann_date.isoformat())
+            except ValueError:
+                pass   # bad day number — skip
+
+        if not dates:
+            log.warning("FOMC online: parsed 0 dates for %d — HTML structure may have changed", year)
+            return None
+
+        log.info("FOMC online: fetched %d announcement dates for %d from federalreserve.gov",
+                 len(dates), year)
+        return sorted(set(dates))
+
+    except Exception as exc:
+        log.warning("FOMC online fetch failed: %s", exc)
+        return None
+
+
+def _fetch_nfp_dates_online(year: int) -> list[str] | None:
+    """Scrape NFP release dates from BLS employment situation schedule page.
+    Returns list of ISO date strings, or None if fetch/parse fails.
+    Source: https://www.bls.gov/schedule/news_release/empsit.htm
+    """
+    import re
+    try:
+        import requests as _req
+        r = _req.get(
+            "https://www.bls.gov/schedule/news_release/empsit.htm",
+            timeout=10,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; IBKRTrader/1.0)"},
+        )
+        r.raise_for_status()
+        html = r.text
+
+        _MONTH_NUM = {
+            "January": 1, "February": 2, "March": 3, "April": 4,
+            "May": 5, "June": 6, "July": 7, "August": 8,
+            "September": 9, "October": 10, "November": 11, "December": 12,
+        }
+
+        dates: list[str] = []
+        # BLS page format: "Friday, August 01, 2025" or "Friday, August 1, 2025"
+        for m in re.finditer(
+            r'(?:Monday|Tuesday|Wednesday|Thursday|Friday),\s+'
+            r'(January|February|March|April|May|June|July|August'
+            r'|September|October|November|December)\s+(\d{1,2}),\s+(\d{4})',
+            html,
+        ):
+            month_name = m.group(1)
+            day        = int(m.group(2))
+            yr         = int(m.group(3))
+            if yr == year:
+                try:
+                    dates.append(date(yr, _MONTH_NUM[month_name], day).isoformat())
+                except ValueError:
+                    pass
+
+        if not dates:
+            log.warning("NFP online: parsed 0 dates for %d from BLS — page structure may have changed", year)
+            return None
+
+        log.info("NFP online: fetched %d release dates for %d from bls.gov", len(dates), year)
+        return sorted(set(dates))
+
+    except Exception as exc:
+        log.warning("NFP online fetch failed: %s", exc)
+        return None
+
+
+def _refresh_macro_calendar() -> None:
+    """Fetch FOMC + NFP dates online; merge with hardcoded fallback.
+    Runs at most once per calendar day (cached). Safe to call frequently.
+    """
+    today = date.today()
+    if _macro_cache["last_refreshed"] == today:
+        return   # already fresh
+
+    year   = today.year
+    merged: dict[str, str] = {}
+
+    # ── FOMC ──────────────────────────────────────────────────────────────────
+    fomc_online = _fetch_fomc_dates_online(year)
+    if fomc_online:
+        fomc_dates               = fomc_online
+        _macro_cache["fomc_source"] = "online (federalreserve.gov)"
+    else:
+        fomc_dates               = _FOMC_DATES_FALLBACK.get(year, [])
+        _macro_cache["fomc_source"] = "fallback (hardcoded)"
+        if not fomc_dates:
+            log.warning("SPX macro: no FOMC fallback dates for %d — update _FOMC_DATES_FALLBACK", year)
+    for d in fomc_dates:
+        merged[d] = "FOMC rate decision"
+
+    # ── NFP ───────────────────────────────────────────────────────────────────
+    nfp_online = _fetch_nfp_dates_online(year)
+    if nfp_online:
+        nfp_dates               = nfp_online
+        _macro_cache["nfp_source"] = "online (bls.gov)"
+    else:
+        nfp_dates               = _nfp_dates(year)
+        _macro_cache["nfp_source"] = "calculated (first Friday)"
+    for d in nfp_dates:
+        merged.setdefault(d, "NFP release")   # FOMC wins if same day
+
+    _macro_cache["dates"]          = merged
+    _macro_cache["last_refreshed"] = today
+    log.info("SPX macro calendar refreshed: %d skip dates for %d  "
+             "(FOMC=%s, NFP=%s)",
+             len(merged), year,
+             _macro_cache["fomc_source"], _macro_cache["nfp_source"])
+
+
+def _spx_macro_skip_dates(year: int | None = None) -> dict[str, str]:
+    """Return {date_iso: reason} for all FOMC + NFP days.
+
+    Triggers a daily online refresh on first call of the day.
+    For years other than current, returns hardcoded + calculated data.
+    """
+    _refresh_macro_calendar()
+    if year is None or year == date.today().year:
+        return _macro_cache["dates"]
+    # Non-current year: use fallback + calculated
     result: dict[str, str] = {}
-    fomc = _FOMC_DATES.get(year)
-    if not fomc:
-        log.warning("SPX 0DTE: no FOMC dates configured for %d — "
-                    "add to _FOMC_DATES in main.py", year)
-    for d in (fomc or []):
+    for d in _FOMC_DATES_FALLBACK.get(year, []):
         result[d] = "FOMC rate decision"
     for d in _nfp_dates(year):
-        result.setdefault(d, "NFP release")   # FOMC takes priority if same day
+        result.setdefault(d, "NFP release")
     return result
 
 
@@ -13001,34 +13163,44 @@ def spx_0dte_history(limit: int = 50):
 
 @app.get("/spx-0dte/macro-calendar")
 def spx_macro_calendar():
-    """FOMC + NFP skip dates for this year and next, plus upcoming events."""
+    """FOMC + NFP skip dates for this year and next, with source metadata."""
     today     = date.today()
     this_year = today.year
     next_year = this_year + 1
-    calendar  = {}
+
+    macro_days = _spx_macro_skip_dates()   # triggers refresh if needed
+
+    calendar: dict = {}
     for yr in [this_year, next_year]:
-        fomc     = _FOMC_DATES.get(yr, [])
-        nfp      = _nfp_dates(yr)
-        combined = sorted(set(fomc) | set(nfp))
+        if yr == this_year:
+            all_dates = sorted(macro_days.items())
+        else:
+            yr_data   = _spx_macro_skip_dates(yr)
+            all_dates = sorted(yr_data.items())
+        fomc = [d for d, r in all_dates if "FOMC" in r]
+        nfp  = [d for d, r in all_dates if "NFP"  in r]
         calendar[str(yr)] = {
-            "fomc_dates": sorted(fomc),
-            "nfp_dates":  sorted(nfp),
-            "all_skip":   combined,
+            "fomc_dates": fomc,
+            "nfp_dates":  nfp,
+            "all_skip":   [d for d, _ in all_dates],
         }
-    macro_days = _spx_macro_skip_dates()
-    upcoming   = [
+
+    upcoming = [
         {"date": d, "reason": r}
         for d, r in sorted(macro_days.items())
         if d >= today.isoformat()
     ][:10]
+
     manual = state["spx_0dte"]["config"].get("skip_dates", [])
     return {
         "calendar":          calendar,
         "upcoming":          upcoming,
         "manual_skip_dates": manual,
-        "note": "FOMC dates are hardcoded in main.py (_FOMC_DATES). "
-                "Update each January when the Fed publishes the new schedule. "
-                "NFP is computed as first Friday of each month.",
+        "data_sources": {
+            "fomc": _macro_cache.get("fomc_source", "not yet refreshed"),
+            "nfp":  _macro_cache.get("nfp_source",  "not yet refreshed"),
+            "last_refreshed": str(_macro_cache.get("last_refreshed") or "never"),
+        },
     }
 
 
