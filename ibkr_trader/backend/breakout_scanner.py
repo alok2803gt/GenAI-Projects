@@ -276,6 +276,10 @@ def fmt_alert(ind: dict, signal: str, tape: dict | None = None) -> str:
             f" · vwap_z {'+' if comp.get('vwap_z',0)>=0 else ''}{comp.get('vwap_z',0):.2f}"
         )
 
+    # Daily state context (always shown — key for intraday signals where daily != signal type)
+    daily_state    = ind.get("curr_daily_state") or "—"
+    daily_state_str = f"  |  Daily: <b>{daily_state}</b>"
+
     # Intraday confirmation line (dual-%B signals only)
     intraday_line = ""
     if ind.get("intraday_confirmed"):
@@ -327,7 +331,7 @@ def fmt_alert(ind: dict, signal: str, tape: dict | None = None) -> str:
     return (
         f"{emoji} <b>{signal}</b> — {ind['ticker']}\n"
         f"💰 Price: ${ind['price']:.2f} ({day_sign}{ind['day_chg_pct']:.1f}%)\n"
-        f"📊 %B: {ind['pct_b']:.1f}  |  Vol: {vol_str}{proj_note} (90th-pct: {ind['vol_90pct']:.2f}×)\n"
+        f"📊 %B: {ind['pct_b']:.1f}  |  Vol: {vol_str}{proj_note} (90th-pct: {ind['vol_90pct']:.2f}×){daily_state_str}\n"
         f"📈 RSI: {ind['rsi']:.0f}  |  {sma_txt}"
         f"{intraday_line}"
         f"{quality_line}"
@@ -1928,6 +1932,7 @@ def _main_loop():
                 # Stocks that skip PRE-BREAKOUT entirely (NEUTRAL → BREAKOUT) are dropped;
                 # requiring re-confirmation removes news-spike chasing.
                 _curr_daily_state = _ticker_states.get(tk, {}).get("state")
+                ind["curr_daily_state"] = _curr_daily_state   # available in fmt_alert
                 _came_via_pre = (
                     ind.get("prev_state") == "PRE-BREAKOUT"
                     or _curr_daily_state == "PRE-BREAKOUT"
