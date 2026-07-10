@@ -11687,6 +11687,56 @@ def day_trader_history(days: int = Query(30, ge=1, le=365)):
 
 # ── SPX 0DTE Trader ──────────────────────────────────────────────────────────
 
+# FOMC announcement dates (second day of each 2-day meeting = rate decision day).
+# Update each January when the Fed publishes the new year's schedule.
+# Source: https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm
+_FOMC_DATES: dict[int, list[str]] = {
+    2025: [
+        "2025-01-29", "2025-03-19", "2025-05-07", "2025-06-18",
+        "2025-07-30", "2025-09-17", "2025-10-29", "2025-12-10",
+    ],
+    2026: [
+        "2026-01-28", "2026-03-18", "2026-04-29", "2026-06-17",
+        "2026-07-29", "2026-09-16", "2026-10-28", "2026-12-09",
+    ],
+}
+
+
+def _nfp_dates(year: int) -> list[str]:
+    """First Friday of each month = NFP release day.
+    Holiday adjustments (e.g. Jan 1 landing on Friday) shift NFP to following Friday —
+    those edge cases are rare and handled via manual skip_dates override in config.
+    """
+    result = []
+    for month in range(1, 13):
+        for day in range(1, 8):
+            d = date(year, month, day)
+            if d.weekday() == 4:   # Friday
+                result.append(d.isoformat())
+                break
+    return result
+
+
+def _spx_macro_skip_dates(year: int | None = None) -> dict[str, str]:
+    """Return {date_iso: reason} for all FOMC + NFP days in the given year.
+
+    Checked dynamically at entry time so no restart is needed when the year rolls over.
+    User can still override / extend via config skip_dates (manual list).
+    """
+    if year is None:
+        year = date.today().year
+    result: dict[str, str] = {}
+    fomc = _FOMC_DATES.get(year)
+    if not fomc:
+        log.warning("SPX 0DTE: no FOMC dates configured for %d — "
+                    "add to _FOMC_DATES in main.py", year)
+    for d in (fomc or []):
+        result[d] = "FOMC rate decision"
+    for d in _nfp_dates(year):
+        result.setdefault(d, "NFP release")   # FOMC takes priority if same day
+    return result
+
+
 def _spx_log(action: str, detail: str, spread_id: str = "—") -> None:
     from zoneinfo import ZoneInfo
     t = datetime.now(ZoneInfo("America/New_York")).strftime("%H:%M:%S ET")
@@ -12094,10 +12144,14 @@ async def _spx_entry_coro(ib) -> None:
         if afternoon_done >= int(cfg.get("max_afternoon_attempts", 1)):
             return
 
-    # ── Skip dates: FOMC, CPI, NFP etc. ──────────────────────────────────────
-    today_iso = date.today().isoformat()
+    # ── Macro calendar skip: FOMC + NFP auto-computed; manual skip_dates in config ──
+    today_iso  = date.today().isoformat()
+    macro_days = _spx_macro_skip_dates()
+    if today_iso in macro_days:
+        _spx_log("SKIP", f"{today_iso} is a {macro_days[today_iso]} day — no entry (macro risk)")
+        return
     if today_iso in cfg.get("skip_dates", []):
-        _spx_log("SKIP", f"{today_iso} is in skip_dates (macro/Fed day) — no entry")
+        _spx_log("SKIP", f"{today_iso} is in manual skip_dates — no entry")
         return
 
     # ── Cooldown after a stop loss (30 min) ──────────────────────────────────
@@ -12943,6 +12997,39 @@ def spx_0dte_history(limit: int = 50):
         ]}
     except Exception as exc:
         return {"history": [], "error": str(exc)}
+
+
+@app.get("/spx-0dte/macro-calendar")
+def spx_macro_calendar():
+    """FOMC + NFP skip dates for this year and next, plus upcoming events."""
+    today     = date.today()
+    this_year = today.year
+    next_year = this_year + 1
+    calendar  = {}
+    for yr in [this_year, next_year]:
+        fomc     = _FOMC_DATES.get(yr, [])
+        nfp      = _nfp_dates(yr)
+        combined = sorted(set(fomc) | set(nfp))
+        calendar[str(yr)] = {
+            "fomc_dates": sorted(fomc),
+            "nfp_dates":  sorted(nfp),
+            "all_skip":   combined,
+        }
+    macro_days = _spx_macro_skip_dates()
+    upcoming   = [
+        {"date": d, "reason": r}
+        for d, r in sorted(macro_days.items())
+        if d >= today.isoformat()
+    ][:10]
+    manual = state["spx_0dte"]["config"].get("skip_dates", [])
+    return {
+        "calendar":          calendar,
+        "upcoming":          upcoming,
+        "manual_skip_dates": manual,
+        "note": "FOMC dates are hardcoded in main.py (_FOMC_DATES). "
+                "Update each January when the Fed publishes the new schedule. "
+                "NFP is computed as first Friday of each month.",
+    }
 
 
 @app.post("/spx-0dte/enable")

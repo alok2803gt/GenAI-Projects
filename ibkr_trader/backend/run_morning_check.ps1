@@ -132,14 +132,24 @@ try {
 
 # 7. SPX 0DTE
 try {
-    $spx = Invoke-RestMethod -Uri "$BackendUrl/spx-0dte/status" -Method Get -TimeoutSec 5
+    $spx    = Invoke-RestMethod -Uri "$BackendUrl/spx-0dte/status" -Method Get -TimeoutSec 5
+    $spxCal = Invoke-RestMethod -Uri "$BackendUrl/spx-0dte/macro-calendar" -Method Get -TimeoutSec 5
     $spxPnl     = $spx.summary.today_pnl
-    $spxNext    = $spx.summary.next_target
     $spxFloor   = $spx.config.daily_floor_pnl
     $spxTiers   = ($spx.config.stop_loss_tiers -join "/") + "x"
     $spxAttempt = $spx.attempts_today
-    if ($spx.enabled -eq $true) {
-        [void]$checks.Add("[OK] SPX 0DTE: enabled | attempts=$spxAttempt | day_pnl=`$$spxPnl | next_target=`$$spxNext | stops=$spxTiers | floor=`$$spxFloor")
+
+    # Check if today is a macro skip day
+    $todayIso   = (Get-Date).ToString("yyyy-MM-dd")
+    $macroToday = $spxCal.upcoming | Where-Object { $_.date -eq $todayIso } | Select-Object -First 1
+    $nextMacro  = $spxCal.upcoming | Where-Object { $_.date -gt $todayIso } | Select-Object -First 1
+
+    if ($macroToday) {
+        [void]$checks.Add("[WARN] SPX 0DTE: TODAY is $($macroToday.reason) day ($todayIso) — NO TRADES")
+        [void]$issues.Add("SPX 0DTE auto-skip: $($macroToday.reason) today — system will not enter any trades")
+    } elseif ($spx.enabled -eq $true) {
+        $nextMacroNote = if ($nextMacro) { " | next skip: $($nextMacro.date) ($($nextMacro.reason))" } else { "" }
+        [void]$checks.Add("[OK] SPX 0DTE: enabled | attempts=$spxAttempt | day_pnl=`$$spxPnl | stops=$spxTiers | floor=`$$spxFloor$nextMacroNote")
     } else {
         [void]$checks.Add("[WARN] SPX 0DTE: disabled")
         [void]$issues.Add("SPX 0DTE is disabled -- enable before market open if trading today")
