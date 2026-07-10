@@ -104,6 +104,7 @@ DEFAULT_CONFIG = {
     "vol_threshold_pct":      0.75,
     "backend_url":            "http://localhost:8000",
     "use_ibkr_hist":          True,   # refresh cache via backend IBKR endpoint; falls back to yfinance
+    "pre_bo_grace_minutes":   15,     # F9: allow BREAKOUT if PRE-BREAKOUT was seen within this window
 }
 
 
@@ -229,9 +230,10 @@ def post_to_backend_with_tape(backend_url: str, ind: dict, signal_type: str,
             payload["tape_score"] = tape.get("score")
             payload["tape_label"] = tape.get("label")
         # State lifecycle context (Stage 2 enrichment)
-        if ind.get("prev_state")           is not None: payload["prev_state"]           = ind["prev_state"]
-        if ind.get("mins_in_pre_breakout") is not None: payload["mins_in_pre_breakout"] = ind["mins_in_pre_breakout"]
-        if ind.get("state_path")           is not None: payload["state_path"]           = ind["state_path"]
+        if ind.get("prev_state")              is not None: payload["prev_state"]              = ind["prev_state"]
+        if ind.get("mins_in_pre_breakout")   is not None: payload["mins_in_pre_breakout"]   = ind["mins_in_pre_breakout"]
+        if ind.get("mins_since_pre_breakout") is not None: payload["mins_since_pre_breakout"] = ind["mins_since_pre_breakout"]
+        if ind.get("state_path")              is not None: payload["state_path"]              = ind["state_path"]
         if ind.get("sr_resistance")        is not None: payload["sr_resistance"]        = ind["sr_resistance"]
         if ind.get("sr_support")           is not None: payload["sr_support"]           = ind["sr_support"]
         r = requests.post(
@@ -915,12 +917,13 @@ def process_state_transitions(
         if stored is None:
             # First encounter — initialise ledger without alerting or persisting
             _ticker_states[tk] = {
-                "state":              new_state,
-                "since":              now,
-                "prev_state":         None,
-                "pre_breakout_since": now if new_state == "PRE-BREAKOUT" else None,
-                "path":               [new_state],
-                "pct_b":              ind["pct_b"],
+                "state":                  new_state,
+                "since":                  now,
+                "prev_state":             None,
+                "pre_breakout_since":     now if new_state == "PRE-BREAKOUT" else None,
+                "pre_breakout_last_seen": now if new_state == "PRE-BREAKOUT" else None,
+                "path":                   [new_state],
+                "pct_b":                  ind["pct_b"],
             }
             continue
 
@@ -939,19 +942,24 @@ def process_state_transitions(
             new_path = new_path[-10:]
 
         # Track when PRE-BREAKOUT was entered (conviction time for Stage 2)
-        pre_bo_since = stored.get("pre_breakout_since")
+        pre_bo_since     = stored.get("pre_breakout_since")
+        pre_bo_last_seen = stored.get("pre_breakout_last_seen")
         if new_state == "PRE-BREAKOUT":
-            pre_bo_since = now
+            if pre_bo_since is None:
+                pre_bo_since = now   # first time entering PRE-BREAKOUT this session
+            pre_bo_last_seen = now   # always refresh last-seen timestamp
         elif new_state not in {"PRE-BREAKOUT", "BREAKOUT", "EXTENDED"}:
-            pre_bo_since = None   # left the bullish zone — reset
+            pre_bo_since = None      # left the bullish zone — reset conviction timer
+            # pre_bo_last_seen intentionally preserved for F9 grace window
 
         _ticker_states[tk] = {
-            "state":              new_state,
-            "since":              now,
-            "prev_state":         prev_state,
-            "pre_breakout_since": pre_bo_since,
-            "path":               new_path,
-            "pct_b":              ind["pct_b"],
+            "state":                  new_state,
+            "since":                  now,
+            "prev_state":             prev_state,
+            "pre_breakout_since":     pre_bo_since,
+            "pre_breakout_last_seen": pre_bo_last_seen,
+            "path":                   new_path,
+            "pct_b":                  ind["pct_b"],
         }
 
         if is_first_scan:
@@ -1002,25 +1010,37 @@ def _get_state_context(ticker: str) -> dict:
     Called just before firing a BREAKOUT/PRE-BREAKOUT alert so the state path
     context is stamped into alert_history at the moment of alert.
 
-    Returns dict with keys: prev_state, mins_in_pre_breakout, state_path.
+    Returns dict with keys: prev_state, mins_in_pre_breakout,
+    mins_since_pre_breakout, state_path.
     All values may be None if the ledger has no history (e.g. first scan).
     """
     stored = _ticker_states.get(ticker)
     if not stored:
-        return {"prev_state": None, "mins_in_pre_breakout": None, "state_path": None}
+        return {
+            "prev_state": None, "mins_in_pre_breakout": None,
+            "mins_since_pre_breakout": None, "state_path": None,
+        }
 
+    now          = datetime.now(ET)
     prev_state   = stored.get("prev_state")
     state_path   = "→".join(stored.get("path", [stored["state"]])) or None
 
     mins_in_pre  = None
     pre_since    = stored.get("pre_breakout_since")
     if pre_since is not None:
-        mins_in_pre = int((datetime.now(ET) - pre_since).total_seconds() / 60)
+        mins_in_pre = int((now - pre_since).total_seconds() / 60)
+
+    # Minutes since PRE-BREAKOUT was last active (survives a brief NEUTRAL dip)
+    mins_since_pre = None
+    last_seen = stored.get("pre_breakout_last_seen")
+    if last_seen is not None:
+        mins_since_pre = int((now - last_seen).total_seconds() / 60)
 
     return {
-        "prev_state":           prev_state,
-        "mins_in_pre_breakout": mins_in_pre,
-        "state_path":           state_path,
+        "prev_state":              prev_state,
+        "mins_in_pre_breakout":    mins_in_pre,
+        "mins_since_pre_breakout": mins_since_pre,
+        "state_path":              state_path,
     }
 
 
@@ -1898,14 +1918,32 @@ def _main_loop():
                 # Backtest: instant jumps (0d in PRE-BO) → 52.9% win rate, -0.03% avg 5d.
                 # 2-step path (via PRE-BO)              → 62.0% win rate, +1.31% avg 5d.
                 # Pass-through when prev_state is None (no intraday history yet — first scan).
+                # Grace window: a single scan cycle dipping briefly below PRE-BREAKOUT threshold
+                # (e.g., one 3-min bar where %B touches 74) should not disqualify the setup.
+                # Allow BREAKOUT if PRE-BREAKOUT was active within pre_bo_grace_minutes.
+                _grace_mins = cfg.get("pre_bo_grace_minutes", 15)
+                _mins_since = ind.get("mins_since_pre_breakout")
+                _came_via_pre = (
+                    ind.get("prev_state") == "PRE-BREAKOUT"
+                    or (_mins_since is not None and _mins_since <= _grace_mins)
+                )
                 if (sig_type == "BREAKOUT"
                         and cfg.get("require_2step_breakout", True)
                         and ind.get("prev_state") is not None
-                        and ind.get("prev_state") != "PRE-BREAKOUT"):
-                    log.info("F9 path-gate dropped %s: BREAKOUT jumped from %s (not via PRE-BREAKOUT)",
-                             tk, ind["prev_state"])
+                        and not _came_via_pre):
+                    log.info(
+                        "F9 path-gate dropped %s: BREAKOUT jumped from %s "
+                        "(PRE-BREAKOUT last seen: %s)",
+                        tk, ind["prev_state"],
+                        f"{_mins_since}m ago" if _mins_since is not None else "never",
+                    )
                     n_f9_dropped += 1
                     continue
+                if sig_type == "BREAKOUT" and _mins_since is not None and _mins_since > 0:
+                    log.info(
+                        "F9 grace pass %s: PRE-BREAKOUT last seen %dm ago (within %dm window)",
+                        tk, _mins_since, _grace_mins,
+                    )
 
                 # Sync to backend watchlist only after all local filters pass (F1–F9).
                 # This keeps watchlist consistent with Telegram and stock-trader triggers.

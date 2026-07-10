@@ -3582,9 +3582,9 @@ function PnLTab() {
   }
 
   const cards = [
-    { label:"Total P&L",      value:fmtDol(stats.total_pnl,true),            color:pnlCol(stats.total_pnl),            sub:"realized + unrealized" },
-    { label:"Realized P&L",   value:fmtDol(stats.total_realized_pnl,true),   color:pnlCol(stats.total_realized_pnl),   sub:`${stats.total_trades} closed trades` },
-    { label:"Unrealized P&L", value:fmtDol(stats.total_unrealized_pnl,true), color:pnlCol(stats.total_unrealized_pnl), sub:`${stats.open_count} open positions` },
+    { label:"Total P&L",      value:fmtDol(stats.total_realized_pnl,true),   color:pnlCol(stats.total_realized_pnl),   sub:`${stats.total_trades} closed trades` },
+    { label:"Unrealized P&L", value:fmtDol(stats.total_unrealized_pnl,true), color:pnlCol(stats.total_unrealized_pnl), sub:`${stats.open_count} open · live` },
+    { label:"Net P&L",        value:fmtDol(stats.total_pnl,true),            color:pnlCol(stats.total_pnl),            sub:"realized + unrealized" },
     { label:"Today's P&L",    value:fmtDol(stats.today_pnl,true),            color:pnlCol(stats.today_pnl),            sub:new Date().toLocaleDateString("en-US",{weekday:"short"}) },
     { label:"Win Rate",       value:stats.win_rate!=null?`${stats.win_rate}%`:"—", color:stats.win_rate>50?C.bull:stats.win_rate<50?C.bear:C.muted,
       sub:`avg W ${fmtDol(stats.avg_win)} / L ${fmtDol(stats.avg_loss)}` },
