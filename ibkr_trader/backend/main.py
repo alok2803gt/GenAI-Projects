@@ -453,6 +453,7 @@ state: Dict = {
             "max_attempts":             5,    # hard cap across both phases
             "max_margin":           20000.0,
             "min_credit_per_spread":    0.20,
+            "trend_filter_pts":        15.0,  # if SPX moved > this from session open → go one-sided
             "skip_dates":              [],    # ["YYYY-MM-DD"] — FOMC, CPI, NFP days to skip entirely
             # ── Legacy (kept for display / backward compat) ───────────────────
             "daily_profit_target":    200.0,
@@ -11880,6 +11881,24 @@ def _fetch_bls_dates_online(year: int, url: str, label: str) -> list[str] | None
         return None
 
 
+def _spx_get_session_open() -> float:
+    """Return today's SPX session open price via yfinance ^GSPC (fallback: SPY × 10).
+    Returns 0.0 if unavailable.
+    """
+    try:
+        import yfinance as yf
+        data = yf.Ticker("^GSPC").history(period="1d", interval="1d", auto_adjust=False)
+        if not data.empty:
+            return float(data["Open"].iloc[-1])
+        spy = yf.Ticker("SPY").history(period="1d", interval="1d", auto_adjust=False)
+        if not spy.empty:
+            return float(spy["Open"].iloc[-1]) * 10.0
+        return 0.0
+    except Exception as exc:
+        log.debug("SPX session open fetch failed: %s", exc)
+        return 0.0
+
+
 def _get_10yr_rate_change() -> float:
     """Return today's intraday change in 10yr treasury yield (basis points).
     Uses yfinance ^TNX (10yr CMT yield, in %). Returns 0.0 if unavailable.
@@ -12455,9 +12474,33 @@ async def _spx_entry_coro(ib) -> None:
         _spx_log("SKIP", f"Both legs thin: P={p_credit:.2f} C={c_credit:.2f} min={min_cred:.2f}")
         return
 
-    if not use_put:
+    # ── Trend / displacement filter ───────────────────────────────────────────
+    # If SPX has moved > trend_filter_pts from the session open, go one-sided:
+    #   rallied → sell puts only  (call strikes are relatively closer to price)
+    #   dropped → sell calls only (put strikes are relatively closer to price)
+    trend_pts    = float(cfg.get("trend_filter_pts", 15.0))
+    spx_open     = await asyncio.get_event_loop().run_in_executor(None, _spx_get_session_open)
+    displacement = round(spot - spx_open, 1) if spx_open > 0 else 0.0
+    trend_note   = ""
+    if trend_pts > 0 and spx_open > 0 and abs(displacement) > trend_pts:
+        if displacement > 0:
+            use_call   = False   # SPX rallied — stay away from call side
+            trend_note = f"trend +{displacement}pts → PUT only"
+            _spx_log("INFO", f"Trend filter: SPX open={spx_open:.0f} now={spot:.0f} "
+                             f"+{displacement}pts → PUT spread only (call side too close)")
+        else:
+            use_put    = False   # SPX dropped — stay away from put side
+            trend_note = f"trend {displacement}pts → CALL only"
+            _spx_log("INFO", f"Trend filter: SPX open={spx_open:.0f} now={spot:.0f} "
+                             f"{displacement}pts → CALL spread only (put side too close)")
+
+    if not use_put and not use_call:
+        _spx_log("SKIP", "Both legs eliminated after trend filter — no entry")
+        return
+
+    if not use_put and not trend_note:
         _spx_log("INFO", f"Put leg thin ({p_credit:.2f}) — call spread only (C={c_credit:.2f})")
-    elif not use_call:
+    elif not use_call and not trend_note:
         _spx_log("INFO", f"Call leg thin ({c_credit:.2f}) — put spread only (P={p_credit:.2f})")
 
     strategy      = "iron_condor" if (use_put and use_call) else ("call_spread" if use_call else "put_spread")
@@ -12714,6 +12757,31 @@ async def _spx_monitor_loop() -> None:
 
 # ── Earnings Volatility Crush — core async functions ──────────────────────────
 
+def _evc_earnings_is_upcoming(ticker: str) -> bool:
+    """
+    Return True only if the next earnings datetime is still in the future (ET).
+    Distinguishes BMO reporters (already done by 9:30 AM) from AH reporters.
+    Falls back to True on any data error so we don't silently drop candidates.
+    """
+    from zoneinfo import ZoneInfo
+    try:
+        cal = yf.Ticker(ticker).calendar
+        if not cal or not isinstance(cal, dict):
+            return True
+        raw = cal.get("Earnings Date", [])
+        if not raw:
+            return True
+        dt = pd.to_datetime(raw[0])
+        if dt.tzinfo is None:
+            dt = dt.tz_localize("UTC")
+        tz_et   = ZoneInfo("America/New_York")
+        dt_et   = dt.tz_convert(tz_et)
+        now_et  = datetime.now(tz_et)
+        return dt_et > now_et
+    except Exception:
+        return True   # safe fallback — prefer false positive over silent miss
+
+
 async def _evc_scan_universe(ib) -> list:
     """Return CANDIDATE_POOL tickers (excluding ETFs) with earnings tonight (days_out==0)."""
     ev    = state["evc"]
@@ -12724,16 +12792,23 @@ async def _evc_scan_universe(ib) -> list:
     candidates = []
     universe   = [t for t in CANDIDATE_POOL if t not in _EVC_ETF_SET]
     _evc_log("SCAN", "universe", f"checking {len(universe)} tickers for tonight's earnings")
+    loop = asyncio.get_event_loop()
     for ticker in universe:
         try:
             days = await _earnings_days_out(ticker)
-            # days==0: earnings today AH (announce tonight)
-            # days==1: earnings tomorrow — catch BMO reporters (8 AM before open)
-            #          IV crush still happens next morning for both cases
-            if days in (0, 1):
-                label = "earnings tonight (AH)" if days == 0 else "earnings tomorrow (BMO/AH)"
+            if days == 0:
+                # days==0 means earnings date is today — could be BMO (already done)
+                # or AH (still upcoming). Verify the datetime is in the future.
+                upcoming = await loop.run_in_executor(None, _evc_earnings_is_upcoming, ticker)
+                if not upcoming:
+                    _evc_log("SKIP", ticker, "earnings today but already BMO — skipping")
+                    continue
                 candidates.append(ticker)
-                _evc_log("CANDIDATE", ticker, label)
+                _evc_log("CANDIDATE", ticker, "earnings tonight (AH)")
+            elif days == 1:
+                # days==1: earnings tomorrow — catches BMO reporters announced 8 AM next day
+                candidates.append(ticker)
+                _evc_log("CANDIDATE", ticker, "earnings tomorrow (BMO/AH)")
         except Exception as exc:
             log.debug("EVC earnings check %s: %s", ticker, exc)
     ev["scan_date"] = today
@@ -13152,14 +13227,6 @@ async def _evc_monitor_loop() -> None:
                             ib.cancelMktData(c)
                         live_pnl = round((net_credit - current_cost) * pos["qty"] * 100, 2)
                         pos["live_pnl"] = live_pnl
-                        # Intraday stop
-                        max_loss = -(net_credit * pos["qty"] * 100 * cfg["max_loss_pct"] / 100)
-                        if live_pnl < max_loss:
-                            _evc_log("STOP", ticker, f"live_pnl=${live_pnl:.2f} < max_loss=${max_loss:.2f}")
-                            await loop.run_in_executor(
-                                None,
-                                lambda pid=pos_id: _run_in_streaming_loop(
-                                    _evc_close_position(ib, pid, "max_loss_stop"), timeout=60))
                     except Exception as exc:
                         log.debug("EVC P&L update %s: %s", pos_id, exc)
                 _evc_save_state()
@@ -13194,6 +13261,7 @@ class SPXConfigRequest(BaseModel):
     max_attempts:            Optional[int]         = None
     max_margin:              Optional[float]       = None
     min_credit_per_spread:   Optional[float]       = None
+    trend_filter_pts:        Optional[float]       = None
     skip_dates:              Optional[list[str]]   = None
     # Legacy (kept for backward compat)
     daily_profit_target:     Optional[float]       = None

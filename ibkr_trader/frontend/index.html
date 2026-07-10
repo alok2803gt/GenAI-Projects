@@ -5016,17 +5016,20 @@ function StockTraderTab() {
 // ── SPX 0DTE Tab ──────────────────────────────────────────────────────────────
 function SPX0DTETab() {
   const [status,  setStatus]  = useState(null);
+  const [macro,   setMacro]   = useState(null);
   const [history, setHistory] = useState([]);
   const [loading, setLoading] = useState(true);
 
   const load = async () => {
     try {
-      const [s, h] = await Promise.all([
+      const [s, h, m] = await Promise.all([
         apiFetch("/spx-0dte/status"),
         apiFetch("/spx-0dte/history?limit=50"),
+        apiFetch("/spx-0dte/macro-calendar"),
       ]);
       setStatus(s);
       setHistory(h.history || []);
+      setMacro(m);
     } catch(_) {}
     finally { setLoading(false); }
   };
@@ -5041,27 +5044,33 @@ function SPX0DTETab() {
   };
   const closeSpread = async (sid) => { await apiFetch(`/spx-0dte/close/${sid}`, {method:"POST"}); load(); };
 
-  const pnlColor = v => v == null ? C.muted : v >= 0 ? "#22c55e" : "#ef4444";
+  const pnlColor  = v => v == null ? C.muted : v >= 0 ? "#22c55e" : "#ef4444";
   const exitColor = t => t === "profit_target" ? "#4ade80" : t === "stop_loss" ? "#f87171"
                        : t === "force_close" ? "#f59e0b" : C.muted;
+  const phaseBadge = phase => {
+    if (phase === "morning")   return <span style={{fontSize:10,padding:"2px 6px",borderRadius:4,fontWeight:700,background:"#172554",color:"#93c5fd",border:"1px solid #1d4ed8"}}>🌅 AM</span>;
+    if (phase === "afternoon") return <span style={{fontSize:10,padding:"2px 6px",borderRadius:4,fontWeight:700,background:"#2e1065",color:"#c4b5fd",border:"1px solid #7c3aed"}}>🌆 THETA</span>;
+    return null;
+  };
 
   if (loading) return <div style={{color:C.muted,...sans,fontSize:13}}>Loading…</div>;
   if (!status)  return <div style={{color:C.muted,...sans,fontSize:13}}>Backend unavailable</div>;
 
-  const { config:cfg, spreads, closed_today, decisions, summary, attempts_today } = status;
-  const goalPct = Math.min(100, summary.goal_pct || 0);
+  const { config:cfg, spreads, closed_today, decisions, summary } = status;
+  const todayIso   = new Date().toISOString().slice(0,10);
+  const macroToday = macro?.upcoming?.find(d => d.date === todayIso);
+  const nextMacro  = macro?.upcoming?.find(d => d.date > todayIso);
 
   return (
     <div>
       {/* Header */}
-      <div style={{display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:16}}>
+      <div style={{display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:12}}>
         <div>
           <div style={{...sans, fontSize:17, fontWeight:700, color:C.white}}>SPX 0DTE Trader 🎯</div>
           <div style={{...sans, fontSize:12, color:C.muted, marginTop:2}}>
-            Iron Condor · SPX 0DTE · entries 09:45–{cfg.entry_cutoff_time} ET · force-close {cfg.force_close_time} ET
-          </div>
-          <div style={{...sans, fontSize:11, color:"#f59e0b", marginTop:2}}>
-            ⚠ After ~14:00 ET gamma accelerates — tighten OTM% or reduce size
+            🌅 Morning IC {cfg.entry_start_time}–{cfg.morning_entry_cutoff} · {cfg.profit_pct_morning}% of credit · tiered stops
+            &nbsp;&nbsp;|&nbsp;&nbsp;
+            🌆 Theta decay {cfg.afternoon_entry_start}–{cfg.afternoon_entry_cutoff} · {cfg.profit_pct_afternoon}% of credit · {cfg.stop_mult_afternoon}× stop
           </div>
         </div>
         <button onClick={toggle} style={{
@@ -5072,61 +5081,113 @@ function SPX0DTETab() {
         }}>{status.enabled ? "● LIVE" : "○ Disabled"}</button>
       </div>
 
-      {/* Daily Goal Card */}
-      <div style={{background:"#0f172a", border:`1px solid ${C.border}`, borderRadius:8, padding:16, marginBottom:16}}>
-        <div style={{...sans, fontSize:13, fontWeight:700, color:C.white, marginBottom:12}}>Daily Goal</div>
-        <div style={{display:"grid", gridTemplateColumns:"1fr 1fr 1fr 1fr", gap:12, marginBottom:12}}>
+      {/* Macro skip notice */}
+      {macroToday ? (
+        <div style={{background:"#431407", border:"1px solid #b45309", borderRadius:6, padding:"10px 14px", marginBottom:12, ...sans, fontSize:12}}>
+          🚫 <b style={{color:"#fcd34d"}}>No trades today</b> — {macroToday.reason} ({todayIso}). System skips all entry attempts automatically.
+        </div>
+      ) : nextMacro ? (
+        <div style={{background:"#0c1520", border:`1px solid ${C.border}`, borderRadius:6, padding:"8px 14px", marginBottom:12, ...sans, fontSize:11, color:C.muted}}>
+          📅 Next macro skip: <b style={{color:"#f59e0b"}}>{nextMacro.date}</b> — {nextMacro.reason}
+          {macro?.data_sources?.fomc_source && <span style={{marginLeft:10, color:"#475569"}}>· {macro.data_sources.fomc_source.split(" ")[0]}</span>}
+        </div>
+      ) : null}
+
+      {/* Today summary */}
+      <div style={{background:"#0f172a", border:`1px solid ${C.border}`, borderRadius:8, padding:"12px 16px", marginBottom:14}}>
+        <div style={{display:"grid", gridTemplateColumns:"1fr 1fr 1fr 1fr", gap:12}}>
           {[
-            {label:"Target",         value:`$${cfg.daily_profit_target}`,             color:C.white},
-            {label:"Today P&L",      value:`${summary.today_pnl>=0?"+":""}$${summary.today_pnl.toFixed(2)}`, color:pnlColor(summary.today_pnl)},
-            {label:"Remaining",      value:`$${Math.max(0, cfg.daily_profit_target - summary.today_pnl).toFixed(2)}`, color:summary.today_pnl >= cfg.daily_profit_target ? "#22c55e" : "#f59e0b"},
-            {label:"Attempts",       value:`${summary.attempts_today}/${cfg.max_attempts}`, color:C.muted},
+            {label:"Today P&L",   value:`${(summary.today_pnl||0)>=0?"+":""}$${(summary.today_pnl||0).toFixed(2)}`, color:pnlColor(summary.today_pnl)},
+            {label:"Attempts",    value:`${summary.attempts_today||0} / ${cfg.max_attempts}`,                         color:C.muted},
+            {label:"Floor PNL",   value:`$${cfg.daily_floor_pnl}`,                                                   color:"#64748b"},
+            {label:"Force Close", value:`${cfg.force_close_time} ET`,                                                 color:C.muted},
           ].map(({label,value,color}) => (
             <div key={label} style={{textAlign:"center"}}>
-              <div style={{...sans, fontSize:11, color:C.muted, marginBottom:4}}>{label}</div>
-              <div style={{...mono, fontSize:16, fontWeight:700, color}}>{value}</div>
+              <div style={{...sans, fontSize:10, color:C.muted, marginBottom:3}}>{label}</div>
+              <div style={{...mono, fontSize:15, fontWeight:700, color}}>{value}</div>
             </div>
           ))}
         </div>
-        <div style={{background:"#1e293b", borderRadius:4, height:8, overflow:"hidden", marginBottom:8}}>
-          <div style={{height:"100%", borderRadius:4, width:`${goalPct}%`,
-            background: goalPct>=100 ? "#22c55e" : goalPct>=50 ? "#f59e0b" : "#3b82f6",
-            transition:"width 0.5s"}} />
-        </div>
-        <div style={{...sans, fontSize:11, color:C.muted}}>{goalPct.toFixed(1)}% of daily goal</div>
       </div>
 
-      {/* Config Row */}
-      <div style={{display:"grid", gridTemplateColumns:"repeat(6,1fr)", gap:10, marginBottom:16}}>
+      {/* Morning Phase Config */}
+      <div style={{...sans, fontSize:11, fontWeight:700, color:"#93c5fd", marginBottom:6, letterSpacing:1, textTransform:"uppercase"}}>🌅 Morning Phase</div>
+      <div style={{display:"grid", gridTemplateColumns:"repeat(5,1fr)", gap:8, marginBottom:10}}>
+        <div style={{background:"#0f172a", border:"1px solid #172554", borderRadius:6, padding:"8px 10px"}}>
+          <div style={{...sans, fontSize:10, color:"#60a5fa", marginBottom:4}}>Entry Start</div>
+          <input defaultValue={cfg.entry_start_time} type="text"
+            style={{...mono, fontSize:13, width:"100%", background:"none", border:"none", color:C.white, outline:"none"}}
+            onBlur={e => updateCfg("entry_start_time", e.target.value.trim())} />
+        </div>
+        <div style={{background:"#0f172a", border:"1px solid #172554", borderRadius:6, padding:"8px 10px"}}>
+          <div style={{...sans, fontSize:10, color:"#60a5fa", marginBottom:4}}>Morning Cutoff</div>
+          <input defaultValue={cfg.morning_entry_cutoff} type="text"
+            style={{...mono, fontSize:13, width:"100%", background:"none", border:"none", color:C.white, outline:"none"}}
+            onBlur={e => updateCfg("morning_entry_cutoff", e.target.value.trim())} />
+        </div>
+        <div style={{background:"#0f172a", border:"1px solid #172554", borderRadius:6, padding:"8px 10px"}}>
+          <div style={{...sans, fontSize:10, color:"#60a5fa", marginBottom:4}}>Profit % of Credit</div>
+          <input defaultValue={cfg.profit_pct_morning} type="number" step={5}
+            style={{...mono, fontSize:13, width:"100%", background:"none", border:"none", color:C.white, outline:"none"}}
+            onBlur={e => updateCfg("profit_pct_morning", parseFloat(e.target.value))} />
+        </div>
+        <div style={{background:"#0f172a", border:"1px solid #172554", borderRadius:6, padding:"8px 10px"}}>
+          <div style={{...sans, fontSize:10, color:"#60a5fa", marginBottom:4}}>VIX Max</div>
+          <input defaultValue={cfg.vix_max_morning} type="number" step={1}
+            style={{...mono, fontSize:13, width:"100%", background:"none", border:"none", color:C.white, outline:"none"}}
+            onBlur={e => updateCfg("vix_max_morning", parseFloat(e.target.value))} />
+        </div>
+        <div style={{background:"#0f172a", border:"1px solid #172554", borderRadius:6, padding:"8px 10px"}}>
+          <div style={{...sans, fontSize:10, color:"#60a5fa", marginBottom:4}}>Stop Tiers × (csv)</div>
+          <input defaultValue={(cfg.stop_loss_tiers||[]).join(", ")} type="text"
+            style={{...mono, fontSize:13, width:"100%", background:"none", border:"none", color:C.white, outline:"none"}}
+            onBlur={e => {
+              const v = e.target.value.split(",").map(x=>parseFloat(x.trim())).filter(x=>!isNaN(x));
+              if (v.length > 0) updateCfg("stop_loss_tiers", v);
+            }} />
+        </div>
+      </div>
+
+      {/* Afternoon Phase Config */}
+      <div style={{...sans, fontSize:11, fontWeight:700, color:"#c4b5fd", marginBottom:6, letterSpacing:1, textTransform:"uppercase"}}>🌆 Afternoon Theta Phase</div>
+      <div style={{display:"grid", gridTemplateColumns:"repeat(6,1fr)", gap:8, marginBottom:10}}>
         {[
-          {label:"Daily Target $",  key:"daily_profit_target", type:"number", step:50},
-          {label:"Spread Width pts",key:"spread_width",         type:"number", step:5},
-          {label:"OTM %",           key:"otm_pct",              type:"number", step:0.25},
-          {label:"Profit Close %",  key:"profit_pct",           type:"number", step:5},
-          {label:"Stop Mult",       key:"stop_loss_mult",       type:"number", step:0.5},
-          {label:"Max Margin $",    key:"max_margin",           type:"number", step:1000},
-        ].map(({label,key,type,step}) => (
-          <div key={key} style={{background:"#0f172a", border:`1px solid ${C.border}`, borderRadius:6, padding:"8px 10px"}}>
-            <div style={{...sans, fontSize:10, color:C.muted, marginBottom:4}}>{label}</div>
+          {label:"Afternoon Start",  key:"afternoon_entry_start",  type:"text"},
+          {label:"Afternoon Cutoff", key:"afternoon_entry_cutoff", type:"text"},
+          {label:"Profit % of Cred", key:"profit_pct_afternoon",  step:5},
+          {label:"Stop Mult",        key:"stop_mult_afternoon",    step:0.25},
+          {label:"VIX Max",          key:"vix_max_afternoon",      step:1},
+          {label:"Max Attempts",     key:"max_afternoon_attempts", step:1},
+        ].map(({label, key, type="number", step}) => (
+          <div key={key} style={{background:"#0f172a", border:"1px solid #2e1065", borderRadius:6, padding:"8px 10px"}}>
+            <div style={{...sans, fontSize:10, color:"#a78bfa", marginBottom:4}}>{label}</div>
             <input defaultValue={cfg[key]} type={type} step={step}
               style={{...mono, fontSize:13, width:"100%", background:"none", border:"none", color:C.white, outline:"none"}}
-              onBlur={e => { const v = parseFloat(e.target.value); if (v !== cfg[key]) updateCfg(key, v); }} />
+              onBlur={e => {
+                const v = type==="number" ? parseFloat(e.target.value) : e.target.value.trim();
+                updateCfg(key, v);
+              }} />
           </div>
         ))}
       </div>
-      {/* Time config row */}
-      <div style={{display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:10, marginBottom:16}}>
+
+      {/* Shared Config */}
+      <div style={{...sans, fontSize:11, fontWeight:700, color:C.muted, marginBottom:6, letterSpacing:1, textTransform:"uppercase"}}>Shared</div>
+      <div style={{display:"grid", gridTemplateColumns:"repeat(7,1fr)", gap:8, marginBottom:16}}>
         {[
-          {label:"Entry Start",   key:"entry_start_time"},
-          {label:"Entry Cutoff",  key:"entry_cutoff_time"},
-          {label:"Force Close",   key:"force_close_time"},
-          {label:"Min Credit/Sprd",key:"min_credit_per_spread", isNum:true},
-        ].map(({label,key,isNum}) => (
+          {label:"Spread Width pts", key:"spread_width",           step:5},
+          {label:"OTM %",            key:"otm_pct",                step:0.25},
+          {label:"Max Margin $",     key:"max_margin",             step:1000},
+          {label:"Rate Bps Max",     key:"rate_move_bps_max",      step:1},
+          {label:"Trend Filter Pts", key:"trend_filter_pts",       step:5},
+          {label:"Min Credit/Sprd",  key:"min_credit_per_spread",  step:0.05},
+          {label:"Max Attempts",     key:"max_attempts",           step:1},
+        ].map(({label, key, step}) => (
           <div key={key} style={{background:"#0f172a", border:`1px solid ${C.border}`, borderRadius:6, padding:"8px 10px"}}>
             <div style={{...sans, fontSize:10, color:C.muted, marginBottom:4}}>{label}</div>
-            <input defaultValue={cfg[key]} type={isNum?"number":"text"}
+            <input defaultValue={cfg[key]} type="number" step={step}
               style={{...mono, fontSize:13, width:"100%", background:"none", border:"none", color:C.white, outline:"none"}}
-              onBlur={e => { const v = isNum ? parseFloat(e.target.value) : e.target.value; if (v !== cfg[key]) updateCfg(key, v); }} />
+              onBlur={e => updateCfg(key, parseFloat(e.target.value))} />
           </div>
         ))}
       </div>
@@ -5134,9 +5195,9 @@ function SPX0DTETab() {
       {/* Open Spreads */}
       <div style={{...sans, fontSize:13, fontWeight:700, color:C.white, marginBottom:8}}>Open Iron Condors</div>
       {Object.keys(spreads).length === 0 ? (
-        <div style={{color:C.muted, ...sans, fontSize:13, padding:"16px 0"}}>
+        <div style={{color:C.muted, ...sans, fontSize:13, padding:"14px 0"}}>
           {status.enabled
-            ? (summary.today_pnl >= cfg.daily_profit_target ? "✓ Daily target reached" : `Waiting for entry window (${cfg.entry_start_time}–${cfg.entry_cutoff_time} ET)`)
+            ? (macroToday ? "🚫 Macro skip — no entry today" : "Waiting for entry window")
             : "Trader disabled"}
         </div>
       ) : (
@@ -5144,7 +5205,7 @@ function SPX0DTETab() {
           <table style={{width:"100%", borderCollapse:"collapse", ...sans, fontSize:12}}>
             <thead>
               <tr style={{background:"#0f172a"}}>
-                {["ID","Entry","Put Spread","Call Spread","SPX @","Credit","Target","Live P&L",""].map(h=>(
+                {["Phase","ID","Entry","Put Spread","Call Spread","SPX @","Credit","Target","Live P&L",""].map(h=>(
                   <th key={h} style={{padding:"7px 10px", textAlign:"left", color:C.muted,
                     fontSize:11, fontWeight:600, textTransform:"uppercase",
                     borderBottom:`1px solid ${C.border}`}}>{h}</th>
@@ -5154,6 +5215,7 @@ function SPX0DTETab() {
             <tbody>
               {Object.entries(spreads).map(([sid, sp]) => (
                 <tr key={sid} style={{borderBottom:`1px solid ${C.border}`}}>
+                  <td style={{padding:"8px 10px"}}>{phaseBadge(sp.trade_phase)}</td>
                   <td style={{padding:"8px 10px", ...mono, fontWeight:700, color:C.white}}>{sid}</td>
                   <td style={{padding:"8px 10px", color:C.muted, fontSize:11}}>{sp.placed_at}</td>
                   <td style={{padding:"8px 10px", ...mono, color:"#86efac"}}>
@@ -5166,7 +5228,10 @@ function SPX0DTETab() {
                   </td>
                   <td style={{padding:"8px 10px", ...mono}}>{sp.spot_at_entry?.toFixed(0)}</td>
                   <td style={{padding:"8px 10px", ...mono, color:"#22c55e"}}>${sp.total_credit?.toFixed(2)}</td>
-                  <td style={{padding:"8px 10px", ...mono, color:"#f59e0b"}}>${sp.profit_target?.toFixed(2)}</td>
+                  <td style={{padding:"8px 10px", ...mono, color:"#f59e0b"}}>
+                    ${(sp.profit_target_dollar ?? sp.profit_target)?.toFixed(2)}
+                    {sp.profit_pct != null && <span style={{color:C.muted, fontSize:10, marginLeft:3}}>({(sp.profit_pct*100).toFixed(0)}%)</span>}
+                  </td>
                   <td style={{padding:"8px 10px", ...mono, fontWeight:700, color:pnlColor(sp.live_pnl)}}>
                     {sp.live_pnl != null ? `${sp.live_pnl>=0?"+":""}$${sp.live_pnl.toFixed(2)}` : "—"}
                   </td>
@@ -5190,7 +5255,7 @@ function SPX0DTETab() {
             <table style={{width:"100%", borderCollapse:"collapse", ...sans, fontSize:12}}>
               <thead>
                 <tr style={{background:"#0f172a"}}>
-                  {["ID","Put Spread","Call Spread","Qty","Credit","P&L","P&L%","Exit"].map(h=>(
+                  {["Phase","ID","Put Spread","Call Spread","Qty","Credit","P&L","P&L%","Exit"].map(h=>(
                     <th key={h} style={{padding:"7px 10px", textAlign:"left", color:C.muted,
                       fontSize:11, fontWeight:600, textTransform:"uppercase",
                       borderBottom:`1px solid ${C.border}`}}>{h}</th>
@@ -5200,6 +5265,7 @@ function SPX0DTETab() {
               <tbody>
                 {[...closed_today].reverse().map((r,i)=>(
                   <tr key={i} style={{borderBottom:`1px solid ${C.border}`}}>
+                    <td style={{padding:"8px 10px"}}>{phaseBadge(r.trade_phase)}</td>
                     <td style={{padding:"8px 10px", ...mono, fontWeight:700, color:C.white}}>{r.spread_id}</td>
                     <td style={{padding:"8px 10px", ...mono, color:"#86efac"}}>{r.put_strikes}</td>
                     <td style={{padding:"8px 10px", ...mono, color:"#fca5a5"}}>{r.call_strikes}</td>
@@ -5248,7 +5314,7 @@ function SPX0DTETab() {
         </>
       )}
 
-      {/* Trade History (from journal DB — persists across sessions) */}
+      {/* Trade History */}
       {history.length > 0 && (
         <>
           <div style={{...sans, fontSize:13, fontWeight:700, color:C.white, marginBottom:8, marginTop:20}}>
@@ -5264,7 +5330,7 @@ function SPX0DTETab() {
             <table style={{width:"100%", borderCollapse:"collapse", ...sans, fontSize:12}}>
               <thead>
                 <tr style={{background:"#0f172a"}}>
-                  {["Date","Qty","Credit","P&L","P&L%","SPX @","Exit"].map(h=>(
+                  {["Date","Qty","Credit","P&L","P&L%","SPX @","Phase","Exit"].map(h=>(
                     <th key={h} style={{padding:"6px 10px", textAlign:"left", color:C.muted,
                       fontSize:11, fontWeight:600, textTransform:"uppercase",
                       borderBottom:`1px solid ${C.border}`}}>{h}</th>
@@ -5286,6 +5352,7 @@ function SPX0DTETab() {
                       {r.pnl_pct >= 0 ? "+" : ""}{r.pnl_pct?.toFixed(1)}%
                     </td>
                     <td style={{padding:"7px 10px", ...mono, color:C.muted}}>{r.spot || "—"}</td>
+                    <td style={{padding:"7px 10px"}}>{phaseBadge(r.trade_phase)}</td>
                     <td style={{padding:"7px 10px"}}>
                       <span style={{fontSize:11, padding:"2px 7px", borderRadius:4, fontWeight:700,
                         color: exitColor(r.exit_type), background:`${exitColor(r.exit_type)}22`}}>
