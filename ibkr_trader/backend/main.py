@@ -444,6 +444,7 @@ state: Dict = {
             # ── VIX filters: high vol = skip entry ────────────────────────────
             "vix_max_morning":         25.0,  # skip morning IC if VIX > this (volatile open)
             "vix_max_afternoon":       18.0,  # skip afternoon play if VIX > this (decay unreliable)
+            "rate_move_bps_max":        8.0,  # skip if 10yr yield moved > this many bps today
             # ── Shared ────────────────────────────────────────────────────────
             "spread_width":            25,    # points per spread leg ($2500 max risk/contract)
             "otm_pct":                  0.5,  # % OTM for short strike (~35 pts OTM at SPX 7000)
@@ -11706,8 +11707,10 @@ _FOMC_DATES_FALLBACK: dict[int, list[str]] = {
 _macro_cache: dict = {
     "dates":          {},      # populated by _refresh_macro_calendar()
     "last_refreshed": None,    # date object
-    "fomc_source":    None,    # "online" | "fallback"
-    "nfp_source":     None,    # "online" | "calculated"
+    "fomc_source":    None,    # "online (federalreserve.gov)" | "fallback (hardcoded)"
+    "nfp_source":     None,    # "online (bls.gov)" | "calculated (first Friday)"
+    "cpi_source":     None,    # "online (bls.gov)" | "none"
+    "ppi_source":     None,    # "online (bls.gov)" | "none"
 }
 
 
@@ -11838,8 +11841,65 @@ def _fetch_nfp_dates_online(year: int) -> list[str] | None:
         return None
 
 
+def _fetch_bls_dates_online(year: int, url: str, label: str) -> list[str] | None:
+    """Generic BLS schedule page scraper (CPI, PPI, etc.).
+    All BLS release schedule pages use the same date format:
+      "Wednesday, January 15, 2025" or "Thursday, January 16, 2025"
+    """
+    import re
+    _MONTH_NUM = {
+        "January": 1, "February": 2, "March": 3, "April": 4,
+        "May": 5, "June": 6, "July": 7, "August": 8,
+        "September": 9, "October": 10, "November": 11, "December": 12,
+    }
+    try:
+        import requests as _req
+        r = _req.get(url, timeout=10,
+                     headers={"User-Agent": "Mozilla/5.0 (compatible; IBKRTrader/1.0)"})
+        r.raise_for_status()
+        dates: list[str] = []
+        for m in re.finditer(
+            r'(?:Monday|Tuesday|Wednesday|Thursday|Friday),\s+'
+            r'(January|February|March|April|May|June|July|August'
+            r'|September|October|November|December)\s+(\d{1,2}),\s+(\d{4})',
+            r.text,
+        ):
+            mon, day, yr = m.group(1), int(m.group(2)), int(m.group(3))
+            if yr == year and mon in _MONTH_NUM:
+                try:
+                    dates.append(date(yr, _MONTH_NUM[mon], day).isoformat())
+                except ValueError:
+                    pass
+        if not dates:
+            log.warning("%s online: 0 dates for %d — BLS page structure may have changed", label, year)
+            return None
+        log.info("%s online: fetched %d dates for %d", label, len(dates), year)
+        return sorted(set(dates))
+    except Exception as exc:
+        log.warning("%s online fetch failed: %s", label, exc)
+        return None
+
+
+def _get_10yr_rate_change() -> float:
+    """Return today's intraday change in 10yr treasury yield (basis points).
+    Uses yfinance ^TNX (10yr CMT yield, in %). Returns 0.0 if unavailable.
+    Positive = rates rising (hawkish pressure), negative = rates falling.
+    """
+    try:
+        import yfinance as yf
+        tnx = yf.Ticker("^TNX").history(period="2d", interval="1d", auto_adjust=False)
+        if len(tnx) >= 2:
+            prev_close = float(tnx["Close"].iloc[-2])
+            today_val  = float(tnx["Close"].iloc[-1])
+            return round((today_val - prev_close) * 100, 1)   # convert % → bps
+        return 0.0
+    except Exception as exc:
+        log.debug("10yr rate fetch failed: %s", exc)
+        return 0.0
+
+
 def _refresh_macro_calendar() -> None:
-    """Fetch FOMC + NFP dates online; merge with hardcoded fallback.
+    """Fetch FOMC, NFP, CPI, and PPI dates online; merge with fallbacks.
     Runs at most once per calendar day (cached). Safe to call frequently.
     """
     today = date.today()
@@ -11852,10 +11912,10 @@ def _refresh_macro_calendar() -> None:
     # ── FOMC ──────────────────────────────────────────────────────────────────
     fomc_online = _fetch_fomc_dates_online(year)
     if fomc_online:
-        fomc_dates               = fomc_online
+        fomc_dates                  = fomc_online
         _macro_cache["fomc_source"] = "online (federalreserve.gov)"
     else:
-        fomc_dates               = _FOMC_DATES_FALLBACK.get(year, [])
+        fomc_dates                  = _FOMC_DATES_FALLBACK.get(year, [])
         _macro_cache["fomc_source"] = "fallback (hardcoded)"
         if not fomc_dates:
             log.warning("SPX macro: no FOMC fallback dates for %d — update _FOMC_DATES_FALLBACK", year)
@@ -11863,22 +11923,46 @@ def _refresh_macro_calendar() -> None:
         merged[d] = "FOMC rate decision"
 
     # ── NFP ───────────────────────────────────────────────────────────────────
-    nfp_online = _fetch_nfp_dates_online(year)
+    nfp_online = _fetch_bls_dates_online(
+        year, "https://www.bls.gov/schedule/news_release/empsit.htm", "NFP")
     if nfp_online:
-        nfp_dates               = nfp_online
+        nfp_dates                  = nfp_online
         _macro_cache["nfp_source"] = "online (bls.gov)"
     else:
-        nfp_dates               = _nfp_dates(year)
+        nfp_dates                  = _nfp_dates(year)
         _macro_cache["nfp_source"] = "calculated (first Friday)"
     for d in nfp_dates:
-        merged.setdefault(d, "NFP release")   # FOMC wins if same day
+        merged.setdefault(d, "NFP release")
+
+    # ── CPI ───────────────────────────────────────────────────────────────────
+    cpi_dates = _fetch_bls_dates_online(
+        year, "https://www.bls.gov/schedule/news_release/cpi.htm", "CPI")
+    if cpi_dates:
+        _macro_cache["cpi_source"] = "online (bls.gov)"
+        for d in cpi_dates:
+            merged.setdefault(d, "CPI inflation report")
+    else:
+        _macro_cache["cpi_source"] = "none (fetch failed — add manually to skip_dates)"
+
+    # ── PPI ───────────────────────────────────────────────────────────────────
+    ppi_dates = _fetch_bls_dates_online(
+        year, "https://www.bls.gov/schedule/news_release/ppi.htm", "PPI")
+    if ppi_dates:
+        _macro_cache["ppi_source"] = "online (bls.gov)"
+        for d in ppi_dates:
+            merged.setdefault(d, "PPI inflation report")
+    else:
+        _macro_cache["ppi_source"] = "none (fetch failed — add manually to skip_dates)"
 
     _macro_cache["dates"]          = merged
     _macro_cache["last_refreshed"] = today
-    log.info("SPX macro calendar refreshed: %d skip dates for %d  "
-             "(FOMC=%s, NFP=%s)",
-             len(merged), year,
-             _macro_cache["fomc_source"], _macro_cache["nfp_source"])
+    log.info(
+        "SPX macro calendar refreshed: %d skip dates for %d  "
+        "(FOMC=%s, NFP=%s, CPI=%s, PPI=%s)",
+        len(merged), year,
+        _macro_cache["fomc_source"], _macro_cache["nfp_source"],
+        _macro_cache["cpi_source"],  _macro_cache["ppi_source"],
+    )
 
 
 def _spx_macro_skip_dates(year: int | None = None) -> dict[str, str]:
@@ -12330,6 +12414,17 @@ async def _spx_entry_coro(ib) -> None:
         return
     vix_note = f"VIX={vix_val:.1f}" if vix_val > 0 else "VIX=n/a"
 
+    # ── 10yr treasury rate change filter ──────────────────────────────────────
+    # Rapid intraday rate moves signal active macro repricing — bad for IC theta
+    rate_bps_max = float(cfg.get("rate_move_bps_max", 8.0))
+    rate_change  = await asyncio.get_event_loop().run_in_executor(None, _get_10yr_rate_change)
+    if abs(rate_change) > rate_bps_max:
+        _spx_log("SKIP",
+                 f"10yr yield moved {rate_change:+.1f}bps today "
+                 f"(threshold ±{rate_bps_max:.0f}bps) — macro repricing, no entry")
+        return
+    rate_note = f"10yr={rate_change:+.1f}bps" if rate_change != 0.0 else ""
+
     # ── Get SPX spot ──────────────────────────────────────────────────────────
     spot = await _spx_get_spot(ib)
     if spot <= 0:
@@ -12405,9 +12500,10 @@ async def _spx_entry_coro(ib) -> None:
     total_credit_dollar  = round(qty * active_credit * 100, 2)
     profit_target_dollar = round(total_credit_dollar * profit_pct, 2)
 
+    rate_str = f"  {rate_note}" if rate_note else ""
     _spx_log("ENTRY",
              f"SPX {spot:.0f}  [{trade_phase.upper()}]  strategy={strategy}  "
-             f"attempt={sx['attempts_today']+1}  {vix_note}  stop={stop_mult}× | "
+             f"attempt={sx['attempts_today']+1}  {vix_note}{rate_str}  stop={stop_mult}× | "
              + (f"P {int(put_short_k)}/{int(put_long_k)} cr={p_credit:.2f} | " if use_put else "")
              + (f"C {int(call_short_k)}/{int(call_long_k)} cr={c_credit:.2f} | " if use_call else "")
              + f"qty={qty}  total_cr=${total_credit_dollar:.0f}  "
@@ -12456,10 +12552,11 @@ async def _spx_entry_coro(ib) -> None:
     }
     sx["attempts_today"] += 1
 
-    phase_emoji = "🌅" if in_morning else "🌆"
+    phase_emoji  = "🌅" if in_morning else "🌆"
+    filters_note = "   ".join(x for x in [vix_note, rate_note] if x)
     _spx_notify(
         f"📈 <b>SPX 0DTE ENTRY</b> {phase_emoji} {trade_phase.upper()} — trade #{sx['attempts_today']}  ({strategy})\n"
-        f"SPX: {spot:.0f}   {vix_note}   Target: <b>${profit_target_dollar:.0f}</b> ({profit_pct*100:.0f}% of cr)   Stop: {stop_mult}×   Qty: {qty}\n"
+        f"SPX: {spot:.0f}   {filters_note}   Target: <b>${profit_target_dollar:.0f}</b> ({profit_pct*100:.0f}% of cr)   Stop: {stop_mult}×   Qty: {qty}\n"
         + (f"PUT  {int(put_short_k)}/{int(put_long_k)}  cr={p_credit:.2f}\n" if use_put else "")
         + (f"CALL {int(call_short_k)}/{int(call_long_k)}  cr={c_credit:.2f}\n" if use_call else "")
         + f"Total credit: ${total_credit_dollar:.0f}   Floor: ${floor:.0f}"
@@ -13081,6 +13178,7 @@ class SPXConfigRequest(BaseModel):
     profit_pct_morning:      Optional[float]       = None
     stop_loss_tiers:         Optional[list[float]] = None
     vix_max_morning:         Optional[float]       = None
+    rate_move_bps_max:       Optional[float]       = None
     # Afternoon theta phase
     afternoon_entry_start:   Optional[str]         = None
     afternoon_entry_cutoff:  Optional[str]         = None
@@ -13197,8 +13295,10 @@ def spx_macro_calendar():
         "upcoming":          upcoming,
         "manual_skip_dates": manual,
         "data_sources": {
-            "fomc": _macro_cache.get("fomc_source", "not yet refreshed"),
-            "nfp":  _macro_cache.get("nfp_source",  "not yet refreshed"),
+            "fomc":           _macro_cache.get("fomc_source", "not yet refreshed"),
+            "nfp":            _macro_cache.get("nfp_source",  "not yet refreshed"),
+            "cpi":            _macro_cache.get("cpi_source",  "not yet refreshed"),
+            "ppi":            _macro_cache.get("ppi_source",  "not yet refreshed"),
             "last_refreshed": str(_macro_cache.get("last_refreshed") or "never"),
         },
     }
