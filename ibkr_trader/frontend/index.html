@@ -7921,7 +7921,7 @@ function AlertsTab() {
     try {
       const d = new Date(iso.endsWith("Z") ? iso : iso + "Z");
       return d.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", timeZone: "America/New_York", hour12: false }) + " ET";
-    } catch { return iso.slice(11, 16); }
+    } catch(_e) { return iso.slice(11, 16); }
   };
 
   const fmtDate = (s) => s ? s.slice(5) : "—"; // MM-DD from YYYY-MM-DD
