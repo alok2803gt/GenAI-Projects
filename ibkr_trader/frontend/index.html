@@ -8043,7 +8043,6 @@ function AlertsTab() {
                   <tr><td colSpan={8} style={{ ...sans, fontSize: 12, color: C.muted, paddingTop: 16 }}>
                     No transitions{filterDate ? ` for ${filterDate}` : " today"}.</td></tr>
                 ) : transitions.map(t => {
-                  const isUpgrade = ["PRE-BREAKOUT","BREAKOUT","EXTENDED"].includes(t.new_state);
                   return (
                     <tr key={t.id} style={{ borderBottom: `1px solid ${C.border}22` }}>
                       <td style={{ ...cell, color: C.muted }}>{fmtDate(t.session_date)}</td>
@@ -8051,7 +8050,7 @@ function AlertsTab() {
                       <td style={{ ...cell, color: "#60a5fa", fontWeight: 700 }}>{t.ticker}</td>
                       <td style={{ ...cell }}>
                         <span style={{ color: C.muted }}>{t.prev_state}</span>
-                        <span style={{ color: C.muted, margin: "0 6px" }}>→</span>
+                        <span style={{ color: C.muted, margin: "0 6px" }}>{"→"}</span>
                         {stateBadge(t.new_state)}
                       </td>
                       <td style={{ ...cell, color: pctBColor(t.pct_b) }}>{t.pct_b != null ? t.pct_b.toFixed(1) : "—"}</td>
