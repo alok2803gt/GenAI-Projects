@@ -7871,6 +7871,205 @@ function NewsMonitorTab() {
   );
 }
 
+// ── Alerts Tab (Scanner alert history + state machine transitions) ────────
+function AlertsTab() {
+  const [alerts,      setAlerts]      = useState([]);
+  const [transitions, setTransitions] = useState([]);
+  const [loading,     setLoading]     = useState(true);
+  const [filterDate,  setFilterDate]  = useState("");
+  const [view,        setView]        = useState("alerts"); // "alerts" | "transitions"
+  const [, tick]                      = useState(0);
+
+  const load = () => {
+    const dateQ = filterDate ? `&session_date=${filterDate}` : "";
+    Promise.all([
+      fetch(API + `/alerts/history?limit=300${dateQ}`).then(r => r.json()).catch(() => ({alerts:[]})),
+      fetch(API + `/scanner/state-transitions?days=1${filterDate ? `&session_date=${filterDate}` : ""}`).then(r => r.json()).catch(() => ({transitions:[]})),
+    ]).then(([ah, st]) => {
+      setAlerts(ah.alerts || []);
+      setTransitions(st.transitions || []);
+      setLoading(false);
+    });
+  };
+
+  useEffect(() => { load(); const iv = setInterval(load, 30000); return () => clearInterval(iv); }, [filterDate]);
+  useEffect(() => { const iv = setInterval(() => tick(n => n+1), 60000); return () => clearInterval(iv); }, []);
+
+  const card = { background: C.card, border: `1px solid ${C.border}`, borderRadius: 8, padding: "16px 20px", marginBottom: 12 };
+  const hdr  = { ...sans, fontSize: 11, color: C.muted, textAlign: "left", paddingBottom: 6, paddingRight: 10, fontWeight: 600 };
+  const cell = { ...mono, fontSize: 11, paddingTop: 4, paddingRight: 10, whiteSpace: "nowrap" };
+
+  const sigBadge = (sig) => {
+    const isBO = sig === "BREAKOUT";
+    return <span style={{ background: isBO ? "#7c3aed22" : "#f0883e22",
+      color: isBO ? "#a78bfa" : C.orange, border: `1px solid ${isBO ? "#7c3aed" : C.orange}`,
+      borderRadius: 4, padding: "1px 6px", fontSize: 10, fontWeight: 700, ...sans }}>
+      {isBO ? "🚨 BREAKOUT" : "⚡ PRE-BO"}
+    </span>;
+  };
+
+  const stateBadge = (s) => {
+    if (!s || s === "—") return <span style={{color: C.muted, fontSize: 11}}>—</span>;
+    const col = s === "BREAKOUT" ? "#a78bfa" : s === "PRE-BREAKOUT" ? C.orange : s === "EXTENDED" ? "#34d399" : C.muted;
+    return <span style={{ color: col, fontSize: 11, fontWeight: 600 }}>{s}</span>;
+  };
+
+  const pctBColor = (v) => v == null ? C.muted : v >= 95 ? "#a78bfa" : v >= 75 ? C.orange : v >= 50 ? C.bull : C.muted;
+
+  const fmtTime = (iso) => {
+    if (!iso) return "—";
+    try {
+      const d = new Date(iso.endsWith("Z") ? iso : iso + "Z");
+      return d.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", timeZone: "America/New_York", hour12: false }) + " ET";
+    } catch { return iso.slice(11, 16); }
+  };
+
+  const fmtDate = (s) => s ? s.slice(5) : "—"; // MM-DD from YYYY-MM-DD
+
+  const todayEt = () => {
+    const d = new Date();
+    return d.toLocaleDateString("en-CA", { timeZone: "America/New_York" }); // YYYY-MM-DD
+  };
+
+  const viewBtn = (id, label) => (
+    <button onClick={() => setView(id)} style={{
+      background: view === id ? C.accent : "transparent",
+      color: view === id ? "#fff" : C.muted,
+      border: `1px solid ${view === id ? C.accent : C.border}`,
+      borderRadius: 4, padding: "4px 14px", ...sans, fontSize: 12, cursor: "pointer"
+    }}>{label}</button>
+  );
+
+  return (
+    <div style={{ padding: 16, maxWidth: 1400, margin: "0 auto" }}>
+
+      {/* Header row */}
+      <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 12 }}>
+        <div style={{ ...sans, fontSize: 16, fontWeight: 700, color: C.text }}>Scanner Alerts</div>
+        <div style={{ display: "flex", gap: 6 }}>
+          {viewBtn("alerts",      "Alerts")}
+          {viewBtn("transitions", "State Changes")}
+        </div>
+        <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 8 }}>
+          <span style={{ ...sans, fontSize: 12, color: C.muted }}>Date:</span>
+          <input type="date" value={filterDate}
+            onChange={e => setFilterDate(e.target.value)}
+            style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 4,
+              color: C.text, padding: "3px 8px", ...sans, fontSize: 12 }} />
+          {filterDate && (
+            <button onClick={() => setFilterDate("")}
+              style={{ background: "transparent", border: `1px solid ${C.border}`, borderRadius: 4,
+                color: C.muted, padding: "3px 10px", ...sans, fontSize: 12, cursor: "pointer" }}>
+              Today
+            </button>
+          )}
+          <button onClick={load}
+            style={{ background: C.accent, border: "none", borderRadius: 4,
+              color: "#fff", padding: "4px 12px", ...sans, fontSize: 12, cursor: "pointer" }}>
+            Refresh
+          </button>
+        </div>
+      </div>
+
+      {loading && <div style={{ ...sans, fontSize: 13, color: C.muted, padding: 20 }}>Loading…</div>}
+
+      {/* ── Alerts table ── */}
+      {view === "alerts" && !loading && (
+        <div style={card}>
+          <div style={{ ...sans, fontSize: 12, color: C.muted, marginBottom: 10, fontWeight: 600 }}>
+            {alerts.length} alert{alerts.length !== 1 ? "s" : ""}
+            {filterDate ? ` on ${filterDate}` : ` (last 300)`}
+          </div>
+          <div style={{ overflowX: "auto" }}>
+            <table style={{ width: "100%", borderCollapse: "collapse" }}>
+              <thead>
+                <tr style={{ borderBottom: `1px solid ${C.border}` }}>
+                  {["Date", "Time", "Ticker", "Signal", "Daily State", "Prev State", "%B", "RSI", "Vol×",
+                    "Tape", "State Path"].map(h => (
+                    <th key={h} style={hdr}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {alerts.length === 0 ? (
+                  <tr><td colSpan={11} style={{ ...sans, fontSize: 12, color: C.muted, paddingTop: 16 }}>
+                    No alerts{filterDate ? ` for ${filterDate}` : ""}.</td></tr>
+                ) : alerts.map(a => (
+                  <tr key={a.id} style={{ borderBottom: `1px solid ${C.border}22` }}>
+                    <td style={{ ...cell, color: C.muted }}>{fmtDate(a.session_date)}</td>
+                    <td style={{ ...cell, color: C.muted }}>{fmtTime(a.fired_at)}</td>
+                    <td style={{ ...cell, color: "#60a5fa", fontWeight: 700 }}>{a.ticker}</td>
+                    <td style={{ ...cell, paddingTop: 2 }}>{sigBadge(a.signal_type)}</td>
+                    <td style={{ ...cell }}>{stateBadge(a.curr_daily_state)}</td>
+                    <td style={{ ...cell, color: C.muted, fontSize: 11 }}>{a.prev_state || "—"}</td>
+                    <td style={{ ...cell, color: pctBColor(a.pct_b) }}>{a.pct_b != null ? a.pct_b.toFixed(1) : "—"}</td>
+                    <td style={{ ...cell, color: C.muted }}>{a.rsi != null ? a.rsi.toFixed(1) : "—"}</td>
+                    <td style={{ ...cell, color: C.muted }}>{a.vol_ratio != null ? a.vol_ratio.toFixed(2) + "×" : "—"}</td>
+                    <td style={{ ...cell, color: a.tape_label === "NO DATA" ? C.muted :
+                      a.tape_label?.includes("BULL") ? C.bull : a.tape_label?.includes("BEAR") ? C.bear : C.muted,
+                      fontSize: 11 }}>
+                      {a.tape_label || "—"}
+                    </td>
+                    <td style={{ ...mono, fontSize: 10, paddingTop: 4, color: C.muted, maxWidth: 200,
+                      overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                      {a.state_path || "—"}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {/* ── State transitions table ── */}
+      {view === "transitions" && !loading && (
+        <div style={card}>
+          <div style={{ ...sans, fontSize: 12, color: C.muted, marginBottom: 10, fontWeight: 600 }}>
+            {transitions.length} transition{transitions.length !== 1 ? "s" : ""}
+            {filterDate ? ` on ${filterDate}` : " (today)"}
+          </div>
+          <div style={{ overflowX: "auto" }}>
+            <table style={{ width: "100%", borderCollapse: "collapse" }}>
+              <thead>
+                <tr style={{ borderBottom: `1px solid ${C.border}` }}>
+                  {["Date", "Time ET", "Ticker", "Transition", "%B", "RSI", "Mins in Prev", "Close"].map(h => (
+                    <th key={h} style={hdr}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {transitions.length === 0 ? (
+                  <tr><td colSpan={8} style={{ ...sans, fontSize: 12, color: C.muted, paddingTop: 16 }}>
+                    No transitions{filterDate ? ` for ${filterDate}` : " today"}.</td></tr>
+                ) : transitions.map(t => {
+                  const isUpgrade = ["PRE-BREAKOUT","BREAKOUT","EXTENDED"].includes(t.new_state);
+                  return (
+                    <tr key={t.id} style={{ borderBottom: `1px solid ${C.border}22` }}>
+                      <td style={{ ...cell, color: C.muted }}>{fmtDate(t.session_date)}</td>
+                      <td style={{ ...cell, color: C.muted }}>{t.transition_time_et || "—"}</td>
+                      <td style={{ ...cell, color: "#60a5fa", fontWeight: 700 }}>{t.ticker}</td>
+                      <td style={{ ...cell }}>
+                        <span style={{ color: C.muted }}>{t.prev_state}</span>
+                        <span style={{ color: C.muted, margin: "0 6px" }}>→</span>
+                        {stateBadge(t.new_state)}
+                      </td>
+                      <td style={{ ...cell, color: pctBColor(t.pct_b) }}>{t.pct_b != null ? t.pct_b.toFixed(1) : "—"}</td>
+                      <td style={{ ...cell, color: C.muted }}>{t.rsi != null ? t.rsi.toFixed(1) : "—"}</td>
+                      <td style={{ ...cell, color: C.muted }}>{t.mins_in_prev_state != null ? `${t.mins_in_prev_state}m` : "—"}</td>
+                      <td style={{ ...cell, color: C.muted }}>{t.close_price != null ? `$${t.close_price.toFixed(2)}` : "—"}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ── Risk Monitor Tab ──────────────────────────────────────────────────────
 function RiskMonitorTab() {
   const [data,      setData]    = useState(null);
@@ -8154,6 +8353,7 @@ function App() {
       { id:"instflow",   label:"Inst. Flow" },
       { id:"technicals", label:"Technicals" },
       { id:"news",       label:"News Feed"  },
+      { id:"alerts",     label:"Alerts"     },
     ]},
     { id:"analytics",label:"Analytics", tabs: [
       { id:"universe",    label:"Universe"     },
@@ -8257,6 +8457,7 @@ function App() {
         <div style={{display: tab==="tape"         ? "" : "none"}}><TapeTab /></div>
         <div style={{display: tab==="instflow"     ? "" : "none"}}><InstFlowTab /></div>
         <div style={{display: tab==="news"         ? "" : "none"}}><NewsMonitorTab /></div>
+        <div style={{display: tab==="alerts"       ? "" : "none"}}><AlertsTab /></div>
         <div style={{display: tab==="performance"  ? "" : "none"}}><PerformanceTab /></div>
 
         {/* ── Footer ── */}

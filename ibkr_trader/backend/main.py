@@ -4233,6 +4233,11 @@ def _tape_db_init() -> None:
         )
     """)
     con.execute("CREATE INDEX IF NOT EXISTS idx_ah_ticker ON alert_history (ticker, session_date)")
+    # Migrate alert_history — add curr_daily_state for intraday dual-%B signals
+    try:
+        con.execute("ALTER TABLE alert_history ADD COLUMN curr_daily_state TEXT")
+    except Exception:
+        pass
     con.execute("""
         CREATE TABLE IF NOT EXISTS alert_performance (
             id                   INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -4299,7 +4304,8 @@ def _alert_history_insert(ticker: str, signal_type: str, price: Optional[float],
                            tape_label: Optional[str],
                            prev_state: Optional[str] = None,
                            mins_in_pre_breakout: Optional[int] = None,
-                           state_path: Optional[str] = None) -> None:
+                           state_path: Optional[str] = None,
+                           curr_daily_state: Optional[str] = None) -> None:
     """Persist one scanner alert to alert_history (fire-and-forget, never raises)."""
     try:
         from zoneinfo import ZoneInfo
@@ -4309,11 +4315,11 @@ def _alert_history_insert(ticker: str, signal_type: str, price: Optional[float],
             """INSERT INTO alert_history
                (fired_at, session_date, ticker, signal_type, price,
                 pct_b, rsi, vol_ratio, tape_score, tape_label,
-                prev_state, mins_in_pre_breakout, state_path)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                prev_state, mins_in_pre_breakout, state_path, curr_daily_state)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (datetime.utcnow().isoformat(), now_et.strftime("%Y-%m-%d"),
              ticker, signal_type, price, pct_b, rsi, vol_ratio, tape_score, tape_label,
-             prev_state, mins_in_pre_breakout, state_path),
+             prev_state, mins_in_pre_breakout, state_path, curr_daily_state),
         )
         con.commit()
         con.close()
@@ -8111,6 +8117,7 @@ class WatchlistAlertRequest(BaseModel):
     prev_state:           Optional[str]   = None   # state before entering current signal zone
     mins_in_pre_breakout: Optional[int]   = None   # minutes spent in PRE-BREAKOUT before BREAKOUT
     state_path:           Optional[str]   = None   # e.g. "NEUTRAL→PRE-BREAKOUT→BREAKOUT"
+    curr_daily_state:     Optional[str]   = None   # daily %B state at time of intraday signal
     # S/R levels from scanner (swing-based, 60-bar lookback)
     sr_resistance:        Optional[float] = None   # nearest swing high above price
     sr_support:           Optional[float] = None   # nearest swing low below price
@@ -8169,7 +8176,8 @@ def watchlist_add_alert(req: WatchlistAlertRequest):
                                   resolved_ts, resolved_tl,
                                   prev_state=req.prev_state,
                                   mins_in_pre_breakout=req.mins_in_pre_breakout,
-                                  state_path=req.state_path)
+                                  state_path=req.state_path,
+                                  curr_daily_state=req.curr_daily_state)
             return True
         return False
 
@@ -8233,7 +8241,8 @@ def watchlist_add_alert(req: WatchlistAlertRequest):
                           req.pct_b, req.rsi, req.vol_ratio, ts, tl,
                           prev_state=req.prev_state,
                           mins_in_pre_breakout=req.mins_in_pre_breakout,
-                          state_path=req.state_path)
+                          state_path=req.state_path,
+                          curr_daily_state=req.curr_daily_state)
     _watchlist_save()
     return {"ok": True, "action": "added"}
 
@@ -9189,25 +9198,39 @@ async def backtest_breakout_filtered_endpoint():
 # ── Watchlist alert history + backtest ─────────────────────────────────────
 
 @app.get("/alerts/history")
-def alerts_history_endpoint(limit: int = 500):
+def alerts_history_endpoint(limit: int = 500, session_date: Optional[str] = None):
     """Return persisted breakout alert history from alert_history table.
 
     Each row is one unique alert-fire event (only new tickers logged, not refreshes).
-    Returns most-recent first.
+    Returns most-recent first. Optionally filter by session_date (YYYY-MM-DD).
     """
     try:
         con = sqlite3.connect(TAPE_DB_PATH, check_same_thread=False)
-        rows = con.execute(
-            """SELECT id, fired_at, session_date, ticker, signal_type, price,
-                      pct_b, rsi, vol_ratio, tape_score, tape_label
-               FROM alert_history
-               ORDER BY id DESC
-               LIMIT ?""",
-            (limit,),
-        ).fetchall()
+        if session_date:
+            rows = con.execute(
+                """SELECT id, fired_at, session_date, ticker, signal_type, price,
+                          pct_b, rsi, vol_ratio, tape_score, tape_label,
+                          prev_state, mins_in_pre_breakout, state_path, curr_daily_state
+                   FROM alert_history
+                   WHERE session_date = ?
+                   ORDER BY id DESC
+                   LIMIT ?""",
+                (session_date, limit),
+            ).fetchall()
+        else:
+            rows = con.execute(
+                """SELECT id, fired_at, session_date, ticker, signal_type, price,
+                          pct_b, rsi, vol_ratio, tape_score, tape_label,
+                          prev_state, mins_in_pre_breakout, state_path, curr_daily_state
+                   FROM alert_history
+                   ORDER BY id DESC
+                   LIMIT ?""",
+                (limit,),
+            ).fetchall()
         con.close()
         cols = ["id", "fired_at", "session_date", "ticker", "signal_type",
-                "price", "pct_b", "rsi", "vol_ratio", "tape_score", "tape_label"]
+                "price", "pct_b", "rsi", "vol_ratio", "tape_score", "tape_label",
+                "prev_state", "mins_in_pre_breakout", "state_path", "curr_daily_state"]
         return {"alerts": [dict(zip(cols, r)) for r in rows], "total": len(rows)}
     except Exception as exc:
         return {"alerts": [], "total": 0, "error": str(exc)}
@@ -9525,6 +9548,40 @@ async def performance_indicators(days: int = Query(30)):
     loop = asyncio.get_event_loop()
     result = await loop.run_in_executor(None, lambda: _compute_indicator_analysis(days))
     return result
+
+
+@app.get("/scanner/state-transitions")
+def scanner_state_transitions(session_date: Optional[str] = None, days: int = 1):
+    """Return state machine transitions from state_transitions table.
+
+    Defaults to today (days=1). Pass session_date=YYYY-MM-DD to filter to a specific day.
+    Used by the Alerts tab to show daily state change log alongside alert history.
+    """
+    try:
+        con = sqlite3.connect(TAPE_DB_PATH, check_same_thread=False)
+        con.row_factory = sqlite3.Row
+        if session_date:
+            rows = [dict(r) for r in con.execute(
+                """SELECT id, session_date, ticker, prev_state, new_state,
+                          pct_b, rsi, transition_time_et, mins_in_prev_state, close_price
+                   FROM state_transitions WHERE session_date = ?
+                   ORDER BY transition_time_et DESC""",
+                (session_date,)
+            ).fetchall()]
+        else:
+            from zoneinfo import ZoneInfo
+            cutoff = (datetime.now(ZoneInfo("America/New_York")) - timedelta(days=days)).strftime("%Y-%m-%d")
+            rows = [dict(r) for r in con.execute(
+                """SELECT id, session_date, ticker, prev_state, new_state,
+                          pct_b, rsi, transition_time_et, mins_in_prev_state, close_price
+                   FROM state_transitions WHERE session_date >= ?
+                   ORDER BY transition_time_et DESC""",
+                (cutoff,)
+            ).fetchall()]
+        con.close()
+        return {"transitions": rows, "total": len(rows)}
+    except Exception as exc:
+        return {"transitions": [], "total": 0, "error": str(exc)}
 
 
 @app.get("/performance/state-outcomes")

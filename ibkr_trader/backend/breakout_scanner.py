@@ -236,6 +236,7 @@ def post_to_backend_with_tape(backend_url: str, ind: dict, signal_type: str,
         if ind.get("state_path")              is not None: payload["state_path"]              = ind["state_path"]
         if ind.get("sr_resistance")        is not None: payload["sr_resistance"]        = ind["sr_resistance"]
         if ind.get("sr_support")           is not None: payload["sr_support"]           = ind["sr_support"]
+        if ind.get("curr_daily_state")     is not None: payload["curr_daily_state"]     = ind["curr_daily_state"]
         r = requests.post(
             f"{backend_url.rstrip('/')}/watchlist/alert",
             json=payload,
