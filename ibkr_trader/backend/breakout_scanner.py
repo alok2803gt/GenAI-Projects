@@ -105,6 +105,7 @@ DEFAULT_CONFIG = {
     "backend_url":            "http://localhost:8000",
     "use_ibkr_hist":          True,   # refresh cache via backend IBKR endpoint; falls back to yfinance
     "pre_bo_grace_minutes":   15,     # retired — kept for config compat; no longer used by F9
+    "min_pre_breakout_mins":  15,     # BREAKOUT via PRE-BO path must have spent ≥N mins in PRE-BO
 }
 
 
@@ -1955,7 +1956,21 @@ def _main_loop():
                         tk,
                     )
 
-                # Sync to backend watchlist only after all local filters pass (F1–F9).
+                # ── F10: PRE-BREAKOUT duration gate ───────────────────────────────────────
+                # Signals from stocks that consolidated in PRE-BREAKOUT for <15m have
+                # historically shown 44% win rate / -0.45% avg return — worse than random.
+                # Only applies to BREAKOUT signals that came via the PRE-BREAKOUT path.
+                if sig_type == "BREAKOUT" and _came_via_pre:
+                    _min_mins = cfg.get("min_pre_breakout_mins", 15)
+                    _actual   = ind.get("mins_in_pre_breakout")
+                    if _min_mins > 0 and _actual is not None and _actual < _min_mins:
+                        log.info(
+                            "F10 duration-gate dropped %s: only %dm in PRE-BREAKOUT (min=%d)",
+                            tk, _actual, _min_mins,
+                        )
+                        continue
+
+                # Sync to backend watchlist only after all local filters pass (F1–F10).
                 # This keeps watchlist consistent with Telegram and stock-trader triggers.
                 response = post_to_backend_with_tape(backend_url, ind, sig_type, tape)
                 action   = response.get("action", "no_backend")
@@ -2014,7 +2029,7 @@ def _main_loop():
         if n_alerted_this_cycle > 0:
             bo_count  = sum(1 for v in alerted_today.values() if v == "BREAKOUT")
             pre_count = sum(1 for v in alerted_today.values() if v == "PRE-BREAKOUT")
-            f9_note   = f" | F9 path-gate ✓ ({n_f9_dropped} dropped)" if cfg.get("require_2step_breakout") else ""
+            f9_note   = f" | F9/F10 gates ({n_f9_dropped} dropped)" if cfg.get("require_2step_breakout") else ""
             summary = (
                 f"📋 <b>Scan summary</b> {datetime.now(ET).strftime('%H:%M ET')}\n"
                 f"🚨 BREAKOUT today: {bo_count}\n"
