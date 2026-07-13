@@ -5819,6 +5819,11 @@ function SigTraderTab() {
                   <td style={{padding:"8px 10px", color:C.muted, fontSize:11}}>{p.deadline ? p.deadline.slice(11,16)+"Z" : "--"}</td>
                   <td style={{padding:"8px 10px", ...mono, fontWeight:700, color:pnlColor(p.live_pnl)}}>
                     {p.live_pnl != null ? `${p.live_pnl>=0?"+":""}$${p.live_pnl.toFixed(2)}` : "--"}
+                    {p.option_live_mid != null && (
+                      <div style={{...sans, fontSize:10, color:C.muted, fontWeight:400}}>
+                        mid ${p.option_live_mid.toFixed(2)} · entry ${p.option_entry_price?.toFixed(2)}
+                      </div>
+                    )}
                   </td>
                   <td style={{padding:"8px 10px"}}>
                     <button onClick={()=>closePos(pid)} style={{

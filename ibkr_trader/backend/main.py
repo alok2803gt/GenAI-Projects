@@ -13854,19 +13854,21 @@ async def _st_close_position(ib, pos_id: str, reason: str) -> None:
 
 
 async def _st_monitor_coro(ib) -> None:
-    """Check open positions against target/stop/deadline; close as needed."""
+    """Check open positions against target/stop/deadline; update live option P&L."""
     st = state["sig_trader"]
     if not st["positions"]:
         return
 
-    tickers_needed = list({p["ticker"] for p in st["positions"].values()
-                           if p.get("phase") == "open"})
-    if not tickers_needed:
+    open_positions = {pid: p for pid, p in st["positions"].items()
+                      if p.get("phase") == "open"}
+    if not open_positions:
         return
 
-    from ib_insync import Stock as IbStock
-    contracts = [IbStock(tk, "SMART", "USD") for tk in tickers_needed]
-    spot_tickers = await ib.reqTickersAsync(*contracts)
+    # ── 1. Batch-fetch live spot prices ──────────────────────────────────────
+    from ib_insync import Stock as IbStock, Option as IbOpt
+    tickers_needed = list({p["ticker"] for p in open_positions.values()})
+    spot_contracts = [IbStock(tk, "SMART", "USD") for tk in tickers_needed]
+    spot_tickers = await ib.reqTickersAsync(*spot_contracts)
     await asyncio.sleep(2)
 
     spot_map: dict = {}
@@ -13877,18 +13879,47 @@ async def _st_monitor_coro(ib) -> None:
             if px > 0:
                 spot_map[sym] = px
 
-    now_utc = datetime.utcnow()
-    for pos_id, pos in list(st["positions"].items()):
-        if pos.get("phase") != "open":
+    # ── 2. Fetch live option mids for all open positions ──────────────────────
+    opt_contracts = []
+    pid_to_opt: dict = {}  # pos_id → index in opt_contracts
+    for pos_id, pos in open_positions.items():
+        if not pos.get("conid"):
             continue
+        c = IbOpt(pos["ticker"], pos["expiry"], pos["strike"], "C", "SMART", "100", "USD")
+        c.conId = pos["conid"]
+        pid_to_opt[pos_id] = len(opt_contracts)
+        opt_contracts.append(c)
+
+    opt_mids: dict = {}  # pos_id → current mid price
+    if opt_contracts:
+        try:
+            opt_tickers = await ib.reqTickersAsync(*opt_contracts)
+            await asyncio.sleep(3)
+            for pos_id, idx in pid_to_opt.items():
+                if idx < len(opt_tickers):
+                    mid = _spx_mid(opt_tickers[idx])
+                    if mid > 0:
+                        opt_mids[pos_id] = mid
+        except Exception as e:
+            log.warning("SIG_TRADER option quote error: %s", e)
+
+    # ── 3. Apply target / stop / deadline; update live P&L ───────────────────
+    now_utc = datetime.utcnow()
+    for pos_id, pos in list(open_positions.items()):
         tk = pos["ticker"]
         spot = spot_map.get(tk)
+
+        # Live P&L from actual option mid (falls back to spot-based estimate)
+        opt_mid = opt_mids.get(pos_id)
+        if opt_mid is not None:
+            pos["live_pnl"] = round((opt_mid - pos["option_entry_price"]) * 100, 2)
+            pos["option_live_mid"] = round(opt_mid, 2)
+        elif spot:
+            # Rough delta-1 approximation until option quote arrives
+            pos["live_pnl"] = round((spot - pos["spot_at_entry"]) * 100, 2)
+
         if not spot:
             continue
-
-        # Live P&L estimate (spot-based, not option-based — simpler)
-        spot_pnl = round((spot - pos["spot_at_entry"]) * 100, 2)
-        pos["live_pnl"] = spot_pnl
 
         deadline = datetime.strptime(pos["deadline"], "%Y-%m-%dT%H:%M:%SZ")
 
