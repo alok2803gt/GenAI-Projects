@@ -109,6 +109,24 @@ DEFAULT_CONFIG = {
 }
 
 
+# ── Signal Trader prime-window config (mirrors ST_SETUPS in main.py) ─────────
+# Only signal+window needed here for annotation; full setup lives in the backend.
+ST_WINDOWS = {
+    "GOOG": {"signal": "PRE-BREAKOUT", "win_start": "10:30", "win_end": "12:00"},
+    "AAPL": {"signal": "PRE-BREAKOUT", "win_start": "09:30", "win_end": "10:30"},
+    "AMZN": {"signal": "BREAKOUT",     "win_start": "09:30", "win_end": "16:00"},
+    "UNH":  {"signal": "BREAKOUT",     "win_start": "09:30", "win_end": "16:00"},
+    "SPXC": {"signal": "BREAKOUT",     "win_start": "12:00", "win_end": "14:00"},
+    "MU":   {"signal": "PRE-BREAKOUT", "win_start": "12:00", "win_end": "14:00"},
+    "NFLX": {"signal": "BREAKOUT",     "win_start": "14:00", "win_end": "15:00"},
+    "ASML": {"signal": "PRE-BREAKOUT", "win_start": "10:30", "win_end": "12:00"},
+    "META": {"signal": "PRE-BREAKOUT", "win_start": "12:00", "win_end": "14:00"},
+    "MSFT": {"signal": "PRE-BREAKOUT", "win_start": "12:00", "win_end": "14:00"},
+    "LRCX": {"signal": "PRE-BREAKOUT", "win_start": "12:00", "win_end": "14:00"},
+    "NVDA": {"signal": "BREAKOUT",     "win_start": "09:30", "win_end": "16:00"},
+}
+
+
 def load_config() -> dict:
     if not os.path.exists(CONFIG_PATH):
         with open(CONFIG_PATH, "w") as f:
@@ -238,6 +256,13 @@ def post_to_backend_with_tape(backend_url: str, ind: dict, signal_type: str,
         if ind.get("sr_resistance")        is not None: payload["sr_resistance"]        = ind["sr_resistance"]
         if ind.get("sr_support")           is not None: payload["sr_support"]           = ind["sr_support"]
         if ind.get("curr_daily_state")     is not None: payload["curr_daily_state"]     = ind["curr_daily_state"]
+        # Prime-window annotation for Signal Trader
+        sw = ST_WINDOWS.get(ind["ticker"])
+        if sw and signal_type == sw["signal"]:
+            t = datetime.now(ET).strftime("%H:%M")
+            payload["prime_window"] = sw["win_start"] <= t <= sw["win_end"]
+        else:
+            payload["prime_window"] = False
         r = requests.post(
             f"{backend_url.rstrip('/')}/watchlist/alert",
             json=payload,
@@ -330,6 +355,16 @@ def fmt_alert(ind: dict, signal: str, tape: dict | None = None) -> str:
         sr_parts.append(f"S ${ind['sr_support']:.2f} (-{dist:.1f}%)")
     sr_line = ("\n\U0001f4d0 S/R: " + "  |  ".join(sr_parts)) if sr_parts else ""
 
+    # Signal Trader prime-window annotation
+    prime_line = ""
+    sw = ST_WINDOWS.get(ind["ticker"])
+    if sw and signal == sw["signal"]:
+        t_now = datetime.now(ET).strftime("%H:%M")
+        in_window = sw["win_start"] <= t_now <= sw["win_end"]
+        icon  = "✅" if in_window else "⏰"
+        label = "PRIME WINDOW" if in_window else f"off-peak (prime {sw['win_start']}–{sw['win_end']})"
+        prime_line = f"\n{icon} <b>Sig Trader: {label}</b>"
+
     return (
         f"{emoji} <b>{signal}</b> — {ind['ticker']}\n"
         f"💰 Price: ${ind['price']:.2f} ({day_sign}{ind['day_chg_pct']:.1f}%)\n"
@@ -340,6 +375,7 @@ def fmt_alert(ind: dict, signal: str, tape: dict | None = None) -> str:
         f"{score_line}"
         f"{sr_line}"
         f"{tape_line}"
+        f"{prime_line}"
     )
 
 

@@ -151,6 +151,7 @@ ST_STATE_PATH       = "stock_state.json"        # stock trader state (persisted)
 DT_STATE_PATH       = "day_trader_state.json"   # day trader state (persisted)
 SPX_STATE_PATH      = "spx_0dte_state.json"     # SPX 0DTE trader state (persisted)
 EVC_STATE_PATH      = "earnings_vol_crush_state.json"  # Earnings Vol Crush state (persisted)
+SIGT_STATE_PATH     = "sig_trader_state.json"          # Signal Trader state (persisted)
 UNIVERSE_CACHE_PATH = "universe_cache.json"     # screened universe (refreshed nightly)
 WATCHLIST_PATH      = "watchlist.json"          # breakout scanner watchlist
 
@@ -486,6 +487,17 @@ state: Dict = {
         "scan_date":    None, # date of last universe scan (avoid rescanning same day)
         "scanning":     False,# guard against concurrent scan+entry
     },
+    "sig_trader": {
+        "enabled": False,
+        "config": {
+            "max_positions":    3,
+            "dte_max":          2,     # look for expiry 0–2 days out
+            "budget_per_trade": 500,   # max debit per call ($)
+        },
+        "positions":    {},  # pos_id → position dict
+        "closed_today": [],
+        "decisions":    [],
+    },
     "news_monitor": {
         "enabled":        True,
         "config": {
@@ -538,6 +550,23 @@ state: Dict = {
 
 TICKERS: List[str] = ["AAPL", "MSFT", "NVDA", "SPY"]
 _tickers_lock = threading.Lock()
+
+# ── Signal Trader: per-ticker prime-window setups ──────────────────────────
+# Derived from 2yr/1h + 60d/15m intraday backtest (win rates 57–72%).
+ST_SETUPS: dict = {
+    "GOOG": {"signal": "PRE-BREAKOUT", "win_start": "10:30", "win_end": "12:00", "hold_mins": 240, "target_pct": 0.33, "stop_pct": 0.21},
+    "AAPL": {"signal": "PRE-BREAKOUT", "win_start": "09:30", "win_end": "10:30", "hold_mins": 120, "target_pct": 0.23, "stop_pct": 0.24},
+    "AMZN": {"signal": "BREAKOUT",     "win_start": "09:30", "win_end": "16:00", "hold_mins":  60, "target_pct": 0.19, "stop_pct": 0.28},
+    "UNH":  {"signal": "BREAKOUT",     "win_start": "09:30", "win_end": "16:00", "hold_mins":  60, "target_pct": 0.30, "stop_pct": 0.30},
+    "SPXC": {"signal": "BREAKOUT",     "win_start": "12:00", "win_end": "14:00", "hold_mins": 240, "target_pct": 0.37, "stop_pct": 0.37},
+    "MU":   {"signal": "PRE-BREAKOUT", "win_start": "12:00", "win_end": "14:00", "hold_mins":  60, "target_pct": 0.64, "stop_pct": 0.44},
+    "NFLX": {"signal": "BREAKOUT",     "win_start": "14:00", "win_end": "15:00", "hold_mins": 240, "target_pct": 0.31, "stop_pct": 0.28},
+    "ASML": {"signal": "PRE-BREAKOUT", "win_start": "10:30", "win_end": "12:00", "hold_mins": 240, "target_pct": 0.43, "stop_pct": 0.28},
+    "META": {"signal": "PRE-BREAKOUT", "win_start": "12:00", "win_end": "14:00", "hold_mins": 120, "target_pct": 0.32, "stop_pct": 0.30},
+    "MSFT": {"signal": "PRE-BREAKOUT", "win_start": "12:00", "win_end": "14:00", "hold_mins":  60, "target_pct": 0.24, "stop_pct": 0.18},
+    "LRCX": {"signal": "PRE-BREAKOUT", "win_start": "12:00", "win_end": "14:00", "hold_mins": 240, "target_pct": 0.49, "stop_pct": 0.38},
+    "NVDA": {"signal": "BREAKOUT",     "win_start": "09:30", "win_end": "16:00", "hold_mins":  60, "target_pct": 0.45, "stop_pct": 0.35},
+}
 
 # ── Feature engineering ────────────────────────────────────────────────────
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -7016,6 +7045,8 @@ async def lifespan(app: FastAPI):
 
     # Restore Earnings Vol Crush state from last shutdown
     _evc_load_state()
+    # Restore Signal Trader state from last shutdown
+    _st_load_state()
 
     # Restore breakout watchlist
     _watchlist_load()
@@ -7047,6 +7078,8 @@ async def lifespan(app: FastAPI):
     log.info("SPX 0DTE monitor loop started")
     asyncio.create_task(_evc_monitor_loop())
     log.info("Earnings Vol Crush monitor loop started")
+    asyncio.create_task(_st_monitor_loop())
+    log.info("Signal Trader monitor loop started")
     asyncio.create_task(_risk_monitor_loop())
     log.info("Risk monitor loop started")
     asyncio.create_task(_news_monitor_loop())
@@ -8121,6 +8154,8 @@ class WatchlistAlertRequest(BaseModel):
     # S/R levels from scanner (swing-based, 60-bar lookback)
     sr_resistance:        Optional[float] = None   # nearest swing high above price
     sr_support:           Optional[float] = None   # nearest swing low below price
+    # Signal Trader annotation
+    prime_window:         Optional[bool]  = None   # True = ticker+signal in its backtested prime window
 
 
 @app.post("/watchlist/alert")
@@ -8244,6 +8279,10 @@ def watchlist_add_alert(req: WatchlistAlertRequest):
                           state_path=req.state_path,
                           curr_daily_state=req.curr_daily_state)
     _watchlist_save()
+
+    # ── Signal Trader hook ────────────────────────────────────────────────────
+    _st_maybe_enter(tk, req.signal_type, req.price_at_alert, req.prime_window)
+
     return {"ok": True, "action": "added"}
 
 
@@ -13564,6 +13603,431 @@ async def evc_close(pos_id: str):
         None,
         lambda: _run_in_streaming_loop(_evc_close_position(ib, pos_id, "manual_close"), timeout=60))
     return {"status": "closing", "pos_id": pos_id}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SIGNAL TRADER — auto-executes ATM calls on scanner alerts in prime windows
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _st_log(action: str, ticker: str, detail: str) -> None:
+    entry = {"time": datetime.now(ET).strftime("%H:%M:%S"), "action": action,
+             "ticker": ticker, "detail": detail}
+    st = state["sig_trader"]
+    st["decisions"].append(entry)
+    st["decisions"] = st["decisions"][-200:]
+    log.info("SIG_TRADER [%s] %s — %s", action, ticker, detail)
+
+
+def _st_save_state() -> None:
+    try:
+        st = state["sig_trader"]
+        with open(SIGT_STATE_PATH, "w") as f:
+            json.dump({"config": st["config"], "positions": st["positions"],
+                       "closed_today": st["closed_today"]}, f, indent=2, default=str)
+    except Exception as e:
+        log.warning("SIG_TRADER save_state error: %s", e)
+
+
+def _st_load_state() -> None:
+    if not os.path.exists(SIGT_STATE_PATH):
+        return
+    try:
+        with open(SIGT_STATE_PATH) as f:
+            saved = json.load(f)
+        st = state["sig_trader"]
+        st["config"].update(saved.get("config", {}))
+        today = datetime.now(ET).strftime("%Y-%m-%d")
+        # Keep only today's open positions
+        for pos_id, pos in saved.get("positions", {}).items():
+            if pos.get("phase") == "open" and pos.get("entry_time", "")[:10] == today:
+                st["positions"][pos_id] = pos
+        st["closed_today"] = [p for p in saved.get("closed_today", [])
+                               if p.get("entry_time", "")[:10] == today]
+    except Exception as e:
+        log.warning("SIG_TRADER load_state error: %s", e)
+
+
+def _st_in_prime_window(ticker: str, signal_type: str, et_now) -> bool:
+    setup = ST_SETUPS.get(ticker)
+    if not setup:
+        return False
+    if setup["signal"] != signal_type:
+        return False
+    t = et_now.strftime("%H:%M")
+    return setup["win_start"] <= t <= setup["win_end"]
+
+
+async def _st_enter_trade(ib, ticker: str, signal_type: str, spot_price: float) -> None:
+    """Qualify ATM call, place limit order, record position on fill."""
+    st = state["sig_trader"]
+    cfg = st["config"]
+    setup = ST_SETUPS.get(ticker)
+    if not setup:
+        return
+
+    pos_id = f"{ticker}_{datetime.now(ET).strftime('%Y%m%d_%H%M%S')}"
+
+    if len(st["positions"]) >= cfg["max_positions"]:
+        _st_log("SKIP", ticker, f"max_positions={cfg['max_positions']} reached")
+        return
+    # Prevent duplicate entries for same ticker
+    if any(p["ticker"] == ticker for p in st["positions"].values()):
+        _st_log("SKIP", ticker, "already have open position")
+        return
+
+    try:
+        # ── 1. Get real option chain ──────────────────────────────────────────
+        expiry, real_strikes = await _evc_get_chain_params(ib, ticker)
+        if not real_strikes:
+            _st_log("SKIP", ticker, "no option chain returned")
+            return
+
+        atm_strike = min(real_strikes, key=lambda s: abs(s - spot_price))
+
+        # ── 2. Qualify the ATM call ───────────────────────────────────────────
+        from ib_insync import Option as IbOpt
+        contract = IbOpt(ticker, expiry, atm_strike, "C", "SMART", "100", "USD")
+        qualified = await ib.qualifyContractsAsync(contract)
+        if not qualified:
+            _st_log("SKIP", ticker, f"could not qualify {atm_strike}C {expiry}")
+            return
+        contract = qualified[0]
+
+        # ── 3. Get live quote ─────────────────────────────────────────────────
+        tickers = await ib.reqTickersAsync(contract)
+        await asyncio.sleep(3)
+        mid = _spx_mid(tickers[0]) if tickers else 0.0
+        if mid <= 0:
+            _st_log("SKIP", ticker, f"no valid quote for {atm_strike}C")
+            return
+
+        cost = mid * 100
+        if cost > cfg["budget_per_trade"]:
+            _st_log("SKIP", ticker, f"cost ${cost:.0f} > budget ${cfg['budget_per_trade']}")
+            return
+
+        entry_price = round(mid + 0.05, 2)
+
+        # ── 4. Place limit order ──────────────────────────────────────────────
+        order = LimitOrder("BUY", 1, entry_price, tif="DAY")
+        trade = ib.placeOrder(contract, order)
+        _st_log("ORDERING", ticker, f"{atm_strike}C {expiry} @ ${entry_price:.2f} (mid ${mid:.2f})")
+
+        # ── 5. Wait for fill (up to 30s) ──────────────────────────────────────
+        for _ in range(30):
+            await asyncio.sleep(1)
+            if trade.orderStatus.status in ("Filled", "Submitted"):
+                break
+        if trade.orderStatus.status != "Filled":
+            ib.cancelOrder(order)
+            _st_log("SKIP", ticker, f"no fill in 30s (status={trade.orderStatus.status})")
+            return
+
+        fill_price = trade.orderStatus.avgFillPrice or entry_price
+        now_utc = datetime.utcnow()
+        deadline = now_utc + timedelta(minutes=setup["hold_mins"])
+        target_spot = round(spot_price * (1 + setup["target_pct"] / 100), 2)
+        stop_spot   = round(spot_price * (1 - setup["stop_pct"]   / 100), 2)
+
+        pos = {
+            "pos_id":             pos_id,
+            "ticker":             ticker,
+            "signal_type":        signal_type,
+            "entry_time":         now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "deadline":           deadline.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "spot_at_entry":      round(spot_price, 2),
+            "target_spot":        target_spot,
+            "stop_spot":          stop_spot,
+            "strike":             atm_strike,
+            "expiry":             expiry,
+            "conid":              contract.conId,
+            "qty":                1,
+            "option_entry_price": round(fill_price, 2),
+            "order_id":           trade.order.orderId,
+            "phase":              "open",
+            "live_pnl":           0.0,
+        }
+        st["positions"][pos_id] = pos
+        _st_log("ENTERED", ticker,
+                f"{atm_strike}C {expiry} fill=${fill_price:.2f} spot=${spot_price:.2f} "
+                f"tgt=${target_spot:.2f} stp=${stop_spot:.2f} dl={deadline.strftime('%H:%MZ')}")
+
+        # ── 6. Journal insert ──────────────────────────────────────────────────
+        try:
+            con = sqlite3.connect(JOURNAL_DB_PATH)
+            con.execute("""INSERT INTO trade_journal
+                (ticker, strategy_type, direction, qty, entry_price, entry_date,
+                 status, notes)
+                VALUES (?,?,?,?,?,?,?,?)""",
+                (ticker, "signal_trader", "LONG_CALL", 1, fill_price,
+                 datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S"), "open",
+                 f"strike={atm_strike} expiry={expiry} spot={spot_price:.2f}"))
+            con.commit()
+            con.close()
+        except Exception as je:
+            log.warning("SIG_TRADER journal insert error: %s", je)
+
+        _st_save_state()
+
+    except Exception as e:
+        _st_log("ERROR", ticker, f"_st_enter_trade: {e}")
+        log.exception("SIG_TRADER _st_enter_trade error for %s", ticker)
+
+
+async def _st_close_position(ib, pos_id: str, reason: str) -> None:
+    """Close an open call position at market and record the result."""
+    st = state["sig_trader"]
+    pos = st["positions"].get(pos_id)
+    if not pos or pos.get("phase") != "open":
+        return
+
+    pos["phase"] = "closing"
+    ticker = pos["ticker"]
+
+    try:
+        from ib_insync import Option as IbOpt
+        contract = IbOpt(ticker, pos["expiry"], pos["strike"], "C", "SMART", "100", "USD")
+        contract.conId = pos["conid"]
+        qualified = await ib.qualifyContractsAsync(contract)
+        if qualified:
+            contract = qualified[0]
+
+        # Aggressive limit at mid — fall back to market
+        close_price = 0.0
+        tickers = await ib.reqTickersAsync(contract)
+        await asyncio.sleep(2)
+        mid = _spx_mid(tickers[0]) if tickers else 0.0
+        lmt = max(0.01, round(mid - 0.05, 2)) if mid > 0 else None
+
+        if lmt:
+            order = LimitOrder("SELL", 1, lmt, tif="DAY")
+        else:
+            from ib_insync import MarketOrder
+            order = MarketOrder("SELL", 1)
+
+        trade = ib.placeOrder(contract, order)
+        for _ in range(15):
+            await asyncio.sleep(1)
+            if trade.orderStatus.status == "Filled":
+                break
+        if trade.orderStatus.status != "Filled":
+            # Escalate to market
+            ib.cancelOrder(order)
+            from ib_insync import MarketOrder
+            mkt = MarketOrder("SELL", 1)
+            trade = ib.placeOrder(contract, mkt)
+            await asyncio.sleep(5)
+
+        close_price = trade.orderStatus.avgFillPrice or mid or pos["option_entry_price"]
+        pnl = round((close_price - pos["option_entry_price"]) * 100, 2)
+        pos["phase"] = "closed"
+        pos["exit_price"] = round(close_price, 2)
+        pos["exit_reason"] = reason
+        pos["pnl"] = pnl
+        pos["closed_at"] = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        st["closed_today"].append(pos)
+        del st["positions"][pos_id]
+
+        _st_log("CLOSED", ticker, f"{reason} close=${close_price:.2f} pnl=${pnl:+.2f}")
+
+        # ── Update journal ──────────────────────────────────────────────────
+        try:
+            con = sqlite3.connect(JOURNAL_DB_PATH)
+            con.execute("""UPDATE trade_journal SET
+                exit_price=?, pnl=?, status=?, notes=notes||?
+                WHERE ticker=? AND strategy_type='signal_trader' AND status='open'
+                ORDER BY rowid DESC LIMIT 1""",
+                (close_price, pnl, "closed",
+                 f" | exit={reason} pnl={pnl:+.2f}", ticker))
+            con.commit()
+            con.close()
+        except Exception as je:
+            log.warning("SIG_TRADER journal update error: %s", je)
+
+        _st_save_state()
+
+    except Exception as e:
+        pos["phase"] = "open"  # revert so monitor can retry
+        _st_log("ERROR", ticker, f"_st_close_position {reason}: {e}")
+        log.exception("SIG_TRADER _st_close_position error %s %s", pos_id, reason)
+
+
+async def _st_monitor_coro(ib) -> None:
+    """Check open positions against target/stop/deadline; close as needed."""
+    st = state["sig_trader"]
+    if not st["positions"]:
+        return
+
+    tickers_needed = list({p["ticker"] for p in st["positions"].values()
+                           if p.get("phase") == "open"})
+    if not tickers_needed:
+        return
+
+    from ib_insync import Stock as IbStock
+    contracts = [IbStock(tk, "SMART", "USD") for tk in tickers_needed]
+    spot_tickers = await ib.reqTickersAsync(*contracts)
+    await asyncio.sleep(2)
+
+    spot_map: dict = {}
+    for td in spot_tickers:
+        sym = getattr(td.contract, "symbol", None)
+        if sym:
+            px = _spx_safe_px(td.last) or _spx_safe_px(td.close)
+            if px > 0:
+                spot_map[sym] = px
+
+    now_utc = datetime.utcnow()
+    for pos_id, pos in list(st["positions"].items()):
+        if pos.get("phase") != "open":
+            continue
+        tk = pos["ticker"]
+        spot = spot_map.get(tk)
+        if not spot:
+            continue
+
+        # Live P&L estimate (spot-based, not option-based — simpler)
+        spot_pnl = round((spot - pos["spot_at_entry"]) * 100, 2)
+        pos["live_pnl"] = spot_pnl
+
+        deadline = datetime.strptime(pos["deadline"], "%Y-%m-%dT%H:%M:%SZ")
+
+        if spot >= pos["target_spot"]:
+            await _st_close_position(ib, pos_id, "target_hit")
+        elif spot <= pos["stop_spot"]:
+            await _st_close_position(ib, pos_id, "stop_hit")
+        elif now_utc >= deadline:
+            await _st_close_position(ib, pos_id, "time_exit")
+
+    _st_save_state()
+
+
+async def _st_monitor_loop() -> None:
+    """30-second background loop: checks open Signal Trader positions."""
+    while True:
+        await asyncio.sleep(30)
+        try:
+            st = state["sig_trader"]
+            if not st["enabled"] or not st["positions"]:
+                continue
+            ib = state.get("ib")
+            if not ib or not ib.isConnected():
+                continue
+            loop = state.get("streaming_loop")
+            if loop:
+                loop.run_in_executor(
+                    None,
+                    lambda: _run_in_streaming_loop(_st_monitor_coro(ib), timeout=25)
+                )
+        except Exception as e:
+            log.warning("_st_monitor_loop error: %s", e)
+
+
+def _st_maybe_enter(ticker: str, signal_type: str, spot: float,
+                    prime_window: Optional[bool]) -> None:
+    """Called from /watchlist/alert — fires trade entry if conditions are met."""
+    st = state["sig_trader"]
+    if not st["enabled"]:
+        return
+    if ticker not in ST_SETUPS:
+        return
+    if len(st["positions"]) >= st["config"]["max_positions"]:
+        return
+
+    # Use scanner-provided prime_window flag if available, else compute locally
+    if prime_window is None:
+        et_now = datetime.now(ET)
+        in_window = _st_in_prime_window(ticker, signal_type, et_now)
+    else:
+        in_window = prime_window and (ST_SETUPS[ticker]["signal"] == signal_type)
+
+    if not in_window:
+        return
+
+    ib = state.get("ib")
+    if not ib or not ib.isConnected():
+        _st_log("SKIP", ticker, "IB not connected")
+        return
+
+    loop = state.get("streaming_loop")
+    if not loop:
+        return
+
+    _st_log("TRIGGER", ticker, f"{signal_type} in prime window @ ${spot:.2f} — entering")
+    loop.run_in_executor(
+        None,
+        lambda: _run_in_streaming_loop(_st_enter_trade(ib, ticker, signal_type, spot), timeout=60)
+    )
+
+
+# ── Signal Trader API endpoints ────────────────────────────────────────────
+
+class STConfigRequest(BaseModel):
+    max_positions:     Optional[int]   = None
+    dte_max:           Optional[int]   = None
+    budget_per_trade:  Optional[float] = None
+
+
+@app.get("/signal-trader/status")
+def st_status():
+    st = state["sig_trader"]
+    return {
+        "enabled":      st["enabled"],
+        "config":       st["config"],
+        "setups":       ST_SETUPS,
+        "positions":    st["positions"],
+        "closed_today": st["closed_today"],
+        "decisions":    st["decisions"][-50:],
+    }
+
+
+@app.post("/signal-trader/enable")
+def st_enable(body: dict):
+    enabled = bool(body.get("enabled", False))
+    state["sig_trader"]["enabled"] = enabled
+    _st_save_state()
+    return {"enabled": enabled}
+
+
+@app.post("/signal-trader/config")
+def st_config(req: STConfigRequest):
+    cfg = state["sig_trader"]["config"]
+    updates = req.model_dump(exclude_none=True)
+    cfg.update(updates)
+    _st_log("CONFIG", "system", f"updated: {updates}")
+    _st_save_state()
+    return {"config": cfg}
+
+
+@app.post("/signal-trader/close/{pos_id}")
+async def st_close(pos_id: str):
+    st = state["sig_trader"]
+    if pos_id not in st["positions"]:
+        raise HTTPException(404, f"{pos_id} not found in open positions")
+    ib = state.get("ib")
+    if not ib or not ib.isConnected():
+        raise HTTPException(503, "IBKR not connected")
+    _st_log("MANUAL_CLOSE", st["positions"][pos_id]["ticker"], f"manual close {pos_id}")
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(
+        None,
+        lambda: _run_in_streaming_loop(_st_close_position(ib, pos_id, "manual_close"), timeout=60)
+    )
+    return {"status": "closing", "pos_id": pos_id}
+
+
+@app.get("/signal-trader/history")
+def st_history(limit: int = 50):
+    try:
+        con = sqlite3.connect(JOURNAL_DB_PATH)
+        con.row_factory = sqlite3.Row
+        rows = con.execute("""
+            SELECT * FROM trade_journal WHERE strategy_type='signal_trader'
+            ORDER BY rowid DESC LIMIT ?""", (limit,)).fetchall()
+        con.close()
+        return {"trades": [dict(r) for r in rows]}
+    except Exception as e:
+        return {"trades": [], "error": str(e)}
 
 
 # ── Live Tape WebSocket ─────────────────────────────────────────────────────

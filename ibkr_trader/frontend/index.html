@@ -5644,6 +5644,308 @@ function EVCTab() {
 }
 
 
+// ── Signal Trader Tab ─────────────────────────────────────────────────────────
+function SigTraderTab() {
+  const [status,  setStatus]  = useState(null);
+  const [history, setHistory] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  const load = async () => {
+    try {
+      const [s, h] = await Promise.all([
+        apiFetch("/signal-trader/status"),
+        apiFetch("/signal-trader/history?limit=50"),
+      ]);
+      setStatus(s);
+      setHistory(h.trades || []);
+    } catch(_e) {}
+    finally { setLoading(false); }
+  };
+
+  useEffect(() => { load(); const id = setInterval(load, 15000); return () => clearInterval(id); }, []);
+
+  const toggle    = async () => { await apiFetch("/signal-trader/enable", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({enabled:!status.enabled})}); load(); };
+  const updateCfg = async (key, val) => {
+    await apiFetch("/signal-trader/config", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({[key]:val})});
+    load();
+  };
+  const closePos  = async (pid) => { await apiFetch(`/signal-trader/close/${pid}`, {method:"POST"}); load(); };
+
+  const pnlColor  = v => v == null ? C.muted : v >= 0 ? "#22c55e" : "#ef4444";
+  const exitColor = t => t === "target_hit" ? "#4ade80" : t === "stop_hit" ? "#f87171"
+                       : t === "time_exit"  ? "#f59e0b" : t === "manual_close" ? "#a78bfa"
+                       : C.muted;
+  const actionColor = a => a === "ENTERED" ? "#93c5fd" : a === "CLOSED" ? "#4ade80"
+                         : a === "TRIGGER" ? "#a78bfa" : a === "SKIP"   ? "#f59e0b"
+                         : a === "ERROR"   ? "#f87171" : C.muted;
+  const signalColor = s => s === "BREAKOUT" ? "#c084fc" : "#fb923c";
+
+  const WIN_RATE_COLORS = {
+    "GOOG":72, "AAPL":71, "AMZN":71, "UNH":68, "SPXC":67,
+    "MU":64, "NFLX":62, "ASML":60, "META":59, "MSFT":69, "LRCX":50, "NVDA":57
+  };
+
+  if (loading) return <div style={{color:C.muted,...sans,fontSize:13}}>Loading...</div>;
+  if (!status)  return <div style={{color:C.muted,...sans,fontSize:13}}>Backend unavailable</div>;
+
+  const { config:cfg, setups, positions, closed_today, decisions } = status;
+  const todayPnl = closed_today.reduce((s,p) => s + (p.pnl || 0), 0);
+
+  return (
+    <div>
+      {/* Header */}
+      <div style={{display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:16}}>
+        <div>
+          <div style={{...sans, fontSize:17, fontWeight:700, color:C.white}}>Signal Trader</div>
+          <div style={{...sans, fontSize:12, color:C.muted, marginTop:2}}>
+            Buys ATM calls on scanner alerts · fires only in backtested prime windows · auto-exits on target / stop / deadline
+          </div>
+          <div style={{...sans, fontSize:11, color:"#fb923c", marginTop:2}}>
+            12 tickers · 57–72% win rate · position size capped at ${cfg.budget_per_trade}
+          </div>
+        </div>
+        <button onClick={toggle} style={{
+          ...sans, fontSize:13, padding:"8px 18px", borderRadius:6, cursor:"pointer", fontWeight:700,
+          background: status.enabled ? "#14532d" : "#1e293b",
+          border:`1px solid ${status.enabled ? "#16a34a" : C.border}`,
+          color: status.enabled ? "#4ade80" : C.muted,
+        }}>{status.enabled ? "LIVE" : "Disabled"}</button>
+      </div>
+
+      {/* Summary cards */}
+      <div style={{background:"#0f172a", border:`1px solid ${C.border}`, borderRadius:8, padding:16, marginBottom:16}}>
+        <div style={{display:"grid", gridTemplateColumns:"1fr 1fr 1fr 1fr", gap:12}}>
+          {[
+            {label:"Open Positions", value:`${Object.keys(positions).length}/${cfg.max_positions}`, color:C.white},
+            {label:"Today P&L",      value:`${todayPnl>=0?"+":""}$${todayPnl.toFixed(2)}`,         color:pnlColor(todayPnl)},
+            {label:"Closed Today",   value:`${closed_today.length}`,                               color:C.muted},
+            {label:"Budget/Trade",   value:`$${cfg.budget_per_trade}`,                             color:"#a78bfa"},
+          ].map(({label,value,color}) => (
+            <div key={label} style={{textAlign:"center"}}>
+              <div style={{...sans, fontSize:11, color:C.muted, marginBottom:4}}>{label}</div>
+              <div style={{...mono, fontSize:15, fontWeight:700, color}}>{value}</div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Config */}
+      <div style={{display:"grid", gridTemplateColumns:"repeat(3,1fr)", gap:10, marginBottom:16}}>
+        {[
+          {label:"Max Positions",   key:"max_positions",    step:1},
+          {label:"Budget/Trade $",  key:"budget_per_trade", step:50},
+          {label:"Max DTE",         key:"dte_max",          step:1},
+        ].map(({label,key,step}) => (
+          <div key={key} style={{background:"#0f172a", border:`1px solid ${C.border}`, borderRadius:6, padding:"8px 10px"}}>
+            <div style={{...sans, fontSize:10, color:C.muted, marginBottom:4}}>{label}</div>
+            <input defaultValue={cfg[key]} type="number" step={step}
+              style={{...mono, fontSize:13, width:"100%", background:"none", border:"none", color:C.white, outline:"none"}}
+              onBlur={e => { const v = parseFloat(e.target.value); if (v !== cfg[key]) updateCfg(key, v); }} />
+          </div>
+        ))}
+      </div>
+
+      {/* Setups reference table */}
+      <div style={{...sans, fontSize:13, fontWeight:700, color:C.white, marginBottom:8}}>Prime Window Setups</div>
+      <div style={{overflowX:"auto", marginBottom:20}}>
+        <table style={{width:"100%", borderCollapse:"collapse", ...sans, fontSize:11}}>
+          <thead>
+            <tr style={{background:"#0f172a"}}>
+              {["Ticker","Signal","Window","Hold","Target","Stop","Win Rate"].map(h=>(
+                <th key={h} style={{padding:"6px 10px", textAlign:"left", color:C.muted,
+                  fontWeight:600, textTransform:"uppercase", borderBottom:`1px solid ${C.border}`}}>{h}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {setups && Object.entries(setups).sort((a,b)=>(WIN_RATE_COLORS[b[0]]||0)-(WIN_RATE_COLORS[a[0]]||0)).map(([tk,s]) => {
+              const wr = WIN_RATE_COLORS[tk] || 0;
+              const wrColor = wr >= 70 ? "#4ade80" : wr >= 64 ? "#fb923c" : C.muted;
+              return (
+                <tr key={tk} style={{borderBottom:`1px solid ${C.border}`}}>
+                  <td style={{padding:"6px 10px", ...mono, fontWeight:700, color:C.white}}>{tk}</td>
+                  <td style={{padding:"6px 10px"}}>
+                    <span style={{fontSize:10, padding:"2px 6px", borderRadius:4, fontWeight:700,
+                      color:signalColor(s.signal), background:`${signalColor(s.signal)}22`}}>
+                      {s.signal === "BREAKOUT" ? "BO" : "PRE-BO"}
+                    </span>
+                  </td>
+                  <td style={{padding:"6px 10px", ...mono, color:"#94a3b8"}}>{s.win_start}–{s.win_end}</td>
+                  <td style={{padding:"6px 10px", ...mono, color:C.muted}}>{s.hold_mins >= 60 ? `${s.hold_mins/60}h` : `${s.hold_mins}m`}</td>
+                  <td style={{padding:"6px 10px", ...mono, color:"#4ade80"}}>+{s.target_pct}%</td>
+                  <td style={{padding:"6px 10px", ...mono, color:"#f87171"}}>-{s.stop_pct}%</td>
+                  <td style={{padding:"6px 10px", ...mono, fontWeight:700, color:wrColor}}>{wr}%</td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+
+      {/* Open Positions */}
+      <div style={{...sans, fontSize:13, fontWeight:700, color:C.white, marginBottom:8}}>Open Calls</div>
+      {Object.keys(positions).length === 0 ? (
+        <div style={{color:C.muted, ...sans, fontSize:13, padding:"16px 0"}}>
+          {status.enabled ? "No open positions" : "Trader disabled"}
+        </div>
+      ) : (
+        <div style={{overflowX:"auto", marginBottom:20}}>
+          <table style={{width:"100%", borderCollapse:"collapse", ...sans, fontSize:12}}>
+            <thead>
+              <tr style={{background:"#0f172a"}}>
+                {["Ticker","Signal","Strike","Expiry","Entry Debit","Spot Entry","Target","Stop","Deadline","Live P&L",""].map(h=>(
+                  <th key={h} style={{padding:"7px 10px", textAlign:"left", color:C.muted,
+                    fontSize:11, fontWeight:600, textTransform:"uppercase",
+                    borderBottom:`1px solid ${C.border}`}}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {Object.entries(positions).map(([pid, p]) => (
+                <tr key={pid} style={{borderBottom:`1px solid ${C.border}`}}>
+                  <td style={{padding:"8px 10px", ...mono, fontWeight:700, color:C.white}}>{p.ticker}</td>
+                  <td style={{padding:"8px 10px"}}>
+                    <span style={{fontSize:10, padding:"2px 5px", borderRadius:3, fontWeight:700,
+                      color:signalColor(p.signal_type), background:`${signalColor(p.signal_type)}22`}}>
+                      {p.signal_type === "BREAKOUT" ? "BO" : "PRE-BO"}
+                    </span>
+                  </td>
+                  <td style={{padding:"8px 10px", ...mono, color:"#a78bfa"}}>{p.strike}C</td>
+                  <td style={{padding:"8px 10px", color:C.muted, fontSize:11}}>{p.expiry}</td>
+                  <td style={{padding:"8px 10px", ...mono, color:"#94a3b8"}}>${p.option_entry_price?.toFixed(2)}</td>
+                  <td style={{padding:"8px 10px", ...mono, color:C.muted}}>${p.spot_at_entry?.toFixed(2)}</td>
+                  <td style={{padding:"8px 10px", ...mono, color:"#4ade80"}}>${p.target_spot?.toFixed(2)}</td>
+                  <td style={{padding:"8px 10px", ...mono, color:"#f87171"}}>${p.stop_spot?.toFixed(2)}</td>
+                  <td style={{padding:"8px 10px", color:C.muted, fontSize:11}}>{p.deadline ? p.deadline.slice(11,16)+"Z" : "--"}</td>
+                  <td style={{padding:"8px 10px", ...mono, fontWeight:700, color:pnlColor(p.live_pnl)}}>
+                    {p.live_pnl != null ? `${p.live_pnl>=0?"+":""}$${p.live_pnl.toFixed(2)}` : "--"}
+                  </td>
+                  <td style={{padding:"8px 10px"}}>
+                    <button onClick={()=>closePos(pid)} style={{
+                      ...sans, fontSize:11, padding:"3px 8px", borderRadius:4, cursor:"pointer",
+                      background:"#450a0a", border:"1px solid #7f1d1d", color:"#fca5a5"}}>Close</button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {/* Closed Today */}
+      {closed_today.length > 0 && (
+        <>
+          <div style={{...sans, fontSize:13, fontWeight:700, color:C.white, marginBottom:8}}>Closed Today</div>
+          <div style={{overflowX:"auto", marginBottom:20}}>
+            <table style={{width:"100%", borderCollapse:"collapse", ...sans, fontSize:12}}>
+              <thead>
+                <tr style={{background:"#0f172a"}}>
+                  {["Ticker","Signal","Strike","Debit","P&L","Exit"].map(h=>(
+                    <th key={h} style={{padding:"7px 10px", textAlign:"left", color:C.muted,
+                      fontSize:11, fontWeight:600, textTransform:"uppercase",
+                      borderBottom:`1px solid ${C.border}`}}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {[...closed_today].reverse().map((p,i)=>(
+                  <tr key={i} style={{borderBottom:`1px solid ${C.border}`}}>
+                    <td style={{padding:"8px 10px", ...mono, fontWeight:700, color:C.white}}>{p.ticker}</td>
+                    <td style={{padding:"8px 10px"}}>
+                      <span style={{fontSize:10, padding:"2px 5px", borderRadius:3, fontWeight:700,
+                        color:signalColor(p.signal_type), background:`${signalColor(p.signal_type)}22`}}>
+                        {p.signal_type === "BREAKOUT" ? "BO" : "PRE-BO"}
+                      </span>
+                    </td>
+                    <td style={{padding:"8px 10px", ...mono, color:"#a78bfa"}}>{p.strike}C</td>
+                    <td style={{padding:"8px 10px", ...mono, color:"#94a3b8"}}>${p.option_entry_price?.toFixed(2)}</td>
+                    <td style={{padding:"8px 10px", ...mono, fontWeight:700, color:pnlColor(p.pnl)}}>
+                      {p.pnl>=0?"+":""}${p.pnl?.toFixed(2)}
+                    </td>
+                    <td style={{padding:"8px 10px"}}>
+                      <span style={{fontSize:11, padding:"2px 7px", borderRadius:4, fontWeight:700,
+                        color:exitColor(p.exit_reason), background:`${exitColor(p.exit_reason)}22`}}>
+                        {p.exit_reason?.replace(/_/g," ")}
+                      </span>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </>
+      )}
+
+      {/* Decisions log */}
+      {decisions.length > 0 && (
+        <>
+          <div style={{...sans, fontSize:13, fontWeight:700, color:C.white, marginBottom:8}}>Decisions</div>
+          <div style={{background:"#0f172a", border:`1px solid ${C.border}`, borderRadius:6,
+            padding:10, maxHeight:200, overflowY:"auto", marginBottom:16}}>
+            {[...decisions].reverse().map((d,i)=>(
+              <div key={i} style={{...mono, fontSize:11, padding:"2px 0",
+                borderBottom: i<decisions.length-1 ? `1px solid ${C.border}` : "none"}}>
+                <span style={{color:C.muted}}>{d.time}</span>
+                {" "}<span style={{color:actionColor(d.action), fontWeight:700}}>{d.action}</span>
+                {" "}<span style={{color:"#94a3b8"}}>{d.ticker}</span>
+                {" "}<span style={{color:C.muted}}>{d.detail}</span>
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+
+      {/* Trade History */}
+      {history.length > 0 && (
+        <>
+          <div style={{...sans, fontSize:13, fontWeight:700, color:C.white, marginBottom:8, marginTop:20}}>
+            Trade History
+            <span style={{...sans, fontSize:11, fontWeight:400, color:C.muted, marginLeft:8}}>
+              {history.length} trades &middot;{" "}
+              P&amp;L: <span style={{color:history.reduce((s,r)=>s+(r.pnl||0),0)>=0 ? "#22c55e":"#ef4444"}}>
+                ${history.reduce((s,r)=>s+(r.pnl||0),0).toFixed(2)}
+              </span>
+            </span>
+          </div>
+          <div style={{overflowX:"auto", marginBottom:20}}>
+            <table style={{width:"100%", borderCollapse:"collapse", ...sans, fontSize:12}}>
+              <thead>
+                <tr style={{background:"#0f172a"}}>
+                  {["Date","Ticker","Notes","Entry","P&L","Exit"].map(h=>(
+                    <th key={h} style={{padding:"6px 10px", textAlign:"left", color:C.muted,
+                      fontSize:11, fontWeight:600, textTransform:"uppercase",
+                      borderBottom:`1px solid ${C.border}`}}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {history.map((r,i)=>(
+                  <tr key={i} style={{borderBottom:`1px solid ${C.border}`}}>
+                    <td style={{padding:"7px 10px", color:C.muted, fontSize:11}}>{r.entry_date?.slice(0,10)}</td>
+                    <td style={{padding:"7px 10px", ...mono, fontWeight:700}}>{r.ticker}</td>
+                    <td style={{padding:"7px 10px", color:C.muted, fontSize:11}}>{r.notes?.slice(0,40)}</td>
+                    <td style={{padding:"7px 10px", ...mono}}>${r.entry_price?.toFixed(2)}</td>
+                    <td style={{padding:"7px 10px", ...mono, fontWeight:700, color:pnlColor(r.pnl)}}>
+                      {r.pnl!=null ? `${r.pnl>=0?"+":""}$${r.pnl.toFixed(2)}` : "--"}
+                    </td>
+                    <td style={{padding:"7px 10px"}}>
+                      <span style={{fontSize:11, padding:"2px 6px", borderRadius:4, fontWeight:700,
+                        color:exitColor(r.exit_reason), background:`${exitColor(r.exit_reason)}22`}}>
+                        {r.exit_reason?.replace(/_/g," ") || "--"}
+                      </span>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+
 // ── Day Trader Tab ────────────────────────────────────────────────────────────
 function DayTraderTab() {
   const [status,   setStatus]   = useState(null);
@@ -8337,6 +8639,7 @@ function App() {
       { id:"daytrader",   label:"Day Trader"    },
       { id:"spx0dte",     label:"SPX 0DTE"      },
       { id:"evc",         label:"Earnings"      },
+      { id:"sigtrader",   label:"Sig Trader"    },
       { id:"risk",        label:"Risk Monitor"  },
     ]},
     { id:"research", label:"Research", tabs: [
@@ -8445,6 +8748,7 @@ function App() {
         <div style={{display: tab==="daytrader"    ? "" : "none"}}><DayTraderTab /></div>
         <div style={{display: tab==="spx0dte"      ? "" : "none"}}><SPX0DTETab /></div>
         <div style={{display: tab==="evc"          ? "" : "none"}}><EVCTab /></div>
+        <div style={{display: tab==="sigtrader"    ? "" : "none"}}><SigTraderTab /></div>
         <div style={{display: tab==="risk"         ? "" : "none"}}><RiskMonitorTab /></div>
         <div style={{display: tab==="backtest"     ? "" : "none"}}><BacktestTab   connected={connected} /></div>
         <div style={{display: tab==="0dte"         ? "" : "none"}}><ZeroDTETab    connected={connected} /></div>
