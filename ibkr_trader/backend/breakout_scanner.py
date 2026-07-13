@@ -99,7 +99,7 @@ DEFAULT_CONFIG = {
     "batch_size":             50,     # yfinance batch size (initial cache load only)
     "alert_on":               ["BREAKOUT", "PRE-BREAKOUT"],
     "breakout_pct_b_min":     95,
-    "pre_breakout_pct_b_min": 75,
+    "pre_breakout_pct_b_min": 65,
     "pre_breakout_rsi_min":   60,
     "vol_threshold_pct":      0.75,
     "backend_url":            "http://localhost:8000",
