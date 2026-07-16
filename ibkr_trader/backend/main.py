@@ -12648,10 +12648,20 @@ def _evc_round_strike(price: float, step: float = 0.0) -> float:
 
 
 async def _spx_get_spot(ib) -> float:
-    """SPX spot: SPY bars × 10 (primary), live reqMktData for SPX index (fallback)."""
+    """
+    SPX spot — three live IBKR sources tried in order (no delayed data):
+      1. state["bars"]["SPY"] last close × 10   (real-time streaming bars, preferred)
+      2. reqMktData on SPX Index via CBOE        (live snapshot)
+      3. ib.portfolio() SPY marketPrice × 10     (IBKR portfolio feed — live, no delay)
+    If all three fail it means IBKR market data is blocked (competing live session —
+    check TWS: only one account should be connected at a time).
+    """
+    # 1. Live streaming bars
     spy_bars = state["bars"].get("SPY", [])
     if spy_bars:
         return round(float(spy_bars[-1]["close"]) * 10, 2)
+
+    # 2. Direct SPX index snapshot
     try:
         from ib_insync import Index
         spx_c = Index("SPX", "CBOE")
@@ -12661,9 +12671,24 @@ async def _spx_get_spot(ib) -> float:
         px = float(td.last or td.close or 0)
         ib.cancelMktData(spx_c)
         if px > 0:
+            log.info("SPX 0DTE: spot from SPX index snapshot: %.2f", px)
             return px
     except Exception as e:
-        log.warning("SPX 0DTE: spot unavailable via IB: %s", e)
+        log.warning("SPX 0DTE: index snapshot failed: %s", e)
+
+    # 3. IBKR portfolio cache — live price from account feed, no market data subscription needed
+    try:
+        for item in ib.portfolio():
+            if getattr(item.contract, "symbol", "") == "SPY":
+                px = float(item.marketPrice or 0)
+                if px > 0:
+                    log.info("SPX 0DTE: spot from IBKR portfolio feed SPY=%.2f → SPX≈%.0f", px, px * 10)
+                    return round(px * 10, 2)
+    except Exception as e:
+        log.warning("SPX 0DTE: portfolio fallback failed: %s", e)
+
+    # All sources failed — likely competing live session blocking IBKR market data
+    log.error("SPX 0DTE: all spot sources failed — check TWS for competing live session (error 10197/162)")
     return 0.0
 
 
@@ -14952,6 +14977,30 @@ def _fx_load_state() -> None:
         log.warning("FX_TRADER load_state error: %s", e)
 
 
+def _fx_pushover(title: str, message: str) -> None:
+    """Fire-and-forget Pushover push notification for FX Trader trade events."""
+    import threading
+    def _send():
+        try:
+            cfg_path = os.path.join(os.path.dirname(__file__), "scanner_config.json")
+            with open(cfg_path) as f:
+                cfg = json.load(f)
+            token = cfg.get("pushover_token", "")
+            user  = cfg.get("pushover_user",  "")
+            if not token or not user:
+                return
+            requests.post(
+                "https://api.pushover.net/1/messages.json",
+                data={"token": token, "user": user,
+                      "title": title, "message": message,
+                      "priority": 0},
+                timeout=10,
+            )
+        except Exception as exc:
+            log.warning("FX Pushover error: %s", exc)
+    threading.Thread(target=_send, daemon=True).start()
+
+
 def _fx_size_qty(pair: str, stop_pips: float, risk_usd: float, spot: float) -> int:
     """Return position size in units. Clamps micro (1k) – standard (100k) lot."""
     pcfg    = FX_PAIRS[pair]
@@ -15096,6 +15145,13 @@ async def _fx_enter_trade(ib, pair: str) -> None:
         _fx_log("ENTERED", pair,
                 f"{direction} {qty}u fill={fill_px:.5f}  sl={stop_px:.5f}  tp={target_px:.5f}  "
                 f"R:R={target_pips/max(stop_pips,0.1):.1f}  risk=${cfg['risk_usd']:.0f}")
+        _fx_pushover(
+            f"FX {'LONG' if direction == 'LONG' else 'SHORT'} {pair}",
+            f"Fill: {fill_px:.5f} | Qty: {qty:,}u\n"
+            f"Stop: {stop_px:.5f} ({stop_pips:.1f}p)\n"
+            f"Target: {target_px:.5f} ({target_pips:.1f}p)\n"
+            f"R:R {target_pips/max(stop_pips,0.1):.1f} | Risk ${cfg['risk_usd']:.0f}",
+        )
         try:
             con = sqlite3.connect(JOURNAL_DB_PATH)
             con.execute("""INSERT INTO trade_journal
@@ -15159,6 +15215,14 @@ async def _fx_close_position(ib, pair: str, reason: str) -> None:
         del fx["positions"][pair]
         _fx_log("CLOSED", pair,
                 f"{reason} @ {close_px:.5f}  pips={pips_pnl:+.1f}  pnl=${pnl_usd:+.2f}")
+        _exit_label = {"tp_hit": "TARGET HIT", "sl_hit": "STOP HIT",
+                       "eod_force_close": "EOD CLOSE", "manual_close": "MANUAL CLOSE"}.get(reason, reason.upper())
+        _fx_pushover(
+            f"FX {_exit_label} {pair}",
+            f"Exit: {close_px:.5f}\n"
+            f"P&L: {pips_pnl:+.1f} pips | ${pnl_usd:+.2f}\n"
+            f"Entry was: {pos['entry_price']:.5f} ({pos['direction']})",
+        )
         try:
             con = sqlite3.connect(JOURNAL_DB_PATH)
             con.execute("""UPDATE trade_journal SET exit_price=?, pnl=?, status=?, notes=notes||?
