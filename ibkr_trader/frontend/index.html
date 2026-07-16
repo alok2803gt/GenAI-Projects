@@ -1644,6 +1644,18 @@ function AutoTraderTab() {
         }} title="Mark phantom open journal entries as closed (safe, display only)">
           Fix Journal
         </button>
+        <button onClick={async () => {
+          try {
+            const r = await fetch("/ibkr/reconcile", {method:"POST"});
+            const d = await r.json();
+            alert(d.message || "Reconciliation triggered — check Telegram");
+          } catch(e) { alert("Reconcile failed: " + e); }
+        }} style={{
+          background:"#0f766e", color:"#fff", border:"none", borderRadius:8,
+          padding:"8px 16px", fontSize:12, cursor:"pointer",
+        }} title="Compare IBKR portfolio against all strategy states; alerts on Telegram">
+          Reconcile IBKR
+        </button>
         <button onClick={() => reconnect(7497)} disabled={!!reconnMode} style={{
           background:"#7f8c8d", color:"#fff", border:"none", borderRadius:8,
           padding:"8px 16px", fontSize:13, cursor:"pointer",
@@ -3454,6 +3466,243 @@ function UniverseTab() {
 }
 
 // ── P&L Dashboard Tab ─────────────────────────────────────────────────────
+// ── Exit Breakdown (extracted to avoid hook-in-callback violation) ─────────
+function ExitBreakdown({ exit_breakdown, fmtDol, pnlCol }) {
+  const [xOpen, setXOpen] = useState(false);
+  const total = Object.values(exit_breakdown).reduce((s,d)=>s+d.count,0);
+  return (
+    <Card style={{marginTop:10,marginBottom:10}}>
+      <div onClick={()=>setXOpen(o=>!o)} style={{display:"flex",alignItems:"center",gap:8,cursor:"pointer"}}>
+        <span style={{...sans,fontWeight:600,fontSize:12,color:C.text}}>{xOpen?"▾":"▸"} Exit Breakdown</span>
+        <span style={{...mono,fontSize:11,color:C.muted,marginLeft:"auto"}}>{total} trades</span>
+      </div>
+      {xOpen && (
+        <div style={{marginTop:12,overflowX:"auto"}}>
+          <table style={{fontSize:12,width:"100%",borderCollapse:"collapse"}}>
+            <thead><tr>{["Reason","Count","Total P&L","Avg P&L"].map(h=>(
+              <th key={h} style={{...mono,fontSize:10,color:C.muted,fontWeight:600,paddingBottom:6,textAlign:"left",paddingRight:16}}>{h}</th>
+            ))}</tr></thead>
+            <tbody>{Object.entries(exit_breakdown).sort((a,b)=>b[1].count-a[1].count).map(([reason,d])=>{
+              const isOrphan = reason==="orphaned";
+              const ec = isOrphan?C.muted:d.pnl>=0?C.bull:C.bear;
+              return (
+                <tr key={reason} style={{borderTop:`1px solid ${C.border}33`}}>
+                  <td style={{padding:"5px 16px 5px 0"}}>
+                    <span style={{fontSize:10,fontWeight:600,padding:"2px 7px",borderRadius:8,background:ec+"22",color:ec,border:`1px solid ${ec}44`}}>{reason}</span>
+                  </td>
+                  <td style={{...mono,padding:"5px 16px 5px 0"}}>{d.count}</td>
+                  <td style={{...mono,padding:"5px 16px 5px 0",color:isOrphan?C.muted:pnlCol(d.pnl)}}>{isOrphan?"—":fmtDol(d.pnl,true)}</td>
+                  <td style={{...mono,padding:"5px 0",color:isOrphan?C.muted:pnlCol(d.count>0?d.pnl/d.count:0)}}>{isOrphan?"—":fmtDol(d.count>0?d.pnl/d.count:0,true)}</td>
+                </tr>
+              );
+            })}</tbody>
+          </table>
+        </div>
+      )}
+    </Card>
+  );
+}
+
+// ── Per-strategy P&L section ──────────────────────────────────────────────
+const STRAT_META = {
+  "SPX_0DTE":           { label:"SPX 0DTE",            color:"#f97316" },
+  "earnings_vol_crush": { label:"Earnings Vol Crush",   color:"#a855f7" },
+  "DAY_BREAKOUT":       { label:"Day Trader",           color:"#22c55e" },
+  "STOCK_BREAKOUT":     { label:"Stock Trader",         color:"#10b981" },
+  "CSP":                { label:"Auto-Trader (CSP)",    color:"#3b82f6" },
+  "LEAP":               { label:"Auto-Trader (LEAP)",   color:"#8b5cf6" },
+  "signal_trader":      { label:"Signal Trader",        color:"#06b6d4" },
+  "OTHER":              { label:"Other / Unknown",      color:"#64748b" },
+  "UNTRACKED":          { label:"Untracked (IBKR only)",color:"#ef4444" },
+};
+const STRAT_ORDER = ["SPX_0DTE","earnings_vol_crush","DAY_BREAKOUT","STOCK_BREAKOUT","CSP","LEAP","signal_trader","OTHER","UNTRACKED"];
+
+function StratSection({ stratKey, closed, openPos, todaySummary, fmtDol, pnlCol, fmtDT, fmtDTE }) {
+  const m = STRAT_META[stratKey] || { label: stratKey, color: C.muted };
+  const hasOpen   = openPos.length > 0;
+  const hasClosed = closed.length > 0;
+  const [expanded, setExpanded] = useState(hasOpen || hasClosed);
+
+  // All-time stats from real closed (exclude orphans/unknowns)
+  const realClosed = closed.filter(t => t.exit_reason && !["orphaned","unknown"].includes(t.exit_reason));
+  const allTimePnl = realClosed.reduce((s, t) => s + (t.pnl || 0), 0);
+  const wins       = realClosed.filter(t => t.win === 1).length;
+  const winRate    = realClosed.length > 0 ? Math.round(wins / realClosed.length * 100) : null;
+  const todayPnl   = todaySummary?.pnl ?? null;
+
+  return (
+    <Card style={{ marginBottom:10, padding:0, overflow:"hidden" }}>
+      {/* Section header */}
+      <div onClick={() => setExpanded(e => !e)} style={{
+        display:"flex", alignItems:"center", gap:12, padding:"12px 16px",
+        cursor:"pointer", borderBottom: expanded ? `1px solid ${C.border}` : "none",
+      }}>
+        {/* Color stripe */}
+        <div style={{ width:4, height:22, borderRadius:2, background:m.color, flexShrink:0 }}/>
+        <div style={{ ...sans, fontWeight:700, fontSize:14, color:C.text, minWidth:180 }}>{m.label}</div>
+
+        {/* Today P&L */}
+        <div style={{ display:"flex", flexDirection:"column", minWidth:90 }}>
+          <span style={{ ...sans, fontSize:9, color:C.muted, textTransform:"uppercase", letterSpacing:1 }}>Today</span>
+          <span style={{ ...mono, fontSize:13, fontWeight:700,
+            color: todayPnl == null ? C.muted : pnlCol(todayPnl) }}>
+            {todayPnl == null ? "—" : fmtDol(todayPnl, true)}
+          </span>
+        </div>
+
+        {/* All-time P&L */}
+        <div style={{ display:"flex", flexDirection:"column", minWidth:100 }}>
+          <span style={{ ...sans, fontSize:9, color:C.muted, textTransform:"uppercase", letterSpacing:1 }}>All-Time</span>
+          <span style={{ ...mono, fontSize:13, fontWeight:700, color: pnlCol(allTimePnl) }}>
+            {realClosed.length > 0 ? fmtDol(allTimePnl, true) : "—"}
+          </span>
+        </div>
+
+        {/* Win rate */}
+        <div style={{ display:"flex", flexDirection:"column", minWidth:70 }}>
+          <span style={{ ...sans, fontSize:9, color:C.muted, textTransform:"uppercase", letterSpacing:1 }}>Win Rate</span>
+          <span style={{ ...mono, fontSize:13, fontWeight:700,
+            color: winRate == null ? C.muted : winRate >= 50 ? C.bull : C.bear }}>
+            {winRate != null ? `${winRate}%` : "—"}
+          </span>
+        </div>
+
+        {/* Trade counts */}
+        <div style={{ display:"flex", gap:8, marginLeft:"auto", alignItems:"center" }}>
+          {hasOpen   && <span style={{ ...mono, fontSize:11, background:m.color+"22", color:m.color, padding:"2px 8px", borderRadius:10, border:`1px solid ${m.color}44` }}>{openPos.length} open</span>}
+          {hasClosed && <span style={{ ...mono, fontSize:11, color:C.muted }}>{closed.length} closed</span>}
+          <span style={{ color:C.muted, fontSize:13 }}>{expanded ? "▾" : "▸"}</span>
+        </div>
+      </div>
+
+      {expanded && (
+        <div style={{ padding:"14px 16px" }}>
+
+          {/* Open positions */}
+          {hasOpen && (
+            <div style={{ marginBottom:16 }}>
+              <div style={{ ...sans, fontSize:10, textTransform:"uppercase", letterSpacing:1, color:m.color, fontWeight:600, marginBottom:8 }}>
+                Open Positions ({openPos.length})
+              </div>
+              <div style={{ overflowX:"auto" }}>
+                <table style={{ fontSize:12, width:"100%", borderCollapse:"collapse" }}>
+                  <thead><tr>
+                    {["Ticker","Type","Strike","Expiry","DTE","Qty","Entry","Mkt Val","Unrealized P&L"].map(h => (
+                      <th key={h} style={{ ...mono, fontSize:10, color:C.muted, fontWeight:600, paddingBottom:6, textAlign:"left", paddingRight:12 }}>{h}</th>
+                    ))}
+                  </tr></thead>
+                  <tbody>
+                    {openPos.map((p, i) => {
+                      const dte = fmtDTE(p.expiry);
+                      return (
+                        <tr key={p.id || i} style={{ borderTop:`1px solid ${C.border}33` }}>
+                          <td style={{ ...mono, fontWeight:700, color:C.accent, padding:"5px 12px 5px 0" }}>{p.ticker}</td>
+                          <td style={{ padding:"5px 12px 5px 0" }}>
+                            <span style={{ fontSize:10, fontWeight:700, padding:"2px 7px", borderRadius:8,
+                              background:(p.right==="C"?C.bull:p.right==="P"?C.bear:C.muted)+"22",
+                              color:(p.right==="C"?C.bull:p.right==="P"?C.bear:C.muted) }}>
+                              {p.right==="C"?"CALL":p.right==="P"?"PUT":strategyLabel(p)}
+                            </span>
+                          </td>
+                          <td style={{ ...mono, padding:"5px 12px 5px 0" }}>{p.strike ? `$${p.strike}` : "—"}</td>
+                          <td style={{ ...mono, fontSize:11, color:C.muted, padding:"5px 12px 5px 0" }}>
+                            {p.expiry ? `${p.expiry.slice(0,4)}-${p.expiry.slice(4,6)}-${p.expiry.slice(6,8)}` : "—"}
+                          </td>
+                          <td style={{ ...mono, padding:"5px 12px 5px 0",
+                            color: dte < 7 ? C.bear : dte < 21 ? C.neutral : C.muted }}>{dte}</td>
+                          <td style={{ ...mono, padding:"5px 12px 5px 0" }}>{p.qty}</td>
+                          <td style={{ ...mono, padding:"5px 12px 5px 0" }}>{p.entry_price != null ? `$${Number(p.entry_price).toFixed(2)}` : "—"}</td>
+                          <td style={{ ...mono, padding:"5px 12px 5px 0" }}>{p.market_value != null ? `$${Number(p.market_value).toFixed(0)}` : "—"}</td>
+                          <td style={{ ...mono, fontWeight:700, padding:"5px 0",
+                            color: pnlCol(p.unrealized_pnl) }}>{p.unrealized_pnl != null ? fmtDol(p.unrealized_pnl, true) : "—"}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
+          {/* Closed trades */}
+          {hasClosed && (
+            <div>
+              <div style={{ ...sans, fontSize:10, textTransform:"uppercase", letterSpacing:1, color:C.muted, fontWeight:600, marginBottom:8 }}>
+                Closed Trades ({closed.length})
+                {realClosed.length > 0 && (
+                  <span style={{ marginLeft:12, ...mono, fontSize:10, color: pnlCol(allTimePnl), fontWeight:700 }}>
+                    {fmtDol(allTimePnl, true)} total  ·  {wins}W / {realClosed.length - wins}L
+                  </span>
+                )}
+              </div>
+              <div style={{ overflowX:"auto" }}>
+                <table style={{ fontSize:12, width:"100%", borderCollapse:"collapse" }}>
+                  <thead><tr>
+                    {["Ticker","Strike","Opened","Closed","Days","P&L","Fees","Net P&L","P&L %","Exit","W/L"].map(h => (
+                      <th key={h} style={{ ...mono, fontSize:10, color:C.muted, fontWeight:600, paddingBottom:6, textAlign:"left", paddingRight:12 }}>{h}</th>
+                    ))}
+                  </tr></thead>
+                  <tbody>
+                    {closed.slice(0, 50).map(t => {
+                      const days = t.closed_at && t.opened_at
+                        ? Math.max(0, Math.round((new Date(t.closed_at) - new Date(t.opened_at)) / 86400000))
+                        : null;
+                      const exitCol = (t.exit_reason||"").includes("profit") || (t.exit_reason||"").includes("target")
+                        ? C.bull : (t.exit_reason||"").includes("stop") || (t.exit_reason||"").includes("loss")
+                        ? C.bear : C.neutral;
+                      const isOrphan = (t.exit_reason||"") === "orphaned";
+                      return (
+                        <tr key={t.id} style={{ borderTop:`1px solid ${C.border}33`, opacity: isOrphan ? 0.45 : 1 }}>
+                          <td style={{ ...mono, fontWeight:700, color:C.accent, padding:"5px 12px 5px 0" }}>{t.ticker}</td>
+                          <td style={{ ...mono, padding:"5px 12px 5px 0" }}>{t.strike ? `$${t.strike}` : "—"}</td>
+                          <td style={{ ...mono, fontSize:10, color:C.muted, padding:"5px 12px 5px 0" }}>{fmtDT(t.opened_at)}</td>
+                          <td style={{ ...mono, fontSize:10, color:C.muted, padding:"5px 12px 5px 0" }}>{fmtDT(t.closed_at)}</td>
+                          <td style={{ ...mono, color:C.muted, padding:"5px 12px 5px 0" }}>{days != null ? `${days}d` : "—"}</td>
+                          <td style={{ ...mono, fontWeight:700, padding:"5px 12px 5px 0", color: isOrphan ? C.muted : pnlCol(t.pnl) }}>
+                            {isOrphan ? "—" : fmtDol(t.pnl, true)}
+                          </td>
+                          <td style={{ ...mono, fontSize:11, padding:"5px 12px 5px 0", color: t.commission ? C.bear : C.muted }}>
+                            {t.commission ? `-$${Number(t.commission).toFixed(2)}` : "—"}
+                          </td>
+                          <td style={{ ...mono, fontWeight:700, padding:"5px 12px 5px 0", color: isOrphan ? C.muted : pnlCol((t.pnl||0)-(t.commission||0)) }}>
+                            {isOrphan ? "—" : fmtDol((t.pnl||0)-(t.commission||0), true)}
+                          </td>
+                          <td style={{ ...mono, padding:"5px 12px 5px 0", color: isOrphan ? C.muted : pnlCol(t.pnl_pct) }}>
+                            {isOrphan || t.pnl_pct == null ? "—" : `${Number(t.pnl_pct).toFixed(1)}%`}
+                          </td>
+                          <td style={{ padding:"5px 12px 5px 0" }}>
+                            <span style={{ fontSize:10, fontWeight:600, padding:"2px 7px", borderRadius:8,
+                              background:exitCol+"22", color:exitCol, border:`1px solid ${exitCol}44` }}>
+                              {t.exit_reason || "—"}
+                            </span>
+                          </td>
+                          <td style={{ ...mono, fontWeight:700, padding:"5px 0",
+                            color: t.win===1 ? C.bull : t.win===0 ? C.bear : C.muted }}>
+                            {t.win===1 ? "W" : t.win===0 ? "L" : "—"}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+                {closed.length > 50 && (
+                  <div style={{ ...sans, fontSize:11, color:C.muted, padding:"8px 0", textAlign:"center" }}>
+                    Showing 50 of {closed.length} — use trade journal for full history
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
+          {!hasOpen && !hasClosed && (
+            <div style={{ ...sans, fontSize:13, color:C.muted, textAlign:"center", padding:"12px 0" }}>No data</div>
+          )}
+        </div>
+      )}
+    </Card>
+  );
+}
+
 function PnLTab() {
   const [data,        setData]        = useState(null);
   const [loading,     setLoading]     = useState(true);
@@ -3581,6 +3830,7 @@ function PnLTab() {
     );
   }
 
+  const commTracked = stats.total_commission != null && stats.total_commission > 0;
   const cards = [
     { label:"Total P&L",      value:fmtDol(stats.total_realized_pnl,true),   color:pnlCol(stats.total_realized_pnl),   sub:`${stats.total_trades} closed trades` },
     { label:"Unrealized P&L", value:fmtDol(stats.total_unrealized_pnl,true), color:pnlCol(stats.total_unrealized_pnl), sub:`${stats.open_count} open · live` },
@@ -3588,8 +3838,25 @@ function PnLTab() {
     { label:"Today's P&L",    value:fmtDol(stats.today_pnl,true),            color:pnlCol(stats.today_pnl),            sub:new Date().toLocaleDateString("en-US",{weekday:"short"}) },
     { label:"Win Rate",       value:stats.win_rate!=null?`${stats.win_rate}%`:"—", color:stats.win_rate>50?C.bull:stats.win_rate<50?C.bear:C.muted,
       sub:`avg W ${fmtDol(stats.avg_win)} / L ${fmtDol(stats.avg_loss)}` },
-    { label:"Net Liquidation", value:fmtDol(account.net_liquidation),         color:C.accent,                           sub:account.account||"—" },
+    { label: commTracked ? "Net (after fees)" : "Net Liquidation",
+      value: commTracked ? fmtDol(stats.net_realized_pnl,true) : fmtDol(account.net_liquidation),
+      color: commTracked ? pnlCol(stats.net_realized_pnl) : C.accent,
+      sub: commTracked ? `fees: ${fmtDol(stats.total_commission)} · liq: ${fmtDol(account.net_liquidation)}` : (account.account||"—") },
   ];
+
+  // ── Group closed trades + open positions by strategy ──────────────────────
+  // Plain computation — data is guaranteed non-null here (guarded by early returns above)
+  const byStrategy = {};
+  for (const t of (closed_trades || [])) {
+    const k = t.strategy_type || "OTHER";
+    if (!byStrategy[k]) byStrategy[k] = { closed:[], open:[] };
+    byStrategy[k].closed.push(t);
+  }
+  for (const p of (open_positions || [])) {
+    const k = p.strategy_type || "UNTRACKED";
+    if (!byStrategy[k]) byStrategy[k] = { closed:[], open:[] };
+    byStrategy[k].open.push(p);
+  }
 
   return (
     <div style={{animation:"fadeIn 0.2s ease"}}>
@@ -3629,44 +3896,42 @@ function PnLTab() {
         <PnLChart/>
       </Card>
 
-      {/* Today by Strategy */}
+      {/* Today by Strategy — compact tiles */}
       {strategy_today && Object.keys(strategy_today).length > 0 && (() => {
-        const LABELS = {
-          SPX_0DTE:           "SPX 0DTE",
-          DAY_BREAKOUT:       "Day Trader",
-          earnings_vol_crush: "EVC",
-          LEAP:               "LEAP",
-          CSP:                "CSP",
-          OTHER:              "Other",
-        };
         const totalToday = Object.values(strategy_today).reduce((s,v)=>s+(v.pnl||0),0);
         return (
-          <Card style={{marginBottom:20}}>
-            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}>
-              <div style={{...sans,fontSize:10,textTransform:"uppercase",letterSpacing:2,color:C.muted}}>
-                Today's P&amp;L by Strategy
-              </div>
-              <div style={{...mono,fontSize:15,fontWeight:700,color:totalToday>=0?C.bull:C.bear}}>
-                {totalToday>=0?"+":""}{fmtDol(totalToday)}
+          <Card style={{marginBottom:16}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
+              <div style={{...sans,fontSize:10,textTransform:"uppercase",letterSpacing:2,color:C.muted}}>Today by Strategy</div>
+              <div style={{...mono,fontSize:14,fontWeight:700,color:totalToday>=0?C.bull:C.bear}}>
+                {fmtDol(totalToday,true)} total
               </div>
             </div>
-            <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(160px,1fr))",gap:10}}>
+            <div style={{display:"flex",flexWrap:"wrap",gap:8}}>
               {Object.entries(strategy_today).sort((a,b)=>Math.abs(b[1].pnl)-Math.abs(a[1].pnl)).map(([key,val])=>{
+                const m = STRAT_META[key] || { label:key, color:C.muted };
                 const pnl = val.pnl || 0;
-                const barW = totalToday !== 0 ? Math.min(100, Math.abs(pnl/totalToday)*100) : 0;
                 return (
-                  <div key={key} style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:8,padding:"10px 14px"}}>
-                    <div style={{...sans,fontSize:11,color:C.muted,marginBottom:4}}>{LABELS[key]||key}</div>
-                    <div style={{...mono,fontSize:17,fontWeight:700,color:pnl>=0?C.bull:C.bear}}>
-                      {pnl>=0?"+":""}{fmtDol(pnl)}
+                  <div key={key} style={{
+                    display:"flex", alignItems:"center", gap:10, padding:"8px 14px",
+                    background:C.bg, border:`1px solid ${m.color}44`, borderLeft:`3px solid ${m.color}`,
+                    borderRadius:8, minWidth:170,
+                  }}>
+                    <div>
+                      <div style={{...sans,fontSize:10,color:C.muted,marginBottom:2}}>{m.label}</div>
+                      <div style={{...mono,fontSize:15,fontWeight:700,color:pnl>=0?C.bull:C.bear}}>
+                        {fmtDol(pnl,true)}
+                      </div>
                     </div>
-                    <div style={{display:"flex",gap:8,marginTop:6,alignItems:"center"}}>
-                      <span style={{...mono,fontSize:10,color:C.muted}}>{val.trades||0} trade{val.trades!==1?"s":""}</span>
-                      {val.wins!=null && <span style={{...mono,fontSize:10,color:C.bull}}>✅{val.wins}</span>}
-                      {val.losses!=null && val.losses>0 && <span style={{...mono,fontSize:10,color:C.bear}}>🛑{val.losses}</span>}
-                    </div>
-                    <div style={{marginTop:6,height:3,background:C.border,borderRadius:2}}>
-                      <div style={{width:`${barW}%`,height:"100%",background:pnl>=0?C.bull:C.bear,borderRadius:2}}/>
+                    <div style={{marginLeft:"auto",textAlign:"right"}}>
+                      <div style={{...mono,fontSize:10,color:C.muted}}>{val.trades||0} trade{val.trades!==1?"s":""}</div>
+                      {(val.wins||0)+(val.losses||0) > 0 && (
+                        <div style={{...mono,fontSize:10}}>
+                          <span style={{color:C.bull}}>{val.wins||0}W</span>
+                          <span style={{color:C.muted}}> / </span>
+                          <span style={{color:C.bear}}>{val.losses||0}L</span>
+                        </div>
+                      )}
                     </div>
                   </div>
                 );
@@ -3676,113 +3941,44 @@ function PnLTab() {
         );
       })()}
 
-      {/* Open positions + Exit breakdown */}
-      <div style={{display:"grid",gridTemplateColumns:"3fr 2fr",gap:16,marginBottom:20}}>
-        <Card>
-          <div style={{...sans,fontSize:10,textTransform:"uppercase",letterSpacing:2,color:C.muted,marginBottom:12}}>
-            Open Positions ({open_positions.length}) — IBKR live
-          </div>
-          {open_positions.length === 0
-            ? <div style={{...sans,fontSize:13,color:C.muted,padding:"20px 0",textAlign:"center"}}>
-                No open positions in IBKR portfolio
-              </div>
-            : <div style={{overflowX:"auto"}}>
-                <table style={{fontSize:12}}>
-                  <thead><tr>{["Ticker","Type","Strike","Expiry","DTE","Qty","Entry","Mkt Val","Unrealized P&L","IV","Roll#"].map(h=>(
-                    <th key={h} style={{...mono,fontSize:10,color:C.muted,fontWeight:600,paddingBottom:8}}>{h}</th>
-                  ))}</tr></thead>
-                  <tbody>{open_positions.map((t,i) => {
-                    const dte = fmtDTE(t.expiry);
-                    return (
-                      <tr key={t.id||i}>
-                        <td style={{...mono,fontWeight:700,color:C.accent}}>{t.ticker}</td>
-                        <td><Pill color={t.action==="BUY"?C.bull:C.bear}>{strategyLabel(t)}</Pill></td>
-                        <td style={{...mono}}>{t.strike?`$${t.strike}`:"—"}</td>
-                        <td style={{...mono,fontSize:11}}>{t.expiry?`${t.expiry.slice(0,4)}-${t.expiry.slice(4,6)}-${t.expiry.slice(6,8)}`:"—"}</td>
-                        <td style={{...mono,color:dte<21?C.bear:dte<30?C.neutral:C.muted}}>{dte}</td>
-                        <td style={{...mono}}>{t.qty}</td>
-                        <td style={{...mono}}>{t.entry_price!=null?`$${Number(t.entry_price).toFixed(2)}`:"—"}</td>
-                        <td style={{...mono}}>{t.market_value!=null?`$${Number(t.market_value).toFixed(0)}`:"—"}</td>
-                        <td style={{...mono,fontWeight:700,color:pnlCol(t.unrealized_pnl)}}>
-                          {t.unrealized_pnl!=null?fmtDol(t.unrealized_pnl,true):"—"}
-                        </td>
-                        <td style={{...mono}}>{t.live_iv_entry?`${Number(t.live_iv_entry).toFixed(0)}%`:"—"}</td>
-                        <td style={{...mono,color:C.muted}}>{t.roll_count||0}</td>
-                      </tr>
-                    );
-                  })}</tbody>
-                </table>
-              </div>
-          }
-        </Card>
-
-        <Card>
-          <div style={{...sans,fontSize:10,textTransform:"uppercase",letterSpacing:2,color:C.muted,marginBottom:12}}>Exit Breakdown</div>
-          {Object.keys(exit_breakdown).length === 0
-            ? <div style={{...sans,fontSize:13,color:C.muted,padding:"20px 0",textAlign:"center"}}>No closed trades yet</div>
-            : <table style={{fontSize:12}}>
-                <thead><tr>{["Reason","Count","Total","Avg"].map(h=>(
-                  <th key={h} style={{...mono,fontSize:10,color:C.muted,fontWeight:600,paddingBottom:8}}>{h}</th>
-                ))}</tr></thead>
-                <tbody>{Object.entries(exit_breakdown).sort((a,b)=>b[1].count-a[1].count).map(([reason,d])=>{
-                  const isOrphan = reason === "orphaned";
-                  const pillColor = isOrphan ? C.muted : d.pnl >= 0 ? C.bull : C.bear;
-                  return (
-                  <tr key={reason}>
-                    <td><Pill color={pillColor}>{reason}</Pill></td>
-                    <td style={{...mono}}>{d.count}</td>
-                    <td style={{...mono,color:isOrphan?C.muted:pnlCol(d.pnl)}}>
-                      {isOrphan ? "—" : fmtDol(d.pnl,true)}
-                    </td>
-                    <td style={{...mono,color:isOrphan?C.muted:pnlCol(d.count>0?d.pnl/d.count:0)}}>
-                      {isOrphan ? "—" : fmtDol(d.count>0?d.pnl/d.count:0,true)}
-                    </td>
-                  </tr>
-                )})}</tbody>
-              </table>
-          }
-
-          {/* IBKR Live Portfolio data is now shown in the Open Positions table (left card) */}
-        </Card>
+      {/* ── Per-Strategy Sections ─────────────────────────────────────────── */}
+      <div style={{...sans,fontSize:10,textTransform:"uppercase",letterSpacing:2,color:C.muted,marginBottom:10,marginTop:4}}>
+        Per-Strategy P&amp;L
       </div>
+      {STRAT_ORDER.filter(k => byStrategy[k]).map(k => (
+        <StratSection
+          key={k}
+          stratKey={k}
+          closed={byStrategy[k].closed}
+          openPos={byStrategy[k].open}
+          todaySummary={strategy_today?.[k]}
+          fmtDol={fmtDol}
+          pnlCol={pnlCol}
+          fmtDT={fmtDT}
+          fmtDTE={fmtDTE}
+        />
+      ))}
+      {Object.keys(byStrategy).filter(k => !STRAT_ORDER.includes(k)).map(k => (
+        <StratSection
+          key={k}
+          stratKey={k}
+          closed={byStrategy[k].closed}
+          openPos={byStrategy[k].open}
+          todaySummary={strategy_today?.[k]}
+          fmtDol={fmtDol}
+          pnlCol={pnlCol}
+          fmtDT={fmtDT}
+          fmtDTE={fmtDTE}
+        />
+      ))}
 
-      {/* Closed trades table */}
-      <Card>
-        <div style={{...sans,fontSize:10,textTransform:"uppercase",letterSpacing:2,color:C.muted,marginBottom:12}}>
-          Recent Closed Trades ({closed_trades.length})
-        </div>
-        {closed_trades.length === 0
-          ? <div style={{...sans,fontSize:13,color:C.muted,padding:"20px 0",textAlign:"center"}}>No closed trades yet</div>
-          : <div style={{overflowX:"auto"}}>
-              <table style={{fontSize:12}}>
-                <thead><tr>{["Ticker","Type","Strike","Opened","Closed","Days","P&L","P&L%","Exit Reason","W/L"].map(h=>(
-                  <th key={h} style={{...mono,fontSize:10,color:C.muted,fontWeight:600,paddingBottom:8}}>{h}</th>
-                ))}</tr></thead>
-                <tbody>{closed_trades.map(t => {
-                  const days = Math.max(0, Math.round((new Date(t.closed_at)-new Date(t.opened_at))/86400000));
-                  const exitCol = (t.exit_reason||"").includes("profit") ? C.bull : (t.exit_reason||"").includes("stop")||( t.exit_reason||"").includes("loss") ? C.bear : C.neutral;
-                  return (
-                    <tr key={t.id}>
-                      <td style={{...mono,fontWeight:700,color:C.accent}}>{t.ticker}</td>
-                      <td><Pill color={t.action==="BUY"?C.bull:C.bear}>{strategyLabel(t)}</Pill></td>
-                      <td style={{...mono}}>${t.strike}</td>
-                      <td style={{...mono,fontSize:11,color:C.muted}}>{fmtDT(t.opened_at)}</td>
-                      <td style={{...mono,fontSize:11,color:C.muted}}>{fmtDT(t.closed_at)}</td>
-                      <td style={{...mono}}>{days}d</td>
-                      <td style={{...mono,fontWeight:700,color:pnlCol(t.pnl)}}>{fmtDol(t.pnl,true)}</td>
-                      <td style={{...mono,color:pnlCol(t.pnl_pct)}}>{t.pnl_pct!=null?`${Number(t.pnl_pct).toFixed(1)}%`:"—"}</td>
-                      <td><Pill color={exitCol}>{t.exit_reason||"—"}</Pill></td>
-                      <td style={{...mono,fontWeight:700,color:t.win===1?C.bull:t.win===0?C.bear:C.muted}}>{t.win===1?"W":t.win===0?"L":"—"}</td>
-                    </tr>
-                  );
-                })}</tbody>
-              </table>
-            </div>
-        }
-      </Card>
+      {/* Exit breakdown — compact, collapsible */}
+      {Object.keys(exit_breakdown).length > 0 && (
+        <ExitBreakdown exit_breakdown={exit_breakdown} fmtDol={fmtDol} pnlCol={pnlCol} />
+      )}
 
-      {/* Portfolio Delta + Orders — collapsible panel (replaces old Positions tab) */}
-      <Card style={{ marginTop:16 }}>
+      {/* Portfolio Delta + Orders — collapsible */}
+      <Card style={{ marginTop:10 }}>
         <div style={{ display:"flex", alignItems:"center", gap:12, cursor:"pointer" }}
              onClick={() => { setDeltaOpen(o => !o); if (!deltaData) loadDelta(); }}>
           <span style={{ ...sans, fontWeight:700, fontSize:13, color:C.text }}>
@@ -5943,6 +6139,308 @@ function SigTraderTab() {
                 ))}
               </tbody>
             </table>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+
+// ── FX Trader Tab ────────────────────────────────────────────────────────────
+function FXTraderTab() {
+  const [status,  setStatus]  = useState(null);
+  const [history, setHistory] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  const load = async () => {
+    try {
+      const [s, h] = await Promise.all([
+        apiFetch("/fx-trader/status"),
+        apiFetch("/fx-trader/history?limit=50"),
+      ]);
+      setStatus(s);
+      setHistory(h.trades || []);
+    } catch(_e) {}
+    finally { setLoading(false); }
+  };
+  useEffect(() => { load(); const id = setInterval(load, 15000); return () => clearInterval(id); }, []);
+
+  const toggle    = async () => { await apiFetch("/fx-trader/enable", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({enabled:!status.enabled})}); load(); };
+  const updateCfg = async (key, val) => { await apiFetch("/fx-trader/config", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({[key]:val})}); load(); };
+  const closePos  = async (pair) => { await apiFetch(`/fx-trader/close/${pair}`, {method:"POST"}); load(); };
+
+  const pnlColor  = v => v == null ? C.muted : v >= 0 ? "#22c55e" : "#ef4444";
+  const dirColor  = d => d === "LONG" ? "#4ade80" : "#f87171";
+  const exitColor = t => t === "tp_hit" ? "#4ade80" : t === "sl_hit" ? "#f87171"
+                       : t === "eod_force_close" ? "#f59e0b" : t === "manual_close" ? "#a78bfa"
+                       : C.muted;
+  const actionColor = a => a === "ENTERED" ? "#93c5fd" : a === "CLOSED" ? "#4ade80"
+                          : a === "ORDERING" ? "#a78bfa" : a === "SKIP" ? "#f59e0b"
+                          : a === "NO_SIGNAL" ? "#475569" : a === "ERROR" ? "#f87171" : C.muted;
+
+  if (loading) return <div style={{color:C.muted,...sans,fontSize:13}}>Loading...</div>;
+  if (!status)  return <div style={{color:C.muted,...sans,fontSize:13}}>Backend unavailable</div>;
+
+  const { config:cfg, pairs, positions, closed_today, decisions } = status;
+  const todayPnl   = closed_today.reduce((s,p) => s + (p.pnl_usd || 0), 0);
+  const openCount  = Object.keys(positions).length;
+
+  return (
+    <div>
+      {/* Header */}
+      <div style={{display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:16}}>
+        <div>
+          <div style={{...sans, fontSize:17, fontWeight:700, color:C.white}}>FX Trader</div>
+          <div style={{...sans, fontSize:12, color:C.muted, marginTop:2}}>
+            EMA(50) + 20-bar breakout · 4 major pairs · 08:00–12:00 ET · OCA bracket orders
+          </div>
+          <div style={{...sans, fontSize:11, color:"#fb923c", marginTop:2}}>
+            EURUSD · GBPUSD · USDJPY · AUDUSD · 72–77% win rate backtest
+          </div>
+        </div>
+        <button onClick={toggle} style={{
+          ...sans, fontSize:13, padding:"8px 18px", borderRadius:6, cursor:"pointer", fontWeight:700,
+          background: status.enabled ? "#14532d" : "#1e293b",
+          border:`1px solid ${status.enabled ? "#16a34a" : C.border}`,
+          color: status.enabled ? "#4ade80" : C.muted,
+        }}>{status.enabled ? "LIVE" : "Disabled"}</button>
+      </div>
+
+      {/* Summary cards */}
+      <div style={{background:"#0f172a", border:`1px solid ${C.border}`, borderRadius:8, padding:16, marginBottom:16}}>
+        <div style={{display:"grid", gridTemplateColumns:"1fr 1fr 1fr 1fr", gap:12}}>
+          {[
+            {label:"Open Positions",  value:`${openCount}/${cfg.max_positions}`,                color:C.white},
+            {label:"Today P&L",       value:`${todayPnl>=0?"+":""}$${todayPnl.toFixed(2)}`,    color:pnlColor(todayPnl)},
+            {label:"Closed Today",    value:`${closed_today.length}`,                          color:C.muted},
+            {label:"Risk / Trade",    value:`$${cfg.risk_usd}`,                                color:"#a78bfa"},
+          ].map(({label,value,color}) => (
+            <div key={label} style={{textAlign:"center"}}>
+              <div style={{...sans, fontSize:11, color:C.muted, marginBottom:4}}>{label}</div>
+              <div style={{...mono, fontSize:15, fontWeight:700, color}}>{value}</div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Config */}
+      <div style={{display:"grid", gridTemplateColumns:"repeat(3,1fr)", gap:10, marginBottom:16}}>
+        {[
+          {label:"Risk / Trade $",    key:"risk_usd",         step:10},
+          {label:"Max Spread (pips)", key:"max_spread_pips",  step:0.5},
+          {label:"Max Positions",     key:"max_positions",    step:1},
+          {label:"Entry Start (ET)",  key:"entry_start",      isText:true},
+          {label:"Entry End (ET)",    key:"entry_end",        isText:true},
+          {label:"Force Close (ET)",  key:"force_close_time", isText:true},
+        ].map(({label,key,step,isText}) => (
+          <div key={key} style={{background:"#0f172a", border:`1px solid ${C.border}`, borderRadius:6, padding:"8px 10px"}}>
+            <div style={{...sans, fontSize:10, color:C.muted, marginBottom:4}}>{label}</div>
+            <input defaultValue={cfg[key]} type={isText ? "text" : "number"} step={step}
+              style={{...mono, fontSize:13, width:"100%", background:"none", border:"none", color:C.white, outline:"none"}}
+              onBlur={e => { const v = isText ? e.target.value : parseFloat(e.target.value); if (String(v) !== String(cfg[key])) updateCfg(key, v); }} />
+          </div>
+        ))}
+      </div>
+
+      {/* Pairs reference */}
+      <div style={{...sans, fontSize:13, fontWeight:700, color:C.white, marginBottom:8}}>Pairs · Backtest Results</div>
+      <div style={{overflowX:"auto", marginBottom:20}}>
+        <table style={{width:"100%", borderCollapse:"collapse", ...sans, fontSize:11}}>
+          <thead>
+            <tr style={{background:"#0f172a"}}>
+              {["Pair","Pip Size","Session","Win Rate","Expect (pip)"].map(h=>(
+                <th key={h} style={{padding:"6px 10px", textAlign:"left", color:C.muted,
+                  fontWeight:600, textTransform:"uppercase", borderBottom:`1px solid ${C.border}`}}>{h}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {pairs && Object.entries(pairs).map(([pair,p]) => {
+              const wrColor = p.win_rate >= 76 ? "#4ade80" : p.win_rate >= 73 ? "#86efac" : "#fb923c";
+              return (
+                <tr key={pair} style={{borderBottom:`1px solid ${C.border}`}}>
+                  <td style={{padding:"7px 10px", ...mono, fontWeight:700, color:C.white}}>{pair}</td>
+                  <td style={{padding:"7px 10px", ...mono, color:"#94a3b8"}}>{p.pip}</td>
+                  <td style={{padding:"7px 10px", color:C.muted}}>08:00–12:00 ET</td>
+                  <td style={{padding:"7px 10px", ...mono, fontWeight:700, color:wrColor}}>{p.win_rate}%</td>
+                  <td style={{padding:"7px 10px", ...mono, color:"#4ade80"}}>+{p.expect_pip}p</td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+
+      {/* Open Positions */}
+      <div style={{...sans, fontSize:13, fontWeight:700, color:C.white, marginBottom:8}}>Open Positions</div>
+      {openCount === 0 ? (
+        <div style={{color:C.muted, ...sans, fontSize:13, padding:"12px 0"}}>
+          {status.enabled ? "No open positions" : "Trader disabled"}
+        </div>
+      ) : (
+        <div style={{overflowX:"auto", marginBottom:20}}>
+          <table style={{width:"100%", borderCollapse:"collapse", ...sans, fontSize:12}}>
+            <thead>
+              <tr style={{background:"#0f172a"}}>
+                {["Pair","Dir","Qty","Entry","Stop","Target","Stop pips","Target pips","Live P&L",""].map(h=>(
+                  <th key={h} style={{padding:"7px 10px", textAlign:"left", color:C.muted,
+                    fontSize:11, fontWeight:600, textTransform:"uppercase",
+                    borderBottom:`1px solid ${C.border}`}}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {Object.entries(positions).map(([pair, p]) => (
+                <tr key={pair} style={{borderBottom:`1px solid ${C.border}`}}>
+                  <td style={{padding:"8px 10px", ...mono, fontWeight:700, color:C.white}}>{p.pair}</td>
+                  <td style={{padding:"8px 10px"}}>
+                    <span style={{fontSize:11, padding:"2px 7px", borderRadius:4, fontWeight:700,
+                      color:dirColor(p.direction), background:`${dirColor(p.direction)}22`}}>
+                      {p.direction}
+                    </span>
+                  </td>
+                  <td style={{padding:"8px 10px", ...mono, color:"#94a3b8"}}>{p.qty?.toLocaleString()}</td>
+                  <td style={{padding:"8px 10px", ...mono, color:C.white}}>{p.entry_price?.toFixed(5)}</td>
+                  <td style={{padding:"8px 10px", ...mono, color:"#f87171"}}>{p.stop_price?.toFixed(5)}</td>
+                  <td style={{padding:"8px 10px", ...mono, color:"#4ade80"}}>{p.target_price?.toFixed(5)}</td>
+                  <td style={{padding:"8px 10px", ...mono, color:"#f87171"}}>{p.stop_pips?.toFixed(1)}p</td>
+                  <td style={{padding:"8px 10px", ...mono, color:"#4ade80"}}>{p.target_pips?.toFixed(1)}p</td>
+                  <td style={{padding:"8px 10px", ...mono, fontWeight:700, color:pnlColor(p.live_pnl)}}>
+                    {p.live_pnl != null ? `${p.live_pnl>=0?"+":""}$${p.live_pnl.toFixed(2)}` : "--"}
+                    {p.live_price != null && (
+                      <div style={{...sans, fontSize:10, color:C.muted, fontWeight:400}}>
+                        mid {p.live_price?.toFixed(5)}
+                      </div>
+                    )}
+                  </td>
+                  <td style={{padding:"8px 10px"}}>
+                    <button onClick={()=>closePos(pair)} style={{
+                      ...sans, fontSize:11, padding:"3px 8px", borderRadius:4, cursor:"pointer",
+                      background:"#450a0a", border:"1px solid #7f1d1d", color:"#fca5a5"}}>Close</button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {/* Closed Today */}
+      {closed_today.length > 0 && (
+        <>
+          <div style={{...sans, fontSize:13, fontWeight:700, color:C.white, marginBottom:8}}>Closed Today</div>
+          <div style={{overflowX:"auto", marginBottom:20}}>
+            <table style={{width:"100%", borderCollapse:"collapse", ...sans, fontSize:12}}>
+              <thead>
+                <tr style={{background:"#0f172a"}}>
+                  {["Pair","Dir","Qty","Entry","Exit","Pips","P&L","Exit Reason"].map(h=>(
+                    <th key={h} style={{padding:"7px 10px", textAlign:"left", color:C.muted,
+                      fontSize:11, fontWeight:600, textTransform:"uppercase",
+                      borderBottom:`1px solid ${C.border}`}}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {[...closed_today].reverse().map((p,i) => (
+                  <tr key={i} style={{borderBottom:`1px solid ${C.border}`}}>
+                    <td style={{padding:"8px 10px", ...mono, fontWeight:700, color:C.white}}>{p.pair}</td>
+                    <td style={{padding:"8px 10px"}}>
+                      <span style={{fontSize:11, padding:"2px 6px", borderRadius:3, fontWeight:700,
+                        color:dirColor(p.direction), background:`${dirColor(p.direction)}22`}}>
+                        {p.direction}
+                      </span>
+                    </td>
+                    <td style={{padding:"8px 10px", ...mono, color:"#94a3b8"}}>{p.qty?.toLocaleString()}</td>
+                    <td style={{padding:"8px 10px", ...mono, color:C.muted}}>{p.entry_price?.toFixed(5)}</td>
+                    <td style={{padding:"8px 10px", ...mono, color:C.muted}}>{p.exit_price?.toFixed(5)}</td>
+                    <td style={{padding:"8px 10px", ...mono, fontWeight:700,
+                      color:pnlColor(p.pips_pnl)}}>{p.pips_pnl != null ? `${p.pips_pnl>=0?"+":""}${p.pips_pnl?.toFixed(1)}p` : "--"}</td>
+                    <td style={{padding:"8px 10px", ...mono, fontWeight:700, color:pnlColor(p.pnl_usd)}}>
+                      {p.pnl_usd != null ? `${p.pnl_usd>=0?"+":""}$${p.pnl_usd?.toFixed(2)}` : "--"}
+                    </td>
+                    <td style={{padding:"8px 10px"}}>
+                      <span style={{fontSize:11, padding:"2px 7px", borderRadius:4, fontWeight:700,
+                        color:exitColor(p.exit_reason), background:`${exitColor(p.exit_reason)}22`}}>
+                        {p.exit_reason?.replace(/_/g," ")}
+                      </span>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </>
+      )}
+
+      {/* Trade History */}
+      {history.length > 0 && (
+        <>
+          <div style={{...sans, fontSize:13, fontWeight:700, color:C.white, marginBottom:8, marginTop:4}}>
+            Trade History
+            <span style={{...sans, fontSize:11, fontWeight:400, color:C.muted, marginLeft:8}}>
+              {history.length} trades &middot;{" "}
+              P&amp;L: <span style={{color:history.reduce((s,r)=>s+(r.pnl||0),0)>=0?"#22c55e":"#ef4444"}}>
+                ${history.reduce((s,r)=>s+(r.pnl||0),0).toFixed(2)}
+              </span>
+            </span>
+          </div>
+          <div style={{overflowX:"auto", marginBottom:20}}>
+            <table style={{width:"100%", borderCollapse:"collapse", ...sans, fontSize:12}}>
+              <thead>
+                <tr style={{background:"#0f172a"}}>
+                  {["Date","Pair","Dir","Notes","Entry","P&L","Exit"].map(h=>(
+                    <th key={h} style={{padding:"6px 10px", textAlign:"left", color:C.muted,
+                      fontSize:11, fontWeight:600, textTransform:"uppercase",
+                      borderBottom:`1px solid ${C.border}`}}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {history.map((r,i)=>(
+                  <tr key={i} style={{borderBottom:`1px solid ${C.border}`}}>
+                    <td style={{padding:"7px 10px", color:C.muted, fontSize:11}}>{r.entry_date?.slice(0,10)}</td>
+                    <td style={{padding:"7px 10px", ...mono, fontWeight:700}}>{r.ticker}</td>
+                    <td style={{padding:"7px 10px"}}>
+                      <span style={{fontSize:10, padding:"2px 6px", borderRadius:3, fontWeight:700,
+                        color:dirColor(r.direction), background:`${dirColor(r.direction)}22`}}>
+                        {r.direction}
+                      </span>
+                    </td>
+                    <td style={{padding:"7px 10px", color:C.muted, fontSize:11}}>{r.notes?.slice(0,50)}</td>
+                    <td style={{padding:"7px 10px", ...mono}}>{r.entry_price?.toFixed(5)}</td>
+                    <td style={{padding:"7px 10px", ...mono, fontWeight:700, color:pnlColor(r.pnl)}}>
+                      {r.pnl!=null ? `${r.pnl>=0?"+":""}$${r.pnl.toFixed(2)}` : "--"}
+                    </td>
+                    <td style={{padding:"7px 10px"}}>
+                      <span style={{fontSize:11, padding:"2px 6px", borderRadius:4, fontWeight:700,
+                        color:exitColor(r.exit_reason), background:`${exitColor(r.exit_reason)}22`}}>
+                        {r.exit_reason?.replace(/_/g," ") || "--"}
+                      </span>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </>
+      )}
+
+      {/* Decisions */}
+      {decisions.length > 0 && (
+        <>
+          <div style={{...sans, fontSize:13, fontWeight:700, color:C.white, marginBottom:8}}>Decisions</div>
+          <div style={{background:"#0f172a", border:`1px solid ${C.border}`, borderRadius:6,
+            padding:10, maxHeight:200, overflowY:"auto", marginBottom:16}}>
+            {[...decisions].reverse().map((d,i)=>(
+              <div key={i} style={{...mono, fontSize:11, padding:"2px 0",
+                borderBottom: i<decisions.length-1 ? `1px solid ${C.border}` : "none"}}>
+                <span style={{color:C.muted}}>{d.time}</span>
+                {" "}<span style={{color:actionColor(d.action), fontWeight:700}}>{d.action}</span>
+                {" "}<span style={{color:"#94a3b8"}}>{d.pair}</span>
+                {" "}<span style={{color:C.muted}}>{d.detail}</span>
+              </div>
+            ))}
           </div>
         </>
       )}
@@ -8223,13 +8721,20 @@ function AlertsTab() {
 
   const pctBColor = (v) => v == null ? C.muted : v >= 95 ? "#a78bfa" : v >= 75 ? C.orange : v >= 50 ? C.bull : C.muted;
 
-  const fmtTime = (iso) => {
+  // fmtTs: parse any UTC ISO string (with or without offset/Z) → local browser time HH:MM
+  const fmtTs = (iso) => {
     if (!iso) return "—";
     try {
-      const d = new Date(iso.endsWith("Z") ? iso : iso + "Z");
-      return d.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", timeZone: "America/New_York", hour12: false }) + " ET";
+      // new Date() handles "+00:00", "Z", and bare ISO (treated as UTC per spec for date-only;
+      // for datetime we normalise by appending "Z" only when there is no existing offset marker)
+      const normalised = /[Z+\-]\d{2}:?\d{2}$/.test(iso) ? iso : iso + "Z";
+      const d = new Date(normalised);
+      if (isNaN(d)) return iso.slice(11, 16);
+      return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
     } catch(_e) { return iso.slice(11, 16); }
   };
+  // fmtTime kept for backward compat; now delegates to fmtTs
+  const fmtTime = fmtTs;
 
   const fmtDate = (s) => s ? s.slice(5) : "—"; // MM-DD from YYYY-MM-DD
 
@@ -8645,6 +9150,7 @@ function App() {
       { id:"spx0dte",     label:"SPX 0DTE"      },
       { id:"evc",         label:"Earnings"      },
       { id:"sigtrader",   label:"Sig Trader"    },
+      { id:"fxtrader",   label:"FX Trader"     },
       { id:"risk",        label:"Risk Monitor"  },
     ]},
     { id:"research", label:"Research", tabs: [
@@ -8754,6 +9260,7 @@ function App() {
         <div style={{display: tab==="spx0dte"      ? "" : "none"}}><SPX0DTETab /></div>
         <div style={{display: tab==="evc"          ? "" : "none"}}><EVCTab /></div>
         <div style={{display: tab==="sigtrader"    ? "" : "none"}}><SigTraderTab /></div>
+        <div style={{display: tab==="fxtrader"    ? "" : "none"}}><FXTraderTab /></div>
         <div style={{display: tab==="risk"         ? "" : "none"}}><RiskMonitorTab /></div>
         <div style={{display: tab==="backtest"     ? "" : "none"}}><BacktestTab   connected={connected} /></div>
         <div style={{display: tab==="0dte"         ? "" : "none"}}><ZeroDTETab    connected={connected} /></div>

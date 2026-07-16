@@ -18,8 +18,18 @@ import sqlite3
 import threading
 import traceback
 from contextlib import asynccontextmanager
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Dict, List, Optional
+
+def _utcnow() -> datetime:
+    """Current UTC time, always timezone-aware."""
+    return datetime.now(timezone.utc)
+
+def _parse_utc(s: str) -> datetime:
+    """Parse any ISO datetime string and return a UTC-aware datetime.
+    Handles naive strings (assumes UTC), '+HH:MM' offsets, and 'Z' suffix."""
+    dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 import numpy as np
 import pandas as pd
@@ -52,7 +62,7 @@ log = logging.getLogger("ibkr_trader")
 
 # ── Config — bar streaming ──────────────────────────────────────────────────
 TWS_HOST = "127.0.0.1"
-TWS_PORT = 7497          # 7497=TWS paper | 7496=TWS live | 4002=IB Gateway paper
+TWS_PORT = int(os.environ.get("IBKR_PORT", "7497"))  # env var wins; 7497=TWS paper|7496=TWS live|4001=GW live|4002=GW paper
 TWS_CLIENT_ID = 10
 MODEL_PATH = "model.joblib"
 BAR_SIZE = "5 mins"
@@ -152,13 +162,14 @@ DT_STATE_PATH       = "day_trader_state.json"   # day trader state (persisted)
 SPX_STATE_PATH      = "spx_0dte_state.json"     # SPX 0DTE trader state (persisted)
 EVC_STATE_PATH      = "earnings_vol_crush_state.json"  # Earnings Vol Crush state (persisted)
 SIGT_STATE_PATH     = "sig_trader_state.json"          # Signal Trader state (persisted)
+FX_STATE_PATH       = "fx_trader_state.json"           # FX Trader state (persisted)
 UNIVERSE_CACHE_PATH = "universe_cache.json"     # screened universe (refreshed nightly)
 WATCHLIST_PATH      = "watchlist.json"          # breakout scanner watchlist
 
 # ── Config — LEAP scanner ──────────────────────────────────────────────────
 LEAP_MIN_DTE   = 180   # ≥ 6 months
 LEAP_MAX_DTE   = 540   # ≤ 18 months
-LEAP_MIN_DELTA = 0.65  # Research: deep ITM (0.80+) preferred; 0.65 min to avoid pure speculation
+LEAP_MIN_DELTA = 0.75  # Raised from 0.65 — only deep ITM with strong intrinsic value
 LEAP_MAX_DELTA = 0.85  # Cap to avoid overpaying for very deep ITM
 LEAP_MAX_IV    = 0.70  # Don't overpay for implied vol
 
@@ -234,7 +245,7 @@ CANDIDATE_POOL: List[str] = [
     "UPS", "FDX", "ETN", "EMR", "ITW", "PH", "ROK", "MMM",
     "TDG", "AXON", "LHX", "HII", "LDOS", "FAST", "GWW",
     # ── Airlines / Transportation ────────────────────────────────────────
-    "DAL", "UAL", "AAL", "LUV", "ALK",
+    "DAL", "UAL", "AAL", "LUV", "ALK", "JBHT", "SW",
     "JBLU", "HA", "SAVE",
     # ── Comm / Media / Streaming ─────────────────────────────────────────
     "NFLX", "DIS", "CMCSA", "T", "VZ", "ROKU", "SPOT",
@@ -248,6 +259,12 @@ CANDIDATE_POOL: List[str] = [
     # ── High-vol / options-active ─────────────────────────────────────────
     "COIN", "HOOD", "SOFI", "MARA", "RIOT",
     "SHOP", "SNAP", "PINS", "MSTR",
+    # ── Solar / Clean energy (high IV at earnings) ────────────────────────
+    "ENPH", "FSLR", "SEDG",
+    # ── Semis (newer high-IV names) ───────────────────────────────────────
+    "ARM",
+    # ── High-growth consumer (5-15% earner movers) ───────────────────────
+    "CELH", "ELF", "ONON", "SKX", "DECK",
 ]
 
 # ── Stock sector mapping for rotation sector guard ─────────────────────────
@@ -326,6 +343,9 @@ state: Dict = {
     # Bar streaming
     "ib": None,
     "connected": False,
+    "is_live":        False,   # True when connected to a live (non-DU) account
+    "connected_port": None,    # port used for the current connection
+    "account_id":     None,    # IBKR account string (e.g. U1234567 or DU9876543)
     "model": None,
     "model_accuracy": None,
     "bars": {},
@@ -394,15 +414,20 @@ state: Dict = {
     "stock_trader": {
         "enabled": False,
         "config": {
-            "position_size":        2500,    # fixed $ per trade — 5% of $50k account (concentration limit)
+            "position_size":        2500,    # fixed $ per trade (overridden when position_size_pct > 0)
+            "position_size_pct":    10.0,    # % of account net liquidation per trade (0 = use fixed $)
             "max_positions":        8,       # concurrent cap
-            "hard_stop_pct":        5.0,     # phase 1 GTC stop — turnaround rule: exit if down >5%
-            "trail_pct":            5.0,     # phase 2 IBKR TRAIL order
-            "max_hold_days":        5,       # force-close at 5 trading days — turnaround rule (was 30, caused NKE/HD/LOW losses)
+            "hard_stop_pct":        20.0,    # phase 1 flat stop — 20% below entry for days 0-5
+            "max_hold_days":        90,      # backstop force-close; 23-DMA trail is the primary exit
             "min_composite_score":  70.0,    # skip signals below this — top ~30% of universe only
             "signal_freshness_min": 30,      # skip alerts older than this
             "limit_buffer_pct":     0.10,    # LIMIT = last_price × (1 + buffer/100)
             "rotation_enabled":     False,   # auto-rotate weak positions on new breakout
+            "use_entry_filters":    True,    # ATR + 23-DMA + 3.7σ entry confirmation
+            "atr_period":           14,      # ATR period (bars)
+            "atr_multiplier":       1.8,     # today's range must be ≥ this × ATR to confirm entry
+            "std_dev_period":       20,      # look-back for daily-return std dev
+            "std_dev_threshold":    3.7,     # today's move must be ≥ this many σ to pass
         },
         "positions":    {},   # ticker → position dict
         "closed_today": [],   # list of closed trade summaries (reset each day)
@@ -412,7 +437,8 @@ state: Dict = {
     "day_trader": {
         "enabled": False,
         "config": {
-            "position_size":        5000,    # fixed $ per trade — 5-yr backtest optimal
+            "position_size":        5000,    # fixed $ per trade (overridden when position_size_pct > 0)
+            "position_size_pct":    10.0,    # % of account net liquidation per trade (0 = use fixed $)
             "max_positions":        10,      # intraday concurrent cap — quality over quantity
             "hard_stop_pct":        3.0,     # intraday stop loss — 2:1 R/R with 2% target
             "profit_target_pct":    2.0,     # take profit at +2.0% — 5yr backtest: only config that makes money
@@ -423,6 +449,11 @@ state: Dict = {
             "expected_return_pct":  2.0,     # assumed avg win % per trade (for goal math)
             "win_rate_est":         0.55,    # assumed win rate per trade (for goal math)
             "min_composite_score":  75.0,    # skip signals below this score (0 = disabled)
+            "use_entry_filters":    True,    # ATR + 23-DMA + 3.7σ entry confirmation
+            "atr_period":           14,      # ATR period (bars)
+            "atr_multiplier":       1.8,     # today's range must be ≥ this × ATR to confirm entry
+            "std_dev_period":       20,      # look-back for daily-return std dev
+            "std_dev_threshold":    3.7,     # today's move must be ≥ this many σ to pass
         },
         "positions":    {},   # ticker → position dict
         "closed_today": [],   # closed trade summaries (reset each day)
@@ -484,8 +515,9 @@ state: Dict = {
         "positions":    {},   # pos_id -> position dict
         "closed_today": [],   # closed positions (reset daily)
         "decisions":    [],   # decision log (last 200)
-        "scan_date":    None, # date of last universe scan (avoid rescanning same day)
-        "scanning":     False,# guard against concurrent scan+entry
+        "scan_date":        None, # date of last universe scan (avoid rescanning same day)
+        "candidates_today": [],   # tickers found in today's scan
+        "scanning":         False,# guard against concurrent scan+entry
     },
     "sig_trader": {
         "enabled": False,
@@ -497,6 +529,21 @@ state: Dict = {
         "positions":    {},  # pos_id → position dict
         "closed_today": [],
         "decisions":    [],
+    },
+    "fx_trader": {
+        "enabled": False,
+        "config": {
+            "risk_usd":          50.0,   # $ risk per trade (stop distance × pip value × qty)
+            "max_spread_pips":    3.0,   # skip entry if live spread exceeds this
+            "max_positions":      2,     # max simultaneous open FX positions
+            "entry_start":       "08:00", # ET window open for new signals
+            "entry_end":         "12:00", # ET window close for new signals
+            "force_close_time":  "17:00", # EOD force-close all FX positions (ET)
+        },
+        "positions":    {},  # pair → position dict
+        "closed_today": [],
+        "decisions":    [],
+        "last_scan":    None,  # timestamp of last entry scan
     },
     "news_monitor": {
         "enabled":        True,
@@ -568,6 +615,15 @@ ST_SETUPS: dict = {
     "NVDA": {"signal": "BREAKOUT",     "win_start": "09:30", "win_end": "16:00", "hold_mins":  60, "target_pct": 0.45, "stop_pct": 0.35},
 }
 
+# ── FX Trader: pairs config (EMA Breakout, 08:00–12:00 ET London/NY overlap) ─
+# Backtest (2yr 1H): EURUSD 74% WR +13pip, GBPUSD 77% +27pip, USDJPY 72% +11pip, AUDUSD 75% +17pip
+FX_PAIRS: dict = {
+    "EURUSD": {"pip": 0.0001, "quote": "USD", "win_rate": 74, "expect_pip": 13},
+    "GBPUSD": {"pip": 0.0001, "quote": "USD", "win_rate": 77, "expect_pip": 27},
+    "USDJPY": {"pip": 0.01,   "quote": "JPY", "win_rate": 72, "expect_pip": 11},
+    "AUDUSD": {"pip": 0.0001, "quote": "USD", "win_rate": 75, "expect_pip": 17},
+}
+
 # ── Feature engineering ────────────────────────────────────────────────────
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
@@ -635,7 +691,7 @@ def predict(model, df: pd.DataFrame) -> dict:
         "confidence": round(conf, 4),
         "features": {k: round(float(v), 4) for k, v in feat.items()},
         "close": round(float(df["close"].iloc[-1]), 4),
-        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "timestamp": _utcnow().isoformat() + "Z",
     }
 
 
@@ -686,7 +742,7 @@ def on_bar_update(ticker: str, bars, has_new_bar: bool) -> None:
             sig["ticker"] = ticker
             sig["session"] = _session_label(df["time"].iloc[-1])
             state["signals"][ticker] = sig
-            state["last_update"][ticker] = datetime.utcnow().isoformat()
+            state["last_update"][ticker] = _utcnow().isoformat()
             if has_new_bar:
                 log.info(
                     f"NEW BAR  {ticker}  {sig['label']}  "
@@ -770,7 +826,7 @@ def _tape_is_fresh(sent: dict) -> bool:
     if not lu:
         return False
     try:
-        age = (datetime.utcnow() - datetime.fromisoformat(lu)).total_seconds()
+        age = (_utcnow() - _parse_utc(lu)).total_seconds()
         return age < TAPE_STALENESS_SECS
     except Exception:
         return False
@@ -785,7 +841,7 @@ def _update_tape_bar(sym: str, price: float, size: int, direction: int) -> None:
     try:
         now_et = datetime.now(ZoneInfo("America/New_York"))
     except Exception:
-        now_et = datetime.now()
+        now_et = datetime.now(timezone.utc)
     minute = now_et.hour * 60 + now_et.minute
     cur = sent["cur_bar"]
 
@@ -870,7 +926,7 @@ def _compute_tape_score(sym: str) -> tuple:
         from zoneinfo import ZoneInfo
         hour = datetime.now(ZoneInfo("America/New_York")).hour
     except Exception:
-        hour = datetime.now().hour
+        hour = datetime.now(timezone.utc).hour
     tod = 2.0 if (hour < 10 or hour >= 15) else 0.6 if (12 <= hour < 13) else 1.0
     adj_avg   = sent.get("avg_vol_per_bar", 0.0) * tod
     cur       = sent["cur_bar"]
@@ -979,7 +1035,7 @@ def _make_tape_callback(sym: str):
         sent["score"]      = score
         sent["label"]      = label
         sent["components"] = components
-        sent["last_updated"] = datetime.utcnow().isoformat()
+        sent["last_updated"] = _utcnow().isoformat()
 
         # ── Real-time block capture for institutional flow report ─────────────
         if int(size) >= TAPE_BLOCK_MIN_SHARES:
@@ -1073,7 +1129,7 @@ async def _subscribe_vix(ib: IB) -> None:
                         pass
             if price:
                 state["vix_live"]["price"]      = price
-                state["vix_live"]["updated"]    = datetime.utcnow().isoformat()
+                state["vix_live"]["updated"]    = _utcnow().isoformat()
                 if prev_close:
                     state["vix_live"]["prev_close"] = prev_close
 
@@ -1179,6 +1235,28 @@ async def streaming_loop_async() -> None:
             state["ib"] = ib
             state["connected"] = True
             state["error"] = None
+
+            # ── Detect live vs paper from account type (DU* = paper, U* = live) ──
+            accounts   = ib.managedAccounts()
+            account_id = accounts[0] if accounts else ""
+            prev_live  = state.get("is_live", False)
+            is_live    = bool(account_id) and not account_id.upper().startswith("DU")
+            state["is_live"]        = is_live
+            state["connected_port"] = port
+            state["account_id"]     = account_id
+            mode_tag = "🔴 LIVE" if is_live else "📄 PAPER"
+            log.info("Account: %s  %s  port=%d", account_id, mode_tag, port)
+
+            # Reload SPX 0DTE state when mode changes (paper↔live use separate files)
+            if is_live != prev_live:
+                log.info("SPX 0DTE: mode changed (%s→%s) — reloading state",
+                         "paper" if prev_live else "live",
+                         "live"  if is_live   else "paper")
+                _spx_load_state()
+                if is_live:
+                    _at_log("SYSTEM", f"[LIVE MODE] {account_id} on port {port} — paper workarounds disabled")
+                    # Apply conservative live defaults only if values are still at paper defaults
+                    _spx_apply_live_defaults()
 
             # Cancel any Inactive orders left over from previous sessions.
             # Use reqGlobalCancel (cancels ALL orders for this account regardless of session/clientId).
@@ -1321,6 +1399,11 @@ def _next_expiry(weeks_out: int = 0) -> str:
     return friday.strftime("%Y%m%d")
 
 
+# Intraday cache for reqSecDefOptParamsAsync results (strikes/expiries don't change during the day).
+# Keyed by ticker → (OptionChain object, cache_date). Cleared automatically on next trading day.
+_chain_params_cache: dict = {}
+
+
 async def _fetch_opra_chain(
     ib: IB,
     ticker: str,
@@ -1337,17 +1420,21 @@ async def _fetch_opra_chain(
     + reqTickersAsync.  Returns (list[Ticker], expiry_YYYYMMDD, dte_int).
     Raises ValueError if chain unavailable — caller should fall back to yfinance.
     """
-    stock = Stock(ticker, "SMART", "USD")
-    await ib.qualifyContractsAsync(stock)
-    if not stock.conId:
-        raise ValueError(f"qualify failed: {ticker}")
-
-    chains = await ib.reqSecDefOptParamsAsync(ticker, "", "STK", stock.conId)
-    if not chains:
-        raise ValueError(f"no chain params: {ticker}")
-    chain = next((c for c in chains if c.exchange == "SMART"), chains[0])
-
     today_d = date.today()
+    cached = _chain_params_cache.get(ticker)
+    if cached and cached[1] == today_d:
+        chain = cached[0]
+    else:
+        stock = Stock(ticker, "SMART", "USD")
+        await ib.qualifyContractsAsync(stock)
+        if not stock.conId:
+            raise ValueError(f"qualify failed: {ticker}")
+        chains = await ib.reqSecDefOptParamsAsync(ticker, "", "STK", stock.conId)
+        if not chains:
+            raise ValueError(f"no chain params: {ticker}")
+        chain = next((c for c in chains if c.exchange == "SMART"), chains[0])
+        _chain_params_cache[ticker] = (chain, today_d)
+
     chosen_exp, chosen_dte = None, 0
     for exp in sorted(chain.expirations):
         try:
@@ -1723,7 +1810,7 @@ def _sync_watchlist_to_alert_history() -> None:
 
 def _universe_save(tickers: list) -> None:
     """Persist screened universe to disk so restarts don't revert to hardcoded list."""
-    saved_at = datetime.utcnow().isoformat() + "Z"   # Z suffix so browsers parse as UTC
+    saved_at = _utcnow().isoformat() + "Z"   # Z suffix so browsers parse as UTC
     try:
         with open(UNIVERSE_CACHE_PATH, "w") as f:
             json.dump({"tickers": tickers, "saved_at": saved_at}, f)
@@ -1739,10 +1826,8 @@ def _universe_load() -> None:
     try:
         with open(UNIVERSE_CACHE_PATH, "r") as f:
             data = json.load(f)
-        saved_at = datetime.fromisoformat(
-            (data.get("saved_at", "2000-01-01") or "2000-01-01").replace("Z", "+00:00")
-        ).replace(tzinfo=None)   # strip tz for naive UTC comparison
-        age_days = (datetime.utcnow() - saved_at).days
+        saved_at = _parse_utc(data.get("saved_at", "2000-01-01") or "2000-01-01")
+        age_days = (_utcnow() - saved_at).days
         if age_days > 7:
             log.info("Universe cache is %d days old — using hardcoded universe", age_days)
             return
@@ -1887,7 +1972,7 @@ async def _earnings_days_out(ticker: str) -> Optional[int]:
     Cached 6 h per ticker.  Never blocks the scan on error — returns None.
     """
     cache = state["ext_cache"]["earnings"]
-    now = datetime.utcnow()
+    now = _utcnow()
     if ticker in cache and (now - cache[ticker]["ts"]).total_seconds() < EARNINGS_CACHE_TTL:
         return cache[ticker]["days"]
 
@@ -1901,20 +1986,26 @@ async def _earnings_days_out(ticker: str) -> Optional[int]:
                 return None
             if cal is None:
                 return None
-            today = date.today()
+            from zoneinfo import ZoneInfo
+            _ET = ZoneInfo("America/New_York")
+            today = datetime.now(_ET).date()   # ET date, not server-local date
             # yfinance >= 0.2 returns dict; older versions return DataFrame
             if isinstance(cal, dict):
                 raw = cal.get("Earnings Date", [])
                 if not raw:
                     return None
-                d = pd.to_datetime(raw[0]).date()
+                raw_dt = pd.to_datetime(raw[0])
             elif hasattr(cal, "loc"):
                 try:
-                    d = pd.to_datetime(cal.loc["Earnings Date"].iloc[0]).date()
+                    raw_dt = pd.to_datetime(cal.loc["Earnings Date"].iloc[0])
                 except Exception:
                     return None
             else:
                 return None
+            # yfinance Earnings Date is a calendar date (no time component).
+            # Use .date() directly — do NOT localise/convert, as midnight UTC
+            # conversion produces the wrong ET date (e.g. 2026-07-16 → 2026-07-15).
+            d = raw_dt.date()
             days = (d - today).days
             return days if 0 <= days <= 60 else None
 
@@ -1936,7 +2027,7 @@ async def _iv_rank_for_ticker(ticker: str) -> dict:
     Falls back to rank=50 (neutral) on any error.  Cached 1 h per ticker.
     """
     cache = state["ext_cache"]["iv_rank"]
-    now = datetime.utcnow()
+    now = _utcnow()
     if ticker in cache and (now - cache[ticker]["ts"]).total_seconds() < IV_RANK_CACHE_TTL:
         return {k: v for k, v in cache[ticker].items() if k != "ts"}
 
@@ -2015,7 +2106,7 @@ async def _market_regime() -> dict:
     Cached 5 min.  Falls back to UNKNOWN on network error.
     """
     cached = state["ext_cache"]["regime"]
-    now = datetime.utcnow()
+    now = _utcnow()
     if cached and (now - cached["ts"]).total_seconds() < REGIME_CACHE_TTL:
         return {k: v for k, v in cached.items() if k != "ts"}
 
@@ -2401,7 +2492,7 @@ def _update_regime_cache_sync() -> None:
         "spy_above_sma200": spy_price > spy_sma200,
         "spy_ret20":        round(spy_ret20, 2),
         "stock_ret20":      stock_ret20,
-        "updated":          datetime.now().isoformat(),
+        "updated":          _utcnow().isoformat(),
     }
     bull = "BULL" if spy_price > spy_sma200 else "BEAR"
     log.info("Regime cache refreshed: SPY=%.2f SMA200=%.2f [%s] spy_ret20=%.2f%% %d stocks",
@@ -2580,8 +2671,8 @@ def _filter_leap_recommended(candidates: list) -> list:
             reasons.append(f"warning: {w[:80]}")
         elif r["liquidity_score"] < 60:
             reasons.append(f"liquidity={r['liquidity_score']:.0f} (< 60 for LEAP)")
-        elif iv_rank > 75:
-            reasons.append(f"iv_rank={iv_rank:.0f} (> 75 — IV too high to buy calls)")
+        elif iv_rank > 50:
+            reasons.append(f"iv_rank={iv_rank:.0f} (> 50 — IV too high to buy calls)")
 
         if reasons:
             log.info("NEAR-MISS LEAP skip %s: score=%.0f iv=%.0f → %s",
@@ -2645,12 +2736,23 @@ def _filter_leap_recommended(candidates: list) -> list:
         ls = _learned_score(r)
         r["learned_score"] = ls
         r["_sort_key"] = ls if ls is not None else r["score"]
+    # ── Max 1 LEAP at a time ──────────────────────────────────────────────────
+    leap_open = sum(1 for p in state["autotrader"]["positions"].values()
+                    if p.get("action") == "BUY")
+    if leap_open >= 1:
+        reason = f"already have {leap_open} LEAP open — max 1 at a time"
+        log.info("LEAP capacity gate: %s", reason)
+        for r in clean:
+            _record_near_miss(r["ticker"], "leap", r.get("score", 0), r.get("iv_rank", 50), [reason])
+        return []
+
     seen: set = set()
     out: list = []
     for r in sorted(clean, key=lambda x: x["_sort_key"], reverse=True):
         if r["ticker"] not in seen:
             seen.add(r["ticker"])
-            out.append(r)
+            out.append(r)  # only the best candidate (1 slot available)
+            break
     return out
 
 
@@ -2727,8 +2829,8 @@ def _kelly_qty(cfg: dict, strike: float, t_type: str, mid_price: float = 0.0,
         base = float(cfg.get("csp_capital", 20000.0))
         capital = base * frac * regime_scale
         return max(1, int(capital / (strike * 100)))
-    else:  # leap
-        base = float(cfg.get("leap_capital", 5000.0))
+    else:  # leap — self-financed only, size from leap_budget (CSP wins)
+        base = max(0.0, state["autotrader"].get("leap_budget", 0.0))
         m = mid_price if mid_price > 0 else 5.0
         capital = base * frac * regime_scale
         return max(1, int(capital / (m * 100)))
@@ -2933,7 +3035,7 @@ async def _autotrader_monitor_coro(ib: IB) -> None:
 
         if upnl <= stop_threshold:
             ticker = info.get("ticker", key.split("_")[0])
-            at.setdefault("stopped_out", {})[ticker] = datetime.utcnow().isoformat()
+            at.setdefault("stopped_out", {})[ticker] = _utcnow().isoformat()
             _at_log("CLOSE",
                     f"{key}: stop-loss hit (${upnl:.0f}, {eff_stop_mult}× threshold=${stop_threshold:.0f}, IV={live_iv:.0f}%)")
             info["exit_reason"] = "stop_loss"
@@ -3025,7 +3127,7 @@ async def _autotrader_monitor_coro(ib: IB) -> None:
     for _stk, _qty in _live_stk.items():
         _assign_key = f"_assigned_{_stk}"
         if _stk not in _at_tickers and not at.get(_assign_key):
-            at[_assign_key] = datetime.utcnow().isoformat()
+            at[_assign_key] = _utcnow().isoformat()
             _at_log("ASSIGN",
                     f"{_stk}: {_qty} shares in IBKR portfolio not tracked by AT — "
                     f"likely CSP assignment. Review in TWS and consider selling a covered call.")
@@ -3050,7 +3152,7 @@ async def _autotrader_roll_coro(ib: IB, item, info: dict, key: str) -> None:
     if roll_count >= 2:
         _at_log("ROLL", f"{ticker}: max 2 rolls reached — closing and adding to cooldown")
         info["exit_reason"] = "roll_max"
-        state["autotrader"].setdefault("stopped_out", {})[ticker] = datetime.utcnow().isoformat()
+        state["autotrader"].setdefault("stopped_out", {})[ticker] = _utcnow().isoformat()
         await _autotrader_close_coro(ib, item, info, key)
         return
 
@@ -3065,7 +3167,7 @@ async def _autotrader_roll_coro(ib: IB, item, info: dict, key: str) -> None:
                     f"{ticker}: earnings in {earnings_days}d — closing instead of rolling "
                     f"(block={EARNINGS_BLOCK_DAYS}d, cooldown applied)")
             info["exit_reason"] = "roll_close"
-            state["autotrader"].setdefault("stopped_out", {})[ticker] = datetime.utcnow().isoformat()
+            state["autotrader"].setdefault("stopped_out", {})[ticker] = _utcnow().isoformat()
             await _autotrader_close_coro(ib, item, info, key)
             return
     except Exception as _earn_exc:
@@ -3155,7 +3257,7 @@ async def _autotrader_roll_coro(ib: IB, item, info: dict, key: str) -> None:
                     f"{ticker}: roll credit ${net_credit:.2f}/sh below $0.30 minimum "
                     f"(buyback=${buyback_ask:.2f}, new=${new_fill:.2f}) — closing + cooldown")
             info["exit_reason"] = "roll_no_credit"
-            state["autotrader"].setdefault("stopped_out", {})[ticker] = datetime.utcnow().isoformat()
+            state["autotrader"].setdefault("stopped_out", {})[ticker] = _utcnow().isoformat()
             await _autotrader_close_coro(ib, item, info, key)
             return
 
@@ -3286,9 +3388,10 @@ async def _autotrader_close_coro(ib: IB, item, info: dict, key: str) -> None:
     # Record exit in trade journal
     j_id = info.get("journal_id")
     if j_id:
-        # Determine exit reason from context (info carries last reason from monitor)
         exit_reason = info.get("exit_reason", "manual")
-        _journal_record_exit(j_id, lmt, upnl_now, exit_reason, live_iv_exit)
+        comm = _commission_for_orders(ib, trade.order.orderId)
+        _journal_record_exit(j_id, lmt, upnl_now, exit_reason, live_iv_exit,
+                             commission=comm)
 
     # Track premium collected / LEAP P&L for the LEAP budget fund.
     # Budget = 50% of cumulative CSP wins PLUS all realised LEAP P&L (wins net losses).
@@ -3571,9 +3674,8 @@ async def _autotrader_scan_and_trade_coro(ib: IB) -> None:
     # per-candidate check that was added in the previous fix.
     leap_deployed = sum(float(p.get("max_profit", 0)) for p in at["positions"].values()
                         if p.get("action") == "BUY")
-    leap_capital_cfg = float(cfg.get("leap_capital", 5000.0))
-    leap_budget_val  = at.get("leap_budget", 0.0)
-    leap_avail_now   = max(0.0, max(leap_capital_cfg, leap_budget_val) - leap_deployed)
+    leap_budget_val  = at.get("leap_budget", 0.0)  # self-financed only (CSP wins)
+    leap_avail_now   = max(0.0, leap_budget_val - leap_deployed)
     # Conservative floor: assume cheapest LEAP is ~$1K/contract (low-price stocks)
     leap_capital_slots = min(count_slots, int(leap_avail_now / 1000)) if leap_avail_now > 0 else 0
     # Total effective slots: CSP + LEAP are additive (separate budgets, shared count cap)
@@ -3611,13 +3713,13 @@ async def _autotrader_scan_and_trade_coro(ib: IB) -> None:
 
     # 48h stop-loss cooldown — don't re-enter tickers recently stopped out
     stopped_out = at.get("stopped_out", {})
-    _now_utc    = datetime.utcnow()
+    _now_utc    = _utcnow()
     def _in_cooldown(ticker: str) -> bool:
         ts = stopped_out.get(ticker)
         if not ts:
             return False
         try:
-            return (_now_utc - datetime.fromisoformat(ts)).total_seconds() < 48 * 3600
+            return (_now_utc - _parse_utc(ts)).total_seconds() < 48 * 3600
         except ValueError:
             return False
 
@@ -3662,14 +3764,13 @@ async def _autotrader_scan_and_trade_coro(ib: IB) -> None:
                     for p in at["positions"].values()
                     if p.get("action") == "BUY"
                 )
-                leap_capital = float(cfg.get("leap_capital", 5000.0))
-                leap_budget  = at.get("leap_budget", 0.0)
-                leap_avail   = max(0.0, max(leap_capital, leap_budget) - leap_deployed)
+                leap_budget  = at.get("leap_budget", 0.0)  # self-financed only
+                leap_avail   = max(0.0, leap_budget - leap_deployed)
                 if cost > leap_avail:
                     _at_log("SCAN", f"Skip {row['ticker']} LEAP: cost ${cost:,.0f} > "
-                                    f"LEAP available ${leap_avail:,.0f} "
+                                    f"self-financed budget ${leap_avail:,.0f} "
                                     f"(deployed=${leap_deployed:,.0f}, "
-                                    f"budget=${leap_budget:,.0f}, capital=${leap_capital:,.0f})")
+                                    f"leap_budget=${leap_budget:,.0f})")
                     continue
             else:
                 cost = float(row.get("strike", 0)) * float(row.get("qty", 1)) * 100
@@ -3781,6 +3882,9 @@ async def _autotrader_place_coro(ib: IB, row: dict, cfg: dict, regime: str = "BU
     lmt           = None
     lmt_src       = "none"
     _flow_abort   = None   # set inside try; raised outside so except doesn't swallow it
+    ibkr_bid = ibkr_ask = ibkr_mid = None   # safe defaults for OPRA value log
+    live_flow = "N/A"
+    live_bid_sz = live_ask_sz = 0
     try:
         # 100=option volume, 101=option OI, 106=implied vol
         # tick 13 (equity OI) is NOT valid for OPT and causes error 321
@@ -3899,6 +4003,37 @@ async def _autotrader_place_coro(ib: IB, row: dict, cfg: dict, regime: str = "BU
         "strategy_type":      row.get("_type", "csp"),
     }
     journal_id = _journal_insert_entry(entry_info)
+
+    # ── OPRA value audit: log what OPRA contributed to this trade decision ──
+    try:
+        _opra_pts, _opra_sigs = 0, []
+        _pcvr = row.get("pc_vol_ratio", 0)
+        _voi  = row.get("vol_oi_ratio", 0)
+        _mp   = row.get("max_pain")
+        _gw   = row.get("gamma_wall")
+        _sf   = row.get("flow_flag", "N/A")
+        if _sf == "ASK HEAVY":           _opra_pts += 4;  _opra_sigs.append(f"scan_flow=ASK_HEAVY +4")
+        if _mp and strike >= _mp:        _opra_pts += 8;  _opra_sigs.append(f"above_max_pain(${_mp}) +8")
+        if _gw and _gw > strike:         _opra_pts += 5;  _opra_sigs.append(f"gamma_wall(${_gw})>strike +5")
+        if _pcvr > 2.0:                  _opra_pts += 5;  _opra_sigs.append(f"P/C_vol={_pcvr:.1f} +5")
+        elif 0 < _pcvr < 0.4:           _opra_pts -= 8;  _opra_sigs.append(f"P/C_vol={_pcvr:.1f} -8")
+        if _voi > 2.0:                   _opra_pts -= 8;  _opra_sigs.append(f"vol/OI={_voi:.1f} -8")
+        _spread_pct = (round((ibkr_ask - ibkr_bid) / ibkr_mid * 100, 1)
+                       if ibkr_bid and ibkr_ask and ibkr_mid else None)
+        _price_str = (
+            f"IBKR bid=${ibkr_bid:.2f}/ask=${ibkr_ask:.2f}"
+            + (f" spread={_spread_pct}%" if _spread_pct is not None else "")
+            + f" → lmt=${lmt:.2f}"
+        ) if lmt_src == "ibkr" else f"yfinance fallback → lmt=${lmt:.2f}"
+        _iv_str    = f"iv={live_iv_entry:.1f}%" if live_iv_entry else "iv=N/A"
+        _flow_str  = (f"exec_flow={live_flow} bid_sz={live_bid_sz}/ask_sz={live_ask_sz}"
+                      if live_flow != "N/A" else "exec_flow=no_data")
+        _at_log("OPRA_VALUE",
+                f"src={lmt_src.upper()}  {_price_str}  {_iv_str}  {_flow_str}  "
+                f"signals=[{', '.join(_opra_sigs) or 'none'}]  "
+                f"score_contribution={_opra_pts:+d}pts")
+    except Exception:
+        pass
 
     from zoneinfo import ZoneInfo
     state["autotrader"]["positions"][key] = {
@@ -4186,7 +4321,7 @@ async def _autotrader_background() -> None:
                 from zoneinfo import ZoneInfo
                 now_et = datetime.now(ZoneInfo("America/New_York"))
                 _at_log("MARKET", f"Market closed ({now_et.strftime('%a %H:%M ET')}) — monitoring only, no new entries")
-            state["autotrader"]["last_run"] = datetime.utcnow().isoformat() + "Z"
+            state["autotrader"]["last_run"] = _utcnow().isoformat() + "Z"
         except Exception as exc:
             _at_log("ERROR", f"Cycle error: {exc}")
             log.error("AutoTrader cycle error: %s", exc, exc_info=True)
@@ -4346,7 +4481,7 @@ def _alert_history_insert(ticker: str, signal_type: str, price: Optional[float],
                 pct_b, rsi, vol_ratio, tape_score, tape_label,
                 prev_state, mins_in_pre_breakout, state_path, curr_daily_state)
                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (datetime.utcnow().isoformat(), now_et.strftime("%Y-%m-%d"),
+            (_utcnow().isoformat(), now_et.strftime("%Y-%m-%d"),
              ticker, signal_type, price, pct_b, rsi, vol_ratio, tape_score, tape_label,
              prev_state, mins_in_pre_breakout, state_path, curr_daily_state),
         )
@@ -4399,7 +4534,7 @@ async def _enrich_day_performance(session_date: str) -> int:
         log.warning("_enrich_day_performance yfinance error: %s", exc)
         closes = {}
     et_zone = ZoneInfo("America/New_York")
-    enriched_at = datetime.utcnow().isoformat()
+    enriched_at = _utcnow().isoformat()
     count = 0
     for r in to_enrich:
         ticker = r["ticker"]
@@ -4439,7 +4574,7 @@ async def _enrich_day_performance(session_date: str) -> int:
 
 
 def _compute_indicator_analysis(days: int = 30) -> dict:
-    cutoff = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
+    cutoff = (_utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
     con = sqlite3.connect(TAPE_DB_PATH, check_same_thread=False)
     df = pd.read_sql_query(
         "SELECT * FROM alert_performance WHERE session_date >= ? AND eod_return_pct IS NOT NULL",
@@ -4681,7 +4816,7 @@ def _tape_db_insert_block_immediate(sym: str, price: float, size: int, direction
         from zoneinfo import ZoneInfo
         now_et = datetime.now(ZoneInfo("America/New_York"))
     except Exception:
-        now_et = datetime.now()
+        now_et = datetime.now(timezone.utc)
     ts_str      = now_et.strftime("%Y-%m-%dT%H:%M:%S")
     sess_date   = now_et.strftime("%Y-%m-%d")
     sent        = state["tape_sentiment"].get(sym, {})
@@ -4797,7 +4932,7 @@ def _journal_insert_entry(info: dict) -> int:
              max_profit, strategy_type, model_version)
         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """, (
-        datetime.utcnow().isoformat(),
+        _utcnow().isoformat(),
         info.get("ticker"), info.get("expiry"),
         info.get("strike"), info.get("right"),
         info.get("action"), info.get("qty"),
@@ -4816,12 +4951,27 @@ def _journal_insert_entry(info: dict) -> int:
     return row_id
 
 
+def _commission_for_orders(ib, *order_ids: int) -> float:
+    """Sum commissionReport.commission from current-session fills for the given order IDs."""
+    if not ib:
+        return 0.0
+    _MAX = 1.7976931348623157e+308   # IB sentinel for "not yet reported"
+    total = 0.0
+    for f in ib.fills():
+        if f.execution.orderId in order_ids:
+            cr = f.commissionReport
+            if cr and cr.commission and cr.commission < _MAX:
+                total += cr.commission
+    return round(total, 4)
+
+
 def _journal_record_exit(
     journal_id: int,
     exit_price: float,
     pnl: float,
     exit_reason: str,
     live_iv_exit: Optional[float] = None,
+    commission: float = 0.0,
 ) -> None:
     """Close out a journal row with exit data and trigger learning."""
     con = sqlite3.connect(JOURNAL_DB_PATH, check_same_thread=False)
@@ -4833,10 +4983,11 @@ def _journal_record_exit(
     win        = 1 if pnl > 0 else 0
     con.execute("""
         UPDATE trade_journal
-        SET closed_at=?, exit_price=?, pnl=?, pnl_pct=?, win=?, exit_reason=?, live_iv_exit=?
+        SET closed_at=?, exit_price=?, pnl=?, pnl_pct=?, win=?, exit_reason=?,
+            live_iv_exit=?, commission=commission+?
         WHERE id=?
-    """, (datetime.utcnow().isoformat(), exit_price, round(pnl, 2),
-          pnl_pct, win, exit_reason, live_iv_exit, journal_id))
+    """, (_utcnow().isoformat(), exit_price, round(pnl, 2),
+          pnl_pct, win, exit_reason, live_iv_exit, round(commission, 4), journal_id))
     con.commit()
     con.close()
 
@@ -4864,7 +5015,7 @@ def _journal_record_orphaned(journal_id: int) -> None:
     con = sqlite3.connect(JOURNAL_DB_PATH, check_same_thread=False)
     con.execute(
         "UPDATE trade_journal SET closed_at=?, exit_reason='orphaned' WHERE id=? AND closed_at IS NULL",
-        (datetime.utcnow().isoformat(), journal_id),
+        (_utcnow().isoformat(), journal_id),
     )
     con.commit()
     con.close()
@@ -4872,7 +5023,9 @@ def _journal_record_orphaned(journal_id: int) -> None:
 
 _REAL_EXIT_REASONS = (
     "'profit_target','stop_loss','roll_close',"
-    "'roll_max','roll_no_credit','21dte','manual','rotation'"
+    "'roll_max','roll_no_credit','21dte','manual','rotation',"
+    "'hard_stop','dma23_trail','max_hold','manual_close','force_close',"
+    "'max_loss_stop','trailing_stop'"
 )
 # roll_close is always win=0 (buying back the put at a loss is WHY you rolled —
 # it's not a final trade outcome). Exclude it from Kelly calibration so the win
@@ -4956,7 +5109,7 @@ def _retrain_from_journal() -> dict:
         INSERT INTO model_log (trained_at, n_trades, win_rate, cv_accuracy, importances, notes)
         VALUES (?,?,?,?,?,?)
     """, (
-        datetime.utcnow().isoformat(), len(df),
+        _utcnow().isoformat(), len(df),
         round(float(y.mean()), 4), round(float(cv.mean()), 4),
         json.dumps(importances),
         f"auto v{state['model_version']}",
@@ -5951,7 +6104,7 @@ async def _live_option_quote(
         "theta":       greeks.theta       if greeks else None,
         "vega":        greeks.vega        if greeks else None,
         "iv_pct":      round(greeks.impliedVol * 100, 2) if greeks and greeks.impliedVol else None,
-        "timestamp":   datetime.utcnow().isoformat() + "Z",
+        "timestamp":   _utcnow().isoformat() + "Z",
     }
 
 
@@ -6041,7 +6194,8 @@ def _st_trading_days_held(entry_date_str: str) -> int:
 
 
 def _close_st_position(ticker: str, pos: dict, exit_px: float,
-                        exit_type: str, pnl: float, days_held: int) -> None:
+                        exit_type: str, pnl: float, days_held: int,
+                        commission: float = 0.0) -> None:
     """Record a closed stock trade to closed_today + trade_journal."""
     st       = state["stock_trader"]
     entry_px = pos.get("entry_price", exit_px)
@@ -6070,15 +6224,15 @@ def _close_st_position(ticker: str, pos: dict, exit_px: float,
             INSERT INTO trade_journal
                 (opened_at, closed_at, ticker, action, qty,
                  entry_price, exit_price, pnl, pnl_pct, win,
-                 exit_reason, strategy_type)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                 exit_reason, strategy_type, commission)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             pos.get("entry_date"),
             date.today().isoformat(),
             ticker, "BUY", pos.get("shares", 0),
             round(entry_px, 4), round(exit_px, 4),
             round(pnl, 2), pnl_pct, 1 if pnl > 0 else 0,
-            exit_type, "STOCK_BREAKOUT",
+            exit_type, "STOCK_BREAKOUT", round(commission, 4),
         ))
         con.commit()
         con.close()
@@ -6170,6 +6324,81 @@ def _st_find_rotation_candidate(new_ticker: str, new_score: float, st: dict):
     return best_ticker, best_detail
 
 
+def _get_net_liq(ib) -> float:
+    """Return account net liquidation value from cached IBKR account values."""
+    for av in ib.accountValues():
+        if av.tag == "NetLiquidation" and av.currency in ("USD", "", "BASE"):
+            try:
+                v = float(av.value)
+                if v > 0:
+                    return v
+            except (ValueError, TypeError):
+                pass
+    return 0.0
+
+
+async def _fetch_entry_metrics(ib, ticker: str) -> dict:
+    """Fetch 40 daily bars; return ATR(14), 23-DMA, today's σ score, and atr_mult.
+
+    atr_mult  = today's high-low range ÷ ATR(14)  — must be ≥ atr_multiplier to confirm signal
+    std_score = abs(today's return) ÷ 20-day return std dev  — must be ≥ std_dev_threshold
+    dma23     = 23-day SMA of closes — price must be above this for trend alignment
+    """
+    from ib_insync import Stock as IbStock
+    contract = IbStock(ticker, "SMART", "USD")
+    try:
+        bars = await asyncio.wait_for(
+            ib.reqHistoricalDataAsync(
+                contract, endDateTime="", durationStr="40 D",
+                barSizeSetting="1 day", whatToShow="TRADES",
+                useRTH=True, keepUpToDate=False,
+            ),
+            timeout=15,
+        )
+    except Exception as exc:
+        log.debug("_fetch_entry_metrics %s: %s", ticker, exc)
+        return {}
+    if len(bars) < 15:
+        return {}
+
+    closes = [b.close for b in bars]
+    highs  = [b.high  for b in bars]
+    lows   = [b.low   for b in bars]
+
+    # ATR(14)
+    trs = []
+    for i in range(1, len(bars)):
+        trs.append(max(highs[i] - lows[i],
+                       abs(highs[i] - closes[i - 1]),
+                       abs(lows[i]  - closes[i - 1])))
+    atr14 = sum(trs[-14:]) / 14 if len(trs) >= 14 else sum(trs) / max(len(trs), 1)
+
+    # 23-DMA
+    dma23 = sum(closes[-23:]) / 23 if len(closes) >= 23 else sum(closes) / len(closes)
+
+    # Today's range as ATR multiple
+    atr_mult = (highs[-1] - lows[-1]) / atr14 if atr14 > 0 else 0.0
+
+    # Today's return in σ units (20-day return std dev)
+    std_score = 0.0
+    if len(closes) >= 2:
+        daily_rets = [(closes[i] - closes[i - 1]) / closes[i - 1]
+                      for i in range(1, len(closes))]
+        period = min(20, len(daily_rets) - 1)
+        if period >= 5:
+            ret_std   = float(np.std(daily_rets[-period:]))
+            today_ret = daily_rets[-1]
+            std_score = abs(today_ret) / ret_std if ret_std > 0 else 0.0
+
+    return {
+        "atr14":     round(atr14,     4),
+        "dma23":     round(dma23,     4),
+        "atr_mult":  round(atr_mult,  2),
+        "std_score": round(std_score, 2),
+        "price":     closes[-1],
+    }
+
+
 async def _stock_monitor_coro(ib) -> None:
     """One monitor cycle: detect fills, phase transitions, exits, force closes."""
     from zoneinfo import ZoneInfo
@@ -6202,13 +6431,8 @@ async def _stock_monitor_coro(ib) -> None:
                 # Cancel stale limit buys that have been pending too long
                 try:
                     alert_ts = pos.get("alert_fired_at", "")
-                    at = datetime.fromisoformat(alert_ts) if alert_ts else None
-                    if at is not None:
-                        if at.tzinfo is None:
-                            at = at.replace(tzinfo=ZoneInfo("America/New_York"))
-                        age_min = (datetime.now(ZoneInfo("America/New_York")) - at).total_seconds() / 60
-                    else:
-                        age_min = 0
+                    at = _parse_utc(alert_ts) if alert_ts else None
+                    age_min = (_utcnow() - at).total_seconds() / 60 if at is not None else 0
                 except Exception:
                     age_min = 0
                 if age_min > cfg.get("signal_freshness_min", 30):
@@ -6254,70 +6478,106 @@ async def _stock_monitor_coro(ib) -> None:
                 fill    = fills_by_oid.get(stop_oid)
                 exit_px = round(float(fill.execution.avgPrice), 4) if fill else pos.get("stop_price", pos["entry_price"])
                 pnl     = round((exit_px - pos["entry_price"]) * pos["shares"], 2)
-                _close_st_position(ticker, pos, exit_px, "hard_stop", pnl, days_held)
+                comm    = _commission_for_orders(ib, pos.get("buy_order_id", 0), stop_oid)
+                _close_st_position(ticker, pos, exit_px, "hard_stop", pnl, days_held, commission=comm)
                 to_remove.append(ticker)
                 continue
 
-            # Day 5: phase 1 → phase 2 transition
+            # Day 5: phase 1 → phase 2 (23-DMA trailing) transition
             if days_held >= 5:
-                contract = Stock(ticker, "SMART", "USD")
                 if stop_oid and stop_oid in open_trades_by_oid:
                     ib.cancelOrder(open_trades_by_oid[stop_oid].order)
                     await asyncio.sleep(1)
-                trail_ord = Order()
-                trail_ord.orderType     = "TRAIL"
-                trail_ord.action        = "SELL"
-                trail_ord.totalQuantity = pos["shares"]
-                trail_ord.trailingPercent = cfg["trail_pct"]
-                trail_ord.tif           = "GTC"
-                trail_ord.outsideRth    = False
-                trade = ib.placeOrder(contract, trail_ord)
-                await asyncio.sleep(0.5)
-                pos["stop_order_id"] = trade.order.orderId
-                pos["stop_type"]     = "TRAIL"
+                pos["stop_order_id"] = None
+                pos["stop_type"]     = "DMA23"
                 pos.pop("stop_price", None)
                 pos["phase"] = 2
                 _st_log("PHASE2", ticker,
-                        f"day {days_held}: hard stop cancelled, "
-                        f"TRAIL {cfg['trail_pct']}% placed (ord#{trade.order.orderId})")
+                        f"day {days_held}: hard stop cancelled — 23-DMA trailing active")
                 _st_save_state()
 
-        # ── Phase 2: trailing stop active (days 5-30) ─────────────────────
+        # ── Phase 2: 23-DMA trailing stop (software check, day 5+) ────────
         elif phase == 2:
+            # Backstop: if a phase-3 MKT order was placed (e.g. DMA23 breach), wait for fill
             if stop_oid and stop_oid not in open_trades_by_oid:
                 fill    = fills_by_oid.get(stop_oid)
                 exit_px = round(float(fill.execution.avgPrice), 4) if fill else pos["entry_price"]
                 pnl     = round((exit_px - pos["entry_price"]) * pos["shares"], 2)
-                _close_st_position(ticker, pos, exit_px, "trail_stop", pnl, days_held)
+                comm    = _commission_for_orders(ib, pos.get("buy_order_id", 0), stop_oid)
+                _close_st_position(ticker, pos, exit_px, "dma23_trail", pnl, days_held, commission=comm)
                 to_remove.append(ticker)
                 continue
 
-            # Day 30: force close
+            # Max-hold backstop (keeps positions from running forever if DMA never crosses)
             if days_held >= cfg["max_hold_days"]:
                 if stop_oid and stop_oid in open_trades_by_oid:
                     ib.cancelOrder(open_trades_by_oid[stop_oid].order)
                     await asyncio.sleep(1)
                 contract = Stock(ticker, "SMART", "USD")
                 mkt_ord = Order()
-                mkt_ord.orderType      = "MKT"
-                mkt_ord.action         = "SELL"
-                mkt_ord.totalQuantity  = pos["shares"]
-                mkt_ord.tif            = "DAY"
+                mkt_ord.orderType     = "MKT"
+                mkt_ord.action        = "SELL"
+                mkt_ord.totalQuantity = pos["shares"]
+                mkt_ord.tif           = "DAY"
                 trade = ib.placeOrder(contract, mkt_ord)
-                pos["phase"]          = 3
-                pos["stop_order_id"]  = trade.order.orderId
+                pos["phase"]              = 3
+                pos["stop_order_id"]      = trade.order.orderId
+                pos["pending_exit_type"]  = "max_hold"
                 _st_log("FORCE_CLOSE", ticker,
-                        f"day {days_held}: max hold reached, MKT sell placed (ord#{trade.order.orderId})")
+                        f"day {days_held}: max hold backstop, MKT sell (ord#{trade.order.orderId})")
                 _st_save_state()
+                continue
 
-        # ── Phase 3: market force-close in flight ─────────────────────────
+            # Compute 23-DMA; cache per trading day to avoid redundant IBKR calls
+            live_px   = pos.get("live_price") or 0
+            today_str = date.today().isoformat()
+            if live_px > 0:
+                cached_date = pos.get("_dma23_date")
+                dma23       = pos.get("dma23")
+                if cached_date != today_str or not dma23:
+                    try:
+                        contract = Stock(ticker, "SMART", "USD")
+                        hist = await asyncio.wait_for(
+                            ib.reqHistoricalDataAsync(
+                                contract, endDateTime="", durationStr="35 D",
+                                barSizeSetting="1 day", whatToShow="TRADES",
+                                useRTH=True, keepUpToDate=False,
+                            ),
+                            timeout=12,
+                        )
+                        if hist and len(hist) >= 23:
+                            dma23 = sum(b.close for b in hist[-23:]) / 23
+                            pos["dma23"]       = round(dma23, 4)
+                            pos["_dma23_date"] = today_str
+                    except Exception as _dma_exc:
+                        log.debug("DMA23 fetch %s: %s", ticker, _dma_exc)
+                        dma23 = pos.get("dma23")   # use stale value if fetch fails
+
+                if dma23 and live_px < dma23:
+                    contract = Stock(ticker, "SMART", "USD")
+                    mkt_ord = Order()
+                    mkt_ord.orderType     = "MKT"
+                    mkt_ord.action        = "SELL"
+                    mkt_ord.totalQuantity = pos["shares"]
+                    mkt_ord.tif           = "DAY"
+                    t = ib.placeOrder(contract, mkt_ord)
+                    pos["phase"]             = 3
+                    pos["stop_order_id"]     = t.order.orderId
+                    pos["pending_exit_type"] = "dma23_trail"
+                    _st_log("DMA23_TRAIL", ticker,
+                            f"price={live_px:.2f} < dma23={dma23:.2f} → MKT sell (ord#{t.order.orderId})")
+                    _st_save_state()
+
+        # ── Phase 3: MKT sell in flight ────────────────────────────────────
         elif phase == 3:
             sell_oid = pos.get("stop_order_id")
             if sell_oid and sell_oid not in open_trades_by_oid:
-                fill    = fills_by_oid.get(sell_oid)
-                exit_px = round(float(fill.execution.avgPrice), 4) if fill else pos["entry_price"]
-                pnl     = round((exit_px - pos["entry_price"]) * pos["shares"], 2)
-                _close_st_position(ticker, pos, exit_px, "max_hold", pnl, days_held)
+                fill      = fills_by_oid.get(sell_oid)
+                exit_px   = round(float(fill.execution.avgPrice), 4) if fill else pos["entry_price"]
+                pnl       = round((exit_px - pos["entry_price"]) * pos["shares"], 2)
+                exit_type = pos.get("pending_exit_type", "max_hold")
+                comm      = _commission_for_orders(ib, pos.get("buy_order_id", 0), sell_oid)
+                _close_st_position(ticker, pos, exit_px, exit_type, pnl, days_held, commission=comm)
                 to_remove.append(ticker)
 
     # ── Live price / P&L from IBKR portfolio ──────────────────────────────
@@ -6793,8 +7053,9 @@ async def _news_monitor_loop():
 
 def _rm_log(severity: str, rule: int, position: str, detail: str, action: str = ""):
     """Append to risk monitor log and active violations list."""
+    from zoneinfo import ZoneInfo as _ZI
     rm  = state["risk_monitor"]
-    now = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %H:%M ET")
+    now = datetime.now(_ZI("America/New_York")).strftime("%Y-%m-%d %H:%M ET")
     entry = {
         "ts":       now,
         "severity": severity,   # CRITICAL / WARNING / INFO
@@ -7046,7 +7307,9 @@ async def lifespan(app: FastAPI):
     # Restore Earnings Vol Crush state from last shutdown
     _evc_load_state()
     # Restore Signal Trader state from last shutdown
-    _st_load_state()
+    _sigt_load_state()
+    # Restore FX Trader state from last shutdown
+    _fx_load_state()
 
     # Restore breakout watchlist
     _watchlist_load()
@@ -7078,12 +7341,19 @@ async def lifespan(app: FastAPI):
     log.info("SPX 0DTE monitor loop started")
     asyncio.create_task(_evc_monitor_loop())
     log.info("Earnings Vol Crush monitor loop started")
-    asyncio.create_task(_st_monitor_loop())
+    asyncio.create_task(_evc_preflight_loop())
+    log.info("EVC preflight loop started (morning scan + 3:15 PM reminder)")
+    asyncio.create_task(_sigt_monitor_loop())
     log.info("Signal Trader monitor loop started")
+    asyncio.create_task(_fx_monitor_loop())
+    log.info("FX Trader monitor loop started")
     asyncio.create_task(_risk_monitor_loop())
     log.info("Risk monitor loop started")
     asyncio.create_task(_news_monitor_loop())
     log.info("News monitor loop started")
+    asyncio.create_task(_ibkr_startup_reconcile())
+    asyncio.create_task(_ibkr_reconcile_loop())
+    log.info("IBKR reconciliation tasks started (startup + 5-min periodic)")
 
     # Run initial universe screen in background (non-blocking)
     async def _initial_screen():
@@ -7261,6 +7531,9 @@ class AddTickerRequest(BaseModel):
 def get_status():
     return {
         "connected":      state["connected"],
+        "is_live":        state.get("is_live", False),
+        "account_id":     state.get("account_id"),
+        "connected_port": state.get("connected_port"),
         "opra_active":    state["opra_active"],
         "error":          state["error"],
         "model_accuracy": state["model_accuracy"],
@@ -7531,7 +7804,7 @@ async def csp_scan(
 
     cache = state["scan_cache"]
     if not refresh and cache["csp"] is not None and cache["ts"]:
-        age = (datetime.utcnow() - cache["ts"]).total_seconds()
+        age = (_utcnow() - cache["ts"]).total_seconds()
         if age < SCAN_CACHE_TTL:
             return {
                 "cached":        True,
@@ -7562,7 +7835,7 @@ async def csp_scan(
 
     candidates = _json_safe(result["candidates"])
     regime     = _json_safe(result["regime"])
-    now = datetime.utcnow()
+    now = _utcnow()
 
     # Compute filter diagnostics for the API response
     recommended = _filter_csp_recommended(candidates)
@@ -7663,7 +7936,7 @@ async def leaps_scan(
 
     cache = state["scan_cache"]
     if not refresh and cache["leaps"] is not None and cache["ts"]:
-        age = (datetime.utcnow() - cache["ts"]).total_seconds()
+        age = (_utcnow() - cache["ts"]).total_seconds()
         if age < SCAN_CACHE_TTL:
             return {
                 "cached":        True,
@@ -7692,7 +7965,7 @@ async def leaps_scan(
 
     candidates = _json_safe(result["candidates"])
     regime     = _json_safe(result["regime"])
-    now = datetime.utcnow()
+    now = _utcnow()
     cache["leaps"]  = candidates
     cache["regime"] = regime
     cache["ts"]     = now
@@ -7860,7 +8133,7 @@ async def _portfolio_positions(ib: IB) -> dict:
         "total_delta":   round(total_delta, 2),
         "positions":     positions,
         "count":         len(positions),
-        "timestamp":     datetime.utcnow().isoformat() + "Z",
+        "timestamp":     _utcnow().isoformat() + "Z",
     }
 
 
@@ -8230,7 +8503,7 @@ def watchlist_add_alert(req: WatchlistAlertRequest):
         existing["tape_confirmed"] = bool(ts is not None and ts > 0.20)
         if _log_if_new_day(existing.get("added_iso", ""), req.signal_type,
                            req.price_at_alert, ts, tl):
-            existing["added_iso"]      = now_et.isoformat()
+            existing["added_iso"]      = _utcnow().isoformat()
             existing["price_at_alert"] = round(req.price_at_alert, 2)
         _watchlist_save()
         return {"ok": True, "action": "refreshed"}
@@ -8249,7 +8522,7 @@ def watchlist_add_alert(req: WatchlistAlertRequest):
         existing["tape_confirmed"] = bool(ts is not None and ts > 0.20)
         if _log_if_new_day(existing.get("added_iso", ""), req.signal_type,
                            req.price_at_alert, ts, tl):
-            existing["added_iso"]      = now_et.isoformat()
+            existing["added_iso"]      = _utcnow().isoformat()
             existing["price_at_alert"] = round(req.price_at_alert, 2)
         _watchlist_save()
         return {"ok": True, "action": "refreshed"}
@@ -8264,7 +8537,7 @@ def watchlist_add_alert(req: WatchlistAlertRequest):
         "rsi":            round(req.rsi, 1) if req.rsi is not None else None,
         "vol_ratio":      round(req.vol_ratio, 2) if req.vol_ratio is not None else None,
         "timestamp_et":   req.timestamp_et or now_et.strftime("%H:%M ET %Y-%m-%d"),
-        "added_iso":      now_et.isoformat(),
+        "added_iso":      _utcnow().isoformat(),
         "tape_score":     ts,
         "tape_label":     tl,
         "tape_confirmed": bool(ts is not None and ts > 0.20),
@@ -8281,7 +8554,7 @@ def watchlist_add_alert(req: WatchlistAlertRequest):
     _watchlist_save()
 
     # ── Signal Trader hook ────────────────────────────────────────────────────
-    _st_maybe_enter(tk, req.signal_type, req.price_at_alert, req.prime_window)
+    _sigt_maybe_enter(tk, req.signal_type, req.price_at_alert, req.prime_window)
 
     return {"ok": True, "action": "added"}
 
@@ -8656,7 +8929,7 @@ async def autotrader_run_now():
             None,
             lambda: _run_in_streaming_loop(_autotrader_scan_and_trade_coro(ib), timeout=270),
         )
-        state["autotrader"]["last_run"] = datetime.utcnow().isoformat() + "Z"
+        state["autotrader"]["last_run"] = _utcnow().isoformat() + "Z"
     except (TimeoutError, RuntimeError) as exc:
         raise HTTPException(503, str(exc))
     return {"ok": True, "log": state["autotrader"]["log"][-20:]}
@@ -8763,7 +9036,7 @@ async def scan_0dte_endpoint(
     _require_connection()
     cache = state["scan_cache"]
     if not refresh and cache.get("0dte") is not None and cache.get("ts"):
-        age = (datetime.utcnow() - cache["ts"]).total_seconds()
+        age = (_utcnow() - cache["ts"]).total_seconds()
         if age < SCAN_CACHE_TTL:
             return {"cached": True, "age_seconds": int(age), **cache["0dte"]}
     try:
@@ -8787,7 +9060,7 @@ async def scan_earnings_iv_endpoint(
     _require_connection()
     cache = state["scan_cache"]
     if not refresh and cache.get("earnings_iv") is not None and cache.get("ts"):
-        age = (datetime.utcnow() - cache["ts"]).total_seconds()
+        age = (_utcnow() - cache["ts"]).total_seconds()
         if age < SCAN_CACHE_TTL:
             return {"cached": True, "age_seconds": int(age), **cache["earnings_iv"]}
     try:
@@ -9523,7 +9796,7 @@ async def performance_daily(date: Optional[str] = Query(None)):
 
 @app.get("/performance/summary")
 async def performance_summary(days: int = Query(30)):
-    cutoff = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
+    cutoff = (_utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
     con = sqlite3.connect(TAPE_DB_PATH, check_same_thread=False)
     con.row_factory = sqlite3.Row
     rows = [dict(r) for r in con.execute(
@@ -9633,7 +9906,7 @@ def performance_state_outcomes(days: int = Query(30)):
     will show counts but no return stats.
     """
     from collections import defaultdict
-    cutoff = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
+    cutoff = (_utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
     con = sqlite3.connect(TAPE_DB_PATH, check_same_thread=False)
     con.row_factory = sqlite3.Row
     rows = [dict(r) for r in con.execute(
@@ -9870,6 +10143,20 @@ async def reconnect_endpoint(req: ReconnectRequest):
             "message": f"Reconnecting to {mode} account on port {req.port}…"}
 
 
+@app.post("/ibkr/reconcile")
+async def manual_reconcile():
+    """Trigger an immediate IBKR position reconciliation."""
+    ib = state.get("ib")
+    if not ib or not ib.isConnected():
+        raise HTTPException(503, "IB not connected")
+    loop = state.get("streaming_loop")
+    if loop:
+        loop.run_in_executor(
+            None,
+            lambda: _run_in_streaming_loop(_ibkr_reconcile(ib, on_startup=False), timeout=30))
+    return {"ok": True, "message": "Reconciliation triggered — check Telegram for results"}
+
+
 # ── Trade Journal endpoints ────────────────────────────────────────────────
 
 @app.get("/journal")
@@ -9983,6 +10270,10 @@ def pnl_dashboard():
     _REAL_EXIT_SET = {
         "profit_target", "stop_loss", "roll_close",
         "roll_max", "roll_no_credit", "21dte", "manual", "rotation",
+        "hard_stop", "dma23_trail", "max_hold",   # stock trader
+        "manual_close", "force_close",             # day trader
+        "max_loss_stop",                           # EVC
+        "trailing_stop",                           # auto-trader CSP/LEAP
     }
     real_closed   = [t for t in closed_trades if t.get("exit_reason") in _REAL_EXIT_SET]
     closed_pnls   = [t["pnl"] for t in real_closed if t.get("pnl") is not None]
@@ -10052,6 +10343,7 @@ def pnl_dashboard():
         # Prefer live state over journal (more up-to-date intraday)
         strategy_today["SPX_0DTE"]["pnl"] = round(float(spx_live["today_pnl"]), 2)
 
+    total_commission = round(sum(t.get("commission") or 0 for t in real_closed), 2)
     total_realized   = round(sum(closed_pnls), 2) if closed_pnls else 0.0
     total_unrealized = round(float(acct.get("unrealized_pnl") or 0), 2)
 
@@ -10109,7 +10401,7 @@ def pnl_dashboard():
                 _con.execute(
                     f"UPDATE trade_journal SET closed_at=?, exit_reason='orphaned' "
                     f"WHERE id IN ({ph}) AND closed_at IS NULL",
-                    [datetime.utcnow().isoformat()] + orphan_ids,
+                    [_utcnow().isoformat()] + orphan_ids,
                 )
                 _con.commit()
                 _con.close()
@@ -10154,7 +10446,7 @@ def pnl_dashboard():
             })
     else:
         # Disconnected: fall back to recent journal entries (last 7 days)
-        recent_cutoff = (datetime.utcnow() - timedelta(days=7)).isoformat()
+        recent_cutoff = (_utcnow() - timedelta(days=7)).isoformat()
         visible_open  = [
             t for t in open_trades
             if (t.get("opened_at") or "") >= recent_cutoff
@@ -10167,6 +10459,8 @@ def pnl_dashboard():
             "open_count":           len(portfolio_items) if ib_connected else len(open_trades),
             "win_rate":             round(len(wins) / len(real_closed) * 100, 1) if real_closed else None,
             "total_realized_pnl":   total_realized,
+            "total_commission":     total_commission,
+            "net_realized_pnl":     round(total_realized - total_commission, 2),
             "total_unrealized_pnl": total_unrealized,
             "total_pnl":            round(total_realized + total_unrealized, 2),
             "today_pnl":            round(today_pnl, 2),
@@ -10175,8 +10469,8 @@ def pnl_dashboard():
             "best_trade":           round(max(closed_pnls), 2) if closed_pnls else 0,
             "worst_trade":          round(min(closed_pnls), 2) if closed_pnls else 0,
         },
-        "open_positions":   visible_open[-20:],
-        "closed_trades":   real_closed[:30],
+        "open_positions":   visible_open,
+        "closed_trades":   real_closed[:300],
         "daily_pnl":       daily_pnl,
         "portfolio":       portfolio_items,
         "exit_breakdown":  exit_breakdown,
@@ -10199,7 +10493,7 @@ def journal_cleanup():
         for info in state["autotrader"].get("positions", {}).values()
         if info.get("journal_id") is not None
     }
-    cutoff = (datetime.utcnow() - timedelta(hours=24)).isoformat()
+    cutoff = (_utcnow() - timedelta(hours=24)).isoformat()
     con = sqlite3.connect(JOURNAL_DB_PATH, check_same_thread=False)
     # Fetch all open entries older than 24 h
     rows = con.execute(
@@ -10211,7 +10505,7 @@ def journal_cleanup():
         con.execute(
             f"UPDATE trade_journal SET closed_at=?, exit_reason='orphaned' "
             f"WHERE id IN ({','.join('?' * len(orphan_ids))}) AND closed_at IS NULL",
-            [datetime.utcnow().isoformat()] + orphan_ids,
+            [_utcnow().isoformat()] + orphan_ids,
         )
         con.commit()
     con.close()
@@ -10282,7 +10576,7 @@ def tape_prints_history(
 ):
     """Historical tick-by-tick prints for a ticker from tape_data.db."""
     sym          = ticker.upper()
-    session_date = date or datetime.utcnow().strftime("%Y-%m-%d")
+    session_date = date or _utcnow().strftime("%Y-%m-%d")
     try:
         con   = sqlite3.connect(TAPE_DB_PATH, check_same_thread=False)
         where = "ticker=? AND session_date=?"
@@ -10312,7 +10606,7 @@ def tape_bars_history(
 ):
     """Historical 1-minute CVD bars for a ticker from tape_data.db."""
     sym          = ticker.upper()
-    session_date = date or datetime.utcnow().strftime("%Y-%m-%d")
+    session_date = date or _utcnow().strftime("%Y-%m-%d")
     try:
         con  = sqlite3.connect(TAPE_DB_PATH, check_same_thread=False)
         rows = con.execute(
@@ -10368,7 +10662,7 @@ def tape_block_report(
         from zoneinfo import ZoneInfo
         sess_date = date or datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
     except Exception:
-        sess_date = date or datetime.utcnow().strftime("%Y-%m-%d")
+        sess_date = date or _utcnow().strftime("%Y-%m-%d")
     try:
         con = sqlite3.connect(TAPE_DB_PATH, check_same_thread=False)
 
@@ -10638,14 +10932,19 @@ class StockSignalRequest(BaseModel):
 
 class StockConfigRequest(BaseModel):
     position_size:        Optional[float] = None
+    position_size_pct:    Optional[float] = None   # % of net-liq per trade (0 = use fixed $)
     max_positions:        Optional[int]   = None
-    hard_stop_pct:        Optional[float] = None
-    trail_pct:            Optional[float] = None
-    max_hold_days:        Optional[int]   = None
+    hard_stop_pct:        Optional[float] = None   # phase-1 flat stop % (default 20%)
+    max_hold_days:        Optional[int]   = None   # backstop force-close day (default 90)
     min_composite_score:  Optional[float] = None
     signal_freshness_min: Optional[int]   = None
     limit_buffer_pct:     Optional[float] = None
     rotation_enabled:     Optional[bool]  = None
+    use_entry_filters:    Optional[bool]  = None   # ATR+DMA23+σ gate (default True)
+    atr_period:           Optional[int]   = None
+    atr_multiplier:       Optional[float] = None
+    std_dev_period:       Optional[int]   = None
+    std_dev_threshold:    Optional[float] = None
 
 
 @app.post("/stock-trader/signal")
@@ -10674,12 +10973,8 @@ async def stock_trader_signal(req: StockSignalRequest):
     # Signal freshness check
     if req.alert_fired_at:
         try:
-            fired_at = datetime.fromisoformat(req.alert_fired_at)
-            # Make both timezone-aware for comparison
-            if fired_at.tzinfo is None:
-                fired_at = fired_at.replace(tzinfo=ZoneInfo("America/New_York"))
-            now_aware = now_et
-            age_min = (now_aware - fired_at).total_seconds() / 60
+            fired_at = _parse_utc(req.alert_fired_at)
+            age_min = (_utcnow() - fired_at).total_seconds() / 60
             if age_min > cfg["signal_freshness_min"]:
                 _st_log("SKIPPED", req.ticker.upper(),
                         f"stale signal ({age_min:.0f} min old, limit {cfg['signal_freshness_min']} min)")
@@ -10705,6 +11000,47 @@ async def stock_trader_signal(req: StockSignalRequest):
             _st_log("SKIPPED", ticker, f"score={score:.0f} < min={min_score:.0f}")
             return {"status": "skipped", "reason": "score_below_threshold",
                     "score": score, "min": min_score}
+
+    # ── ATR / 23-DMA / 3.7σ entry filters ────────────────────────────────
+    if cfg.get("use_entry_filters", True):
+        _ib_pre = state.get("ib")
+        if _ib_pre and _ib_pre.isConnected():
+            try:
+                _loop_pre = asyncio.get_event_loop()
+                metrics = await _loop_pre.run_in_executor(
+                    None,
+                    lambda: _run_in_streaming_loop(
+                        _fetch_entry_metrics(_ib_pre, ticker), timeout=20
+                    ),
+                )
+            except Exception:
+                metrics = {}
+            if not metrics:
+                _st_log("SKIPPED", ticker, "entry-filter data unavailable — skipping")
+                return {"status": "skipped", "reason": "filter_data_unavailable"}
+
+            atr_req = float(cfg.get("atr_multiplier", 1.8))
+            sig_req = float(cfg.get("std_dev_threshold", 3.7))
+
+            if metrics["atr_mult"] < atr_req:
+                _st_log("SKIPPED", ticker,
+                        f"ATR filter: range={metrics['atr_mult']:.2f}× < {atr_req}× ATR14")
+                return {"status": "skipped", "reason": "atr_filter",
+                        "atr_mult": metrics["atr_mult"], "required": atr_req}
+
+            if metrics["std_score"] < sig_req:
+                _st_log("SKIPPED", ticker,
+                        f"σ filter: {metrics['std_score']:.2f}σ < {sig_req}σ threshold")
+                return {"status": "skipped", "reason": "std_dev_filter",
+                        "std_score": metrics["std_score"], "required": sig_req}
+
+            _st_log("FILTERS_PASS", ticker,
+                    f"atr={metrics['atr_mult']:.2f}×ATR14  σ={metrics['std_score']:.2f}  "
+                    f"dma23={metrics['dma23']:.2f} (exit floor)")
+        else:
+            metrics = {}
+    else:
+        metrics = {}
 
     # Capacity check — with optional rotation
     if len(st["positions"]) >= cfg["max_positions"]:
@@ -10760,7 +11096,7 @@ async def stock_trader_signal(req: StockSignalRequest):
 
                 # Record rotation for outcome tracking
                 rot_entry = {
-                    "ts":                           now_et.isoformat(),
+                    "ts":                           _utcnow().isoformat(),
                     "evicted":                      candidate,
                     "evicted_entry_price":          cand_pos.get("entry_price"),
                     "evicted_pnl_at_rotation":      evict_pnl,
@@ -10792,8 +11128,15 @@ async def stock_trader_signal(req: StockSignalRequest):
     if not ib or not ib.isConnected():
         raise HTTPException(503, "IBKR not connected")
 
-    price   = req.price
-    shares  = max(1, int(cfg["position_size"] / price))
+    price = req.price
+    # 10% of account net-liq when position_size_pct is set; else fixed dollar amount
+    pos_size_pct = float(cfg.get("position_size_pct", 0))
+    if pos_size_pct > 0:
+        net_liq = _get_net_liq(ib)
+        position_size = (net_liq * pos_size_pct / 100) if net_liq > 0 else cfg["position_size"]
+    else:
+        position_size = cfg["position_size"]
+    shares  = max(1, int(position_size / price))
     # Widen limit buffer during 9:30-9:45 opening volatility window (spreads $0.20-0.80)
     buf_pct = 0.50 if (now_et.hour == 9 and now_et.minute < 45) else cfg["limit_buffer_pct"]
     lmt_px  = round(price * (1 + buf_pct / 100), 2)
@@ -10832,8 +11175,10 @@ async def stock_trader_signal(req: StockSignalRequest):
         "stop_price":        None,
         "trading_days_held": 0,
         "phase":             0,
-        "alert_fired_at":    req.alert_fired_at or now_et.isoformat(),
+        "alert_fired_at":    req.alert_fired_at or _utcnow().isoformat(),
         "composite_score":   req.composite_score,
+        "dma23":             metrics.get("dma23"),
+        "atr14":             metrics.get("atr14"),
     }
     score_str = f" score={req.composite_score:.0f}" if req.composite_score is not None else ""
     _st_log("ENTERED", ticker,
@@ -11017,7 +11362,7 @@ async def stock_trader_close(ticker: str):
 def stock_trader_history(days: int = Query(30, ge=1, le=365)):
     """Closed stock breakout trades from trade_journal (STOCK_BREAKOUT strategy)."""
     try:
-        cutoff = (datetime.utcnow() - timedelta(days=days)).date().isoformat()
+        cutoff = (_utcnow() - timedelta(days=days)).date().isoformat()
         con = sqlite3.connect(JOURNAL_DB_PATH, check_same_thread=False)
         con.row_factory = sqlite3.Row
         rows = con.execute("""
@@ -11112,7 +11457,8 @@ def _dt_load_state() -> None:
 
 
 def _close_dt_position(ticker: str, pos: dict, exit_px: float,
-                        exit_type: str, pnl: float) -> None:
+                        exit_type: str, pnl: float,
+                        commission: float = 0.0) -> None:
     """Record a closed day trade to closed_today + trade journal."""
     dt = state["day_trader"]
     entry_px = pos.get("entry_price", exit_px)
@@ -11137,8 +11483,8 @@ def _close_dt_position(ticker: str, pos: dict, exit_px: float,
             INSERT INTO trade_journal
                 (opened_at, closed_at, ticker, action, qty,
                  entry_price, exit_price, pnl, pnl_pct, win,
-                 exit_reason, strategy_type, score, vol_ratio)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 exit_reason, strategy_type, score, vol_ratio, commission)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             pos.get("entry_date"), date.today().isoformat(),
             ticker, "BUY", pos.get("shares", 0),
@@ -11146,6 +11492,7 @@ def _close_dt_position(ticker: str, pos: dict, exit_px: float,
             round(pnl, 2), pnl_pct, 1 if pnl > 0 else 0,
             exit_type, "DAY_BREAKOUT",
             pos.get("composite_score"), pos.get("vol_ratio"),
+            round(commission, 4),
         ))
         con.commit()
         con.close()
@@ -11232,13 +11579,8 @@ async def _day_trader_monitor_coro(ib) -> None:
                 # Cancel stale pending buys
                 try:
                     alert_ts = pos.get("alert_fired_at", "")
-                    at = datetime.fromisoformat(alert_ts) if alert_ts else None
-                    if at is not None:
-                        if at.tzinfo is None:
-                            at = at.replace(tzinfo=ZoneInfo("America/New_York"))
-                        age_min = (now_et - at).total_seconds() / 60
-                    else:
-                        age_min = 0
+                    at = _parse_utc(alert_ts) if alert_ts else None
+                    age_min = (_utcnow() - at).total_seconds() / 60 if at is not None else 0
                 except Exception:
                     age_min = 0
                 if age_min > cfg.get("signal_freshness_min", 30):
@@ -11306,7 +11648,8 @@ async def _day_trader_monitor_coro(ib) -> None:
                 exit_px = round(float(fill.execution.avgPrice), 4) if fill else pos.get("entry_price", 0)
                 pnl     = round((exit_px - pos["entry_price"]) * pos["shares"], 2)
                 exit_type = pos.get("pending_exit_type", "force_close")
-                _close_dt_position(ticker, pos, exit_px, exit_type, pnl)
+                comm    = _commission_for_orders(ib, pos.get("buy_order_id", 0), sell_oid)
+                _close_dt_position(ticker, pos, exit_px, exit_type, pnl, commission=comm)
                 to_remove.append(ticker)
             continue
 
@@ -11319,7 +11662,8 @@ async def _day_trader_monitor_coro(ib) -> None:
             fill    = fills_by_oid.get(target_oid)
             exit_px = round(float(fill.execution.avgPrice), 4) if fill else pos.get("profit_price", pos["entry_price"])
             pnl     = round((exit_px - pos["entry_price"]) * pos["shares"], 2)
-            _close_dt_position(ticker, pos, exit_px, "profit_target", pnl)
+            comm    = _commission_for_orders(ib, pos.get("buy_order_id", 0), target_oid)
+            _close_dt_position(ticker, pos, exit_px, "profit_target", pnl, commission=comm)
             to_remove.append(ticker)
             continue
 
@@ -11328,7 +11672,8 @@ async def _day_trader_monitor_coro(ib) -> None:
             fill    = fills_by_oid.get(stop_oid)
             exit_px = round(float(fill.execution.avgPrice), 4) if fill else pos.get("stop_price", pos["entry_price"])
             pnl     = round((exit_px - pos["entry_price"]) * pos["shares"], 2)
-            _close_dt_position(ticker, pos, exit_px, "hard_stop", pnl)
+            comm    = _commission_for_orders(ib, pos.get("buy_order_id", 0), stop_oid)
+            _close_dt_position(ticker, pos, exit_px, "hard_stop", pnl, commission=comm)
             to_remove.append(ticker)
             continue
 
@@ -11416,6 +11761,7 @@ async def _day_trader_monitor_loop() -> None:
 
 class DayConfigRequest(BaseModel):
     position_size:        Optional[float] = None
+    position_size_pct:    Optional[float] = None   # % of net-liq per trade (0 = use fixed $)
     max_positions:        Optional[int]   = None
     hard_stop_pct:        Optional[float] = None
     profit_target_pct:    Optional[float] = None
@@ -11426,6 +11772,11 @@ class DayConfigRequest(BaseModel):
     expected_return_pct:  Optional[float] = None
     win_rate_est:         Optional[float] = None
     min_composite_score:  Optional[float] = None   # 0 = disabled, 75-85 recommended
+    use_entry_filters:    Optional[bool]  = None   # ATR+DMA23+σ gate (default True)
+    atr_period:           Optional[int]   = None
+    atr_multiplier:       Optional[float] = None
+    std_dev_period:       Optional[int]   = None
+    std_dev_threshold:    Optional[float] = None
 
 
 # ── Day Trader endpoints ───────────────────────────────────────────────────────
@@ -11456,10 +11807,8 @@ async def day_trader_signal(req: StockSignalRequest):
 
     if req.alert_fired_at:
         try:
-            fired_at = datetime.fromisoformat(req.alert_fired_at)
-            if fired_at.tzinfo is None:
-                fired_at = fired_at.replace(tzinfo=ZoneInfo("America/New_York"))
-            age_min = (now_et - fired_at).total_seconds() / 60
+            fired_at = _parse_utc(req.alert_fired_at)
+            age_min = (_utcnow() - fired_at).total_seconds() / 60
             if age_min > cfg["signal_freshness_min"]:
                 return {"status": "skipped", "reason": "stale_signal", "age_min": round(age_min, 1)}
         except Exception:
@@ -11489,8 +11838,52 @@ async def day_trader_signal(req: StockSignalRequest):
     if not ib or not ib.isConnected():
         raise HTTPException(503, "IBKR not connected")
 
-    price  = req.price
-    shares = max(1, int(cfg["position_size"] / price))
+    # ── ATR / 23-DMA / 3.7σ entry filters ────────────────────────────────
+    if cfg.get("use_entry_filters", True):
+        try:
+            _loop_pre = asyncio.get_event_loop()
+            dt_metrics = await _loop_pre.run_in_executor(
+                None,
+                lambda: _run_in_streaming_loop(
+                    _fetch_entry_metrics(ib, ticker), timeout=20
+                ),
+            )
+        except Exception:
+            dt_metrics = {}
+        if not dt_metrics:
+            _dt_log("SKIPPED", ticker, "entry-filter data unavailable — skipping")
+            return {"status": "skipped", "reason": "filter_data_unavailable"}
+
+        atr_req = float(cfg.get("atr_multiplier", 1.8))
+        sig_req = float(cfg.get("std_dev_threshold", 3.7))
+
+        if dt_metrics["atr_mult"] < atr_req:
+            _dt_log("SKIPPED", ticker,
+                    f"ATR filter: range={dt_metrics['atr_mult']:.2f}× < {atr_req}× ATR14")
+            return {"status": "skipped", "reason": "atr_filter",
+                    "atr_mult": dt_metrics["atr_mult"], "required": atr_req}
+
+        if dt_metrics["std_score"] < sig_req:
+            _dt_log("SKIPPED", ticker,
+                    f"σ filter: {dt_metrics['std_score']:.2f}σ < {sig_req}σ threshold")
+            return {"status": "skipped", "reason": "std_dev_filter",
+                    "std_score": dt_metrics["std_score"], "required": sig_req}
+
+        _dt_log("FILTERS_PASS", ticker,
+                f"atr={dt_metrics['atr_mult']:.2f}×ATR14  σ={dt_metrics['std_score']:.2f}  "
+                f"dma23={dt_metrics['dma23']:.2f} (exit floor)")
+    else:
+        dt_metrics = {}
+
+    price = req.price
+    # 10% of account net-liq when position_size_pct is set; else fixed dollar amount
+    pos_size_pct = float(cfg.get("position_size_pct", 0))
+    if pos_size_pct > 0:
+        net_liq = _get_net_liq(ib)
+        position_size = (net_liq * pos_size_pct / 100) if net_liq > 0 else cfg["position_size"]
+    else:
+        position_size = cfg["position_size"]
+    shares = max(1, int(position_size / price))
     # Widen limit buffer during 9:30-9:45 opening volatility window (spreads $0.20-0.80)
     buf_pct = 0.50 if (now_et.hour == 9 and now_et.minute < 45) else cfg["limit_buffer_pct"]
     lmt_px = round(price * (1 + buf_pct / 100), 2)
@@ -11530,11 +11923,12 @@ async def day_trader_signal(req: StockSignalRequest):
         "stop_price":        stop_px,
         "profit_price":      profit_px,
         "phase":             0,
-        "alert_fired_at":    req.alert_fired_at or now_et.isoformat(),
+        "alert_fired_at":    req.alert_fired_at or _utcnow().isoformat(),
         "composite_score":   req.composite_score,
         "vol_ratio":         req.vol_ratio,
         "live_price":        None,
         "live_pnl":          None,
+        "atr14":             dt_metrics.get("atr14"),
     }
     score_str = f" score={req.composite_score:.0f}" if req.composite_score is not None else ""
     _dt_log("ENTERED", ticker,
@@ -11754,7 +12148,7 @@ def day_trader_goal():
 def day_trader_history(days: int = Query(30, ge=1, le=365)):
     """Closed day trades from trade_journal (DAY_BREAKOUT strategy)."""
     try:
-        cutoff = (datetime.utcnow() - timedelta(days=days)).date().isoformat()
+        cutoff = (_utcnow() - timedelta(days=days)).date().isoformat()
         con = sqlite3.connect(JOURNAL_DB_PATH, check_same_thread=False)
         con.row_factory = sqlite3.Row
         rows = con.execute("""
@@ -12109,10 +12503,30 @@ def _spx_log(action: str, detail: str, spread_id: str = "—") -> None:
     log.info("SPX0DTE [%s] %s — %s", action, spread_id, detail)
 
 
+def _spx_state_path() -> str:
+    """Return the correct state file depending on live vs paper mode."""
+    return "spx_0dte_live_state.json" if state.get("is_live") else SPX_STATE_PATH
+
+
+def _spx_apply_live_defaults() -> None:
+    """Tighten SPX 0DTE config for live trading — only overrides values still at paper defaults."""
+    cfg = state["spx_0dte"]["config"]
+    changes = []
+    if float(cfg.get("vix_max_morning", 25.0)) >= 25.0:
+        cfg["vix_max_morning"] = 20.0
+        changes.append("vix_max_morning→20")
+    if int(cfg.get("max_attempts", 5)) >= 5:
+        cfg["max_attempts"] = 2
+        changes.append("max_attempts→2")
+    if changes:
+        log.info("SPX 0DTE live defaults applied: %s", ", ".join(changes))
+        _spx_save_state()
+
+
 def _spx_save_state() -> None:
     sx = state["spx_0dte"]
     try:
-        with open(SPX_STATE_PATH, "w") as f:
+        with open(_spx_state_path(), "w") as f:
             json.dump({
                 "enabled":        sx["enabled"],
                 "config":         sx["config"],
@@ -12129,10 +12543,11 @@ def _spx_save_state() -> None:
 
 
 def _spx_load_state() -> None:
-    if not os.path.exists(SPX_STATE_PATH):
+    path = _spx_state_path()
+    if not os.path.exists(path):
         return
     try:
-        with open(SPX_STATE_PATH, "r") as f:
+        with open(path, "r") as f:
             saved = json.load(f)
         sx    = state["spx_0dte"]
         today = date.today().isoformat()
@@ -12149,6 +12564,8 @@ def _spx_load_state() -> None:
         sx["attempts_today"] = saved.get("attempts_today", 0) if same_day else 0
         sx["today_pnl"]      = saved.get("today_pnl", 0.0)    if same_day else 0.0
         sx["last_stop_time"] = saved.get("last_stop_time")
+        # Track the date the state was loaded so the monitor loop can detect day rollover
+        sx["_loop_date"]     = today if same_day else None
         log.info("SPX 0DTE state restored: %d open spreads, $%.2f P&L today",
                  len(sx["spreads"]), sx["today_pnl"])
     except Exception as e:
@@ -12179,13 +12596,14 @@ def _evc_save_state() -> None:
     try:
         with open(EVC_STATE_PATH, "w") as f:
             json.dump({
-                "enabled":      ev["enabled"],
-                "config":       ev["config"],
-                "positions":    ev["positions"],
-                "closed_today": ev["closed_today"],
-                "decisions":    ev["decisions"][-50:],
-                "scan_date":    ev["scan_date"],
-                "date":         date.today().isoformat(),
+                "enabled":          ev["enabled"],
+                "config":           ev["config"],
+                "positions":        ev["positions"],
+                "closed_today":     ev["closed_today"],
+                "decisions":        ev["decisions"][-50:],
+                "scan_date":        ev["scan_date"],
+                "candidates_today": ev.get("candidates_today", []),
+                "date":             date.today().isoformat(),
             }, f, default=str)
     except Exception as e:
         log.warning("EVC state save failed: %s", e)
@@ -12209,8 +12627,10 @@ def _evc_load_state() -> None:
             if v.get("date") == today and v.get("phase") == "open"
         }
         ev["closed_today"] = [r for r in saved.get("closed_today", []) if r.get("date") == today]
-        ev["scan_date"]    = saved.get("scan_date") if saved.get("date") == today else None
-        log.info("EVC state restored: %d open positions", len(ev["positions"]))
+        ev["scan_date"]        = saved.get("scan_date") if saved.get("date") == today else None
+        ev["candidates_today"] = saved.get("candidates_today", []) if saved.get("date") == today else []
+        log.info("EVC state restored: %d open positions, %d candidates today",
+                 len(ev["positions"]), len(ev["candidates_today"]))
     except Exception as e:
         log.warning("EVC state load failed: %s", e)
 
@@ -12366,6 +12786,7 @@ async def _spx_close_spread(ib, spread_id: str, exit_type: str) -> None:
             ("C", sp["call_short_k"], sp["call_conids"][0], "BUY"),
             ("C", sp["call_long_k"],  sp["call_conids"][1], "SELL"),
         ]
+    close_trades = []
     for right, strike, conid, action in legs:
         try:
             c = IbOpt("SPX", expiry, strike, right, "SMART", "100", "USD")
@@ -12374,7 +12795,7 @@ async def _spx_close_spread(ib, spread_id: str, exit_type: str) -> None:
             mkt = Order()
             mkt.orderType = "MKT"; mkt.action = action
             mkt.totalQuantity = qty; mkt.tif = "DAY"
-            ib.placeOrder(c, mkt)
+            close_trades.append(ib.placeOrder(c, mkt))
         except Exception as ex:
             log.warning("SPX 0DTE close leg %s%s failed: %s", right, strike, ex)
     await asyncio.sleep(1)
@@ -12407,19 +12828,22 @@ async def _spx_close_spread(ib, spread_id: str, exit_type: str) -> None:
     # Persist to trade_journal for multi-day history
     try:
         con = sqlite3.connect(JOURNAL_DB_PATH, check_same_thread=False)
+        close_oids = [t.order.orderId for t in close_trades]
+        entry_oids = (sp.get("put_order_ids") or []) + (sp.get("call_order_ids") or [])
+        comm = _commission_for_orders(ib, *entry_oids, *close_oids)
         con.execute("""
             INSERT INTO trade_journal
                 (opened_at, closed_at, ticker, expiry, action, qty,
                  entry_price, exit_price, pnl, pnl_pct, win,
-                 exit_reason, strategy_type, spot_price)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 exit_reason, strategy_type, spot_price, commission)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             sp["date"], date.today().isoformat(),
             "SPX", expiry, "SELL", qty,
             credit, round(credit - pnl, 2),
             pnl, pnl_pct, 1 if pnl > 0 else 0,
             exit_type, "SPX_0DTE",
-            sp.get("spot_at_entry"),
+            sp.get("spot_at_entry"), comm,
         ))
         con.commit()
         con.close()
@@ -12556,8 +12980,10 @@ async def _spx_entry_coro(ib) -> None:
     call_long_k  = call_short_k + width
 
     try:
-        p_credit, p_s_cid, p_l_cid = await _spx_quote_vertical(ib, expiry, "P", put_short_k, put_long_k)
-        c_credit, c_s_cid, c_l_cid = await _spx_quote_vertical(ib, expiry, "C", call_short_k, call_long_k)
+        (p_credit, p_s_cid, p_l_cid), (c_credit, c_s_cid, c_l_cid) = await asyncio.gather(
+            _spx_quote_vertical(ib, expiry, "P", put_short_k, put_long_k),
+            _spx_quote_vertical(ib, expiry, "C", call_short_k, call_long_k),
+        )
     except Exception as e:
         _spx_log("SKIP", f"Chain unavailable: {e}")
         return
@@ -12647,6 +13073,12 @@ async def _spx_entry_coro(ib) -> None:
              + (f"C {int(call_short_k)}/{int(call_long_k)} cr={c_credit:.2f} | " if use_call else "")
              + f"qty={qty}  total_cr=${total_credit_dollar:.0f}  "
              + f"target=${profit_target_dollar:.0f} ({profit_pct*100:.0f}%)  floor=${floor:.0f}")
+    _opra_src = "OPRA-LIVE" if state.get("opra_active") else "OPRA-DELAYED"
+    _spx_log("OPRA_VALUE",
+             f"src={_opra_src}  spread credits priced via IBKR live quotes"
+             + (f"  P cr=${p_credit:.2f}" if use_put else "")
+             + (f"  C cr=${c_credit:.2f}" if use_call else "")
+             + f"  {vix_note}  (yfinance NOT used for pricing)")
 
     p_oid = c_oid = None
     try:
@@ -12726,34 +13158,42 @@ async def _spx_monitor_coro(ib) -> None:
         expiry = sp["expiry"]
         live_pnl = 0.0
 
-        # Re-quote each live leg: short leg value lost = profit for us
-        legs_to_quote = []
-        if sp.get("put_conids") and sp.get("put_short_k") is not None:
-            legs_to_quote.append(("P", sp["put_short_k"], sp["put_long_k"],
-                                  sp["put_credit"], sp["put_conids"]))
-        if sp.get("call_conids") and sp.get("call_short_k") is not None:
-            legs_to_quote.append(("C", sp["call_short_k"], sp["call_long_k"],
-                                  sp["call_credit"], sp["call_conids"]))
+        if state.get("is_live"):
+            # Live account: IBKR marks options to market in real time — use portfolio P&L directly.
+            # Avoids 4-5s reqMktData sleep per leg and unnecessary market data subscriptions.
+            portfolio  = {item.contract.conId: item for item in ib.portfolio() if item.contract.conId}
+            all_conids = (sp.get("put_conids") or []) + (sp.get("call_conids") or [])
+            live_pnl   = sum(float(portfolio[cid].unrealizedPNL or 0)
+                             for cid in all_conids if cid in portfolio)
+        else:
+            # Paper account: portfolio.unrealizedPNL is always 0 for SPX options without
+            # a live data subscription — re-quote each leg manually instead.
+            legs_to_quote = []
+            if sp.get("put_conids") and sp.get("put_short_k") is not None:
+                legs_to_quote.append(("P", sp["put_short_k"], sp["put_long_k"],
+                                      sp["put_credit"], sp["put_conids"]))
+            if sp.get("call_conids") and sp.get("call_short_k") is not None:
+                legs_to_quote.append(("C", sp["call_short_k"], sp["call_long_k"],
+                                      sp["call_credit"], sp["call_conids"]))
 
-        for right, sk, lk, entry_credit, conids in legs_to_quote:
-            try:
-                sc = IbOpt("SPX", expiry, sk, right, "SMART", "100", "USD")
-                lc = IbOpt("SPX", expiry, lk, right, "SMART", "100", "USD")
-                sc.tradingClass = "SPXW"; sc.conId = conids[0]
-                lc.tradingClass = "SPXW"; lc.conId = conids[1]
-                td_s = ib.reqMktData(sc, "100,101,106", False, False)
-                td_l = ib.reqMktData(lc, "100,101,106", False, False)
-                await asyncio.sleep(4)
-                s_mid = _spx_mid(td_s)
-                l_mid = _spx_mid(td_l)
-                ib.cancelMktData(sc)
-                ib.cancelMktData(lc)
-                if s_mid > 0 and l_mid > 0:
-                    current_credit = round(s_mid - l_mid, 2)
-                    # Profit = credit collected at entry minus current cost to close
-                    live_pnl += (entry_credit - current_credit) * 100 * qty
-            except Exception as ex:
-                log.warning("SPX 0DTE monitor quote failed %s %s/%s: %s", right, sk, lk, ex)
+            for right, sk, lk, entry_credit, conids in legs_to_quote:
+                try:
+                    sc = IbOpt("SPX", expiry, sk, right, "SMART", "100", "USD")
+                    lc = IbOpt("SPX", expiry, lk, right, "SMART", "100", "USD")
+                    sc.tradingClass = "SPXW"; sc.conId = conids[0]
+                    lc.tradingClass = "SPXW"; lc.conId = conids[1]
+                    td_s = ib.reqMktData(sc, "100,101,106", False, False)
+                    td_l = ib.reqMktData(lc, "100,101,106", False, False)
+                    await asyncio.sleep(4)
+                    s_mid = _spx_mid(td_s)
+                    l_mid = _spx_mid(td_l)
+                    ib.cancelMktData(sc)
+                    ib.cancelMktData(lc)
+                    if s_mid > 0 and l_mid > 0:
+                        current_credit = round(s_mid - l_mid, 2)
+                        live_pnl += (entry_credit - current_credit) * 100 * qty
+                except Exception as ex:
+                    log.warning("SPX 0DTE monitor quote failed %s %s/%s: %s", right, sk, lk, ex)
 
         sp["live_pnl"] = round(live_pnl, 2)
         _spx_log("MONITOR", f"spread={sid} live_pnl=${live_pnl:.2f} target=${sp['profit_target']:.2f}")
@@ -12803,6 +13243,23 @@ async def _spx_monitor_loop() -> None:
                 await asyncio.sleep(60)
                 continue
             sx = state["spx_0dte"]
+
+            # Daily rollover: reset stale data when backend runs continuously past midnight.
+            # _spx_load_state only runs on startup, so without this check closed_today /
+            # attempts_today / today_pnl from the previous trading day persist in memory.
+            today_str = now.strftime("%Y-%m-%d")
+            if sx.get("_loop_date") is not None and sx["_loop_date"] != today_str:
+                sx["closed_today"]   = []
+                sx["attempts_today"] = 0
+                sx["today_pnl"]      = 0.0
+                sx["last_stop_time"] = None
+                sx["eod_notified"]   = None
+                sx["_loop_date"]     = today_str
+                _spx_save_state()
+                log.info("SPX 0DTE: daily rollover reset → %s", today_str)
+            elif sx.get("_loop_date") is None:
+                sx["_loop_date"] = today_str   # first cycle after a cross-midnight startup
+
             if not sx["enabled"]:
                 await asyncio.sleep(30)
                 continue
@@ -12853,6 +13310,50 @@ async def _spx_monitor_loop() -> None:
 
 # ── Earnings Volatility Crush — core async functions ──────────────────────────
 
+def _evc_earnings_timing(ticker: str) -> str:
+    """
+    Return one of: 'today_bmo', 'today_ah', 'tomorrow_bmo', 'tomorrow_ah',
+                   'nextmon_bmo', or 'none'.
+
+    Uses earningsTimestampStart from yf.Ticker.info — the only yfinance field
+    that carries an actual time (not just a calendar date).
+
+    BMO  = hour < 12 ET   (typically 07:00–09:00 ET)
+    AH   = hour >= 12 ET  (typically 16:00 ET)
+
+    Friday special case: accept Monday BMO reporters (calendar days = 3) since
+    that is the next trading session.  Monday AH reporters are excluded — the EVC
+    exit fires Monday morning at 9:31 AM, before the event, so IV would not
+    have crushed yet.
+    """
+    from zoneinfo import ZoneInfo
+    from datetime import datetime as _dt, timedelta as _td
+    _ET = ZoneInfo("America/New_York")
+    try:
+        info = yf.Ticker(ticker).info
+        ts = info.get("earningsTimestampStart") or info.get("earningsTimestamp")
+        if not ts:
+            return "none"
+        dt_et  = _dt.fromtimestamp(int(ts), _ET)
+        now_et = _dt.now(_ET)
+        days   = (dt_et.date() - now_et.date()).days
+        is_friday = now_et.weekday() == 4
+        bmo = dt_et.hour < 12
+
+        if days < 0:
+            return "none"
+        if days == 0:
+            return "today_bmo" if bmo else "today_ah"
+        if days == 1:
+            return "tomorrow_bmo" if bmo else "tomorrow_ah"
+        if days == 3 and is_friday and bmo:
+            # Monday BMO from Friday — valid: enter Fri, exit Mon after BMO crush
+            return "nextmon_bmo"
+        return "none"
+    except Exception:
+        return "none"
+
+
 def _evc_earnings_is_upcoming(ticker: str) -> bool:
     """
     Return True only if the next earnings datetime is still in the future (ET).
@@ -12883,30 +13384,33 @@ async def _evc_scan_universe(ib) -> list:
     ev    = state["evc"]
     today = date.today().isoformat()
     if ev.get("scan_date") == today:
-        # Already scanned today — return tickers already identified
-        return [p["ticker"] for p in ev["positions"].values()]
+        # Already scanned today — return saved candidates minus already-entered tickers
+        already = {p["ticker"] for p in ev["positions"].values()}
+        return [t for t in ev.get("candidates_today", []) if t not in already]
     candidates = []
     universe   = [t for t in CANDIDATE_POOL if t not in _EVC_ETF_SET]
     _evc_log("SCAN", "universe", f"checking {len(universe)} tickers for tonight's earnings")
+
     loop = asyncio.get_event_loop()
+    _TIMING_LABEL = {
+        "today_ah":     "earnings tonight AH — entering today",
+        "tomorrow_bmo": "earnings tomorrow BMO — entering today",
+        "nextmon_bmo":  "earnings Monday BMO — entering today (Fri)",
+        # "tomorrow_ah" intentionally excluded: EVC exits at 9:31 AM before the
+        # event fires at 4 PM, so IV is still elevated at exit — no crush to capture.
+    }
     for ticker in universe:
         try:
-            days = await _earnings_days_out(ticker)
-            if days == 0:
-                # days==0 means earnings date is today — could be BMO (already done)
-                # or AH (still upcoming). Verify the datetime is in the future.
-                upcoming = await loop.run_in_executor(None, _evc_earnings_is_upcoming, ticker)
-                if not upcoming:
-                    _evc_log("SKIP", ticker, "earnings today but already BMO — skipping")
-                    continue
+            timing = await loop.run_in_executor(None, lambda t=ticker: _evc_earnings_timing(t))
+            if timing == "today_bmo":
+                _evc_log("SKIP_BMO", ticker, "already reported BMO today — IV crushed, skipping")
+            elif timing in _TIMING_LABEL:
                 candidates.append(ticker)
-                _evc_log("CANDIDATE", ticker, "earnings tonight (AH)")
-            elif days == 1:
-                # days==1: earnings tomorrow — catches BMO reporters announced 8 AM next day
-                candidates.append(ticker)
-                _evc_log("CANDIDATE", ticker, "earnings tomorrow (BMO/AH)")
+                _evc_log("CANDIDATE", ticker, _TIMING_LABEL[timing])
+            # "none" = no earnings in 0-1 days, skip silently
         except Exception as exc:
             log.debug("EVC earnings check %s: %s", ticker, exc)
+    ev["candidates_today"] = candidates
     ev["scan_date"] = today
     _evc_log("SCAN_DONE", "universe", f"found {len(candidates)} earnings tonight: {candidates}")
     _evc_save_state()
@@ -12914,13 +13418,20 @@ async def _evc_scan_universe(ib) -> list:
 
 
 async def _evc_get_stock_price(ib, ticker: str) -> float:
-    """Get current stock price via reqMktData."""
+    """Get current stock price via reqMktData. Falls back to bid/ask mid."""
     from ib_insync import Stock as IbStock
     c = IbStock(ticker, "SMART", "USD")
     await ib.qualifyContractsAsync(c)
     td = ib.reqMktData(c, "", False, False)
-    await asyncio.sleep(3)
+    await asyncio.sleep(5)
     px = _spx_safe_px(td.last) or _spx_safe_px(td.close)
+    if not px:
+        b = _spx_safe_px(td.bid)
+        a = _spx_safe_px(td.ask)
+        if b and a:
+            px = round((b + a) / 2, 2)
+        elif b or a:
+            px = b or a
     ib.cancelMktData(c)
     return px
 
@@ -12996,10 +13507,11 @@ async def _evc_quote_condor(ib, ticker: str) -> dict:
         raise ValueError(f"no ATM option quotes for {ticker}: call={call_mid} put={put_mid}")
 
     expected_move = round(call_mid + put_mid, 2)
-    if expected_move < 1.0:
-        raise ValueError(f"expected move too small ({expected_move:.2f}) for {ticker}")
-    if expected_move / spot > 0.25:
-        raise ValueError(f"expected move implausibly large ({expected_move:.2f}/{spot:.2f}) for {ticker}")
+    im_pct = expected_move / spot
+    if im_pct < 0.03:
+        raise ValueError(f"implied move {im_pct:.1%} below 3% minimum (EM=${expected_move:.2f} on ${spot:.2f})")
+    if im_pct > 0.25:
+        raise ValueError(f"expected move implausibly large ({im_pct:.1%}) for {ticker}")
 
     # 5. Condor strikes — nearest real strike to each target
     short_put  = _nearest(spot - expected_move)
@@ -13113,6 +13625,7 @@ async def _evc_place_condor(ib, quote: dict) -> bool:
         "net_credit": round(filled_credit, 2),
         "phase":      "open",
         "live_pnl":   0.0,
+        "entry_time": datetime.now(timezone.utc).isoformat(),
     }
     ev["positions"][pos_id] = pos
     _evc_log("ENTERED", ticker,
@@ -13149,29 +13662,43 @@ async def _evc_close_position(ib, pos_id: str, reason: str) -> None:
     expiry = pos["expiry"]
     qty    = pos["qty"]
 
-    # Close condor by buying it back (reverse of entry): BUY short legs, SELL long legs
+    # Close condor: BUY short legs (cost +), SELL long legs (proceeds −)
     leg_defs = [
-        (pos["long_put"],   "P", pos["conids"]["long_put"],   "SELL"),
-        (pos["short_put"],  "P", pos["conids"]["short_put"],  "BUY"),
-        (pos["short_call"], "C", pos["conids"]["short_call"], "BUY"),
-        (pos["long_call"],  "C", pos["conids"]["long_call"],  "SELL"),
+        (pos["long_put"],   "P", pos["conids"]["long_put"],   "SELL", -1),
+        (pos["short_put"],  "P", pos["conids"]["short_put"],  "BUY",  +1),
+        (pos["short_call"], "C", pos["conids"]["short_call"], "BUY",  +1),
+        (pos["long_call"],  "C", pos["conids"]["long_call"],  "SELL", -1),
     ]
-    close_fills = []
-    for strike, right, conid, action in leg_defs:
+    _TERMINAL = {"Filled", "Cancelled", "ApiCancelled", "Inactive"}
+
+    # Submit all 4 legs simultaneously
+    submitted: list[tuple] = []   # (trade, sign, right, strike)
+    for strike, right, conid, action, sign in leg_defs:
         try:
             c = IbOpt(ticker, expiry, strike, right, "SMART", "100", "USD")
             c.conId = conid
             mkt = Order()
             mkt.orderType = "MKT"; mkt.action = action
             mkt.totalQuantity = qty; mkt.tif = "DAY"
-            trade = ib.placeOrder(c, mkt)
-            await asyncio.sleep(0.5)
-            close_fills.append(float(trade.orderStatus.avgFillPrice or 0))
+            submitted.append((ib.placeOrder(c, mkt), sign, right, strike))
         except Exception as exc:
-            log.warning("EVC close leg %s%s failed: %s", right, strike, exc)
-    await asyncio.sleep(2)
+            log.warning("EVC close place %s%s: %s", right, strike, exc)
 
-    close_cost = sum(close_fills)
+    # Poll until every leg reaches a terminal status (max 30 s)
+    for _ in range(60):
+        await asyncio.sleep(0.5)
+        if all(t.orderStatus.status in _TERMINAL for t, *_ in submitted):
+            break
+
+    # Collect confirmed fill prices + commissions
+    close_cost = 0.0
+    close_oids = [t.order.orderId for t, *_ in submitted]
+    for trade, sign, right, strike in submitted:
+        fill_px = float(trade.orderStatus.avgFillPrice or 0)
+        if fill_px == 0:
+            log.warning("EVC close %s %s%s: no fill after 30s (status=%s)",
+                        ticker, right, strike, trade.orderStatus.status)
+        close_cost += sign * fill_px
     net_credit = pos["net_credit"]
     pnl        = round((net_credit - close_cost) * qty * 100, 2)
     pnl_pct    = round(pnl / (net_credit * qty * 100) * 100, 1) if net_credit else 0
@@ -13195,16 +13722,23 @@ async def _evc_close_position(ib, pos_id: str, reason: str) -> None:
     ev["closed_today"].append(closed_rec)
     ev["positions"].pop(pos_id, None)
 
-    # Journal update
+    # Journal update — SELECT id first; SQLite doesn't support UPDATE … ORDER BY … LIMIT
     try:
         con = sqlite3.connect(JOURNAL_DB_PATH, check_same_thread=False)
-        con.execute("""
-            UPDATE trade_journal
-            SET closed_at=?, exit_price=?, pnl=?, pnl_pct=?, win=?, exit_reason=?
-            WHERE ticker=? AND strategy_type='earnings_vol_crush' AND closed_at IS NULL
-            ORDER BY id DESC LIMIT 1
-        """, (date.today().isoformat(), round(close_cost, 2),
-              pnl, pnl_pct, win, reason, ticker))
+        row = con.execute(
+            "SELECT id FROM trade_journal WHERE ticker=? AND strategy_type='earnings_vol_crush'"
+            " AND closed_at IS NULL ORDER BY id DESC LIMIT 1",
+            (ticker,)).fetchone()
+        if row:
+            entry_oids = list(pos.get("entry_order_ids") or [])
+            comm = _commission_for_orders(ib, *entry_oids, *close_oids)
+            con.execute("""
+                UPDATE trade_journal
+                SET closed_at=?, exit_price=?, pnl=?, pnl_pct=?, win=?, exit_reason=?,
+                    commission=commission+?
+                WHERE id=?
+            """, (date.today().isoformat(), round(close_cost, 2),
+                  pnl, pnl_pct, win, reason, round(comm, 4), row[0]))
         con.commit()
         con.close()
     except Exception as exc:
@@ -13228,7 +13762,9 @@ async def _evc_entry_coro(ib) -> None:
         for ticker in candidates:
             if len(ev["positions"]) >= cfg["max_positions"]:
                 break
-            if ticker in ev["positions"] or any(p["ticker"] == ticker for p in ev["positions"].values()):
+            if (ticker in ev["positions"]
+                    or any(p["ticker"] == ticker for p in ev["positions"].values())
+                    or any(r["ticker"] == ticker for r in ev.get("closed_today", []))):
                 continue
             try:
                 _evc_log("QUOTING", ticker, "requesting condor quote")
@@ -13240,11 +13776,103 @@ async def _evc_entry_coro(ib) -> None:
                 await _evc_place_condor(ib, quote)
             except ValueError as ve:
                 _evc_log("SKIPPED", ticker, str(ve))
+                _evc_save_state()
             except Exception as exc:
                 _evc_log("ERROR", ticker, str(exc))
                 log.warning("EVC entry error %s: %s", ticker, exc)
+                _evc_save_state()
     finally:
         ev["scanning"] = False
+
+
+def _evc_notify(text: str) -> None:
+    """Fire-and-forget Telegram push for EVC events."""
+    import threading
+    token, chat_id = _load_telegram_creds()
+    if token and chat_id:
+        threading.Thread(
+            target=_send_telegram_sync,
+            args=(token, chat_id, text),
+            daemon=True,
+        ).start()
+
+
+async def _evc_preflight_loop() -> None:
+    """
+    Daily EVC preflight:
+      - On startup (or anytime ≥9 AM if not done today): scan yfinance for tonight's
+        earnings candidates and send a Telegram summary.
+      - At 3:15 PM ET: reminder with candidates list + IBKR connection status.
+    Pre-running the scan caches candidates_today so the 15:30 entry coro skips
+    yfinance and goes straight to quoting — no missed windows from slow scans.
+    """
+    from zoneinfo import ZoneInfo as _ZI
+    ET = _ZI("America/New_York")
+    morning_alerted  = None
+    reminder_alerted = None
+    await asyncio.sleep(15)   # let IB connect before first scan
+
+    while True:
+        try:
+            now   = datetime.now(ET)
+            today = date.today()
+
+            if now.weekday() >= 5:          # skip weekends
+                await asyncio.sleep(300)
+                continue
+
+            ev = state["evc"]
+            if not ev["enabled"]:
+                await asyncio.sleep(60)
+                continue
+
+            # ── Morning scan: runs once per day, any time ≥ 9 AM ─────────────
+            if morning_alerted != today and now.hour >= 9:
+                try:
+                    # Force a fresh yfinance scan regardless of scan_date cache,
+                    # then restore scan_date so the 15:30 entry coro uses the results.
+                    ev["scan_date"] = None
+                    candidates = await _evc_scan_universe(None)   # yfinance only, no IB
+                except Exception as exc:
+                    log.warning("EVC morning scan error: %s", exc)
+                    candidates = []
+                morning_alerted = today
+                token, chat_id = _load_telegram_creds()
+                if token and chat_id:
+                    if candidates:
+                        names = ", ".join(candidates)
+                        _evc_log("PREFLIGHT", "morning", f"candidates: {names}")
+                        text = (f"📋 <b>EVC Morning Scan</b>\n"
+                                f"Tonight's earnings: <b>{names}</b>\n"
+                                f"Entry window: 15:30–15:50 ET")
+                    else:
+                        _evc_log("PREFLIGHT", "morning", "no earnings candidates today")
+                        text = "📋 <b>EVC Morning Scan</b>\nNo earnings candidates found for tonight."
+                    await asyncio.get_event_loop().run_in_executor(
+                        None, _send_telegram_sync, token, chat_id, text)
+
+            # ── 3:15 PM reminder: 15 min before entry window ─────────────────
+            if (reminder_alerted != today
+                    and now.hour == 15 and 15 <= now.minute < 30):
+                reminder_alerted = today
+                candidates = ev.get("candidates_today", [])
+                if candidates:
+                    ib    = state.get("ib")
+                    ib_ok = ib and ib.isConnected()
+                    names = ", ".join(candidates)
+                    _evc_log("PREFLIGHT", "reminder", f"entry in 15 min — {names}")
+                    text = (f"⏰ <b>EVC: Entry window in 15 min</b>\n"
+                            f"Candidates: <b>{names}</b>\n"
+                            f"IBKR: {'✅ connected' if ib_ok else '❌ NOT CONNECTED — fix before 15:30!'}")
+                    token, chat_id = _load_telegram_creds()
+                    if token and chat_id:
+                        await asyncio.get_event_loop().run_in_executor(
+                            None, _send_telegram_sync, token, chat_id, text)
+
+        except Exception as exc:
+            log.warning("EVC preflight loop error: %s", exc)
+
+        await asyncio.sleep(60)
 
 
 async def _evc_exit_coro(ib) -> None:
@@ -13307,22 +13935,40 @@ async def _evc_monitor_loop() -> None:
                         net_credit = pos["net_credit"]
                         ticker     = pos["ticker"]
                         expiry     = pos["expiry"]
-                        # Quote each leg and compute current condor value (cost to buy back)
+                        # Quote all 4 legs: short legs cost to buy back (+), long legs proceeds to sell (-)
                         conids = pos["conids"]
                         leg_map = [
-                            (pos["short_put"],  "P", conids["short_put"]),
-                            (pos["short_call"], "C", conids["short_call"]),
+                            (pos["short_put"],  "P", conids["short_put"],  +1),
+                            (pos["short_call"], "C", conids["short_call"], +1),
+                            (pos["long_put"],   "P", conids["long_put"],   -1),
+                            (pos["long_call"],  "C", conids["long_call"],  -1),
                         ]
                         current_cost = 0.0
-                        for strike, right, conid in leg_map:
+                        for strike, right, conid, sign in leg_map:
                             c = IbOpt(ticker, expiry, strike, right, "SMART", "100", "USD")
                             c.conId = conid
                             td = ib.reqMktData(c, "100,101,106", False, False)
                             await asyncio.sleep(2)
-                            current_cost += _spx_mid(td)
+                            mid = _spx_mid(td)
+                            current_cost += sign * mid
                             ib.cancelMktData(c)
                         live_pnl = round((net_credit - current_cost) * pos["qty"] * 100, 2)
                         pos["live_pnl"] = live_pnl
+                        max_loss = net_credit * pos["qty"] * 100 * cfg["max_loss_pct"] / 100
+                        # 5-minute grace: ignore stop immediately after fill (wide spreads)
+                        entry_ts = pos.get("entry_time")
+                        grace_ok = True
+                        if entry_ts:
+                            entry_dt  = _parse_utc(entry_ts)
+                            entry_age = (now - entry_dt).total_seconds()
+                            grace_ok  = entry_age > 300
+                        if live_pnl < -max_loss and grace_ok:
+                            _evc_log("STOP", ticker,
+                                     f"live_pnl=${live_pnl:.2f} < max_loss=${-max_loss:.2f}")
+                            await loop.run_in_executor(
+                                None,
+                                lambda pid=pos_id: _run_in_streaming_loop(
+                                    _evc_close_position(ib, pid, "max_loss_stop"), timeout=60))
                     except Exception as exc:
                         log.debug("EVC P&L update %s: %s", pos_id, exc)
                 _evc_save_state()
@@ -13606,19 +14252,218 @@ async def evc_close(pos_id: str):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# IBKR POSITION RECONCILIATION
+# Startup: runs once after IB connects, flags any divergence between
+#          strategy state and what IBKR actually holds.
+# Periodic: runs every 5 min during market hours (9:00–17:00 ET).
+# Alerts via Telegram on:
+#   • PHANTOM CLOSE  — state marked position closed, IBKR still holds the legs
+#   • UNTRACKED      — IBKR holds a position no strategy claims ownership of
+#   • GHOST OPEN     — state thinks position is open, IBKR holds nothing
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def _ibkr_reconcile(ib, *, on_startup: bool = False) -> None:
+    """Diff IBKR portfolio against all strategy states and alert on divergence."""
+    label = "STARTUP" if on_startup else "PERIODIC"
+    try:
+        portfolio = list(ib.portfolio())
+    except Exception as exc:
+        log.warning("RECON [%s]: portfolio() failed: %s", label, exc)
+        return
+
+    if not portfolio:
+        log.debug("RECON [%s]: empty portfolio response — skipping", label)
+        return
+
+    # ── 1. Build claimed conid / symbol sets from all open strategy positions ──
+    claimed_conids: dict[int, str] = {}   # conid (int) → "STRAT/key"
+
+    # EVC: 4 conids per open position
+    for pos_id, pos in state["evc"]["positions"].items():
+        for leg, cid in pos.get("conids", {}).items():
+            if cid:
+                claimed_conids[int(cid)] = f"EVC/{pos_id}/{leg}"
+
+    # SPX 0DTE: up to 4 conids per spread
+    for sid, sp in state["spx_0dte"]["spreads"].items():
+        for cid in (sp.get("put_conids") or []) + (sp.get("call_conids") or []):
+            if cid:
+                claimed_conids[int(cid)] = f"SPX/{sid}"
+
+    # Signal Trader: 1 conid per open position
+    for pid, pos in state["sig_trader"]["positions"].items():
+        if pos.get("conid") and pos.get("phase") != "closed":
+            claimed_conids[int(pos["conid"])] = f"SIGT/{pid}"
+
+    # Auto-trader: matched by contract key (symbol_right_strike_expiry), no conid stored
+    at_keys = set(state["autotrader"].get("positions", {}).keys())
+
+    # Day Trader + Auto-trader + Stock-trader stocks: matched by symbol
+    dt_symbols  = set(state["day_trader"]["positions"].keys())
+    at_symbols  = {k.split("_")[0] for k in at_keys}
+    st_symbols  = set(state.get("stock_trader", {}).get("positions", {}).keys())
+    claimed_stk = dt_symbols | at_symbols | st_symbols
+
+    # ── 2. Classify each IBKR position ──
+    # Tickers the EVC strategy recently closed (may be phantom closes)
+    evc_closed_tickers = {r["ticker"] for r in state["evc"].get("closed_today", [])}
+    ibkr_conid_set = set()
+
+    phantom_evc:    list = []
+    untracked_opt:  list = []
+    untracked_stk:  list = []
+
+    for item in portfolio:
+        c   = item.contract
+        qty = item.position
+        if qty == 0:
+            continue
+
+        cid = int(c.conId) if c.conId else None
+        if cid:
+            ibkr_conid_set.add(cid)
+
+        if c.secType == "OPT":
+            if cid and cid in claimed_conids:
+                continue                        # owned by a strategy
+            if _at_contract_key(c) in at_keys:
+                continue                        # owned by auto-trader
+
+            # Unclaimed option — phantom close or truly foreign?
+            if c.symbol in evc_closed_tickers:
+                phantom_evc.append(item)
+            else:
+                untracked_opt.append(item)
+
+        elif c.secType == "STK":
+            if c.symbol in claimed_stk:
+                continue
+            if _at_contract_key(c) in at_keys:
+                continue
+            untracked_stk.append(item)
+
+    # ── 3. Ghost opens: state says open, IBKR holds none of those conids ──
+    ghost_evc: list = []
+    for pos_id, pos in list(state["evc"]["positions"].items()):
+        pos_conids = {int(c) for c in pos.get("conids", {}).values() if c}
+        if pos_conids and not pos_conids & ibkr_conid_set:
+            ghost_evc.append((pos_id, pos))
+            pos["phase"] = "externally_closed"   # stop monitor from trying to exit
+    if ghost_evc:
+        _evc_save_state()
+
+    # ── 4. Nothing to report? ──
+    total_issues = len(phantom_evc) + len(untracked_opt) + len(untracked_stk) + len(ghost_evc)
+    if total_issues == 0:
+        log.info("RECON [%s]: all %d IBKR positions accounted for", label, len(portfolio))
+        return
+
+    # ── 5. Build Telegram alert ──
+    lines: list[str] = []
+
+    if phantom_evc:
+        lines.append(f"<b>PHANTOM CLOSE ({len(phantom_evc)} legs)</b>")
+        lines.append("State marked these closed; IBKR still holds them:")
+        for item in phantom_evc:
+            c = item.contract
+            lines.append(
+                f"  {c.symbol} {c.right}{int(c.strike)}"
+                f" exp={c.lastTradeDateOrContractMonth}"
+                f" pos={item.position:+.0f}"
+                f" upnl={item.unrealizedPNL:+.2f}"
+            )
+        lines.append("  Manual close required (TWS or /evc-close endpoint).")
+        lines.append("")
+
+    if untracked_opt:
+        lines.append(f"<b>UNTRACKED OPTIONS ({len(untracked_opt)})</b>")
+        lines.append("No strategy owns these option legs:")
+        for item in untracked_opt:
+            c = item.contract
+            lines.append(
+                f"  {c.symbol} {c.right}{int(c.strike)}"
+                f" exp={c.lastTradeDateOrContractMonth}"
+                f" pos={item.position:+.0f}"
+                f" upnl={item.unrealizedPNL:+.2f}"
+            )
+        lines.append("")
+
+    if untracked_stk:
+        lines.append(f"<b>UNTRACKED STOCKS ({len(untracked_stk)})</b>")
+        for item in untracked_stk:
+            c = item.contract
+            lines.append(
+                f"  {c.symbol}  pos={item.position:+.0f}"
+                f"  upnl={item.unrealizedPNL:+.2f}"
+            )
+        lines.append("")
+
+    if ghost_evc:
+        lines.append(f"<b>GHOST OPENS ({len(ghost_evc)} EVC)</b>")
+        lines.append("State showed open but IBKR holds nothing — marked externally_closed:")
+        for pos_id, pos in ghost_evc:
+            lines.append(
+                f"  {pos_id}  credit={pos.get('net_credit', '?')}"
+                f"  entry={pos.get('entry_time', '?')[:10]}"
+            )
+        lines.append("")
+
+    msg = f"<b>⚠️ IBKR RECON [{label}]</b>\n\n" + "\n".join(lines)
+    log.warning("RECON [%s]: %d issue(s) detected", label, total_issues)
+    _evc_notify(msg)
+
+
+async def _ibkr_startup_reconcile() -> None:
+    """Wait for IB to connect, then run a one-time startup reconcile."""
+    for _ in range(60):         # poll up to 5 minutes (5s intervals)
+        await asyncio.sleep(5)
+        ib = state.get("ib")
+        if ib and ib.isConnected():
+            await asyncio.sleep(3)  # let portfolio items populate
+            try:
+                await _ibkr_reconcile(ib, on_startup=True)
+            except Exception as exc:
+                log.warning("RECON startup: unhandled error: %s", exc)
+            return
+    log.warning("RECON startup: IB never connected within 5 min — skipped")
+
+
+async def _ibkr_reconcile_loop() -> None:
+    """Run IBKR reconciliation every 5 minutes during market hours."""
+    from zoneinfo import ZoneInfo
+    _ET = ZoneInfo("America/New_York")
+    while True:
+        await asyncio.sleep(300)
+        ib = state.get("ib")
+        if not ib or not ib.isConnected():
+            continue
+        now_et = datetime.now(_ET)
+        if now_et.weekday() >= 5:
+            continue                         # weekend
+        t = now_et.strftime("%H:%M")
+        if not ("09:00" <= t <= "17:00"):
+            continue
+        try:
+            await _ibkr_reconcile(ib, on_startup=False)
+        except Exception as exc:
+            log.warning("RECON periodic: unhandled error: %s", exc)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # SIGNAL TRADER — auto-executes ATM calls on scanner alerts in prime windows
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _st_log(action: str, ticker: str, detail: str) -> None:
-    entry = {"time": datetime.now(ET).strftime("%H:%M:%S"), "action": action,
-             "ticker": ticker, "detail": detail}
+def _sigt_log(action: str, ticker: str, detail: str) -> None:
+    from zoneinfo import ZoneInfo as _ZI
+    entry = {"time": datetime.now(_ZI("America/New_York")).strftime("%H:%M:%S"),
+             "action": action, "ticker": ticker, "detail": detail}
     st = state["sig_trader"]
     st["decisions"].append(entry)
     st["decisions"] = st["decisions"][-200:]
     log.info("SIG_TRADER [%s] %s — %s", action, ticker, detail)
 
 
-def _st_save_state() -> None:
+def _sigt_save_state() -> None:
     try:
         st = state["sig_trader"]
         with open(SIGT_STATE_PATH, "w") as f:
@@ -13628,16 +14473,16 @@ def _st_save_state() -> None:
         log.warning("SIG_TRADER save_state error: %s", e)
 
 
-def _st_load_state() -> None:
+def _sigt_load_state() -> None:
     if not os.path.exists(SIGT_STATE_PATH):
         return
     try:
+        from zoneinfo import ZoneInfo as _ZI
         with open(SIGT_STATE_PATH) as f:
             saved = json.load(f)
         st = state["sig_trader"]
         st["config"].update(saved.get("config", {}))
-        today = datetime.now(ET).strftime("%Y-%m-%d")
-        # Keep only today's open positions
+        today = datetime.now(_ZI("America/New_York")).strftime("%Y-%m-%d")
         for pos_id, pos in saved.get("positions", {}).items():
             if pos.get("phase") == "open" and pos.get("entry_time", "")[:10] == today:
                 st["positions"][pos_id] = pos
@@ -13647,7 +14492,7 @@ def _st_load_state() -> None:
         log.warning("SIG_TRADER load_state error: %s", e)
 
 
-def _st_in_prime_window(ticker: str, signal_type: str, et_now) -> bool:
+def _sigt_in_prime_window(ticker: str, signal_type: str, et_now) -> bool:
     setup = ST_SETUPS.get(ticker)
     if not setup:
         return False
@@ -13657,29 +14502,30 @@ def _st_in_prime_window(ticker: str, signal_type: str, et_now) -> bool:
     return setup["win_start"] <= t <= setup["win_end"]
 
 
-async def _st_enter_trade(ib, ticker: str, signal_type: str, spot_price: float) -> None:
+async def _sigt_enter_trade(ib, ticker: str, signal_type: str, spot_price: float) -> None:
     """Qualify ATM call, place limit order, record position on fill."""
+    from zoneinfo import ZoneInfo as _ZI
     st = state["sig_trader"]
     cfg = st["config"]
     setup = ST_SETUPS.get(ticker)
     if not setup:
         return
 
-    pos_id = f"{ticker}_{datetime.now(ET).strftime('%Y%m%d_%H%M%S')}"
+    pos_id = f"{ticker}_{datetime.now(_ZI('America/New_York')).strftime('%Y%m%d_%H%M%S')}"
 
     if len(st["positions"]) >= cfg["max_positions"]:
-        _st_log("SKIP", ticker, f"max_positions={cfg['max_positions']} reached")
+        _sigt_log("SKIP", ticker, f"max_positions={cfg['max_positions']} reached")
         return
     # Prevent duplicate entries for same ticker
     if any(p["ticker"] == ticker for p in st["positions"].values()):
-        _st_log("SKIP", ticker, "already have open position")
+        _sigt_log("SKIP", ticker, "already have open position")
         return
 
     try:
         # ── 1. Get real option chain ──────────────────────────────────────────
         expiry, real_strikes = await _evc_get_chain_params(ib, ticker)
         if not real_strikes:
-            _st_log("SKIP", ticker, "no option chain returned")
+            _sigt_log("SKIP", ticker, "no option chain returned")
             return
 
         atm_strike = min(real_strikes, key=lambda s: abs(s - spot_price))
@@ -13689,7 +14535,7 @@ async def _st_enter_trade(ib, ticker: str, signal_type: str, spot_price: float) 
         contract = IbOpt(ticker, expiry, atm_strike, "C", "SMART", "100", "USD")
         qualified = await ib.qualifyContractsAsync(contract)
         if not qualified:
-            _st_log("SKIP", ticker, f"could not qualify {atm_strike}C {expiry}")
+            _sigt_log("SKIP", ticker, f"could not qualify {atm_strike}C {expiry}")
             return
         contract = qualified[0]
 
@@ -13698,12 +14544,12 @@ async def _st_enter_trade(ib, ticker: str, signal_type: str, spot_price: float) 
         await asyncio.sleep(3)
         mid = _spx_mid(tickers[0]) if tickers else 0.0
         if mid <= 0:
-            _st_log("SKIP", ticker, f"no valid quote for {atm_strike}C")
+            _sigt_log("SKIP", ticker, f"no valid quote for {atm_strike}C")
             return
 
         cost = mid * 100
         if cost > cfg["budget_per_trade"]:
-            _st_log("SKIP", ticker, f"cost ${cost:.0f} > budget ${cfg['budget_per_trade']}")
+            _sigt_log("SKIP", ticker, f"cost ${cost:.0f} > budget ${cfg['budget_per_trade']}")
             return
 
         entry_price = round(mid + 0.05, 2)
@@ -13711,7 +14557,7 @@ async def _st_enter_trade(ib, ticker: str, signal_type: str, spot_price: float) 
         # ── 4. Place limit order ──────────────────────────────────────────────
         order = LimitOrder("BUY", 1, entry_price, tif="DAY")
         trade = ib.placeOrder(contract, order)
-        _st_log("ORDERING", ticker, f"{atm_strike}C {expiry} @ ${entry_price:.2f} (mid ${mid:.2f})")
+        _sigt_log("ORDERING", ticker, f"{atm_strike}C {expiry} @ ${entry_price:.2f} (mid ${mid:.2f})")
 
         # ── 5. Wait for fill (up to 30s) ──────────────────────────────────────
         for _ in range(30):
@@ -13720,11 +14566,11 @@ async def _st_enter_trade(ib, ticker: str, signal_type: str, spot_price: float) 
                 break
         if trade.orderStatus.status != "Filled":
             ib.cancelOrder(order)
-            _st_log("SKIP", ticker, f"no fill in 30s (status={trade.orderStatus.status})")
+            _sigt_log("SKIP", ticker, f"no fill in 30s (status={trade.orderStatus.status})")
             return
 
         fill_price = trade.orderStatus.avgFillPrice or entry_price
-        now_utc = datetime.utcnow()
+        now_utc = _utcnow()
         deadline = now_utc + timedelta(minutes=setup["hold_mins"])
         target_spot = round(spot_price * (1 + setup["target_pct"] / 100), 2)
         stop_spot   = round(spot_price * (1 - setup["stop_pct"]   / 100), 2)
@@ -13748,7 +14594,7 @@ async def _st_enter_trade(ib, ticker: str, signal_type: str, spot_price: float) 
             "live_pnl":           0.0,
         }
         st["positions"][pos_id] = pos
-        _st_log("ENTERED", ticker,
+        _sigt_log("ENTERED", ticker,
                 f"{atm_strike}C {expiry} fill=${fill_price:.2f} spot=${spot_price:.2f} "
                 f"tgt=${target_spot:.2f} stp=${stop_spot:.2f} dl={deadline.strftime('%H:%MZ')}")
 
@@ -13760,21 +14606,21 @@ async def _st_enter_trade(ib, ticker: str, signal_type: str, spot_price: float) 
                  status, notes)
                 VALUES (?,?,?,?,?,?,?,?)""",
                 (ticker, "signal_trader", "LONG_CALL", 1, fill_price,
-                 datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S"), "open",
+                 datetime.now(_ZI("America/New_York")).strftime("%Y-%m-%d %H:%M:%S"), "open",
                  f"strike={atm_strike} expiry={expiry} spot={spot_price:.2f}"))
             con.commit()
             con.close()
         except Exception as je:
             log.warning("SIG_TRADER journal insert error: %s", je)
 
-        _st_save_state()
+        _sigt_save_state()
 
     except Exception as e:
-        _st_log("ERROR", ticker, f"_st_enter_trade: {e}")
-        log.exception("SIG_TRADER _st_enter_trade error for %s", ticker)
+        _sigt_log("ERROR", ticker, f"_sigt_enter_trade: {e}")
+        log.exception("SIG_TRADER _sigt_enter_trade error for %s", ticker)
 
 
-async def _st_close_position(ib, pos_id: str, reason: str) -> None:
+async def _sigt_close_position(ib, pos_id: str, reason: str) -> None:
     """Close an open call position at market and record the result."""
     st = state["sig_trader"]
     pos = st["positions"].get(pos_id)
@@ -13824,12 +14670,12 @@ async def _st_close_position(ib, pos_id: str, reason: str) -> None:
         pos["exit_price"] = round(close_price, 2)
         pos["exit_reason"] = reason
         pos["pnl"] = pnl
-        pos["closed_at"] = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        pos["closed_at"] = _utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
 
         st["closed_today"].append(pos)
         del st["positions"][pos_id]
 
-        _st_log("CLOSED", ticker, f"{reason} close=${close_price:.2f} pnl=${pnl:+.2f}")
+        _sigt_log("CLOSED", ticker, f"{reason} close=${close_price:.2f} pnl=${pnl:+.2f}")
 
         # ── Update journal ──────────────────────────────────────────────────
         try:
@@ -13845,15 +14691,15 @@ async def _st_close_position(ib, pos_id: str, reason: str) -> None:
         except Exception as je:
             log.warning("SIG_TRADER journal update error: %s", je)
 
-        _st_save_state()
+        _sigt_save_state()
 
     except Exception as e:
         pos["phase"] = "open"  # revert so monitor can retry
-        _st_log("ERROR", ticker, f"_st_close_position {reason}: {e}")
-        log.exception("SIG_TRADER _st_close_position error %s %s", pos_id, reason)
+        _sigt_log("ERROR", ticker, f"_sigt_close_position {reason}: {e}")
+        log.exception("SIG_TRADER _sigt_close_position error %s %s", pos_id, reason)
 
 
-async def _st_monitor_coro(ib) -> None:
+async def _sigt_monitor_coro(ib) -> None:
     """Check open positions against target/stop/deadline; update live option P&L."""
     st = state["sig_trader"]
     if not st["positions"]:
@@ -13904,7 +14750,7 @@ async def _st_monitor_coro(ib) -> None:
             log.warning("SIG_TRADER option quote error: %s", e)
 
     # ── 3. Apply target / stop / deadline; update live P&L ───────────────────
-    now_utc = datetime.utcnow()
+    now_utc = _utcnow()
     for pos_id, pos in list(open_positions.items()):
         tk = pos["ticker"]
         spot = spot_map.get(tk)
@@ -13924,16 +14770,16 @@ async def _st_monitor_coro(ib) -> None:
         deadline = datetime.strptime(pos["deadline"], "%Y-%m-%dT%H:%M:%SZ")
 
         if spot >= pos["target_spot"]:
-            await _st_close_position(ib, pos_id, "target_hit")
+            await _sigt_close_position(ib, pos_id, "target_hit")
         elif spot <= pos["stop_spot"]:
-            await _st_close_position(ib, pos_id, "stop_hit")
+            await _sigt_close_position(ib, pos_id, "stop_hit")
         elif now_utc >= deadline:
-            await _st_close_position(ib, pos_id, "time_exit")
+            await _sigt_close_position(ib, pos_id, "time_exit")
 
-    _st_save_state()
+    _sigt_save_state()
 
 
-async def _st_monitor_loop() -> None:
+async def _sigt_monitor_loop() -> None:
     """30-second background loop: checks open Signal Trader positions."""
     while True:
         await asyncio.sleep(30)
@@ -13948,15 +14794,16 @@ async def _st_monitor_loop() -> None:
             if loop:
                 loop.run_in_executor(
                     None,
-                    lambda: _run_in_streaming_loop(_st_monitor_coro(ib), timeout=25)
+                    lambda: _run_in_streaming_loop(_sigt_monitor_coro(ib), timeout=25)
                 )
         except Exception as e:
-            log.warning("_st_monitor_loop error: %s", e)
+            log.warning("_sigt_monitor_loop error: %s", e)
 
 
-def _st_maybe_enter(ticker: str, signal_type: str, spot: float,
-                    prime_window: Optional[bool]) -> None:
+def _sigt_maybe_enter(ticker: str, signal_type: str, spot: float,
+                      prime_window: Optional[bool]) -> None:
     """Called from /watchlist/alert — fires trade entry if conditions are met."""
+    from zoneinfo import ZoneInfo as _ZI
     st = state["sig_trader"]
     if not st["enabled"]:
         return
@@ -13967,8 +14814,8 @@ def _st_maybe_enter(ticker: str, signal_type: str, spot: float,
 
     # Use scanner-provided prime_window flag if available, else compute locally
     if prime_window is None:
-        et_now = datetime.now(ET)
-        in_window = _st_in_prime_window(ticker, signal_type, et_now)
+        et_now = datetime.now(_ZI("America/New_York"))
+        in_window = _sigt_in_prime_window(ticker, signal_type, et_now)
     else:
         in_window = prime_window and (ST_SETUPS[ticker]["signal"] == signal_type)
 
@@ -13977,17 +14824,17 @@ def _st_maybe_enter(ticker: str, signal_type: str, spot: float,
 
     ib = state.get("ib")
     if not ib or not ib.isConnected():
-        _st_log("SKIP", ticker, "IB not connected")
+        _sigt_log("SKIP", ticker, "IB not connected")
         return
 
     loop = state.get("streaming_loop")
     if not loop:
         return
 
-    _st_log("TRIGGER", ticker, f"{signal_type} in prime window @ ${spot:.2f} — entering")
+    _sigt_log("TRIGGER", ticker, f"{signal_type} in prime window @ ${spot:.2f} — entering")
     loop.run_in_executor(
         None,
-        lambda: _run_in_streaming_loop(_st_enter_trade(ib, ticker, signal_type, spot), timeout=60)
+        lambda: _run_in_streaming_loop(_sigt_enter_trade(ib, ticker, signal_type, spot), timeout=60)
     )
 
 
@@ -14016,7 +14863,7 @@ def st_status():
 def st_enable(body: dict):
     enabled = bool(body.get("enabled", False))
     state["sig_trader"]["enabled"] = enabled
-    _st_save_state()
+    _sigt_save_state()
     return {"enabled": enabled}
 
 
@@ -14025,8 +14872,8 @@ def st_config(req: STConfigRequest):
     cfg = state["sig_trader"]["config"]
     updates = req.model_dump(exclude_none=True)
     cfg.update(updates)
-    _st_log("CONFIG", "system", f"updated: {updates}")
-    _st_save_state()
+    _sigt_log("CONFIG", "system", f"updated: {updates}")
+    _sigt_save_state()
     return {"config": cfg}
 
 
@@ -14038,11 +14885,11 @@ async def st_close(pos_id: str):
     ib = state.get("ib")
     if not ib or not ib.isConnected():
         raise HTTPException(503, "IBKR not connected")
-    _st_log("MANUAL_CLOSE", st["positions"][pos_id]["ticker"], f"manual close {pos_id}")
+    _sigt_log("MANUAL_CLOSE", st["positions"][pos_id]["ticker"], f"manual close {pos_id}")
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(
         None,
-        lambda: _run_in_streaming_loop(_st_close_position(ib, pos_id, "manual_close"), timeout=60)
+        lambda: _run_in_streaming_loop(_sigt_close_position(ib, pos_id, "manual_close"), timeout=60)
     )
     return {"status": "closing", "pos_id": pos_id}
 
@@ -14054,6 +14901,477 @@ def st_history(limit: int = 50):
         con.row_factory = sqlite3.Row
         rows = con.execute("""
             SELECT * FROM trade_journal WHERE strategy_type='signal_trader'
+            ORDER BY rowid DESC LIMIT ?""", (limit,)).fetchall()
+        con.close()
+        return {"trades": [dict(r) for r in rows]}
+    except Exception as e:
+        return {"trades": [], "error": str(e)}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FX TRADER — EMA(50) + 20-bar breakout on 4 major pairs, 08:00–12:00 ET
+# Strategy: 1H bars, ATR(14) stop (1.5×) + target (2×), OCA bracket orders
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _fx_log(action: str, pair: str, detail: str) -> None:
+    from zoneinfo import ZoneInfo as _ZI
+    entry = {"time": datetime.now(_ZI("America/New_York")).strftime("%H:%M:%S"),
+             "action": action, "pair": pair, "detail": detail}
+    fx = state["fx_trader"]
+    fx["decisions"].append(entry)
+    fx["decisions"] = fx["decisions"][-200:]
+    log.info("FX_TRADER [%s] %s — %s", action, pair, detail)
+
+
+def _fx_save_state() -> None:
+    try:
+        fx = state["fx_trader"]
+        with open(FX_STATE_PATH, "w") as f:
+            json.dump({"config": fx["config"], "positions": fx["positions"],
+                       "closed_today": fx["closed_today"]}, f, indent=2, default=str)
+    except Exception as e:
+        log.warning("FX_TRADER save_state error: %s", e)
+
+
+def _fx_load_state() -> None:
+    if not os.path.exists(FX_STATE_PATH):
+        return
+    try:
+        from zoneinfo import ZoneInfo as _ZI
+        with open(FX_STATE_PATH) as f:
+            saved = json.load(f)
+        fx = state["fx_trader"]
+        fx["config"].update(saved.get("config", {}))
+        today = datetime.now(_ZI("America/New_York")).strftime("%Y-%m-%d")
+        for pair, pos in saved.get("positions", {}).items():
+            if pos.get("phase") == "open" and pos.get("entry_time", "")[:10] == today:
+                fx["positions"][pair] = pos
+        fx["closed_today"] = [p for p in saved.get("closed_today", [])
+                              if p.get("entry_time", "")[:10] == today]
+    except Exception as e:
+        log.warning("FX_TRADER load_state error: %s", e)
+
+
+def _fx_size_qty(pair: str, stop_pips: float, risk_usd: float, spot: float) -> int:
+    """Return position size in units. Clamps micro (1k) – standard (100k) lot."""
+    pcfg    = FX_PAIRS[pair]
+    pip     = pcfg["pip"]
+    pip_usd = pip if pcfg["quote"] == "USD" else pip / max(spot, 1e-9)
+    if stop_pips <= 0 or pip_usd <= 0:
+        return 1_000
+    qty = int(risk_usd / (stop_pips * pip_usd))
+    return max(1_000, min(qty, 100_000))
+
+
+def _fx_compute_signal(bars, pip_size: float):
+    """
+    EMA(50) trend + 20-bar high/low breakout on 1H bars.
+    Returns (direction, stop_pips, atr14) where direction is 'LONG', 'SHORT', or None.
+    """
+    if len(bars) < 55:
+        return None, 0, 0.0
+    closes = [b.close for b in bars]
+    highs  = [b.high  for b in bars]
+    lows   = [b.low   for b in bars]
+    # EMA(50) over all bars
+    ema50 = closes[0]
+    k = 2.0 / 51.0
+    for c in closes[1:]:
+        ema50 = c * k + ema50 * (1.0 - k)
+    # 20-bar high/low lookback (exclude last bar — it is the signal bar)
+    window_h = highs[-21:-1]
+    window_l = lows[-21:-1]
+    high20 = max(window_h) if window_h else 0.0
+    low20  = min(window_l) if window_l else 1e9
+    # ATR(14) — use last 14 true-range values
+    trs = [max(bars[i].high - bars[i].low,
+               abs(bars[i].high - bars[i - 1].close),
+               abs(bars[i].low  - bars[i - 1].close)) for i in range(1, len(bars))]
+    atr14     = sum(trs[-14:]) / 14 if len(trs) >= 14 else 0.0
+    stop_pips = round(atr14 * 1.5 / pip_size, 1)
+    last_c    = closes[-1]
+    if last_c > high20 and last_c > ema50 and atr14 > 0:
+        return "LONG",  stop_pips, atr14
+    if last_c < low20  and last_c < ema50 and atr14 > 0:
+        return "SHORT", stop_pips, atr14
+    return None, 0, 0.0
+
+
+async def _fx_enter_trade(ib, pair: str) -> None:
+    """Fetch signal, check spread, size position, place market entry + OCA bracket."""
+    from zoneinfo import ZoneInfo as _ZI
+    from ib_insync import Forex as IbForex, MarketOrder, LimitOrder, StopOrder
+    fx   = state["fx_trader"]
+    cfg  = fx["config"]
+    pcfg = FX_PAIRS[pair]
+    if pair in fx["positions"]:
+        _fx_log("SKIP", pair, "position already open")
+        return
+    if len(fx["positions"]) >= cfg["max_positions"]:
+        _fx_log("SKIP", pair, f"max {cfg['max_positions']} positions reached")
+        return
+    try:
+        # ── 1. Qualify contract + fetch 1H bars ────────────────────────────────
+        contract = IbForex(pair)
+        qualified = await ib.qualifyContractsAsync(contract)
+        if not qualified:
+            _fx_log("SKIP", pair, "qualify failed")
+            return
+        contract = qualified[0]
+        bars = await ib.reqHistoricalDataAsync(
+            contract, endDateTime="", durationStr="10 D",
+            barSizeSetting="1 hour", whatToShow="MIDPOINT",
+            useRTH=False, formatDate=1,
+        )
+        if not bars or len(bars) < 55:
+            _fx_log("SKIP", pair, f"insufficient bars ({len(bars) if bars else 0})")
+            return
+        # ── 2. Compute EMA breakout signal ────────────────────────────────────
+        direction, stop_pips, atr14 = _fx_compute_signal(bars, pcfg["pip"])
+        if not direction:
+            return  # no signal — silent
+        # ── 3. Spread check ───────────────────────────────────────────────────
+        tickers = await ib.reqTickersAsync(contract)
+        await asyncio.sleep(2)
+        td = tickers[0] if tickers else None
+        if not td or not td.bid or not td.ask or td.bid <= 0 or td.ask <= 0:
+            _fx_log("SKIP", pair, "no live quote")
+            return
+        spread_pips = round((td.ask - td.bid) / pcfg["pip"], 1)
+        if spread_pips > cfg["max_spread_pips"]:
+            _fx_log("SKIP", pair, f"spread={spread_pips}p > max={cfg['max_spread_pips']}p")
+            return
+        mid = (td.bid + td.ask) / 2.0
+        # ── 4. Position size ──────────────────────────────────────────────────
+        qty = _fx_size_qty(pair, stop_pips, cfg["risk_usd"], mid)
+        # ── 5. Market entry ───────────────────────────────────────────────────
+        action      = "BUY"  if direction == "LONG"  else "SELL"
+        entry_trade = ib.placeOrder(contract, MarketOrder(action, qty))
+        _fx_log("ORDERING", pair,
+                f"{direction} {qty}u MKT  stop_pips={stop_pips:.1f}  spread={spread_pips}p")
+        for _ in range(15):
+            await asyncio.sleep(1)
+            if entry_trade.orderStatus.status == "Filled":
+                break
+        if entry_trade.orderStatus.status != "Filled":
+            ib.cancelOrder(entry_trade.order)
+            _fx_log("SKIP", pair, f"fill timeout ({entry_trade.orderStatus.status})")
+            return
+        fill_px = entry_trade.orderStatus.avgFillPrice or mid
+        # ── 6. OCA stop + target bracket ─────────────────────────────────────
+        exit_act = "SELL" if direction == "LONG" else "BUY"
+        if direction == "LONG":
+            stop_px   = round(fill_px - atr14 * 1.5, 5)
+            target_px = round(fill_px + atr14 * 2.0, 5)
+        else:
+            stop_px   = round(fill_px + atr14 * 1.5, 5)
+            target_px = round(fill_px - atr14 * 2.0, 5)
+        oca = f"FX_{pair}_{datetime.now(_ZI('America/New_York')).strftime('%Y%m%d_%H%M%S')}"
+        sl_trade = ib.placeOrder(contract,
+                                 StopOrder(exit_act,  qty, stop_px,
+                                           tif="GTC", ocaGroup=oca, ocaType=1))
+        tp_trade = ib.placeOrder(contract,
+                                 LimitOrder(exit_act, qty, target_px,
+                                            tif="GTC", ocaGroup=oca, ocaType=1))
+        now_utc      = _utcnow()
+        target_pips  = round(atr14 * 2.0 / pcfg["pip"], 1)
+        fx["positions"][pair] = {
+            "pair":          pair,
+            "direction":     direction,
+            "entry_time":    now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "entry_price":   round(fill_px,   5),
+            "stop_price":    round(stop_px,   5),
+            "target_price":  round(target_px, 5),
+            "stop_pips":     stop_pips,
+            "target_pips":   target_pips,
+            "qty":           qty,
+            "phase":         "open",
+            "oca_group":     oca,
+            "sl_order_id":   sl_trade.order.orderId,
+            "tp_order_id":   tp_trade.order.orderId,
+            "conid":         contract.conId,
+            "live_pnl":      0.0,
+            "live_price":    round(fill_px, 5),
+        }
+        _fx_log("ENTERED", pair,
+                f"{direction} {qty}u fill={fill_px:.5f}  sl={stop_px:.5f}  tp={target_px:.5f}  "
+                f"R:R={target_pips/max(stop_pips,0.1):.1f}  risk=${cfg['risk_usd']:.0f}")
+        try:
+            con = sqlite3.connect(JOURNAL_DB_PATH)
+            con.execute("""INSERT INTO trade_journal
+                (ticker, strategy_type, direction, qty, entry_price, entry_date, status, notes)
+                VALUES (?,?,?,?,?,?,?,?)""",
+                (pair, "fx_trader", direction, qty, fill_px,
+                 datetime.now(_ZI("America/New_York")).strftime("%Y-%m-%d %H:%M:%S"), "open",
+                 f"sl={stop_px:.5f} tp={target_px:.5f} spread={spread_pips}p atr={atr14:.5f}"))
+            con.commit(); con.close()
+        except Exception as je:
+            log.warning("FX_TRADER journal insert: %s", je)
+        _fx_save_state()
+    except Exception as e:
+        _fx_log("ERROR", pair, f"_fx_enter_trade: {e}")
+        log.exception("FX_TRADER enter %s", pair)
+
+
+async def _fx_close_position(ib, pair: str, reason: str) -> None:
+    """Cancel OCA bracket orders, place market close, record result in state + journal."""
+    from ib_insync import MarketOrder, Forex as IbForex
+    fx  = state["fx_trader"]
+    pos = fx["positions"].get(pair)
+    if not pos or pos.get("phase") != "open":
+        return
+    pos["phase"] = "closing"
+    try:
+        # Cancel open bracket orders
+        sl_id = pos.get("sl_order_id")
+        tp_id = pos.get("tp_order_id")
+        for ot in ib.openTrades():
+            if ot.order.orderId in (sl_id, tp_id):
+                try:
+                    ib.cancelOrder(ot.order)
+                except Exception:
+                    pass
+        await asyncio.sleep(1)
+        # Qualify and close at market
+        contract = IbForex(pair)
+        contract.conId = pos.get("conid", 0)
+        qualified = await ib.qualifyContractsAsync(contract)
+        if qualified:
+            contract = qualified[0]
+        close_act   = "SELL" if pos["direction"] == "LONG" else "BUY"
+        close_trade = ib.placeOrder(contract, MarketOrder(close_act, pos["qty"]))
+        for _ in range(15):
+            await asyncio.sleep(1)
+            if close_trade.orderStatus.status == "Filled":
+                break
+        close_px = (close_trade.orderStatus.avgFillPrice
+                    or pos.get("live_price") or pos["entry_price"])
+        pcfg      = FX_PAIRS[pair]
+        pips_pnl  = round(((close_px - pos["entry_price"]) if pos["direction"] == "LONG"
+                           else (pos["entry_price"] - close_px)) / pcfg["pip"], 1)
+        pnl_usd   = (round(pips_pnl * pcfg["pip"] * pos["qty"], 2)
+                     if pcfg["quote"] == "USD"
+                     else round(pips_pnl * pcfg["pip"] / max(close_px, 1e-9) * pos["qty"], 2))
+        pos.update({"phase": "closed", "exit_price": round(close_px, 5), "exit_reason": reason,
+                    "pips_pnl": pips_pnl, "pnl_usd": pnl_usd,
+                    "closed_at": _utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")})
+        fx["closed_today"].append(pos)
+        del fx["positions"][pair]
+        _fx_log("CLOSED", pair,
+                f"{reason} @ {close_px:.5f}  pips={pips_pnl:+.1f}  pnl=${pnl_usd:+.2f}")
+        try:
+            con = sqlite3.connect(JOURNAL_DB_PATH)
+            con.execute("""UPDATE trade_journal SET exit_price=?, pnl=?, status=?, notes=notes||?
+                WHERE ticker=? AND strategy_type='fx_trader' AND status='open'
+                ORDER BY rowid DESC LIMIT 1""",
+                (close_px, pnl_usd, "closed",
+                 f" | exit={reason} pips={pips_pnl:+.1f} pnl=${pnl_usd:+.2f}", pair))
+            con.commit(); con.close()
+        except Exception as je:
+            log.warning("FX_TRADER journal close: %s", je)
+        _fx_save_state()
+    except Exception as e:
+        pos["phase"] = "open"  # revert so monitor can retry
+        _fx_log("ERROR", pair, f"_fx_close_position {reason}: {e}")
+        log.exception("FX_TRADER close %s %s", pair, reason)
+
+
+async def _fx_monitor_coro(ib) -> None:
+    """
+    Runs every 60s: (1) reconcile OCA bracket fills, (2) update live P&L,
+    (3) EOD force-close, (4) scan for new signals if in entry window.
+    """
+    from zoneinfo import ZoneInfo as _ZI
+    from ib_insync import Forex as IbForex
+    fx  = state["fx_trader"]
+    cfg = fx["config"]
+    et_now     = datetime.now(_ZI("America/New_York"))
+    is_weekday = et_now.weekday() < 5
+    t_str      = et_now.strftime("%H:%M")
+
+    # ── 1. Reconcile OCA bracket fills ────────────────────────────────────────
+    if fx["positions"] and is_weekday:
+        try:
+            # ib.portfolio() is synchronous and returns cached positions
+            ibkr_pairs = set()
+            for p in ib.portfolio():
+                sym  = getattr(p.contract, "symbol",   "")
+                cur  = getattr(p.contract, "currency", "")
+                name = sym + cur
+                if name in FX_PAIRS and abs(p.position) > 0:
+                    ibkr_pairs.add(name)
+        except Exception:
+            ibkr_pairs = set(fx["positions"].keys())  # conservative: assume all still open
+
+        for pair in list(fx["positions"].keys()):
+            pos = fx["positions"].get(pair)
+            if not pos or pos.get("phase") != "open":
+                continue
+            if pair in ibkr_pairs:
+                continue  # still open on IBKR — nothing to reconcile
+            # Position gone from IBKR → OCA bracket must have hit TP or SL
+            lp   = pos.get("live_price", pos["entry_price"])
+            pcfg = FX_PAIRS[pair]
+            pips = round(((lp - pos["entry_price"]) if pos["direction"] == "LONG"
+                          else (pos["entry_price"] - lp)) / pcfg["pip"], 1)
+            pnl  = (round(pips * pcfg["pip"] * pos["qty"], 2)
+                    if pcfg["quote"] == "USD"
+                    else round(pips * pcfg["pip"] / max(lp, 1e-9) * pos["qty"], 2))
+            tp = pos.get("target_price")
+            sl = pos.get("stop_price")
+            if pos["direction"] == "LONG":
+                reason = "tp_hit" if (tp and lp >= tp) else "sl_hit"
+            else:
+                reason = "tp_hit" if (tp and lp <= tp) else "sl_hit"
+            pos.update({"phase": "closed", "exit_price": round(lp, 5), "exit_reason": reason,
+                        "pips_pnl": pips, "pnl_usd": pnl,
+                        "closed_at": _utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")})
+            fx["closed_today"].append(pos)
+            del fx["positions"][pair]
+            _fx_log("CLOSED", pair, f"{reason} via OCA  pips={pips:+.1f}  pnl=${pnl:+.2f}")
+            try:
+                con = sqlite3.connect(JOURNAL_DB_PATH)
+                con.execute("""UPDATE trade_journal SET exit_price=?, pnl=?, status=?, notes=notes||?
+                    WHERE ticker=? AND strategy_type='fx_trader' AND status='open'
+                    ORDER BY rowid DESC LIMIT 1""",
+                    (lp, pnl, "closed",
+                     f" | exit={reason} pips={pips:+.1f} pnl=${pnl:+.2f}", pair))
+                con.commit(); con.close()
+            except Exception as je:
+                log.warning("FX_TRADER reconcile journal: %s", je)
+            _fx_save_state()
+
+    # ── 2. Update live P&L + EOD force-close ──────────────────────────────────
+    for pair in list(fx["positions"].keys()):
+        pos = fx["positions"].get(pair)
+        if not pos or pos.get("phase") != "open":
+            continue
+        try:
+            contract = IbForex(pair)
+            tickers  = await ib.reqTickersAsync(contract)
+            await asyncio.sleep(1)
+            td = tickers[0] if tickers else None
+            if td and td.bid and td.ask and td.bid > 0 and td.ask > 0:
+                mid             = (td.bid + td.ask) / 2.0
+                pos["live_price"] = round(mid, 5)
+                pcfg              = FX_PAIRS[pair]
+                pips              = round(((mid - pos["entry_price"]) if pos["direction"] == "LONG"
+                                          else (pos["entry_price"] - mid)) / pcfg["pip"], 1)
+                pos["live_pnl"]   = (round(pips * pcfg["pip"] * pos["qty"], 2)
+                                     if pcfg["quote"] == "USD"
+                                     else round(pips * pcfg["pip"] / max(mid, 1e-9) * pos["qty"], 2))
+        except Exception:
+            pass
+        # EOD force-close — FX session ends 17:00 ET weekdays
+        if is_weekday and t_str >= cfg["force_close_time"]:
+            await _fx_close_position(ib, pair, "eod_force_close")
+
+    # ── 3. Entry scan (once per 5 min, only inside entry window) ──────────────
+    in_window = is_weekday and cfg["entry_start"] <= t_str <= cfg["entry_end"]
+    if in_window:
+        last_scan = fx.get("last_scan")
+        now_ts    = _utcnow().timestamp()
+        if last_scan is None or (now_ts - last_scan) >= 300:
+            fx["last_scan"] = now_ts
+            for pair in FX_PAIRS:
+                if pair in fx["positions"]:
+                    continue
+                try:
+                    await _fx_enter_trade(ib, pair)
+                    await asyncio.sleep(1)
+                except Exception as e:
+                    _fx_log("ERROR", pair, f"scan: {e}")
+
+    _fx_save_state()
+
+
+async def _fx_monitor_loop() -> None:
+    """60-second background task for FX Trader (runs 24/5 when enabled)."""
+    while True:
+        await asyncio.sleep(60)
+        try:
+            fx = state["fx_trader"]
+            if not fx["enabled"]:
+                continue
+            ib = state.get("ib")
+            if not ib or not ib.isConnected():
+                continue
+            loop = state.get("streaming_loop")
+            if loop:
+                loop.run_in_executor(
+                    None,
+                    lambda: _run_in_streaming_loop(_fx_monitor_coro(ib), timeout=55)
+                )
+        except Exception as e:
+            log.warning("_fx_monitor_loop error: %s", e)
+
+
+# ── FX Trader API endpoints ────────────────────────────────────────────────
+
+class FXConfigRequest(BaseModel):
+    risk_usd:         Optional[float] = None
+    max_spread_pips:  Optional[float] = None
+    max_positions:    Optional[int]   = None
+    entry_start:      Optional[str]   = None
+    entry_end:        Optional[str]   = None
+    force_close_time: Optional[str]   = None
+
+
+@app.get("/fx-trader/status")
+def fx_status():
+    fx = state["fx_trader"]
+    return {
+        "enabled":      fx["enabled"],
+        "config":       fx["config"],
+        "pairs":        FX_PAIRS,
+        "positions":    fx["positions"],
+        "closed_today": fx["closed_today"],
+        "decisions":    fx["decisions"][-50:],
+    }
+
+
+@app.post("/fx-trader/enable")
+def fx_enable(body: dict):
+    enabled = bool(body.get("enabled", False))
+    state["fx_trader"]["enabled"] = enabled
+    _fx_save_state()
+    return {"enabled": enabled}
+
+
+@app.post("/fx-trader/config")
+def fx_config_update(req: FXConfigRequest):
+    cfg     = state["fx_trader"]["config"]
+    updates = req.model_dump(exclude_none=True)
+    cfg.update(updates)
+    _fx_log("CONFIG", "system", f"updated: {updates}")
+    _fx_save_state()
+    return {"config": cfg}
+
+
+@app.post("/fx-trader/close/{pair}")
+async def fx_close(pair: str):
+    fx = state["fx_trader"]
+    if pair not in fx["positions"]:
+        raise HTTPException(404, f"{pair} not in open positions")
+    ib = state.get("ib")
+    if not ib or not ib.isConnected():
+        raise HTTPException(503, "IBKR not connected")
+    _fx_log("MANUAL_CLOSE", pair, "manual close requested")
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(
+        None,
+        lambda: _run_in_streaming_loop(_fx_close_position(ib, pair, "manual_close"), timeout=60)
+    )
+    return {"status": "closing", "pair": pair}
+
+
+@app.get("/fx-trader/history")
+def fx_history(limit: int = 50):
+    try:
+        con = sqlite3.connect(JOURNAL_DB_PATH)
+        con.row_factory = sqlite3.Row
+        rows = con.execute("""
+            SELECT * FROM trade_journal WHERE strategy_type='fx_trader'
             ORDER BY rowid DESC LIMIT ?""", (limit,)).fetchall()
         con.close()
         return {"trades": [dict(r) for r in rows]}

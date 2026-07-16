@@ -27,7 +27,7 @@ import logging.handlers
 import os
 import sqlite3
 import time
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -88,6 +88,14 @@ CURATED_TICKERS: list[str] = sorted(set([
     # Miscellaneous with active options
     "RBLX", "RCL", "ABNB",
 ]))
+
+# Sector ETF benchmarks for F2 relative-strength gate.
+# Stocks in this map are compared against their sector ETF (not SPY) so that
+# a breakout within a lagging sector still generates an alert.
+SECTOR_BENCHMARK: dict[str, str] = {
+    "XOM": "XLE", "CVX": "XLE", "OXY": "XLE",
+    "COP": "XLE", "SLB": "XLE", "MPC": "XLE", "VLO": "XLE",
+}
 
 
 # ── Config management ─────────────────────────────────────────────────────────
@@ -1109,6 +1117,15 @@ def apply_quality_filters(candidates: list[dict], regime: dict, cfg: dict) -> li
     kept      = []
     n_f2 = n_f5 = n_f6 = n_f7 = n_f8 = 0
 
+    # Pre-compute 20d return for each sector benchmark ETF from the hist cache
+    sector_etf_ret20: dict[str, float] = {}
+    for etf in set(SECTOR_BENCHMARK.values()):
+        etf_hist = _hist_cache.get(etf)
+        if etf_hist is not None:
+            closes = etf_hist["Close"].dropna()
+            if len(closes) >= 21:
+                sector_etf_ret20[etf] = (float(closes.iloc[-1]) / float(closes.iloc[-21]) - 1) * 100
+
     # F7 setup: intraday RS vs SPY — only applied after 10:00 ET (opening 30 min is too noisy
     # for a same-day relative-strength read; gaps haven't settled into a real trend yet)
     spy_today_ret: float | None = None
@@ -1127,11 +1144,14 @@ def apply_quality_filters(candidates: list[dict], regime: dict, cfg: dict) -> li
     for ind in candidates:
         tk = ind["ticker"]
 
-        # F2: relative strength vs SPY — stock 20d return must beat SPY 20d return
+        # F2: relative strength — compare vs sector ETF if mapped, else vs SPY
         ret_20d = ind.get("ret_20d")
-        if spy_ret20 is not None and ret_20d is not None and ret_20d < spy_ret20:
-            log.info("F2 relative-strength gate dropped %s: %.1f%% < SPY %.1f%%",
-                     tk, ret_20d, spy_ret20)
+        sector_etf   = SECTOR_BENCHMARK.get(tk)
+        benchmark_ret = sector_etf_ret20.get(sector_etf) if sector_etf else spy_ret20
+        benchmark_lbl = sector_etf if sector_etf else "SPY"
+        if benchmark_ret is not None and ret_20d is not None and ret_20d < benchmark_ret:
+            log.info("F2 relative-strength gate dropped %s: %.1f%% < %s %.1f%%",
+                     tk, ret_20d, benchmark_lbl, benchmark_ret)
             n_f2 += 1
             continue
 
@@ -2078,7 +2098,7 @@ def _main_loop():
 
         # ── #6: Heartbeat — written after every scan so a monitor can detect hangs ──
         try:
-            _hb = {"ts": datetime.utcnow().isoformat(), "tickers": len(tickers)}
+            _hb = {"ts": datetime.now(timezone.utc).isoformat(), "tickers": len(tickers)}
             with open(os.path.join(SCRIPT_DIR, "scanner_heartbeat.json"), "w", encoding="utf-8") as _hf:
                 json.dump(_hb, _hf)
         except Exception as _hb_exc:
