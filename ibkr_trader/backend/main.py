@@ -1272,6 +1272,7 @@ async def streaming_loop_async() -> None:
                     # Prevents paper-session state from bleeding into live orders.
                     _disabled = []
                     for _tkey, _save_fn in [
+                        ("autotrader",          _at_save_state),
                         ("day_trader",          _dt_save_state),
                         ("stock_trader",        _st_save_state),
                         ("spx_0dte",            _spx_save_state),
