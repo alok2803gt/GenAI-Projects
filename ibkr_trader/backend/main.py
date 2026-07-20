@@ -1266,6 +1266,30 @@ async def streaming_loop_async() -> None:
                     _at_log("SYSTEM", f"[LIVE MODE] {account_id} on port {port} — paper workarounds disabled")
                     # Apply conservative live defaults only if values are still at paper defaults
                     _spx_apply_live_defaults()
+                    # ── Live-account safety gate ──────────────────────────────
+                    # On every paper→live transition, force-disable all traders
+                    # except FX Trader (the only one cleared for live trading).
+                    # Prevents paper-session state from bleeding into live orders.
+                    _disabled = []
+                    for _tkey, _save_fn in [
+                        ("day_trader",          _dt_save_state),
+                        ("stock_trader",        _st_save_state),
+                        ("spx_0dte",            _spx_save_state),
+                        ("earnings_vol_crush",  _evc_save_state),
+                        ("sig_trader",          _sigt_save_state),
+                    ]:
+                        if state.get(_tkey, {}).get("enabled"):
+                            state[_tkey]["enabled"] = False
+                            _save_fn()
+                            _disabled.append(_tkey)
+                    if _disabled:
+                        log.warning(
+                            "LIVE SAFETY GATE: disabled %d trader(s) that were enabled in paper session: %s",
+                            len(_disabled), ", ".join(_disabled),
+                        )
+                        _at_log("SYSTEM",
+                            f"[LIVE SAFETY GATE] Auto-disabled on live connect: {', '.join(_disabled)}"
+                        )
 
             # Cancel any Inactive orders left over from previous sessions.
             # Use reqGlobalCancel (cancels ALL orders for this account regardless of session/clientId).
@@ -15180,7 +15204,8 @@ def _fx_save_state() -> None:
     try:
         fx = state["fx_trader"]
         with open(FX_STATE_PATH, "w") as f:
-            json.dump({"config": fx["config"], "positions": fx["positions"],
+            json.dump({"enabled": fx["enabled"], "config": fx["config"],
+                       "positions": fx["positions"],
                        "closed_today": fx["closed_today"]}, f, indent=2, default=str)
     except Exception as e:
         log.warning("FX_TRADER save_state error: %s", e)
@@ -15194,6 +15219,8 @@ def _fx_load_state() -> None:
         with open(FX_STATE_PATH) as f:
             saved = json.load(f)
         fx = state["fx_trader"]
+        if saved.get("enabled") is not None:
+            fx["enabled"] = bool(saved["enabled"])
         fx["config"].update(saved.get("config", {}))
         today = datetime.now(_ZI("America/New_York")).strftime("%Y-%m-%d")
         for pair, pos in saved.get("positions", {}).items():
@@ -15206,26 +15233,25 @@ def _fx_load_state() -> None:
 
 
 def _fx_pushover(title: str, message: str) -> None:
-    """Fire-and-forget Pushover push notification for FX Trader trade events."""
+    """Fire-and-forget Telegram notification for FX Trader trade events."""
     import threading
     def _send():
         try:
             cfg_path = os.path.join(os.path.dirname(__file__), "scanner_config.json")
             with open(cfg_path) as f:
                 cfg = json.load(f)
-            token = cfg.get("pushover_token", "")
-            user  = cfg.get("pushover_user",  "")
-            if not token or not user:
+            token   = cfg.get("telegram_token",   "")
+            chat_id = cfg.get("telegram_chat_id", "")
+            if not token or not chat_id:
                 return
+            text = f"<b>{title}</b>\n{message}"
             requests.post(
-                "https://api.pushover.net/1/messages.json",
-                data={"token": token, "user": user,
-                      "title": title, "message": message,
-                      "priority": 0},
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                data={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
                 timeout=10,
             )
         except Exception as exc:
-            log.warning("FX Pushover error: %s", exc)
+            log.warning("FX Telegram error: %s", exc)
     threading.Thread(target=_send, daemon=True).start()
 
 
