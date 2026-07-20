@@ -27,6 +27,16 @@ ibkr_trader/backend/scanner_heartbeat.json
 ibkr_trader/backend/main_last_good.py
 ibkr_trader/backend/ticker_states_*.json
 ibkr_trader/backend/backtest_results/
+ibkr_trader/backend/day_trader_state.json
+ibkr_trader/backend/earnings_vol_crush_state.json
+ibkr_trader/backend/fx_trader_state.json
+ibkr_trader/backend/sig_trader_state.json
+ibkr_trader/backend/spx_0dte_state.json
+ibkr_trader/backend/spx_0dte_live_state.json
+ibkr_trader/backend/backend_launchd.log
+ibkr_trader/backend/scanner_launchd.log
+ibkr_trader/backend/market_close_restart.log
+ibkr_trader/frontend/frontend_launchd.log
 # Root-level strays (created outside backend dir by accident)
 scanner.log
 scanner_out.log
