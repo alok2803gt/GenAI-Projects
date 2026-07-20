@@ -62,7 +62,7 @@ log = logging.getLogger("ibkr_trader")
 
 # ── Config — bar streaming ──────────────────────────────────────────────────
 TWS_HOST = "127.0.0.1"
-TWS_PORT = int(os.environ.get("IBKR_PORT", "7497"))  # env var wins; 7497=TWS paper|7496=TWS live|4001=GW live|4002=GW paper
+TWS_PORT = int(os.environ.get("IBKR_PORT", "7496"))  # env var wins; 7497=TWS paper|7496=TWS live|4001=GW live|4002=GW paper
 TWS_CLIENT_ID = 10
 MODEL_PATH = "model.joblib"
 BAR_SIZE = "5 mins"
@@ -487,6 +487,10 @@ state: Dict = {
             "min_credit_per_spread":    0.20,
             "trend_filter_pts":        15.0,  # if SPX moved > this from session open → go one-sided
             "skip_dates":              [],    # ["YYYY-MM-DD"] — FOMC, CPI, NFP days to skip entirely
+            # ── GLFT-inspired entry repricing (see _spx_reprice_schedule) ─────
+            "reprice_steps":             4,   # price points between mid and the concession floor
+            "reprice_wait_s":            15,  # seconds to wait for a fill at each step
+            "max_reprice_concession":  0.35,  # hard ceiling on how much of the credit we'll give up
             # ── Legacy (kept for display / backward compat) ───────────────────
             "daily_profit_target":    200.0,
             "profit_pct":              50.0,
@@ -511,6 +515,11 @@ state: Dict = {
             "exit_start":     "09:31",
             "exit_cutoff":    "09:35",
             "max_loss_pct":   50,     # close if loss > X% of credit received
+            # GLFT-inspired entry repricing (see _evc_reprice_schedule) —
+            # walk the limit price from mid toward the market instead of one static attempt.
+            "reprice_steps":          4,      # price points between mid and the concession floor
+            "reprice_wait_s":         15,     # seconds to wait for a fill at each step
+            "max_reprice_concession": 0.35,   # hard ceiling on how much of the credit we'll give up
         },
         "positions":    {},   # pos_id -> position dict
         "closed_today": [],   # closed positions (reset daily)
@@ -8283,11 +8292,18 @@ def cancel_order(order_id: int):
     """Cancel an open order by its orderId."""
     _require_connection()
     ib = state["ib"]
-    trades = ib.openTrades()
-    target = next((t for t in trades if t.order.orderId == order_id), None)
-    if target is None:
+
+    async def _do_cancel():
+        trades = ib.openTrades()
+        target = next((t for t in trades if t.order.orderId == order_id), None)
+        if target is None:
+            return False
+        ib.cancelOrder(target.order)
+        return True
+
+    found = _run_in_streaming_loop(_do_cancel(), timeout=10)
+    if not found:
         raise HTTPException(404, f"Order {order_id} not found in open orders")
-    ib.cancelOrder(target.order)
     return {"ok": True, "order_id": order_id, "message": "Cancel request sent"}
 
 
@@ -12741,6 +12757,13 @@ async def _spx_quote_vertical(ib, expiry: str, right: str,
 
     s_mid = _spx_mid(td_s)
     l_mid = _spx_mid(td_l)
+
+    # Liquidity proxy for the entry repricing walk: relative bid-ask spread on the
+    # SHORT leg (the one that sets the credit direction). Wider = thinner market.
+    s_bid = _spx_safe_px(td_s.bid)
+    s_ask = _spx_safe_px(td_s.ask)
+    spread_pct = round((s_ask - s_bid) / ((s_ask + s_bid) / 2), 4) if (s_bid > 0 and s_ask > 0) else 0.0
+
     ib.cancelMktData(sc)
     ib.cancelMktData(lc)
 
@@ -12756,14 +12779,44 @@ async def _spx_quote_vertical(ib, expiry: str, right: str,
         )
 
     net = round(s_mid - l_mid, 2)
-    return net, sc.conId, lc.conId
+    return net, sc.conId, lc.conId, spread_pct
+
+
+def _spx_reprice_schedule(credit_start: float, vix_val: float, spread_pct: float, cfg: dict) -> list[float]:
+    """
+    GLFT-inspired price ladder for the entry limit: start at the passive mid-price
+    and walk toward the market instead of one static attempt. Volatility proxy is
+    VIX (SPX's own market-implied vol) rather than a per-name expected-move calc;
+    liquidity proxy is the resting bid-ask spread on the short leg. Same insight as
+    the EVC repricer: the capturable edge shrinks as volatility rises and liquidity
+    thins, so conditions like that need more concession for a realistic fill.
+    """
+    credit_start = max(0.01, round(credit_start, 2))
+    vix_pct = (vix_val or 15.0) / 100.0
+    concession = 0.10 + 0.5 * vix_pct + 2.0 * spread_pct
+    concession = min(float(cfg.get("max_reprice_concession", 0.35)), max(0.10, concession))
+    credit_floor = max(float(cfg["min_credit_per_spread"]), round(credit_start * (1 - concession), 2))
+    n_steps = max(1, int(cfg.get("reprice_steps", 4)))
+    if credit_start <= credit_floor:
+        return [credit_start]
+    return [
+        max(0.01, round(credit_start - i * (credit_start - credit_floor) / n_steps, 2))
+        for i in range(n_steps + 1)
+    ]
 
 
 async def _spx_place_bag(ib, expiry: str, right: str,
                           short_k: float, long_k: float,
                           short_conid: int, long_conid: int,
-                          qty: int, credit: float) -> int:
-    """Place a vertical spread as a CBOE BAG (combo) order. Returns orderId."""
+                          qty: int, credit: float,
+                          vix_val: float, spread_pct: float, cfg: dict):
+    """
+    Place a vertical spread as a CBOE BAG (combo) order, walking the price from
+    mid toward the market if it doesn't fill. Returns (order_id, filled, filled_credit).
+    filled=False means no position was established — caller must not record one
+    (this is the fix for the phantom-position/force-close bug: a prior version
+    returned just the orderId and the caller recorded a position unconditionally).
+    """
     from ib_insync import Contract as IbCont, ComboLeg
     bag = IbCont()
     bag.symbol   = "SPX"
@@ -12773,11 +12826,68 @@ async def _spx_place_bag(ib, expiry: str, right: str,
     l1 = ComboLeg(); l1.conId = short_conid; l1.ratio = 1; l1.action = "SELL"; l1.exchange = "CBOE"
     l2 = ComboLeg(); l2.conId = long_conid;  l2.ratio = 1; l2.action = "BUY";  l2.exchange = "CBOE"
     bag.comboLegs = [l1, l2]
-    ord_ = LimitOrder("SELL", qty, max(0.01, round(credit, 2)))
-    ord_.tif = "DAY"
-    trade = ib.placeOrder(bag, ord_)
-    await asyncio.sleep(0.5)
-    return trade.order.orderId
+
+    schedule = _spx_reprice_schedule(credit, vix_val, spread_pct, cfg)
+    wait_s   = max(5, int(cfg.get("reprice_wait_s", 15)))
+    _ENTRY_TERMINAL = {"Filled", "Cancelled", "ApiCancelled", "Inactive"}
+
+    trade     = None
+    order_id  = None
+    filled_px = schedule[0]
+    filled    = False
+    try:
+        for i, px in enumerate(schedule):
+            filled_px = px
+            ord_ = LimitOrder("SELL", qty, px)
+            ord_.tif = "DAY"
+            trade = ib.placeOrder(bag, ord_)
+            order_id = trade.order.orderId
+            await asyncio.sleep(1)
+
+            for _ in range(wait_s):
+                await asyncio.sleep(1)
+                if trade.orderStatus.status in _ENTRY_TERMINAL:
+                    break
+
+            filled_qty = float(trade.orderStatus.filled or 0)
+            if trade.orderStatus.status == "Filled" and filled_qty > 0:
+                filled = True
+                break
+
+            if trade.orderStatus.status not in _ENTRY_TERMINAL:
+                try:
+                    ib.cancelOrder(trade.order)
+                    for _ in range(5):
+                        await asyncio.sleep(1)
+                        if trade.orderStatus.status in _ENTRY_TERMINAL:
+                            break
+                except Exception:
+                    pass
+
+            if i < len(schedule) - 1:
+                _spx_log("REPRICE",
+                         f"{right} {short_k}/{long_k} step {i+1}/{len(schedule)} @ ${px:.2f} no fill "
+                         f"(status={trade.orderStatus.status}) — trying ${schedule[i+1]:.2f}")
+    except asyncio.CancelledError:
+        # We were interrupted mid-walk (e.g. the caller's timeout fired). Fire a
+        # best-effort cancel for whatever is still resting so it isn't left live
+        # at the broker — this is the fix for the orphaned-order bug where a
+        # timed-out entry attempt left unfilled SELL orders resting at IBKR.
+        if trade is not None and trade.orderStatus.status not in _ENTRY_TERMINAL:
+            try:
+                ib.cancelOrder(trade.order)
+            except Exception:
+                pass
+        raise
+
+    if not filled:
+        _spx_log("NO_FILL",
+                 f"{right} {short_k}/{long_k} did not fill after {len(schedule)} repricing step(s) "
+                 f"(${schedule[0]:.2f} → ${schedule[-1]:.2f}) — cancelled, skipping")
+        return order_id, False, 0.0
+
+    filled_credit = float(trade.orderStatus.avgFillPrice or filled_px)
+    return order_id, True, filled_credit
 
 
 async def _spx_close_spread(ib, spread_id: str, exit_type: str) -> None:
@@ -13005,7 +13115,7 @@ async def _spx_entry_coro(ib) -> None:
     call_long_k  = call_short_k + width
 
     try:
-        (p_credit, p_s_cid, p_l_cid), (c_credit, c_s_cid, c_l_cid) = await asyncio.gather(
+        (p_credit, p_s_cid, p_l_cid, p_spread_pct), (c_credit, c_s_cid, c_l_cid, c_spread_pct) = await asyncio.gather(
             _spx_quote_vertical(ib, expiry, "P", put_short_k, put_long_k),
             _spx_quote_vertical(ib, expiry, "C", call_short_k, call_long_k),
         )
@@ -13087,17 +13197,13 @@ async def _spx_entry_coro(ib) -> None:
             _spx_log("INFO", f"Floor protection: qty {qty}→{floor_qty}")
             qty = floor_qty
 
-    total_credit_dollar  = round(qty * active_credit * 100, 2)
-    profit_target_dollar = round(total_credit_dollar * profit_pct, 2)
-
     rate_str = f"  {rate_note}" if rate_note else ""
-    _spx_log("ENTRY",
+    _spx_log("ATTEMPT",
              f"SPX {spot:.0f}  [{trade_phase.upper()}]  strategy={strategy}  "
              f"attempt={sx['attempts_today']+1}  {vix_note}{rate_str}  stop={stop_mult}× | "
              + (f"P {int(put_short_k)}/{int(put_long_k)} cr={p_credit:.2f} | " if use_put else "")
              + (f"C {int(call_short_k)}/{int(call_long_k)} cr={c_credit:.2f} | " if use_call else "")
-             + f"qty={qty}  total_cr=${total_credit_dollar:.0f}  "
-             + f"target=${profit_target_dollar:.0f} ({profit_pct*100:.0f}%)  floor=${floor:.0f}")
+             + f"qty={qty}  floor=${floor:.0f}")
     _opra_src = "OPRA-LIVE" if state.get("opra_active") else "OPRA-DELAYED"
     _spx_log("OPRA_VALUE",
              f"src={_opra_src}  spread credits priced via IBKR live quotes"
@@ -13106,21 +13212,42 @@ async def _spx_entry_coro(ib) -> None:
              + f"  {vix_note}  (yfinance NOT used for pricing)")
 
     p_oid = c_oid = None
+    p_filled = c_filled = False
+    p_fill_credit = c_fill_credit = 0.0
     try:
         if use_put:
-            p_oid = await _spx_place_bag(ib, expiry, "P",
-                                          put_short_k, put_long_k, p_s_cid, p_l_cid, qty, p_credit)
+            p_oid, p_filled, p_fill_credit = await _spx_place_bag(
+                ib, expiry, "P", put_short_k, put_long_k, p_s_cid, p_l_cid, qty, p_credit,
+                vix_val, p_spread_pct, cfg)
         if use_call:
-            c_oid = await _spx_place_bag(ib, expiry, "C",
-                                          call_short_k, call_long_k, c_s_cid, c_l_cid, qty, c_credit)
+            c_oid, c_filled, c_fill_credit = await _spx_place_bag(
+                ib, expiry, "C", call_short_k, call_long_k, c_s_cid, c_l_cid, qty, c_credit,
+                vix_val, c_spread_pct, cfg)
     except Exception as e:
         _spx_log("ERROR", f"Order placement failed: {e}")
         return
 
+    sx["attempts_today"] += 1
+
+    # Same fix as EVC: only record a position for legs that actually filled.
+    # A prior version recorded both legs as open unconditionally, so an unfilled
+    # order still got "closed" later via unconditional market orders (the force-
+    # close bug that hit CA_0945 and CA_1043).
+    use_put  = use_put  and p_filled
+    use_call = use_call and c_filled
+    if not use_put and not use_call:
+        _spx_log("NO_FILL", "neither leg filled — no position recorded")
+        _spx_save_state()
+        return
+
+    active_credit = (p_fill_credit if use_put else 0.0) + (c_fill_credit if use_call else 0.0)
+    total_credit_dollar  = round(qty * active_credit * 100, 2)
+    profit_target_dollar = round(total_credit_dollar * profit_pct, 2)
+
     spread_id = f"{strategy[:2].upper()}_{now.strftime('%H%M')}"
     sx["spreads"][spread_id] = {
         "spread_id":      spread_id,
-        "strategy":       strategy,
+        "strategy":       "iron_condor" if (use_put and use_call) else ("call_spread" if use_call else "put_spread"),
         "trade_phase":    trade_phase,
         "date":           today_iso,
         "expiry":         expiry,
@@ -13132,10 +13259,10 @@ async def _spx_entry_coro(ib) -> None:
         "call_long_k":    call_long_k  if use_call else None,
         "put_conids":     [p_s_cid, p_l_cid] if use_put  else [],
         "call_conids":    [c_s_cid, c_l_cid] if use_call else [],
-        "put_order_id":   p_oid,
-        "call_order_id":  c_oid,
-        "put_credit":     p_credit  if use_put  else 0.0,
-        "call_credit":    c_credit  if use_call else 0.0,
+        "put_order_id":   p_oid if use_put else None,
+        "call_order_id":  c_oid if use_call else None,
+        "put_credit":     p_fill_credit  if use_put  else 0.0,
+        "call_credit":    c_fill_credit  if use_call else 0.0,
         "total_credit":   total_credit_dollar,
         "profit_target":  profit_target_dollar,
         "profit_pct":     round(profit_pct * 100, 1),
@@ -13146,15 +13273,18 @@ async def _spx_entry_coro(ib) -> None:
         "live_pnl":       None,
         "placed_at":      now.strftime("%H:%M ET"),
     }
-    sx["attempts_today"] += 1
+    _spx_log("ENTERED",
+             f"strategy={sx['spreads'][spread_id]['strategy']}  total_cr=${total_credit_dollar:.0f}  "
+             f"target=${profit_target_dollar:.0f} ({profit_pct*100:.0f}%)", spread_id)
 
-    phase_emoji  = "🌅" if in_morning else "🌆"
-    filters_note = "   ".join(x for x in [vix_note, rate_note] if x)
+    phase_emoji   = "🌅" if in_morning else "🌆"
+    filters_note  = "   ".join(x for x in [vix_note, rate_note] if x)
+    filled_strategy = sx["spreads"][spread_id]["strategy"]
     _spx_notify(
-        f"📈 <b>SPX 0DTE ENTRY</b> {phase_emoji} {trade_phase.upper()} — trade #{sx['attempts_today']}  ({strategy})\n"
+        f"📈 <b>SPX 0DTE ENTRY</b> {phase_emoji} {trade_phase.upper()} — trade #{sx['attempts_today']}  ({filled_strategy})\n"
         f"SPX: {spot:.0f}   {filters_note}   Target: <b>${profit_target_dollar:.0f}</b> ({profit_pct*100:.0f}% of cr)   Stop: {stop_mult}×   Qty: {qty}\n"
-        + (f"PUT  {int(put_short_k)}/{int(put_long_k)}  cr={p_credit:.2f}\n" if use_put else "")
-        + (f"CALL {int(call_short_k)}/{int(call_long_k)}  cr={c_credit:.2f}\n" if use_call else "")
+        + (f"PUT  {int(put_short_k)}/{int(put_long_k)}  cr={p_fill_credit:.2f}\n" if use_put else "")
+        + (f"CALL {int(call_short_k)}/{int(call_long_k)}  cr={c_fill_credit:.2f}\n" if use_call else "")
         + f"Total credit: ${total_credit_dollar:.0f}   Floor: ${floor:.0f}"
     )
 
@@ -13299,9 +13429,21 @@ async def _spx_monitor_loop() -> None:
                     lambda: _run_in_streaming_loop(_spx_monitor_coro(ib), timeout=25))
             if (not sx["spreads"]
                     and sx["attempts_today"] < int(sx["config"].get("max_attempts", 5))):
+                # Worst case the entry walk prices two legs (iron condor) SEQUENTIALLY,
+                # each stepping through (reprice_steps+1) prices and waiting up to
+                # reprice_wait_s per step plus cancel overhead. A fixed 45s timeout was
+                # far shorter than that, so the walk got cut off mid-order and left
+                # unfilled SELL orders resting live at IBKR instead of being cancelled
+                # (see market_close_restart / 2026-07-20 incident). Size the timeout off
+                # the actual config so it can't be outrun even if reprice_* is retuned.
+                entry_cfg   = sx["config"]
+                steps       = int(entry_cfg.get("reprice_steps", 4)) + 1
+                wait_s      = int(entry_cfg.get("reprice_wait_s", 15))
+                per_leg_s   = steps * (wait_s + 6) + 15   # +6s cancel/place overhead per step, +15s quoting
+                entry_timeout = 2 * per_leg_s + 30        # both legs sequential + buffer
                 await loop.run_in_executor(
                     None,
-                    lambda: _run_in_streaming_loop(_spx_entry_coro(ib), timeout=45))
+                    lambda: _run_in_streaming_loop(_spx_entry_coro(ib), timeout=entry_timeout))
             # EOD summary — fire once after force_close_time when no spreads remain
             cfg       = sx["config"]
             today_str = now.strftime("%Y-%m-%d")
@@ -13566,6 +13708,18 @@ async def _evc_quote_condor(ib, ticker: str) -> dict:
     sp_mid = _spx_mid(td_sp)
     sc_mid = _spx_mid(td_sc)
     lc_mid = _spx_mid(td_lc)
+
+    # Liquidity proxy for the entry repricing walk: relative bid-ask spread on the
+    # two SHORT legs (the ones that set the credit). Wider spread = thinner market =
+    # less likely a mid-priced order fills, so the repricer should concede more.
+    def _rel_spread(td) -> float:
+        b = _spx_safe_px(td.bid)
+        a = _spx_safe_px(td.ask)
+        if b > 0 and a > 0 and (a + b) > 0:
+            return (a - b) / ((a + b) / 2)
+        return 0.0
+    short_spread_pct = round((_rel_spread(td_sp) + _rel_spread(td_sc)) / 2, 4)
+
     for c_ in [c_lp, c_sp, c_sc, c_lc]:
         ib.cancelMktData(c_)
 
@@ -13591,7 +13745,36 @@ async def _evc_quote_condor(ib, ticker: str) -> dict:
         "short_call_conid": c_sc.conId,
         "long_call_conid":  c_lc.conId,
         "net_credit":     net_credit,
+        "im_pct":            round(im_pct, 4),
+        "short_spread_pct":  short_spread_pct,
     }
+
+
+def _evc_reprice_schedule(quote: dict, cfg: dict) -> list[float]:
+    """
+    GLFT-inspired price ladder for the entry limit: start at the passive mid-price
+    and walk toward the market instead of a single static attempt. The concession
+    ceiling scales with the quote's volatility proxy (implied move %) and
+    illiquidity proxy (short-leg bid-ask spread %) — the GLFT insight that the
+    capturable edge shrinks as volatility rises and liquidity thins, so those
+    names need more concession for any realistic chance of filling in-window.
+    """
+    credit_start = max(0.01, round(quote["net_credit"], 2))
+    im_pct       = quote.get("im_pct", 0.05)
+    spread_pct   = quote.get("short_spread_pct", 0.05)
+
+    concession = 0.10 + 0.5 * im_pct + 2.0 * spread_pct
+    concession = min(float(cfg.get("max_reprice_concession", 0.35)), max(0.10, concession))
+
+    credit_floor = max(float(cfg["min_credit"]), round(credit_start * (1 - concession), 2))
+    n_steps = max(1, int(cfg.get("reprice_steps", 4)))
+
+    if credit_start <= credit_floor:
+        return [credit_start]
+    return [
+        max(0.01, round(credit_start - i * (credit_start - credit_floor) / n_steps, 2))
+        for i in range(n_steps + 1)
+    ]
 
 
 async def _evc_place_condor(ib, quote: dict) -> bool:
@@ -13612,21 +13795,60 @@ async def _evc_place_condor(ib, quote: dict) -> bool:
     l4 = ComboLeg(); l4.conId = quote["long_call_conid"];  l4.ratio = 1; l4.action = "BUY";  l4.exchange = "SMART"
     bag.comboLegs = [l1, l2, l3, l4]
 
-    credit = max(0.01, round(quote["net_credit"], 2))
-    ord_   = LimitOrder("SELL", 1, credit)
-    ord_.tif = "DAY"
+    ev_cfg = ev["config"]
+    schedule = _evc_reprice_schedule(quote, ev_cfg)
+    wait_s   = max(5, int(ev_cfg.get("reprice_wait_s", 15)))
+    # "Submitted" means the order reached the exchange, NOT that it filled — treating
+    # it as success recorded unfilled orders as open positions (same failure mode as
+    # the SPX 0DTE force-close bug).
+    _ENTRY_TERMINAL = {"Filled", "Cancelled", "ApiCancelled", "Inactive"}
 
-    trade  = ib.placeOrder(bag, ord_)
-    await asyncio.sleep(1)
-    order_id = trade.order.orderId
-
-    # Wait up to 30s for fill
-    for _ in range(30):
+    trade      = None
+    order_id   = None
+    filled_px  = schedule[0]
+    filled     = False
+    for i, px in enumerate(schedule):
+        filled_px = px
+        ord_ = LimitOrder("SELL", 1, px)
+        ord_.tif = "DAY"
+        trade = ib.placeOrder(bag, ord_)
+        order_id = trade.order.orderId
         await asyncio.sleep(1)
-        if trade.orderStatus.status in ("Filled", "Submitted"):
+
+        for _ in range(wait_s):
+            await asyncio.sleep(1)
+            if trade.orderStatus.status in _ENTRY_TERMINAL:
+                break
+
+        filled_qty = float(trade.orderStatus.filled or 0)
+        if trade.orderStatus.status == "Filled" and filled_qty > 0:
+            filled = True
             break
 
-    filled_credit = float(trade.orderStatus.avgFillPrice or credit)
+        # Not filled at this price — cancel before trying the next (more aggressive) one.
+        if trade.orderStatus.status not in _ENTRY_TERMINAL:
+            try:
+                ib.cancelOrder(trade.order)
+                for _ in range(5):
+                    await asyncio.sleep(1)
+                    if trade.orderStatus.status in _ENTRY_TERMINAL:
+                        break
+            except Exception:
+                pass
+
+        if i < len(schedule) - 1:
+            _evc_log("REPRICE", ticker,
+                     f"step {i+1}/{len(schedule)} @ ${px:.2f} no fill "
+                     f"(status={trade.orderStatus.status}) — trying ${schedule[i+1]:.2f}")
+
+    if not filled:
+        _evc_log("NO_FILL", ticker,
+                 f"condor did not fill after {len(schedule)} repricing step(s) "
+                 f"(${schedule[0]:.2f} → ${schedule[-1]:.2f}) "
+                 "— cancelled, skipping (no position recorded)")
+        return False
+
+    filled_credit = float(trade.orderStatus.avgFillPrice or filled_px)
     pos_id = f"{ticker}_{date.today().strftime('%Y%m%d')}"
     pos = {
         "pos_id":        pos_id,
@@ -14030,6 +14252,9 @@ class SPXConfigRequest(BaseModel):
     min_credit_per_spread:   Optional[float]       = None
     trend_filter_pts:        Optional[float]       = None
     skip_dates:              Optional[list[str]]   = None
+    reprice_steps:           Optional[int]         = None
+    reprice_wait_s:          Optional[int]         = None
+    max_reprice_concession:  Optional[float]       = None
     # Legacy (kept for backward compat)
     daily_profit_target:     Optional[float]       = None
     trade_targets:           Optional[list[float]] = None
@@ -14186,6 +14411,9 @@ class EVCConfigRequest(BaseModel):
     exit_start:    Optional[str]   = None
     exit_cutoff:   Optional[str]   = None
     max_loss_pct:  Optional[float] = None
+    reprice_steps:          Optional[int]   = None
+    reprice_wait_s:         Optional[int]   = None
+    max_reprice_concession: Optional[float] = None
 
 
 @app.get("/earnings-vol-crush/status")
@@ -15450,6 +15678,13 @@ async def ws_tape(websocket: WebSocket, ticker: str, block: int = Query(default=
     Stream real-time tick-by-tick trade data (Time & Sales) for a stock.
     Each message is a JSON object with the raw tick plus plain-English explanations.
     Uses a separate IB client ID (pool 20-29) so it never conflicts with the main app.
+
+    The dedicated IB() client's connect/subscribe/teardown all run on the shared
+    streaming-thread event loop (state["streaming_loop"]) via _run_in_streaming_loop —
+    the same loop the main IBKR connection uses. Running them on this handler's own
+    (uvicorn) loop caused ib_insync transport futures to bind to the wrong loop
+    ("attached to a different loop" errors). Ticks are handed back to this handler's
+    loop via call_soon_threadsafe since asyncio.Queue isn't safe to touch cross-loop.
     """
     await websocket.accept()
 
@@ -15462,14 +15697,48 @@ async def ws_tape(websocket: WebSocket, ticker: str, block: int = Query(default=
         await websocket.close()
         return
 
-    tape_ib = IB()
+    main_loop = asyncio.get_running_loop()
+    tick_queue: asyncio.Queue = asyncio.Queue()
     contract = None
+    tape_print_buffer: list = []   # accumulated this session; flushed to DB on close
+    session: dict = {"ib": None, "tick_idx": 0}   # populated on the streaming-loop thread
+
+    def on_update(t):
+        # Fires on the streaming-loop thread (that's where tape_ib/ticker_sub live) —
+        # hand ticks to this handler's loop instead of touching the Queue directly.
+        new = t.tickByTicks[session["tick_idx"]:]
+        session["tick_idx"] = len(t.tickByTicks)
+        for tk in new:
+            main_loop.call_soon_threadsafe(tick_queue.put_nowait, tk)
+
+    async def _connect_and_subscribe():
+        tib = IB()
+        await tib.connectAsync(TWS_HOST, TWS_PORT, clientId=cid, timeout=15)
+        c = Stock(ticker.upper(), "SMART", "USD")
+        await tib.qualifyContractsAsync(c)
+        ticker_sub = tib.reqTickByTickData(c, "AllLast", numberOfTicks=0, ignoreSize=False)
+        ticker_sub.updateEvent += on_update
+        session["ib"] = tib
+        return c
+
+    async def _teardown():
+        tib = session.get("ib")
+        if not tib:
+            return
+        try:
+            if contract and tib.isConnected():
+                tib.cancelTickByTickData(contract, "AllLast")
+        except Exception:
+            pass
+        try:
+            tib.disconnect()
+        except Exception:
+            pass
 
     try:
-        await tape_ib.connectAsync(TWS_HOST, TWS_PORT, clientId=cid, timeout=15)
-
-        contract = Stock(ticker.upper(), "SMART", "USD")
-        await tape_ib.qualifyContractsAsync(contract)
+        contract = await main_loop.run_in_executor(
+            None, lambda: _run_in_streaming_loop(_connect_and_subscribe(), timeout=15)
+        )
 
         # Per-session accumulators
         cum_vol:    int   = 0
@@ -15480,10 +15749,6 @@ async def ws_tape(websocket: WebSocket, ticker: str, block: int = Query(default=
         last_dir:   int   = 0
         open_price: Optional[float] = None
         block_count: int  = 0
-        tick_idx:   int   = 0
-
-        tick_queue: asyncio.Queue = asyncio.Queue()
-        tape_print_buffer: list  = []   # accumulated this session; flushed to DB on close
 
         def _direction(price: float) -> int:
             nonlocal last_price, last_dir
@@ -15491,18 +15756,6 @@ async def ws_tape(websocket: WebSocket, ticker: str, block: int = Query(default=
             if price > last_price:      last_dir = 1
             elif price < last_price:    last_dir = -1
             return last_dir
-
-        def on_update(t):
-            nonlocal tick_idx
-            new = t.tickByTicks[tick_idx:]
-            tick_idx = len(t.tickByTicks)
-            for tk in new:
-                tick_queue.put_nowait(tk)
-
-        ticker_sub = tape_ib.reqTickByTickData(
-            contract, "AllLast", numberOfTicks=0, ignoreSize=False
-        )
-        ticker_sub.updateEvent += on_update
 
         await websocket.send_json({"type": "connected", "ticker": ticker.upper(), "client_id": cid})
 
@@ -15512,7 +15765,8 @@ async def ws_tape(websocket: WebSocket, ticker: str, block: int = Query(default=
             except asyncio.TimeoutError:
                 # keep the WS alive during quiet periods (pre-market, AH)
                 await websocket.send_json({"type": "heartbeat"})
-                if not tape_ib.isConnected():
+                tib = session.get("ib")
+                if not tib or not tib.isConnected():
                     break
                 continue
 
@@ -15645,12 +15899,9 @@ async def ws_tape(websocket: WebSocket, ticker: str, block: int = Query(default=
             pass
     finally:
         try:
-            if contract and tape_ib.isConnected():
-                tape_ib.cancelTickByTickData(contract, "AllLast")
-        except Exception:
-            pass
-        try:
-            tape_ib.disconnect()
+            await main_loop.run_in_executor(
+                None, lambda: _run_in_streaming_loop(_teardown(), timeout=10)
+            )
         except Exception:
             pass
         _release_tape_cid(cid)
