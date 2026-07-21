@@ -1237,9 +1237,10 @@ async def streaming_loop_async() -> None:
 
             ib.errorEvent += _on_ib_error
 
-            port = state.get("reconnect_port") or TWS_PORT
-            state["reconnect_port"] = None          # consume the request
+            port = state.get("reconnect_port") or state.get("last_good_port") or TWS_PORT
+            state["reconnect_port"] = None          # consume the one-shot request
             await ib.connectAsync(TWS_HOST, port, clientId=TWS_CLIENT_ID, timeout=15)
+            state["last_good_port"] = port          # remember for future retries
             log.info(f"Connected to IBKR  {TWS_HOST}:{port}")
             state["ib"] = ib
             state["connected"] = True
