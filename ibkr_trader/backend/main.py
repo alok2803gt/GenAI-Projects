@@ -63,7 +63,7 @@ log = logging.getLogger("ibkr_trader")
 # ── Config — bar streaming ──────────────────────────────────────────────────
 TWS_HOST = "127.0.0.1"
 TWS_PORT = int(os.environ.get("IBKR_PORT", "7496"))  # env var wins; 7497=TWS paper|7496=TWS live|4001=GW live|4002=GW paper
-TWS_CLIENT_ID = 10
+TWS_CLIENT_ID = 5   # 10 was conflicting; tape readers use 20-29
 MODEL_PATH = "model.joblib"
 BAR_SIZE = "5 mins"
 HISTORY_DURATION = "5 D"
@@ -1356,6 +1356,7 @@ async def streaming_loop_async() -> None:
 
             state["connected"] = False
             log.warning("IBKR disconnected — retrying in 15 s")
+            await asyncio.sleep(15)
 
         except Exception as e:
             state["connected"] = False
@@ -15593,6 +15594,7 @@ async def _fx_monitor_coro(ib) -> None:
         now_ts    = _utcnow().timestamp()
         if last_scan is None or (now_ts - last_scan) >= 300:
             fx["last_scan"] = now_ts
+            _fx_log("SCAN", "system", f"scanning {len(FX_PAIRS)} pairs  pos={len(fx['positions'])}/{cfg['max_positions']}")
             for pair in FX_PAIRS:
                 if pair in fx["positions"]:
                     continue
@@ -15616,12 +15618,10 @@ async def _fx_monitor_loop() -> None:
             ib = state.get("ib")
             if not ib or not ib.isConnected():
                 continue
-            loop = state.get("streaming_loop")
-            if loop:
-                loop.run_in_executor(
-                    None,
-                    lambda: _run_in_streaming_loop(_fx_monitor_coro(ib), timeout=55)
-                )
+            await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: _run_in_streaming_loop(_fx_monitor_coro(ib), timeout=55)
+            )
         except Exception as e:
             log.warning("_fx_monitor_loop error: %s", e)
 
