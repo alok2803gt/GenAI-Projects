@@ -1,6 +1,6 @@
-# run_backend.ps1 — Watchdog: validates syntax before starting, auto-restarts on crash.
+# run_backend.ps1 -- Watchdog: validates syntax before starting, auto-restarts on crash.
 # Launched by Windows Task Scheduler at logon; runs hidden with no console window.
-# Backend writes its own log via uvicorn — no redirection needed here.
+# Backend writes its own log via uvicorn -- no redirection needed here.
 
 $BackendDir  = "C:\Projects\GenAI-Projects\ibkr_trader\backend"
 $Python      = "C:\Users\AlokD\AppData\Local\Programs\Python\Python311\python.exe"
@@ -21,7 +21,7 @@ while ($true) {
     # We catch it here and refuse to start, keeping the last-known-good copy alive.
     $syntaxResult = & $Python -m py_compile $Script 2>&1
     if ($LASTEXITCODE -ne 0) {
-        Write-WLog "SYNTAX ERROR in main.py — refusing to start. Error: $syntaxResult"
+        Write-WLog "SYNTAX ERROR in main.py -- refusing to start. Error: $syntaxResult"
         Write-WLog "Fix main.py or restore from main_last_good.py, then this watchdog will auto-retry in 60s."
         Start-Sleep -Seconds 60
         continue
@@ -36,7 +36,11 @@ while ($true) {
         Write-WLog "Warning: could not write main_last_good.py: $_"
     }
 
-    Write-WLog "Syntax OK — launching backend..."
+    Write-WLog "Syntax OK -- launching backend..."
+    $stamp   = Get-Date -Format "yyyyMMdd_HHmmss"
+    $OutLog  = Join-Path $BackendDir "crash_logs\backend_stdout_$stamp.log"
+    $ErrLog  = Join-Path $BackendDir "crash_logs\backend_stderr_$stamp.log"
+    New-Item -ItemType Directory -Force -Path (Join-Path $BackendDir "crash_logs") | Out-Null
     try {
         $proc = Start-Process `
             -FilePath $Python `
@@ -44,10 +48,12 @@ while ($true) {
             -WorkingDirectory $BackendDir `
             -NoNewWindow `
             -PassThru `
+            -RedirectStandardOutput $OutLog `
+            -RedirectStandardError $ErrLog `
             -ErrorAction Stop
         $proc.WaitForExit()
         $code = $proc.ExitCode
-        Write-WLog "Backend exited (code=$code). Restarting in 15s..."
+        Write-WLog "Backend exited (code=$code). Logs: $ErrLog . Restarting in 15s..."
     } catch {
         Write-WLog "Failed to launch backend: $_. Retrying in 15s..."
     }

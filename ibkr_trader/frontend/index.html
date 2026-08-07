@@ -3712,6 +3712,7 @@ function PnLTab() {
   const [ordersData,  setOrdersData]  = useState(null);
   const [deltaOpen,   setDeltaOpen]   = useState(false);
   const [deltaLoading,setDeltaLoading]= useState(false);
+  const [modeFilter,  setModeFilter]  = useState("all");
   const INTERVAL = 15;
 
   const loadDelta = async () => {
@@ -3758,7 +3759,7 @@ function PnLTab() {
   if (err) return <div style={{...sans, padding:40, textAlign:"center", color:C.bear}}>Error: {err}</div>;
   if (!data) return null;
 
-  const { account, stats, open_positions, closed_trades, daily_pnl, portfolio, exit_breakdown, strategy_today } = data;
+  const { account, stats, open_positions, closed_trades, daily_pnl, portfolio, exit_breakdown, strategy_today, is_live, mt_open, mt_closed } = data;
 
   const pnlCol  = v => v == null ? C.muted : v > 0 ? C.bull : v < 0 ? C.bear : C.muted;
   const fmtDol  = (v, sign=false) => {
@@ -3780,8 +3781,7 @@ function PnLTab() {
   };
 
   // ── SVG cumulative P&L chart ──────────────────────────────────────────────
-  function PnLChart() {
-    const pts = daily_pnl || [];
+  function PnLChart({ pts: pts }) {
     if (pts.length === 0) return (
       <div style={{height:160, display:"flex", alignItems:"center", justifyContent:"center", color:C.muted, ...sans, fontSize:13}}>
         No closed trades yet — chart will appear after the first close
@@ -3830,29 +3830,77 @@ function PnLTab() {
     );
   }
 
+  // ── Paper / Live filter ───────────────────────────────────────────────────
+  const matchesMode = t =>
+    modeFilter === "all"  ? true :
+    modeFilter === "live" ? t.is_paper === 0 :
+    (t.is_paper == null || t.is_paper !== 0);  // paper: is_paper=1 or legacy null
+  const filteredClosed = (closed_trades || []).filter(matchesMode);
+  const filteredOpen   = (open_positions || []).filter(matchesMode);
+
+  // Recompute stats from filtered closed trades
+  const todayStr = new Date().toISOString().slice(0,10);
+  const fWins    = filteredClosed.filter(t => t.win === 1);
+  const fLosses  = filteredClosed.filter(t => t.win === 0);
+  const fPnls    = filteredClosed.map(t => t.pnl).filter(p => p != null);
+  const fTotalR  = fPnls.reduce((s,p) => s+p, 0);
+  const fToday   = filteredClosed
+    .filter(t => (t.closed_at||"").slice(0,10) === todayStr)
+    .reduce((s,t) => s+(t.pnl||0), 0);
+  const fWinRate = filteredClosed.length ? Math.round(fWins.length/filteredClosed.length*1000)/10 : null;
+  const fAvgW    = fWins.length   ? Math.round(fWins.reduce((s,t)=>s+(t.pnl||0),0)/fWins.length*100)/100 : 0;
+  const fAvgL    = fLosses.length ? Math.round(fLosses.reduce((s,t)=>s+(t.pnl||0),0)/fLosses.length*100)/100 : 0;
+
+  // Filtered per-strategy today summary (used by tiles + StratSection)
+  const filteredStrategyToday = {};
+  for (const t of filteredClosed) {
+    if ((t.closed_at||"").slice(0,10) !== todayStr || t.pnl == null) continue;
+    const k = t.strategy_type || "OTHER";
+    if (!filteredStrategyToday[k]) filteredStrategyToday[k] = {pnl:0,trades:0,wins:0,losses:0};
+    filteredStrategyToday[k].pnl += t.pnl; filteredStrategyToday[k].trades++;
+    if (t.win===1) filteredStrategyToday[k].wins++; else filteredStrategyToday[k].losses++;
+  }
+  if (modeFilter !== "live" && strategy_today?.["SPX_0DTE"] && !filteredStrategyToday["SPX_0DTE"]) {
+    filteredStrategyToday["SPX_0DTE"] = strategy_today["SPX_0DTE"];
+  }
+
+  // Filtered chart series
+  const filteredDailyPnl = (() => {
+    if (modeFilter === "all") return daily_pnl;
+    const byDay = {};
+    for (const t of filteredClosed) {
+      const d = (t.closed_at||"").slice(0,10);
+      if (d && t.pnl != null) byDay[d] = (byDay[d]||0) + t.pnl;
+    }
+    let cum = 0;
+    return Object.keys(byDay).sort().map(day => {
+      cum += byDay[day];
+      return { date:day, pnl:Math.round(byDay[day]*100)/100, cumulative:Math.round(cum*100)/100 };
+    });
+  })();
+
   const commTracked = stats.total_commission != null && stats.total_commission > 0;
   const cards = [
-    { label:"Total P&L",      value:fmtDol(stats.total_realized_pnl,true),   color:pnlCol(stats.total_realized_pnl),   sub:`${stats.total_trades} closed trades` },
-    { label:"Unrealized P&L", value:fmtDol(stats.total_unrealized_pnl,true), color:pnlCol(stats.total_unrealized_pnl), sub:`${stats.open_count} open · live` },
-    { label:"Net P&L",        value:fmtDol(stats.total_pnl,true),            color:pnlCol(stats.total_pnl),            sub:"realized + unrealized" },
-    { label:"Today's P&L",    value:fmtDol(stats.today_pnl,true),            color:pnlCol(stats.today_pnl),            sub:new Date().toLocaleDateString("en-US",{weekday:"short"}) },
-    { label:"Win Rate",       value:stats.win_rate!=null?`${stats.win_rate}%`:"—", color:stats.win_rate>50?C.bull:stats.win_rate<50?C.bear:C.muted,
-      sub:`avg W ${fmtDol(stats.avg_win)} / L ${fmtDol(stats.avg_loss)}` },
+    { label:"Total P&L",      value:fmtDol(fTotalR,true),                    color:pnlCol(fTotalR),                    sub:`${filteredClosed.length} closed trades` },
+    { label:"Unrealized P&L", value:fmtDol(stats.total_unrealized_pnl,true), color:pnlCol(stats.total_unrealized_pnl), sub:`${filteredOpen.length} open · live` },
+    { label:"Net P&L",        value:fmtDol(fTotalR + (stats.total_unrealized_pnl||0),true), color:pnlCol(fTotalR + (stats.total_unrealized_pnl||0)), sub:"realized + unrealized" },
+    { label:"Today's P&L",    value:fmtDol(fToday,true),                     color:pnlCol(fToday),                     sub:new Date().toLocaleDateString("en-US",{weekday:"short"}) },
+    { label:"Win Rate",       value:fWinRate!=null?`${fWinRate}%`:"—",       color:fWinRate>50?C.bull:fWinRate<50?C.bear:C.muted,
+      sub:`avg W ${fmtDol(fAvgW)} / L ${fmtDol(fAvgL)}` },
     { label: commTracked ? "Net (after fees)" : "Net Liquidation",
-      value: commTracked ? fmtDol(stats.net_realized_pnl,true) : fmtDol(account.net_liquidation),
-      color: commTracked ? pnlCol(stats.net_realized_pnl) : C.accent,
+      value: commTracked ? fmtDol(Math.round((fTotalR-(stats.total_commission||0))*100)/100,true) : fmtDol(account.net_liquidation),
+      color: commTracked ? pnlCol(fTotalR-(stats.total_commission||0)) : C.accent,
       sub: commTracked ? `fees: ${fmtDol(stats.total_commission)} · liq: ${fmtDol(account.net_liquidation)}` : (account.account||"—") },
   ];
 
   // ── Group closed trades + open positions by strategy ──────────────────────
-  // Plain computation — data is guaranteed non-null here (guarded by early returns above)
   const byStrategy = {};
-  for (const t of (closed_trades || [])) {
+  for (const t of filteredClosed) {
     const k = t.strategy_type || "OTHER";
     if (!byStrategy[k]) byStrategy[k] = { closed:[], open:[] };
     byStrategy[k].closed.push(t);
   }
-  for (const p of (open_positions || [])) {
+  for (const p of filteredOpen) {
     const k = p.strategy_type || "UNTRACKED";
     if (!byStrategy[k]) byStrategy[k] = { closed:[], open:[] };
     byStrategy[k].open.push(p);
@@ -3862,7 +3910,26 @@ function PnLTab() {
     <div style={{animation:"fadeIn 0.2s ease"}}>
       {/* Header row */}
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}>
-        <div style={{...sans,fontSize:10,textTransform:"uppercase",letterSpacing:2,color:C.muted}}>P&amp;L Dashboard</div>
+        <div style={{display:"flex",alignItems:"center",gap:12}}>
+          <div style={{...sans,fontSize:10,textTransform:"uppercase",letterSpacing:2,color:C.muted}}>P&amp;L Dashboard</div>
+          <span style={{
+            ...sans, fontSize:10, fontWeight:700, padding:"2px 8px", borderRadius:10,
+            background: is_live ? "#ff000022" : "#0088ff22",
+            color:      is_live ? C.bear       : C.accent,
+            border:     `1px solid ${is_live ? C.bear : C.accent}44`,
+          }}>{is_live ? "LIVE" : "PAPER"}</span>
+          {/* Mode filter toggle */}
+          <div style={{display:"flex",gap:4,background:"#00000022",borderRadius:8,padding:3}}>
+            {[["all","All"],["paper","📄 Paper"],["live","🔴 Live"]].map(([v,lbl])=>(
+              <button key={v} onClick={()=>setModeFilter(v)} style={{
+                ...sans, fontSize:11, fontWeight:modeFilter===v?700:400,
+                padding:"3px 10px", borderRadius:6, border:"none", cursor:"pointer",
+                background: modeFilter===v ? (v==="live"?"#ff000033":v==="paper"?"#0088ff33":"#ffffff22") : "transparent",
+                color: modeFilter===v ? (v==="live"?C.bear:v==="paper"?C.accent:C.text) : C.muted,
+              }}>{lbl}</button>
+            ))}
+          </div>
+        </div>
         <div style={{display:"flex",gap:10,alignItems:"center"}}>
           {loading && <Spinner/>}
           <span style={{...mono,fontSize:11,color:C.muted}}>refresh in {countdown}s</span>
@@ -3885,20 +3952,22 @@ function PnLTab() {
       <Card style={{marginBottom:20}}>
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
           <div style={{...sans,fontSize:10,textTransform:"uppercase",letterSpacing:2,color:C.muted}}>Cumulative Realized P&amp;L</div>
-          {daily_pnl.length > 0 && (
+          {filteredDailyPnl.length > 0 && (
             <div style={{display:"flex",gap:20}}>
-              <span style={{...mono,fontSize:11,color:C.muted}}>Best day: <span style={{color:C.bull}}>{fmtDol(Math.max(...daily_pnl.map(d=>d.pnl)),true)}</span></span>
-              <span style={{...mono,fontSize:11,color:C.muted}}>Worst day: <span style={{color:C.bear}}>{fmtDol(Math.min(...daily_pnl.map(d=>d.pnl)),true)}</span></span>
-              <span style={{...mono,fontSize:11,color:C.muted}}>Total: <span style={{color:pnlCol(stats.total_realized_pnl)}}>{fmtDol(stats.total_realized_pnl,true)}</span></span>
+              <span style={{...mono,fontSize:11,color:C.muted}}>Best day: <span style={{color:C.bull}}>{fmtDol(Math.max(...filteredDailyPnl.map(d=>d.pnl)),true)}</span></span>
+              <span style={{...mono,fontSize:11,color:C.muted}}>Worst day: <span style={{color:C.bear}}>{fmtDol(Math.min(...filteredDailyPnl.map(d=>d.pnl)),true)}</span></span>
+              <span style={{...mono,fontSize:11,color:C.muted}}>Total: <span style={{color:pnlCol(fTotalR)}}>{fmtDol(fTotalR,true)}</span></span>
             </div>
           )}
         </div>
-        <PnLChart/>
+        <PnLChart pts={filteredDailyPnl}/>
       </Card>
 
       {/* Today by Strategy — compact tiles */}
-      {strategy_today && Object.keys(strategy_today).length > 0 && (() => {
-        const totalToday = Object.values(strategy_today).reduce((s,v)=>s+(v.pnl||0),0);
+      {(() => {
+        if (Object.keys(filteredStrategyToday).length === 0) return null;
+        const totalToday = Object.values(filteredStrategyToday).reduce((s,v)=>s+(v.pnl||0),0);
+        const strategy_today_display = filteredStrategyToday;
         return (
           <Card style={{marginBottom:16}}>
             <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
@@ -3908,7 +3977,7 @@ function PnLTab() {
               </div>
             </div>
             <div style={{display:"flex",flexWrap:"wrap",gap:8}}>
-              {Object.entries(strategy_today).sort((a,b)=>Math.abs(b[1].pnl)-Math.abs(a[1].pnl)).map(([key,val])=>{
+              {Object.entries(strategy_today_display).sort((a,b)=>Math.abs(b[1].pnl)-Math.abs(a[1].pnl)).map(([key,val])=>{
                 const m = STRAT_META[key] || { label:key, color:C.muted };
                 const pnl = val.pnl || 0;
                 return (
@@ -3951,7 +4020,7 @@ function PnLTab() {
           stratKey={k}
           closed={byStrategy[k].closed}
           openPos={byStrategy[k].open}
-          todaySummary={strategy_today?.[k]}
+          todaySummary={filteredStrategyToday[k]}
           fmtDol={fmtDol}
           pnlCol={pnlCol}
           fmtDT={fmtDT}
@@ -3964,13 +4033,104 @@ function PnLTab() {
           stratKey={k}
           closed={byStrategy[k].closed}
           openPos={byStrategy[k].open}
-          todaySummary={strategy_today?.[k]}
+          todaySummary={filteredStrategyToday[k]}
           fmtDol={fmtDol}
           pnlCol={pnlCol}
           fmtDT={fmtDT}
           fmtDTE={fmtDTE}
         />
       ))}
+
+      {/* ── Manual Trader spreads (spread-level P&L, authoritative) ─────────── */}
+      {((mt_open && mt_open.length > 0) || (mt_closed && mt_closed.length > 0)) && (() => {
+        const effPnl = pos => {
+          const hasFills = pos.close_fills && Object.keys(pos.close_fills).length > 0;
+          return hasFills ? (pos.close_pnl ?? 0) : (pos.live_pnl ?? pos.close_pnl ?? 0);
+        };
+        const totalOpen   = (mt_open   || []).reduce((s,p) => s + (p.live_pnl   ?? 0), 0);
+        const totalClosed = (mt_closed || []).reduce((s,p) => s + (effPnl(p) ?? 0), 0);
+        return (
+          <Card style={{marginBottom:10, marginTop:4}}>
+            <div style={{display:"flex", alignItems:"baseline", gap:12, marginBottom:10}}>
+              <span style={{...sans, fontSize:13, fontWeight:700, color:C.text}}>Manual Trader</span>
+              <span style={{...mono, fontSize:12, color:pnlCol(totalOpen), fontWeight:700}}>
+                Open: {totalOpen >= 0 ? "+" : ""}{totalOpen.toFixed(2)}
+              </span>
+              <span style={{...mono, fontSize:12, color:pnlCol(totalClosed), fontWeight:700}}>
+                Closed: {totalClosed >= 0 ? "+" : ""}{totalClosed.toFixed(2)}
+              </span>
+              <span style={{...sans, fontSize:10, color:C.muted}}>spread-level P&L</span>
+            </div>
+
+            {/* Open spreads */}
+            {(mt_open || []).length > 0 && (
+              <div style={{marginBottom:8}}>
+                <div style={{...sans, fontSize:10, color:C.muted, textTransform:"uppercase", letterSpacing:1, marginBottom:4}}>Open</div>
+                <table style={{width:"100%", borderCollapse:"collapse", fontSize:12}}>
+                  <thead>
+                    <tr style={{color:C.muted}}>
+                      {["Name","Ticker","Strategy","Expiry","Entry Credit","Live P&L","Target","Stop"].map(h => (
+                        <th key={h} style={{...sans, fontWeight:600, fontSize:10, textAlign:"left", padding:"2px 8px 4px 0", borderBottom:`1px solid ${C.border}`}}>{h}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {(mt_open || []).map(pos => (
+                      <tr key={pos.pos_id} style={{borderBottom:`1px solid ${C.border}22`}}>
+                        <td style={{...sans, padding:"4px 8px 4px 0", color:C.text}}>{pos.name}</td>
+                        <td style={{...mono, padding:"4px 8px 4px 0", color:C.accent}}>{pos.ticker}</td>
+                        <td style={{...sans, padding:"4px 8px 4px 0", color:C.muted, fontSize:11}}>{(pos.strategy||"").replace(/_/g," ")}</td>
+                        <td style={{...mono, padding:"4px 8px 4px 0", color:C.muted, fontSize:11}}>{pos.expiry ? `${pos.expiry.slice(4,6)}/${pos.expiry.slice(6,8)}` : "—"}</td>
+                        <td style={{...mono, padding:"4px 8px 4px 0", color:C.bull, fontVariantNumeric:"tabular-nums"}}>{pos.net_entry != null ? `+${pos.net_entry.toFixed(2)}` : "—"}</td>
+                        <td style={{...mono, padding:"4px 8px 4px 0", color:pnlCol(pos.live_pnl), fontWeight:700, fontVariantNumeric:"tabular-nums"}}>
+                          {pos.live_pnl != null ? (pos.live_pnl >= 0 ? "+" : "") + pos.live_pnl.toFixed(2) : "—"}
+                        </td>
+                        <td style={{...mono, padding:"4px 8px 4px 0", color:C.bull, fontSize:11}}>{pos.profit_target_usd != null ? `+${pos.profit_target_usd.toFixed(0)}` : "—"}</td>
+                        <td style={{...mono, padding:"4px 8px 4px 0", color:C.bear, fontSize:11}}>{pos.stop_loss_usd != null ? pos.stop_loss_usd.toFixed(0) : "—"}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+
+            {/* Closed spreads */}
+            {(mt_closed || []).length > 0 && (
+              <div>
+                <div style={{...sans, fontSize:10, color:C.muted, textTransform:"uppercase", letterSpacing:1, marginBottom:4}}>Closed</div>
+                <table style={{width:"100%", borderCollapse:"collapse", fontSize:12}}>
+                  <thead>
+                    <tr style={{color:C.muted}}>
+                      {["Name","Ticker","Entry Credit","Realized P&L","Exit Reason","Closed At"].map(h => (
+                        <th key={h} style={{...sans, fontWeight:600, fontSize:10, textAlign:"left", padding:"2px 8px 4px 0", borderBottom:`1px solid ${C.border}`}}>{h}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {(mt_closed || []).map((pos,i) => {
+                      const pnl = effPnl(pos);
+                      const hasFills = pos.close_fills && Object.keys(pos.close_fills).length > 0;
+                      return (
+                        <tr key={pos.pos_id || i} style={{borderBottom:`1px solid ${C.border}22`}}>
+                          <td style={{...sans, padding:"4px 8px 4px 0", color:C.text}}>{pos.name}</td>
+                          <td style={{...mono, padding:"4px 8px 4px 0", color:C.accent}}>{pos.ticker}</td>
+                          <td style={{...mono, padding:"4px 8px 4px 0", color:C.bull, fontVariantNumeric:"tabular-nums"}}>{pos.net_entry != null ? `+${pos.net_entry.toFixed(2)}` : "—"}</td>
+                          <td style={{...mono, padding:"4px 8px 4px 0", color:pnlCol(pnl), fontWeight:700, fontVariantNumeric:"tabular-nums"}}>
+                            {pnl != null ? (pnl >= 0 ? "+" : "") + pnl.toFixed(2) + (!hasFills ? "*" : "") : "—"}
+                          </td>
+                          <td style={{...sans, padding:"4px 8px 4px 0", color:C.muted, fontSize:11}}>{pos.close_reason || "—"}</td>
+                          <td style={{...mono, padding:"4px 8px 4px 0", color:C.muted, fontSize:11}}>{pos.closed_at ? pos.closed_at.slice(0,10) : "—"}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+                <div style={{...sans, fontSize:10, color:C.muted, marginTop:4}}>* mark-to-market at close (no fill record)</div>
+              </div>
+            )}
+          </Card>
+        );
+      })()}
 
       {/* Exit breakdown — compact, collapsible */}
       {Object.keys(exit_breakdown).length > 0 && (
@@ -6449,6 +6609,621 @@ function FXTraderTab() {
 }
 
 
+// ── ORCL Research Tab ─────────────────────────────────────────────────────────
+function ORCLResearchTab() {
+  const [mtStatus, setMtStatus] = useState(null);
+
+  useEffect(() => {
+    const load = async () => {
+      try { setMtStatus(await apiFetch("/manual-trader/status")); } catch(_) {}
+    };
+    load();
+    const id = setInterval(load, 15000);
+    return () => clearInterval(id);
+  }, []);
+
+  const orclPositions = mtStatus
+    ? Object.values(mtStatus.positions || {}).filter(p => p.ticker === "ORCL" && p.phase === "open")
+    : [];
+  const orclClosed = mtStatus
+    ? (mtStatus.closed || []).filter(p => p.ticker === "ORCL")
+    : [];
+
+  const KEY_LEVELS = [
+    { price: 140,    label: "Aug 21 Call Wall",    type: "resist", gex: "+$3.2M" },
+    { price: 130,    label: "C130 Short Leg",       type: "resist", gex: "+$1.5M" },
+    { price: 123.62, label: "Play B BEP",           type: "neutral", gex: "—" },
+    { price: 120,    label: "Overhead Resistance",  type: "resist", gex: "-$7.8M" },
+    { price: 118.68, label: "Entry Price",          type: "entry",  gex: "—" },
+    { price: 116,    label: "52w Low (tested)",     type: "support", gex: "-$5.1M" },
+    { price: 115,    label: "P115 Short Leg",       type: "support", gex: "-$8.6M" },
+    { price: 113.05, label: "Play A BEP",           type: "neutral", gex: "—" },
+    { price: 110,    label: "P110 Long Wing",       type: "warn",   gex: "-$3.0M" },
+  ];
+
+  const typeColor = { resist: C.bear, support: C.bull, entry: C.neutral, neutral: C.muted, warn: C.orange };
+
+  return (
+    <div style={{ padding: "0 4px" }}>
+      {/* Header */}
+      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", marginBottom:20 }}>
+        <div>
+          <div style={{ ...sans, fontSize:20, fontWeight:700, color:C.text }}>ORCL — Oracle Corporation</div>
+          <div style={{ ...sans, fontSize:13, color:C.muted, marginTop:4 }}>
+            Aug 21 spreads active &nbsp;·&nbsp; Entry: $118.68 &nbsp;·&nbsp; 52w low $116.01 tested Jul 24 &nbsp;·&nbsp; Earnings Sep 9
+          </div>
+        </div>
+        <a
+          href="https://claude.ai/code/artifact/d528b867-ad2c-49ea-bc59-59a26a574c90"
+          target="_blank"
+          rel="noopener noreferrer"
+          style={{ ...sans, fontSize:12, color:C.accent, border:`1px solid ${C.accent}44`,
+            padding:"6px 14px", textDecoration:"none", whiteSpace:"nowrap" }}
+        >Full Research Brief</a>
+      </div>
+
+      {/* Thesis callout */}
+      <div style={{ background:"#1a1200", border:`1px solid ${C.neutral}44`, borderLeft:`3px solid ${C.neutral}`,
+        padding:"12px 16px", marginBottom:20, ...sans, fontSize:13, color:"#fbbf24", lineHeight:1.6 }}>
+        <b>Thesis:</b> $116.01 52w low held on intraday test. At $118.68, ORCL trades <i>below</i> SOTP bear case ($122).
+        {" "}GEX: $120 PUT wall is now overhead resistance after expiry rolloff. Play A profits if ORCL stays above $113;
+        {" "}Play B profits if ORCL recovers above $123.62. Combined max profit <b>$833</b> if ORCL reaches $130.
+        {" "}<b>Stop:</b> Close both if ORCL breaks $116 with volume.
+      </div>
+
+      {/* Summary stats */}
+      <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit,minmax(140px,1fr))", gap:12, marginBottom:24 }}>
+        {[
+          { label:"Entry Price",   val:"$118.68",    col:C.neutral },
+          { label:"52w Low",       val:"$116.01",    col:C.bear },
+          { label:"SOTP Bear",     val:"$122",       col:C.muted },
+          { label:"SOTP Base",     val:"$161",       col:C.bull },
+          { label:"Net GEX",       val:"-$7.3M",     col:C.bear },
+          { label:"Earnings",      val:"Sep 9",      col:C.neutral },
+          { label:"Play A Net",    val:"+$195 cr",   col:C.bull },
+          { label:"Play B Net",    val:"-$362 db",   col:C.bear },
+        ].map(s => (
+          <div key={s.label} style={{ background:C.card, border:`1px solid ${C.border}`, padding:"10px 12px" }}>
+            <div style={{ ...sans, fontSize:10, textTransform:"uppercase", letterSpacing:"0.08em", color:C.muted, marginBottom:4 }}>{s.label}</div>
+            <div style={{ ...mono, fontSize:18, color:s.col, lineHeight:1 }}>{s.val}</div>
+          </div>
+        ))}
+      </div>
+
+      <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:16, marginBottom:24 }}>
+        {/* Live positions */}
+        <div>
+          <div style={{ ...sans, fontSize:11, textTransform:"uppercase", letterSpacing:"0.08em", color:C.muted, marginBottom:10 }}>
+            Live Positions ({orclPositions.length})
+          </div>
+          {orclPositions.length === 0 && !mtStatus && (
+            <div style={{ ...sans, fontSize:13, color:C.muted }}>Loading...</div>
+          )}
+          {orclPositions.length === 0 && mtStatus && (
+            <div style={{ ...sans, fontSize:13, color:C.muted }}>No open ORCL positions</div>
+          )}
+          {orclPositions.map(pos => {
+            const pnl = pos.live_pnl || 0;
+            const isDebit = pos.net_entry < 0;
+            return (
+              <div key={pos.pos_id} style={{ background:C.card, border:`1px solid ${C.border}`, padding:"12px 14px", marginBottom:10 }}>
+                <div style={{ display:"flex", justifyContent:"space-between", marginBottom:8 }}>
+                  <div>
+                    <div style={{ ...sans, fontSize:13, fontWeight:600, color:C.text }}>{pos.name}</div>
+                    <div style={{ ...sans, fontSize:11, color:C.muted, marginTop:2 }}>Expiry: {pos.expiry} &nbsp;·&nbsp; {pos.strategy}</div>
+                  </div>
+                  <div style={{ textAlign:"right" }}>
+                    <div style={{ ...mono, fontSize:16, fontWeight:700, color: pnl >= 0 ? C.bull : C.bear }}>
+                      {pnl >= 0 ? "+" : ""}{pnl.toFixed(2)}
+                    </div>
+                    <div style={{ ...sans, fontSize:10, color:C.muted }}>live P&L</div>
+                  </div>
+                </div>
+                {pos.legs.map((leg, i) => (
+                  <div key={i} style={{ display:"flex", gap:8, alignItems:"center", padding:"3px 0",
+                    borderTop: i > 0 ? `1px dashed ${C.border}` : "none", fontSize:12 }}>
+                    <span style={{ ...mono, color: leg.action === "SELL" ? C.bear : C.bull, width:34, fontWeight:700 }}>{leg.action}</span>
+                    <span style={{ color:C.text, flex:1 }}>{leg.right === "P" ? "Put" : "Call"} ${leg.strike} {leg.expiry}</span>
+                    <span style={{ ...mono, color:C.muted }}>@${leg.fill_price}</span>
+                  </div>
+                ))}
+                <div style={{ display:"flex", gap:16, marginTop:10, flexWrap:"wrap" }}>
+                  <div><span style={{ ...sans, fontSize:10, color:C.muted }}>Entry: </span>
+                    <span style={{ ...mono, fontSize:11, color: isDebit ? C.bear : C.bull }}>
+                      {isDebit ? "-" : "+"}${Math.abs(pos.net_entry).toFixed(0)}
+                    </span>
+                  </div>
+                  <div><span style={{ ...sans, fontSize:10, color:C.muted }}>PT: </span>
+                    <span style={{ ...mono, fontSize:11, color:C.bull }}>+${pos.profit_target_usd}</span>
+                  </div>
+                  <div><span style={{ ...sans, fontSize:10, color:C.muted }}>SL: </span>
+                    <span style={{ ...mono, fontSize:11, color:C.bear }}>${pos.stop_loss_usd}</span>
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+          {/* Closed ORCL positions */}
+          {orclClosed.length > 0 && (
+            <>
+              <div style={{ ...sans, fontSize:11, textTransform:"uppercase", letterSpacing:"0.08em", color:C.muted, margin:"14px 0 8px" }}>
+                Closed ({orclClosed.length})
+              </div>
+              {orclClosed.map(pos => (
+                <div key={pos.pos_id} style={{ background:C.surface, border:`1px solid ${C.border}`, padding:"10px 14px", marginBottom:8, opacity:0.75 }}>
+                  <div style={{ display:"flex", justifyContent:"space-between" }}>
+                    <div style={{ ...sans, fontSize:12, color:C.muted }}>{pos.name}</div>
+                    <div style={{ ...mono, fontSize:13, color: (pos.close_pnl||0) >= 0 ? C.bull : C.bear }}>
+                      {(pos.close_pnl||0) >= 0 ? "+" : ""}{(pos.close_pnl||0).toFixed(0)}
+                    </div>
+                  </div>
+                  <div style={{ ...sans, fontSize:11, color:C.muted, marginTop:3 }}>{pos.close_reason}</div>
+                </div>
+              ))}
+            </>
+          )}
+        </div>
+
+        {/* Key levels */}
+        <div>
+          <div style={{ ...sans, fontSize:11, textTransform:"uppercase", letterSpacing:"0.08em", color:C.muted, marginBottom:10 }}>
+            Key GEX Levels
+          </div>
+          <div style={{ background:C.card, border:`1px solid ${C.border}` }}>
+            {KEY_LEVELS.map((lv, i) => (
+              <div key={i} style={{ display:"flex", alignItems:"center", gap:10, padding:"7px 12px",
+                borderBottom: i < KEY_LEVELS.length - 1 ? `1px solid ${C.border}` : "none",
+                background: lv.type === "entry" ? `${C.neutral}12` : "transparent",
+              }}>
+                <div style={{ width:6, height:6, borderRadius:"50%", background:typeColor[lv.type], flexShrink:0 }} />
+                <div style={{ ...mono, fontSize:13, color:typeColor[lv.type], width:52, flexShrink:0 }}>
+                  {lv.type === "entry" ? "▶" : ""} ${lv.price}
+                </div>
+                <div style={{ ...sans, fontSize:12, color:C.text, flex:1 }}>{lv.label}</div>
+                <div style={{ ...mono, fontSize:11, color:C.muted }}>{lv.gex}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      {/* Combined P&L table */}
+      <div style={{ ...sans, fontSize:11, textTransform:"uppercase", letterSpacing:"0.08em", color:C.muted, marginBottom:10 }}>
+        Combined P&amp;L Scenarios at Aug 21 Expiry
+      </div>
+      <div style={{ overflowX:"auto", marginBottom:24 }}>
+        <table style={{ fontSize:12 }}>
+          <thead>
+            <tr>
+              <th>ORCL</th>
+              <th>Play A (Put Spread)</th>
+              <th>Play B (Call Spread)</th>
+              <th>Combined</th>
+              <th>Note</th>
+            </tr>
+          </thead>
+          <tbody>
+            {[
+              { px:"$110",    a:-305, b:-362, note:"Max loss — thesis broken" },
+              { px:"$113",    a:0,    b:-362, note:"Play A at BEP" },
+              { px:"$116",    a:90,   b:-362, note:"52w low — stop watch" },
+              { px:"$118.68", a:121,  b:-362, note:"Entry price today", hl:true },
+              { px:"$120",    a:148,  b:-362, note:"Overhead resistance" },
+              { px:"$123.62", a:185,  b:0,    note:"Play B BEP" },
+              { px:"$125",    a:195,  b:88,   note:"Base case" },
+              { px:"$130+",   a:195,  b:638,  note:"Max profit", bull:true },
+            ].map((row, i) => {
+              const comb = row.a + row.b;
+              return (
+                <tr key={i} style={{ background: row.bull ? `${C.bull}11` : row.hl ? `${C.neutral}12` : "transparent" }}>
+                  <td style={{ ...mono, color: row.bull ? C.bull : row.hl ? C.neutral : C.text }}>{row.px}</td>
+                  <td style={{ ...mono, color: row.a > 0 ? C.bull : row.a < 0 ? C.bear : C.muted }}>{row.a > 0 ? "+" : ""}{row.a}</td>
+                  <td style={{ ...mono, color: row.b > 0 ? C.bull : row.b < 0 ? C.bear : C.muted }}>{row.b > 0 ? "+" : ""}{row.b}</td>
+                  <td style={{ ...mono, fontWeight:700, color: comb > 0 ? C.bull : comb < 0 ? C.bear : C.muted }}>{comb > 0 ? "+" : ""}{comb}</td>
+                  <td style={{ ...sans, color:C.muted, fontSize:11 }}>{row.note}</td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+
+      <div style={{ ...sans, fontSize:11, color:C.muted, borderTop:`1px solid ${C.border}`, paddingTop:12 }}>
+        Positions monitored every 30s by manual trader &nbsp;·&nbsp; Hard close 3:45 PM ET Aug 21
+        &nbsp;·&nbsp; Stop: close both if ORCL breaks $116 with volume &nbsp;·&nbsp;
+        <a href="https://claude.ai/code/artifact/d528b867-ad2c-49ea-bc59-59a26a574c90"
+           target="_blank" rel="noopener noreferrer"
+           style={{ color:C.accent }}>Full research brief</a>
+      </div>
+    </div>
+  );
+}
+
+
+// ── Manual Trader Tab ─────────────────────────────────────────────────────────
+function ManualTraderTab() {
+  const [status,  setStatus]  = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [addOpen, setAddOpen] = useState(false);
+  const emptyLeg = () => ({local_symbol:"", ticker:"", expiry:"", strike:"", right:"C", action:"BUY", qty:1, fill_price:"", multiplier:100});
+  const [form, setForm] = useState({
+    name:"", ticker:"", strategy:"iron_condor", expiry:"",
+    profit_target_usd:"", stop_loss_usd:"", hard_close_time:"15:45", notes:"",
+    legs: [emptyLeg(), emptyLeg(), emptyLeg(), emptyLeg()],
+  });
+
+  const load = async () => {
+    try { setStatus(await apiFetch("/manual-trader/status")); }
+    catch(_e) {}
+    finally { setLoading(false); }
+  };
+  useEffect(() => { load(); const id = setInterval(load, 10000); return () => clearInterval(id); }, []);
+
+  const toggle    = async () => {
+    await apiFetch("/manual-trader/enable", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({enabled:!status.enabled})});
+    load();
+  };
+  const manualClose = async (pos_id) => {
+    if (!confirm(`Close position ${pos_id}?`)) return;
+    await apiFetch(`/manual-trader/positions/${pos_id}/close`, {method:"POST"});
+    load();
+  };
+  const deletePos = async (pos_id) => {
+    if (!confirm(`Delete (without closing) position ${pos_id}?`)) return;
+    await apiFetch(`/manual-trader/positions/${pos_id}`, {method:"DELETE"});
+    load();
+  };
+  const updateField = async (pos_id, field, val) => {
+    const body = {[field]: val === "" ? null : parseFloat(val)};
+    await apiFetch(`/manual-trader/positions/${pos_id}`, {method:"PATCH", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)});
+    load();
+  };
+
+  const pnlColor = v => v == null ? C.muted : v > 0 ? "#22c55e" : v < 0 ? "#ef4444" : C.muted;
+  const actionColor = a => a === "REGISTERED" ? "#93c5fd" : a === "CLOSING" ? "#f59e0b"
+                          : a === "CLOSED" ? "#4ade80" : a === "ERROR" ? "#f87171"
+                          : a === "DELETED" ? "#a78bfa" : a === "MONITOR" ? "#475569" : C.muted;
+  const reasonColor = r => !r ? C.muted : r.startsWith("profit") ? "#4ade80"
+                          : r.startsWith("stop") ? "#ef4444" : r.startsWith("hard_close") ? "#f59e0b"
+                          : r === "manual_close" ? "#a78bfa" : C.muted;
+
+  if (loading) return <div style={{color:C.muted,...sans,fontSize:13}}>Loading...</div>;
+  if (!status)  return <div style={{color:C.muted,...sans,fontSize:13}}>Backend unavailable</div>;
+
+  const { enabled, positions, closed, decisions } = status;
+  const openPositions  = Object.values(positions || {});
+  const closedList     = [...(closed || [])].reverse().slice(0, 30);
+  const totalLivePnl   = openPositions.reduce((s, p) => s + (p.live_pnl || 0), 0);
+  // close_pnl is 0 when fills were empty (order didn't execute) — fall back to live_pnl (mark at close time)
+  const effPnl = pos => {
+    const hasFills = pos.close_fills && Object.keys(pos.close_fills).length > 0;
+    return hasFills ? (pos.close_pnl ?? 0) : (pos.live_pnl ?? pos.close_pnl ?? 0);
+  };
+  const totalClosedPnl = closedList.reduce((s, p) => s + effPnl(p), 0);
+
+  // ── Add Position Form helpers ────────────────────────────────────────────
+  const setFormField = (k, v) => setForm(f => ({...f, [k]: v}));
+  const setLegField  = (i, k, v) => setForm(f => { const legs=[...f.legs]; legs[i]={...legs[i],[k]:v}; return {...f, legs}; });
+  const addLeg  = () => setForm(f => ({...f, legs:[...f.legs, emptyLeg()]}));
+  const remLeg  = (i) => setForm(f => { const legs=f.legs.filter((_,j)=>j!==i); return {...f, legs}; });
+  const submitPosition = async () => {
+    const legsPayload = form.legs
+      .filter(l => l.ticker && l.fill_price !== "")
+      .map(l => ({
+        local_symbol: l.local_symbol || `${l.ticker}_${l.expiry}_${l.action}`,
+        ticker:       l.ticker,
+        expiry:       l.expiry || null,
+        strike:       l.strike ? parseFloat(l.strike) : null,
+        right:        l.right  || null,
+        action:       l.action,
+        qty:          parseInt(l.qty) || 1,
+        fill_price:   parseFloat(l.fill_price),
+        multiplier:   parseInt(l.multiplier) || 100,
+      }));
+    const body = {
+      name:              form.name,
+      ticker:            form.ticker,
+      strategy:          form.strategy,
+      expiry:            form.expiry || null,
+      legs:              legsPayload,
+      profit_target_usd: form.profit_target_usd !== "" ? parseFloat(form.profit_target_usd) : null,
+      stop_loss_usd:     form.stop_loss_usd     !== "" ? parseFloat(form.stop_loss_usd)     : null,
+      hard_close_time:   form.hard_close_time   || null,
+      notes:             form.notes             || null,
+    };
+    try {
+      await apiFetch("/manual-trader/positions", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)});
+      setAddOpen(false);
+      load();
+    } catch(e) { alert("Error adding position: " + e.message); }
+  };
+
+  const inpStyle = {background:"#1e293b", border:"1px solid #334155", borderRadius:4, color:C.white, padding:"4px 8px", fontSize:12, width:"100%", ...sans};
+  const labelSt  = {fontSize:11, color:C.muted, ...sans, marginBottom:2};
+
+  return (
+    <div>
+      {/* Header */}
+      <div style={{display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:16}}>
+        <div>
+          <div style={{...sans, fontSize:17, fontWeight:700, color:C.white}}>Manual Trader</div>
+          <div style={{...sans, fontSize:12, color:C.muted, marginTop:2}}>
+            Track, monitor, and auto-exit any manually-placed position
+          </div>
+          <div style={{...sans, fontSize:11, color:"#fb923c", marginTop:2}}>
+            Stop loss · Profit target · Hard close on expiry day · Multi-leg support
+          </div>
+        </div>
+        <div style={{display:"flex", gap:10, alignItems:"center"}}>
+          <div style={{...sans, fontSize:12, color:C.muted}}>
+            {openPositions.length} open · Live P&L:&nbsp;
+            <span style={{color:pnlColor(totalLivePnl), fontWeight:600}}>
+              {totalLivePnl >= 0 ? "+" : ""}{totalLivePnl.toFixed(2)}
+            </span>
+          </div>
+          <button onClick={() => setAddOpen(!addOpen)}
+            style={{padding:"6px 14px", borderRadius:6, border:"none", cursor:"pointer",
+                    background:"#3b82f6", color:"#fff", ...sans, fontSize:13, fontWeight:600}}>
+            + Add Position
+          </button>
+          <button onClick={toggle}
+            style={{padding:"6px 14px", borderRadius:6, border:"none", cursor:"pointer",
+                    background: enabled ? "#22c55e22" : "#ef444422",
+                    color: enabled ? "#4ade80" : "#ef4444", ...sans, fontSize:13, fontWeight:600,
+                    border: `1px solid ${enabled ? "#4ade8044" : "#ef444444"}`}}>
+            {enabled ? "Enabled" : "Disabled"}
+          </button>
+        </div>
+      </div>
+
+      {/* Add Position Form */}
+      {addOpen && (
+        <div style={{background:"#0f172a", border:"1px solid #1e3a5f", borderRadius:8, padding:16, marginBottom:20}}>
+          <div style={{...sans, fontSize:14, fontWeight:700, color:"#93c5fd", marginBottom:12}}>
+            Register New Position
+          </div>
+          <div style={{display:"grid", gridTemplateColumns:"1fr 1fr 1fr 1fr", gap:10, marginBottom:12}}>
+            {[["Name / Label","name","text"],["Underlying","ticker","text"],["Strategy","strategy","text"],["Expiry (YYYYMMDD)","expiry","text"]].map(([lbl,k,t]) => (
+              <div key={k}>
+                <div style={labelSt}>{lbl}</div>
+                <input style={inpStyle} type={t} value={form[k]} onChange={e=>setFormField(k,e.target.value)} />
+              </div>
+            ))}
+          </div>
+          <div style={{display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:10, marginBottom:12}}>
+            <div>
+              <div style={labelSt}>Profit Target ($)</div>
+              <input style={inpStyle} type="number" placeholder="e.g. 88" value={form.profit_target_usd}
+                     onChange={e=>setFormField("profit_target_usd",e.target.value)} />
+            </div>
+            <div>
+              <div style={labelSt}>Stop Loss ($ negative)</div>
+              <input style={inpStyle} type="number" placeholder="e.g. -177" value={form.stop_loss_usd}
+                     onChange={e=>setFormField("stop_loss_usd",e.target.value)} />
+            </div>
+            <div>
+              <div style={labelSt}>Hard Close Time (HH:MM ET)</div>
+              <input style={inpStyle} type="text" placeholder="15:45" value={form.hard_close_time}
+                     onChange={e=>setFormField("hard_close_time",e.target.value)} />
+            </div>
+          </div>
+
+          {/* Legs */}
+          <div style={{...sans, fontSize:12, color:C.muted, marginBottom:6}}>Legs</div>
+          <div style={{overflowX:"auto"}}>
+            <table style={{width:"100%", borderCollapse:"collapse", fontSize:12, ...sans}}>
+              <thead>
+                <tr style={{color:C.muted}}>
+                  {["Local Symbol","Ticker","Expiry","Strike","Right","Action","Qty","Fill $","Mult",""].map(h=>(
+                    <th key={h} style={{textAlign:"left", padding:"4px 6px", whiteSpace:"nowrap"}}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {form.legs.map((leg, i) => (
+                  <tr key={i}>
+                    {[["local_symbol","text","INTC 260724P00085000"],["ticker","text","INTC"],["expiry","text","20260724"],
+                      ["strike","number","85"],["right","text","P/C"],
+                      ["fill_price","number","1.57"],["multiplier","number","100"]
+                    ].map(([k,t,ph]) => (
+                      <td key={k} style={{padding:"3px 4px"}}>
+                        <input style={{...inpStyle, width: k==="local_symbol" ? 160 : k==="ticker" ? 60 : 70}}
+                               type={t} placeholder={ph} value={leg[k]}
+                               onChange={e=>setLegField(i,k,e.target.value)} />
+                      </td>
+                    ))}
+                    <td style={{padding:"3px 4px"}}>
+                      <select style={{...inpStyle, width:60}} value={leg.action} onChange={e=>setLegField(i,"action",e.target.value)}>
+                        <option>BUY</option><option>SELL</option>
+                      </select>
+                    </td>
+                    <td style={{padding:"3px 4px"}}>
+                      <input style={{...inpStyle, width:40}} type="number" value={leg.qty} onChange={e=>setLegField(i,"qty",e.target.value)} />
+                    </td>
+                    <td style={{padding:"3px 4px"}}>
+                      <button onClick={()=>remLeg(i)}
+                        style={{padding:"2px 8px", borderRadius:4, border:"none", cursor:"pointer", background:"#7f1d1d", color:"#fca5a5", ...sans, fontSize:11}}>
+                        ✕
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <div style={{display:"flex", gap:8, marginTop:10}}>
+            <button onClick={addLeg}
+              style={{padding:"4px 12px", borderRadius:4, border:"1px solid #334155", cursor:"pointer", background:"transparent", color:C.muted, ...sans, fontSize:12}}>
+              + Add Leg
+            </button>
+            <button onClick={submitPosition}
+              style={{padding:"4px 16px", borderRadius:4, border:"none", cursor:"pointer", background:"#3b82f6", color:"#fff", ...sans, fontSize:12, fontWeight:600}}>
+              Register
+            </button>
+            <button onClick={()=>setAddOpen(false)}
+              style={{padding:"4px 12px", borderRadius:4, border:"1px solid #334155", cursor:"pointer", background:"transparent", color:C.muted, ...sans, fontSize:12}}>
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Open Positions */}
+      <div style={{...sans, fontSize:13, fontWeight:600, color:C.muted, marginBottom:8, textTransform:"uppercase", letterSpacing:1}}>
+        Open Positions ({openPositions.length})
+      </div>
+      {openPositions.length === 0 ? (
+        <div style={{...sans, fontSize:13, color:C.muted, marginBottom:20}}>No open positions. Use "+ Add Position" to register one.</div>
+      ) : openPositions.map(pos => (
+        <div key={pos.pos_id} style={{background:"#0f172a", border:"1px solid #1e3a5f", borderRadius:8, padding:14, marginBottom:12}}>
+          <div style={{display:"flex", justifyContent:"space-between", alignItems:"flex-start", marginBottom:8}}>
+            <div>
+              <span style={{...sans, fontSize:14, fontWeight:700, color:"#93c5fd"}}>{pos.name}</span>
+              <span style={{...sans, fontSize:11, color:C.muted, marginLeft:8}}>{pos.ticker} · {pos.strategy}</span>
+              <span style={{...sans, fontSize:11, color:C.muted, marginLeft:8}}>entered {pos.entry_time ? new Date(pos.entry_time).toLocaleTimeString() : "—"}</span>
+            </div>
+            <div style={{display:"flex", gap:8, alignItems:"center"}}>
+              <span style={{...sans, fontSize:15, fontWeight:700, color:pnlColor(pos.live_pnl)}}>
+                {pos.live_pnl >= 0 ? "+" : ""}{(pos.live_pnl || 0).toFixed(2)}
+              </span>
+              <button onClick={()=>manualClose(pos.pos_id)}
+                style={{padding:"3px 10px", borderRadius:4, border:"none", cursor:"pointer", background:"#7f1d1d", color:"#fca5a5", ...sans, fontSize:11, fontWeight:600}}>
+                Close
+              </button>
+              <button onClick={()=>deletePos(pos.pos_id)}
+                style={{padding:"3px 10px", borderRadius:4, border:"none", cursor:"pointer", background:"#1e293b", color:C.muted, ...sans, fontSize:11}}>
+                Delete
+              </button>
+            </div>
+          </div>
+          {/* Legs table */}
+          <div style={{overflowX:"auto", marginBottom:10}}>
+            <table style={{width:"100%", borderCollapse:"collapse", fontSize:12, ...sans}}>
+              <thead>
+                <tr style={{color:C.muted, borderBottom:"1px solid #1e293b"}}>
+                  {["Symbol","Action","Qty","Fill","Mult"].map(h=>(
+                    <th key={h} style={{textAlign:"left", padding:"3px 8px"}}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {(pos.legs||[]).map((leg,i) => (
+                  <tr key={i} style={{borderBottom:"1px solid #0f172a"}}>
+                    <td style={{padding:"3px 8px", color:C.white}}>{leg.local_symbol}</td>
+                    <td style={{padding:"3px 8px", color: leg.action==="BUY"?"#4ade80":"#f87171"}}>{leg.action}</td>
+                    <td style={{padding:"3px 8px", color:C.muted}}>{leg.qty}</td>
+                    <td style={{padding:"3px 8px", color:C.white}}>${(leg.fill_price||0).toFixed(2)}</td>
+                    <td style={{padding:"3px 8px", color:C.muted}}>{leg.multiplier}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          {/* Controls row */}
+          <div style={{display:"flex", gap:16, alignItems:"center", flexWrap:"wrap"}}>
+            {[["profit_target_usd","Profit Target $"],["stop_loss_usd","Stop Loss $"]].map(([field,lbl])=>(
+              <div key={field} style={{display:"flex", gap:6, alignItems:"center"}}>
+                <span style={{...sans, fontSize:11, color:C.muted}}>{lbl}:</span>
+                <input style={{...inpStyle, width:70}} type="number"
+                       defaultValue={pos[field] ?? ""}
+                       onBlur={e=>updateField(pos.pos_id, field, e.target.value)}
+                       placeholder="none" />
+              </div>
+            ))}
+            <div style={{display:"flex", gap:6, alignItems:"center"}}>
+              <span style={{...sans, fontSize:11, color:C.muted}}>Hard Close:</span>
+              <input style={{...inpStyle, width:60}} type="text"
+                     defaultValue={pos.hard_close_time || ""}
+                     onBlur={e=>updateField(pos.pos_id, "hard_close_time", e.target.value)}
+                     placeholder="15:45" />
+            </div>
+            <div style={{...sans, fontSize:11, color:C.muted}}>
+              net_entry: <span style={{color:pnlColor(pos.net_entry)}}>${(pos.net_entry||0).toFixed(2)}</span>
+            </div>
+            {pos.notes && <div style={{...sans, fontSize:11, color:"#94a3b8"}}>{pos.notes}</div>}
+          </div>
+        </div>
+      ))}
+
+      {/* Closed Positions */}
+      {closedList.length > 0 && (
+        <>
+          <div style={{...sans, fontSize:13, fontWeight:600, color:C.muted, margin:"20px 0 4px", textTransform:"uppercase", letterSpacing:1}}>
+            Recently Closed ({closedList.length})  · Total P&L:&nbsp;
+            <span style={{color:pnlColor(totalClosedPnl), fontWeight:600}}>
+              {totalClosedPnl >= 0 ? "+" : ""}{totalClosedPnl.toFixed(2)}
+            </span>
+          </div>
+          <div style={{...sans, fontSize:10, color:C.muted, marginBottom:8}}>
+            * mark-to-market at close time (no fills recorded)
+          </div>
+          <div style={{overflowX:"auto"}}>
+            <table style={{width:"100%", borderCollapse:"collapse", fontSize:12, ...sans}}>
+              <thead>
+                <tr style={{color:C.muted, borderBottom:"1px solid #1e293b"}}>
+                  {["Position","Ticker","Strategy","Net Entry","Close P&L","Reason","Closed At"].map(h=>(
+                    <th key={h} style={{textAlign:"left", padding:"5px 10px", whiteSpace:"nowrap"}}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {closedList.map((pos,i) => (
+                  <tr key={i} style={{borderBottom:"1px solid #0f172a"}}>
+                    <td style={{padding:"5px 10px", color:"#93c5fd"}}>{pos.name}</td>
+                    <td style={{padding:"5px 10px", color:C.white}}>{pos.ticker}</td>
+                    <td style={{padding:"5px 10px", color:C.muted}}>{pos.strategy}</td>
+                    <td style={{padding:"5px 10px", color:pnlColor(pos.net_entry), fontVariantNumeric:"tabular-nums"}}>
+                      {pos.net_entry >= 0 ? "+" : ""}{(pos.net_entry||0).toFixed(2)}
+                    </td>
+                    <td style={{padding:"5px 10px", color:pnlColor(effPnl(pos)), fontWeight:600, fontVariantNumeric:"tabular-nums"}}>
+                      {(() => {
+                        const v = effPnl(pos);
+                        const hasFills = pos.close_fills && Object.keys(pos.close_fills).length > 0;
+                        return v != null
+                          ? (v >= 0 ? "+" : "") + v.toFixed(2) + (!hasFills ? "*" : "")
+                          : "—";
+                      })()}
+                    </td>
+                    <td style={{padding:"5px 10px", color:reasonColor(pos.close_reason)}}>{pos.close_reason || "—"}</td>
+                    <td style={{padding:"5px 10px", color:C.muted, whiteSpace:"nowrap"}}>
+                      {pos.closed_at ? new Date(pos.closed_at).toLocaleString() : "—"}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </>
+      )}
+
+      {/* Decisions log */}
+      {(decisions||[]).length > 0 && (
+        <>
+          <div style={{...sans, fontSize:13, fontWeight:600, color:C.muted, margin:"20px 0 8px", textTransform:"uppercase", letterSpacing:1}}>
+            Activity Log
+          </div>
+          <div style={{background:"#0a0f1a", borderRadius:6, padding:10, maxHeight:240, overflowY:"auto"}}>
+            {[...(decisions||[])].reverse().map((d, i) => {
+              const parts = d.split(" ");
+              const time   = parts[0];
+              const action = parts[1];
+              const rest   = parts.slice(2).join(" ");
+              return (
+                <div key={i} style={{...sans, fontSize:11, color:C.muted, marginBottom:3, display:"flex", gap:8}}>
+                  <span style={{color:"#475569", minWidth:60}}>{time}</span>
+                  <span style={{color:actionColor(action), minWidth:90}}>{action}</span>
+                  <span>{rest}</span>
+                </div>
+              );
+            })}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+
 // ── Day Trader Tab ────────────────────────────────────────────────────────────
 function DayTraderTab() {
   const [status,   setStatus]   = useState(null);
@@ -6522,7 +7297,7 @@ function DayTraderTab() {
   if (loading) return <div style={{ color:C.muted, ...sans, fontSize:13 }}>Loading…</div>;
   if (!status) return <div style={{ color:C.muted, ...sans, fontSize:13 }}>Backend unavailable</div>;
 
-  const { config: cfg, summary, positions, closed_today, decisions, eod_summary: eod } = status;
+  const { config: cfg, summary, positions, watching, closed_today, decisions, eod_summary: eod } = status;
   const goalPct = Math.min(100, summary.goal_pct || 0);
 
   return (
@@ -6601,8 +7376,19 @@ function DayTraderTab() {
         {[
           { label:"Position $", key:"position_size", type:"number", step:100 },
           { label:"Max Positions", key:"max_positions", type:"number", step:1 },
-          { label:"Hard Stop %", key:"hard_stop_pct", type:"number", step:0.5 },
-          { label:"Profit Target %", key:"profit_target_pct", type:"number", step:0.25 },
+          // Trailing stop replaced the fixed target/stop pair (2026-08-07) --
+          // show whichever pair is actually active so this never displays a
+          // dead number. use_trailing_stop:false reverts to the old fields
+          // for instant rollback, so both variants stay wired up.
+          ...(cfg.use_trailing_stop
+            ? [
+                { label:"Trailing Stop %", key:"trailing_stop_pct", type:"number", step:0.1 },
+                { label:"Confirm Move %",  key:"confirm_pct",       type:"number", step:0.05 },
+              ]
+            : [
+                { label:"Hard Stop %",     key:"hard_stop_pct",     type:"number", step:0.5 },
+                { label:"Profit Target %", key:"profit_target_pct", type:"number", step:0.25 },
+              ]),
           { label:"Force Close", key:"force_close_time", type:"text" },
         ].map(({ label, key, type, step }) => (
           <div key={key} style={{ background:"#0f172a", border:`1px solid ${C.border}`, borderRadius:6, padding:"8px 10px" }}>
@@ -6622,6 +7408,7 @@ function DayTraderTab() {
       <div style={{ display:"flex", gap:10, marginBottom:16 }}>
         {[
           { label:"Open", value:summary.open_positions },
+          { label:"Watching", value:summary.watching || 0, color: (summary.watching||0) > 0 ? "#f59e0b" : undefined },
           { label:"Capital Deployed", value:`$${summary.capital_deployed.toLocaleString()}` },
           { label:"Open P&L", value:`${(summary.open_pnl||0)>=0?"+":""}$${(summary.open_pnl||0).toFixed(2)}`, color:pnlColor(summary.open_pnl||0) },
           { label:"Closed P&L", value:`${(summary.closed_pnl||0)>=0?"+":""}$${(summary.closed_pnl||0).toFixed(2)}`, color:pnlColor(summary.closed_pnl||0) },
@@ -6645,7 +7432,7 @@ function DayTraderTab() {
           <table style={{ width:"100%", borderCollapse:"collapse", ...sans, fontSize:13 }}>
             <thead>
               <tr style={{ background:"#0f172a" }}>
-                {["Ticker","Phase","Entry $","Target $","Stop $","Current $","P&L","P&L %","Shares",""].map(h => (
+                {["Ticker","Phase","Entry $","Target / Trail","Stop $","Current $","P&L","P&L %","Shares",""].map(h => (
                   <th key={h} style={{ padding:"7px 10px", textAlign:"left", color:C.muted,
                     fontSize:11, fontWeight:600, textTransform:"uppercase", letterSpacing:0.5,
                     borderBottom:`1px solid ${C.border}` }}>{h}</th>
@@ -6663,7 +7450,13 @@ function DayTraderTab() {
                     </span>
                   </td>
                   <td style={{ padding:"8px 10px", ...mono }}>${(p.entry_price||0).toFixed(2)}</td>
-                  <td style={{ padding:"8px 10px", ...mono, color:"#22c55e" }}>${(p.profit_price||0).toFixed(2)}</td>
+                  {/* Trailing positions have no fixed profit_price -- show the running
+                      high they're trailing from instead of a misleading $0.00 */}
+                  <td style={{ padding:"8px 10px", ...mono, color:"#22c55e" }}>
+                    {p.is_trailing
+                      ? `↑$${(p.running_high||p.entry_price||0).toFixed(2)}`
+                      : `$${(p.profit_price||0).toFixed(2)}`}
+                  </td>
                   <td style={{ padding:"8px 10px", ...mono, color:"#ef4444" }}>${(p.stop_price||0).toFixed(2)}</td>
                   <td style={{ padding:"8px 10px", ...mono, fontWeight:600,
                     color: p.live_price ? C.white : C.muted }}>
@@ -6689,6 +7482,56 @@ function DayTraderTab() {
                   </td>
                 </tr>
               ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {/* Watching — candidates that cleared the entry-quality gates but haven't
+          bought yet; only fires once price + volume actually confirm the move
+          (added 2026-08-07, see trailing_stop_pct's config comment). */}
+      <div style={{ ...sans, fontSize:13, fontWeight:700, color:C.white, marginBottom:8 }}>
+        Watching <span style={{ color:C.muted, fontWeight:400, fontSize:12 }}>
+          — needs ≥{cfg.confirm_pct}% move from open + volume confirmation within {cfg.confirm_window_min}min
+        </span>
+      </div>
+      {!watching || Object.keys(watching).length === 0 ? (
+        <div style={{ color:C.muted, ...sans, fontSize:13, padding:"20px 0" }}>No candidates awaiting confirmation</div>
+      ) : (
+        <div style={{ overflowX:"auto", marginBottom:20 }}>
+          <table style={{ width:"100%", borderCollapse:"collapse", ...sans, fontSize:13 }}>
+            <thead>
+              <tr style={{ background:"#0f172a" }}>
+                {["Ticker","Day Open","Live $","Move %","Score","Registered"].map(h => (
+                  <th key={h} style={{ padding:"7px 10px", textAlign:"left", color:C.muted,
+                    fontSize:11, fontWeight:600, textTransform:"uppercase", letterSpacing:0.5,
+                    borderBottom:`1px solid ${C.border}` }}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {Object.entries(watching).map(([tk, w]) => {
+                const movePct = w.live_price ? (w.live_price / w.day_open - 1) * 100 : null;
+                return (
+                  <tr key={tk} style={{ borderBottom:`1px solid ${C.border}` }}>
+                    <td style={{ padding:"8px 10px", fontWeight:700, color:C.white, fontFamily:"monospace" }}>{tk}</td>
+                    <td style={{ padding:"8px 10px", ...mono }}>${(w.day_open||0).toFixed(2)}</td>
+                    <td style={{ padding:"8px 10px", ...mono, fontWeight:600, color: w.live_price ? C.white : C.muted }}>
+                      {w.live_price ? `$${w.live_price.toFixed(2)}` : "—"}
+                    </td>
+                    <td style={{ padding:"8px 10px", ...mono, fontWeight:700,
+                      color: movePct == null ? C.muted : movePct >= cfg.confirm_pct ? "#22c55e" : C.white }}>
+                      {movePct == null ? "—" : `${movePct>=0?"+":""}${movePct.toFixed(2)}%`}
+                    </td>
+                    <td style={{ padding:"8px 10px", color:C.muted }}>
+                      {w.composite_score != null ? w.composite_score.toFixed(0) : "—"}
+                    </td>
+                    <td style={{ padding:"8px 10px", color:C.muted, fontSize:12 }}>
+                      {w.registered_at ? new Date(w.registered_at).toLocaleTimeString() : "—"}
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </div>
@@ -7050,7 +7893,7 @@ function WatchlistTab() {
           <table style={{ width:"100%", borderCollapse:"collapse", ...sans, fontSize:13 }}>
             <thead>
               <tr style={{ background:"#0f172a" }}>
-                {["Ticker","Signal","Alert Time","Alert Price","Current","Chg %","Pct-B","RSI","Vol Ratio","Tape","S/R Levels",""].map(h => (
+                {["Ticker","Signal","Alert Time","Alert Price","Current","Chg %","Pct-B","RSI","Vol Ratio","SMA50","VWAP","Tape","S/R Levels",""].map(h => (
                   <th key={h} style={{ padding:"8px 10px", textAlign:"left", color:C.muted,
                     fontSize:11, fontWeight:600, textTransform:"uppercase", letterSpacing:0.5,
                     borderBottom:`1px solid ${C.border}` }}>{h}</th>
@@ -7100,6 +7943,32 @@ function WatchlistTab() {
                     </td>
                     <td style={{ padding:"8px 10px", color: e.vol_ratio >= 1.5 ? "#22c55e" : C.muted }}>
                       {e.vol_ratio != null ? `${e.vol_ratio.toFixed(2)}×` : "—"}
+                    </td>
+                    <td style={{ padding:"8px 10px", textAlign:"center" }}>
+                      {e.above_sma50 === true
+                        ? <span style={{color:"#4ade80", fontWeight:700}} title="Price above 50-day SMA">↑</span>
+                        : e.above_sma50 === false
+                        ? <span style={{color:"#f87171", fontWeight:700}} title="Price below 50-day SMA">↓</span>
+                        : <span style={{color:C.muted}}>—</span>}
+                    </td>
+                    <td style={{ padding:"8px 10px", textAlign:"center", whiteSpace:"nowrap" }}>
+                      {e.vwap_above != null ? (
+                        <span
+                          style={{
+                            color: e.vwap_favorable === true ? "#4ade80"
+                                 : e.vwap_favorable === false ? "#f87171"
+                                 : C.muted,
+                            fontWeight: e.vwap_favorable != null ? 700 : 400,
+                          }}
+                          title={e.vwap_favorable === true ? "Favorable VWAP position (backtest edge)"
+                               : e.vwap_favorable === false ? "Unfavorable VWAP position"
+                               : "VWAP position (no backtest rule for this ticker)"}
+                        >
+                          {e.vwap_above ? "↑" : "↓"}
+                          {e.vwap_favorable === true  ? " ★" : ""}
+                          {e.vwap_favorable === false ? " ⚠" : ""}
+                        </span>
+                      ) : <span style={{color:C.muted}}>—</span>}
                     </td>
                     <td style={{ padding:"8px 10px" }}>
                       {e.tape_label && e.tape_label !== "NO DATA" ? (
@@ -7956,6 +8825,197 @@ function IndexBanner() {
         paddingLeft: 14, flexShrink: 0, whiteSpace: "nowrap" }}>
         ● 5s
       </div>
+    </div>
+  );
+}
+
+
+// ── GEX/VEX by Strike Tab (added 2026-08-06) ────────────────────────────────
+function GexVexTab() {
+  const [universe, setUniverse] = useState([]);
+  const [ticker,   setTicker]   = useState("ORCL");
+  const [data,     setData]     = useState(null);
+  const [loading,  setLoading]  = useState(false);
+  const [error,    setError]    = useState(null);
+  const [hover,    setHover]    = useState(null);
+
+  useEffect(() => {
+    apiFetch("/gex-vex/universe").then(res => setUniverse(res.tickers || [])).catch(() => {});
+  }, []);
+
+  const load = async (refresh) => {
+    setLoading(true);
+    setError(null);
+    try {
+      const res = await apiFetch(`/gex-vex/by-strike/${ticker}${refresh ? "?refresh=true" : ""}`);
+      setData(res);
+    } catch (e) {
+      setError(e.message || "Failed to load — check the ticker has a listed 25-45 DTE option chain");
+      setData(null);
+    }
+    setLoading(false);
+  };
+
+  const fmtD = (v) => {
+    const sign = v < 0 ? "-" : "+";
+    const av = Math.abs(v);
+    if (av >= 1e9) return `${sign}$${(av/1e9).toFixed(2)}B`;
+    if (av >= 1e6) return `${sign}$${(av/1e6).toFixed(2)}M`;
+    if (av >= 1e3) return `${sign}$${(av/1e3).toFixed(1)}K`;
+    return `${sign}$${av.toFixed(0)}`;
+  };
+
+  const Chart = ({ strikes, spot, dataKey, title, sub }) => {
+    if (!strikes || strikes.length === 0) return null;
+    const W = Math.max(700, strikes.length * 58);
+    const H = 240;
+    const padTop = 30, padBottom = 30;
+    const plotH = H - padTop - padBottom;
+    const barW = W / strikes.length;
+    const maxAbs = Math.max(...strikes.map(s => Math.abs(s[dataKey])), 1);
+    const midY = padTop + plotH / 2;
+    const scale = (plotH / 2 - 4) / maxAbs;
+
+    let spotX = null;
+    for (let i = 0; i < strikes.length - 1; i++) {
+      if (spot >= strikes[i].strike && spot <= strikes[i+1].strike) {
+        const frac = (spot - strikes[i].strike) / (strikes[i+1].strike - strikes[i].strike);
+        spotX = (i + 0.5 + frac) * barW;
+        break;
+      }
+    }
+    if (spotX === null) spotX = (strikes.length / 2) * barW;
+
+    return (
+      <div style={{ marginBottom: 20 }}>
+        <div style={{ display:"flex", justifyContent:"space-between", marginBottom:8 }}>
+          <span style={{ ...mono, fontSize:13, fontWeight:700, color:C.white }}>{title}</span>
+          <span style={{ ...sans, fontSize:11, color:C.muted }}>{sub}</span>
+        </div>
+        <div style={{ overflowX:"auto" }}>
+          <svg viewBox={`0 0 ${W} ${H}`} width={W} height={H} style={{ display:"block" }}>
+            <line x1={0} x2={W} y1={midY} y2={midY} stroke={C.border} strokeWidth={1} />
+            <line x1={spotX} x2={spotX} y1={padTop-12} y2={H-padBottom+2} stroke={C.accent} strokeWidth={1.5} strokeDasharray="4 3" />
+            <text x={spotX} y={padTop-16} textAnchor="middle" style={{ ...mono, fontSize:10, fill:C.accent }}>spot {spot.toFixed(2)}</text>
+            {strikes.map((s, i) => {
+              const val = s[dataKey];
+              const x = i * barW + barW * 0.18;
+              const w = barW * 0.64;
+              const h = Math.abs(val) * scale;
+              const y = val >= 0 ? midY - h : midY;
+              return (
+                <g key={s.strike}
+                   onMouseEnter={() => setHover(s)}
+                   onMouseLeave={() => setHover(null)}
+                   style={{ cursor:"pointer" }}>
+                  <rect x={x} y={y} width={w} height={Math.max(h, 1.5)} rx={2}
+                        fill={val >= 0 ? C.bull : C.bear}
+                        opacity={hover && hover.strike===s.strike ? 1 : 0.85} />
+                  <text x={x + w/2} y={H - padBottom + 16} textAnchor="middle"
+                        style={{ ...mono, fontSize:10, fill:C.muted }}>{s.strike}</text>
+                </g>
+              );
+            })}
+          </svg>
+        </div>
+      </div>
+    );
+  };
+
+  return (
+    <div>
+      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start",
+        marginBottom:16, flexWrap:"wrap", gap:10 }}>
+        <div>
+          <div style={{ ...sans, fontSize:17, fontWeight:700, color:C.white }}>GEX / VEX by Strike</div>
+          <div style={{ ...sans, fontSize:12, color:C.muted, marginTop:2 }}>
+            Per-strike dealer gamma/vanna exposure, live from IBKR — pick any ticker from the curated universe
+          </div>
+        </div>
+        <div style={{ display:"flex", gap:10, alignItems:"center", flexWrap:"wrap" }}>
+          <select value={ticker} onChange={e => setTicker(e.target.value)}
+            style={{ ...mono, fontSize:12, padding:"6px 10px", borderRadius:6,
+              background:C.dim, border:`1px solid ${C.border}`, color:C.text, outline:"none", minWidth:180 }}>
+            {universe.map(u => <option key={u.ticker} value={u.ticker}>{u.ticker} — {u.sector}</option>)}
+          </select>
+          <button onClick={() => load(false)} disabled={loading}
+            style={{ ...sans, fontSize:12, fontWeight:700, padding:"7px 18px", borderRadius:6,
+              background:C.accent, border:"none", color:"#fff",
+              cursor: loading ? "default" : "pointer", opacity:loading?0.6:1 }}>
+            {loading ? "⟳ Scanning… (1-2 min)" : "Load"}
+          </button>
+          {data && !loading && (
+            <button onClick={() => load(true)}
+              style={{ ...sans, fontSize:11, padding:"7px 12px", borderRadius:6,
+                background:"transparent", border:`1px solid ${C.border}`, color:C.muted, cursor:"pointer" }}>
+              ↻ Refresh
+            </button>
+          )}
+        </div>
+      </div>
+
+      {error && (
+        <div style={{ ...sans, fontSize:12, color:C.bear, padding:"10px 14px",
+          background:"#2d1214", borderRadius:8, marginBottom:16 }}>
+          {error}
+        </div>
+      )}
+
+      {data && (
+        <React.Fragment>
+          <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fill,minmax(140px,1fr))",
+            gap:12, marginBottom:20 }}>
+            {[
+              { label:"Spot",     value:`$${data.spot.toFixed(2)}` },
+              { label:"Expiry",   value:data.expiry },
+              { label:"DTE",      value:`${data.dte}d` },
+              { label:"Net GEX",  value:fmtD(data.net_gex), color: data.net_gex>=0 ? C.bull : C.bear },
+              { label:"Net VEX",  value:fmtD(data.net_vex), color: data.net_vex>=0 ? C.bull : C.bear },
+              { label:"Regime",   value:data.gex_regime.replace("_"," "),
+                color: data.gex_regime==="positive_gamma" ? C.bull : C.bear },
+            ].map(s => (
+              <div key={s.label} style={{ background:C.card, border:`1px solid ${C.border}`,
+                borderRadius:8, padding:"10px 14px" }}>
+                <div style={{ ...sans, fontSize:10, color:C.muted, textTransform:"uppercase",
+                  letterSpacing:0.5, marginBottom:4 }}>{s.label}</div>
+                <div style={{ ...mono, fontSize:15, color:s.color || C.white }}>{s.value}</div>
+              </div>
+            ))}
+          </div>
+
+          <div style={{ background:C.card, border:`1px solid ${C.border}`, borderRadius:10,
+            padding:16, position:"relative" }}>
+            <Chart strikes={data.strikes} spot={data.spot} dataKey="net_gex"
+              title="Net GEX by strike" sub="$ per 1% underlying move" />
+            <Chart strikes={data.strikes} spot={data.spot} dataKey="net_vex"
+              title="Net VEX by strike" sub="$ vanna exposure, same convention" />
+
+            {hover && (
+              <div style={{ position:"absolute", top:8, right:16, background:C.dim,
+                border:`1px solid ${C.border}`, borderRadius:6, padding:"8px 12px",
+                ...mono, fontSize:11, lineHeight:1.6 }}>
+                <div style={{ color:C.accent, fontWeight:700 }}>{hover.strike} strike</div>
+                <div>GEX: <span style={{ color: hover.net_gex>=0?C.bull:C.bear }}>{fmtD(hover.net_gex)}</span></div>
+                <div>VEX: <span style={{ color: hover.net_vex>=0?C.bull:C.bear }}>{fmtD(hover.net_vex)}</span></div>
+                <div style={{ color:C.muted }}>Call OI {hover.call_oi} · Put OI {hover.put_oi}</div>
+              </div>
+            )}
+          </div>
+
+          <div style={{ ...sans, fontSize:11, color:C.muted, lineHeight:1.7, marginTop:14 }}>
+            Regime context, not a precise forecast. Net GEX/VEX rest on a standard dealer-positioning sign
+            convention (call OI×gamma positive, put OI×gamma negative), a flat 4.5% risk-free rate for
+            vanna, a single near-term expiry (25–45 DTE), and only the near-the-money strikes shown —
+            not observed dealer inventory.
+          </div>
+        </React.Fragment>
+      )}
+
+      {!data && !loading && !error && (
+        <div style={{ ...sans, fontSize:13, color:C.muted, padding:"40px 0", textAlign:"center" }}>
+          Select a ticker and click Load. This scans live option chain data (~1-2 minutes for a full strike band).
+        </div>
+      )}
     </div>
   );
 }
@@ -9116,6 +10176,150 @@ function RiskMonitorTab() {
   );
 }
 
+// ── IBKR Live News Panel (appears on all tabs) ─────────────────────────────
+function LiveNewsPanel() {
+  const [data,    setData]    = useState(null);
+  const [open,    setOpen]    = useState(false);
+  const [badge,   setBadge]   = useState(0);
+  const prevCount = React.useRef(0);
+  const [ticker,  setTicker]  = useState("");
+  const [editTick,setEditTick]= useState(false);
+
+  const fetchNews = React.useCallback(() => {
+    fetch(API + "/news/ibkr?limit=50", {signal: AbortSignal.timeout(10000)})
+      .then(r => r.json())
+      .then(d => {
+        const prev  = prevCount.current;
+        const total = d.count || 0;
+        if (total > prev && prev > 0) setBadge(b => b + (total - prev));
+        prevCount.current = total;
+        setData(d);
+      })
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => { fetchNews(); const t = setInterval(fetchNews, 30000); return () => clearInterval(t); }, [fetchNews]);
+
+  const handleToggle = () => { setOpen(o => !o); setBadge(0); };
+
+  const saveTickers = async () => {
+    const list = ticker.split(/[\s,]+/).map(t => t.trim().toUpperCase()).filter(Boolean);
+    await fetch(API + "/news/ibkr/tickers", {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({tickers: list}),
+    });
+    setEditTick(false);
+    fetchNews();
+  };
+
+  const feed = data?.feed || [];
+  const subs = data?.tickers || [];
+
+  const providerColor = p => {
+    if (!p) return C.muted;
+    const h = p.split("").reduce((a,c) => (a * 31 + c.charCodeAt(0)) | 0, 0);
+    const palette = ["#60a5fa","#34d399","#fbbf24","#f472b6","#a78bfa","#38bdf8"];
+    return palette[Math.abs(h) % palette.length];
+  };
+
+  return (
+    <div style={{
+      marginTop:20, border:`1px solid ${C.border}`, borderRadius:8,
+      overflow:"hidden", background:C.surface,
+    }}>
+      {/* ── Header bar (always visible) ── */}
+      <div onClick={handleToggle} style={{
+        display:"flex", alignItems:"center", gap:8,
+        padding:"7px 14px", cursor:"pointer", userSelect:"none",
+        background: open ? C.surface : C.bg,
+        borderBottom: open ? `1px solid ${C.border}` : "none",
+      }}>
+        <span style={{...mono, fontSize:11, fontWeight:700, color:C.accent, letterSpacing:1}}>
+          IBKR NEWS
+        </span>
+        {badge > 0 && (
+          <span style={{background:"#ef4444", color:"#fff", borderRadius:10,
+            padding:"1px 6px", fontSize:9, fontWeight:700, lineHeight:1.6}}>
+            +{badge}
+          </span>
+        )}
+        {!editTick && (
+          <span style={{...mono, fontSize:10, color:C.muted, marginLeft:2}}>
+            {subs.length > 0 ? subs.join(" · ") : "no tickers"}
+          </span>
+        )}
+        <div style={{flex:1}} />
+        <span onClick={e => { e.stopPropagation(); setEditTick(v => !v); if (!open) setOpen(true); }}
+          style={{...mono, fontSize:10, color:C.muted, padding:"1px 6px",
+            border:`1px solid ${C.border}`, borderRadius:4, cursor:"pointer"}}>
+          edit tickers
+        </span>
+        <span style={{...mono, fontSize:10, color:C.muted}}>
+          {feed.length > 0 ? `${feed.length} headlines` : "no headlines"}
+        </span>
+        <span style={{...mono, fontSize:10, color:C.muted}}>{open ? "▲" : "▼"}</span>
+      </div>
+
+      {/* ── Ticker editor ── */}
+      {open && editTick && (
+        <div style={{padding:"8px 14px", borderBottom:`1px solid ${C.border}`,
+          background:C.bg, display:"flex", gap:8, alignItems:"center"}}>
+          <input
+            style={{...mono, fontSize:12, background:C.surface, border:`1px solid ${C.border}`,
+              borderRadius:4, padding:"3px 8px", color:C.text, flex:1}}
+            defaultValue={subs.join(", ")}
+            placeholder="AMZN, META, NVDA, …"
+            onChange={e => setTicker(e.target.value)}
+            onKeyDown={e => e.key === "Enter" && saveTickers()}
+          />
+          <button onClick={saveTickers}
+            style={{...mono, fontSize:11, background:C.accent, color:"#fff",
+              border:"none", borderRadius:4, padding:"3px 10px", cursor:"pointer"}}>
+            Save
+          </button>
+          <button onClick={() => setEditTick(false)}
+            style={{...mono, fontSize:11, background:C.surface, color:C.muted,
+              border:`1px solid ${C.border}`, borderRadius:4, padding:"3px 8px", cursor:"pointer"}}>
+            Cancel
+          </button>
+        </div>
+      )}
+
+      {/* ── Headlines list ── */}
+      {open && (
+        <div style={{maxHeight:260, overflowY:"auto"}}>
+          {feed.length === 0 ? (
+            <div style={{...sans, color:C.muted, padding:"14px 18px", fontSize:12}}>
+              No headlines yet — subscriptions activate on market open.
+            </div>
+          ) : feed.map((item, i) => (
+            <div key={i} style={{
+              display:"flex", alignItems:"flex-start", gap:10,
+              padding:"6px 14px",
+              borderBottom: i < feed.length-1 ? `1px solid ${C.border}` : "none",
+            }}>
+              <span style={{...mono, fontSize:11, fontWeight:700, color:C.accent,
+                flexShrink:0, minWidth:48}}>
+                {item.ticker}
+              </span>
+              <span style={{...mono, fontSize:10, color:C.muted, flexShrink:0, minWidth:58}}>
+                {item.time}
+              </span>
+              <span style={{...sans, fontSize:12, color:C.text, flex:1, lineHeight:1.45}}>
+                {item.headline}
+              </span>
+              <span style={{...mono, fontSize:9,
+                color: providerColor(item.provider), flexShrink:0}}>
+                {item.provider}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ── Root App ──────────────────────────────────────────────────────────────
 function App() {
   const [tab, setTab]         = useState("pnl");
@@ -9150,7 +10354,8 @@ function App() {
       { id:"spx0dte",     label:"SPX 0DTE"      },
       { id:"evc",         label:"Earnings"      },
       { id:"sigtrader",   label:"Sig Trader"    },
-      { id:"fxtrader",   label:"FX Trader"     },
+      { id:"fxtrader",      label:"FX Trader"     },
+      { id:"manualtrader", label:"Manual Trader" },
       { id:"risk",        label:"Risk Monitor"  },
     ]},
     { id:"research", label:"Research", tabs: [
@@ -9159,11 +10364,13 @@ function App() {
       { id:"leaps",     label:"LEAPs"      },
       { id:"backtest",  label:"Backtest"   },
       { id:"0dte",      label:"0DTE / EIV" },
+      { id:"orcl",      label:"ORCL"       },
     ]},
     { id:"market",   label:"Market Data", tabs: [
       { id:"watchlist",  label:"Watchlist"  },
       { id:"tape",       label:"Live Tape"  },
       { id:"instflow",   label:"Inst. Flow" },
+      { id:"gexvex",     label:"GEX/VEX"    },
       { id:"technicals", label:"Technicals" },
       { id:"news",       label:"News Feed"  },
       { id:"alerts",     label:"Alerts"     },
@@ -9260,7 +10467,9 @@ function App() {
         <div style={{display: tab==="spx0dte"      ? "" : "none"}}><SPX0DTETab /></div>
         <div style={{display: tab==="evc"          ? "" : "none"}}><EVCTab /></div>
         <div style={{display: tab==="sigtrader"    ? "" : "none"}}><SigTraderTab /></div>
-        <div style={{display: tab==="fxtrader"    ? "" : "none"}}><FXTraderTab /></div>
+        <div style={{display: tab==="fxtrader"      ? "" : "none"}}><FXTraderTab /></div>
+        <div style={{display: tab==="manualtrader" ? "" : "none"}}><ManualTraderTab /></div>
+        <div style={{display: tab==="orcl"         ? "" : "none"}}><ORCLResearchTab /></div>
         <div style={{display: tab==="risk"         ? "" : "none"}}><RiskMonitorTab /></div>
         <div style={{display: tab==="backtest"     ? "" : "none"}}><BacktestTab   connected={connected} /></div>
         <div style={{display: tab==="0dte"         ? "" : "none"}}><ZeroDTETab    connected={connected} /></div>
@@ -9271,9 +10480,13 @@ function App() {
         <div style={{display: tab==="watchlist"    ? "" : "none"}}><WatchlistTab /></div>
         <div style={{display: tab==="tape"         ? "" : "none"}}><TapeTab /></div>
         <div style={{display: tab==="instflow"     ? "" : "none"}}><InstFlowTab /></div>
+        <div style={{display: tab==="gexvex"       ? "" : "none"}}><GexVexTab /></div>
         <div style={{display: tab==="news"         ? "" : "none"}}><NewsMonitorTab /></div>
         <div style={{display: tab==="alerts"       ? "" : "none"}}><AlertsTab /></div>
         <div style={{display: tab==="performance"  ? "" : "none"}}><PerformanceTab /></div>
+
+        {/* ── IBKR News Panel (persistent across all tabs) ── */}
+        <LiveNewsPanel />
 
         {/* ── Footer ── */}
         <div style={{ marginTop:32, paddingTop:16, borderTop:`1px solid ${C.border}`,

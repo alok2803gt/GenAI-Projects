@@ -132,6 +132,44 @@ ST_WINDOWS = {
     "MSFT": {"signal": "PRE-BREAKOUT", "win_start": "12:00", "win_end": "14:00"},
     "LRCX": {"signal": "PRE-BREAKOUT", "win_start": "12:00", "win_end": "14:00"},
     "NVDA": {"signal": "BREAKOUT",     "win_start": "09:30", "win_end": "16:00"},
+    "CVX":  {"signal": "BREAKOUT",     "win_start": "15:00", "win_end": "16:00"},
+    "JPM":  {"signal": "BREAKOUT",     "win_start": "15:00", "win_end": "16:00"},
+    "COST": {"signal": "BREAKOUT",     "win_start": "12:00", "win_end": "13:00"},
+    "JNJ":  {"signal": "BREAKOUT",     "win_start": "15:00", "win_end": "16:00"},
+    "GS":   {"signal": "BREAKOUT",     "win_start": "11:00", "win_end": "12:00"},
+    "TSLA": {"signal": "PRE-BREAKOUT", "win_start": "12:00", "win_end": "13:00"},
+    "LLY":  {"signal": "BREAKOUT",     "win_start": "15:00", "win_end": "16:00"},
+    "WMT":  {"signal": "PRE-BREAKOUT", "win_start": "09:30", "win_end": "10:00"},
+    "MS":   {"signal": "BREAKOUT",     "win_start": "12:00", "win_end": "13:00"},
+    "XOM":  {"signal": "BREAKOUT",     "win_start": "14:00", "win_end": "16:00"},
+    "HD":   {"signal": "BREAKOUT",     "win_start": "10:00", "win_end": "11:00"},
+}
+
+
+# ── Per-ticker VWAP edge (5-year IBKR 15-min backtest, 20 tickers, ±0.25% target/stop)
+# lift = WR(above VWAP) − WR(below VWAP) in percentage points.
+# Positive → above VWAP wins more; Negative → below VWAP wins more.
+# Source: lift_all = all signals; lift_bk = BREAKOUT signals only.
+# Tickers not listed have no reliable edge (BAC, CAT showed <1pp lift).
+VWAP_RULES: dict[str, dict] = {
+    "UNH":  {"lift_all": +5.0,  "lift_bk": +7.3},
+    "XOM":  {"lift_all": +3.8,  "lift_bk": +3.4},
+    "JPM":  {"lift_all": +3.4,  "lift_bk": +6.6},
+    "HD":   {"lift_all": +0.2,  "lift_bk": +4.6},
+    "GS":   {"lift_all": -0.4,  "lift_bk": +3.6},
+    "CVX":  {"lift_all": -0.7,  "lift_bk": +2.1},
+    "AAPL": {"lift_all": -11.5, "lift_bk": -12.9},
+    "MSFT": {"lift_all": -10.4, "lift_bk": -11.2},
+    "TSLA": {"lift_all": -7.4,  "lift_bk": -8.6},
+    "JNJ":  {"lift_all": -5.8,  "lift_bk": -9.8},
+    "NVDA": {"lift_all": -5.0,  "lift_bk": -0.7},
+    "GOOGL":{"lift_all": -4.1,  "lift_bk": -0.5},
+    "MS":   {"lift_all": -4.3,  "lift_bk": -1.6},
+    "LLY":  {"lift_all": -3.0,  "lift_bk": -4.2},
+    "AMZN": {"lift_all": -2.7,  "lift_bk": -4.8},
+    "COST": {"lift_all": -2.3,  "lift_bk": -2.5},
+    "META": {"lift_all": -1.8,  "lift_bk": -1.7},
+    "WMT":  {"lift_all": -1.4,  "lift_bk": -1.4},
 }
 
 
@@ -256,6 +294,8 @@ def post_to_backend_with_tape(backend_url: str, ind: dict, signal_type: str,
         if tape:
             payload["tape_score"] = tape.get("score")
             payload["tape_label"] = tape.get("label")
+        if ind.get("above_sma50") is not None:
+            payload["above_sma50"] = ind["above_sma50"]
         # State lifecycle context (Stage 2 enrichment)
         if ind.get("prev_state")              is not None: payload["prev_state"]              = ind["prev_state"]
         if ind.get("mins_in_pre_breakout")   is not None: payload["mins_in_pre_breakout"]   = ind["mins_in_pre_breakout"]
@@ -271,6 +311,15 @@ def post_to_backend_with_tape(backend_url: str, ind: dict, signal_type: str,
             payload["prime_window"] = sw["win_start"] <= t <= sw["win_end"]
         else:
             payload["prime_window"] = False
+        # VWAP position + favorability (from backtest rules)
+        if ind.get("vwap_above") is not None:
+            payload["vwap_above"] = ind["vwap_above"]
+            vr = VWAP_RULES.get(ind["ticker"])
+            if vr:
+                lift = vr["lift_bk"] if signal_type == "BREAKOUT" else vr["lift_all"]
+                payload["vwap_favorable"] = (
+                    (lift > 0 and ind["vwap_above"]) or (lift < 0 and not ind["vwap_above"])
+                )
         r = requests.post(
             f"{backend_url.rstrip('/')}/watchlist/alert",
             json=payload,
@@ -373,6 +422,32 @@ def fmt_alert(ind: dict, signal: str, tape: dict | None = None) -> str:
         label = "PRIME WINDOW" if in_window else f"off-peak (prime {sw['win_start']}–{sw['win_end']})"
         prime_line = f"\n{icon} <b>Sig Trader: {label}</b>"
 
+    # VWAP edge annotation — per-ticker 5yr backtest signal
+    vwap_line = ""
+    vwap_rule = VWAP_RULES.get(ind["ticker"])
+    if vwap_rule:
+        vwap_above = ind.get("vwap_above")
+        if vwap_above is not None:
+            lift = vwap_rule["lift_bk"] if signal == "BREAKOUT" else vwap_rule["lift_all"]
+            sig_tag   = "BK" if signal == "BREAKOUT" else "PRE"
+            direction = "↑ above" if vwap_above else "↓ below"
+            # Favorable when lift direction agrees with VWAP position
+            favorable = (lift > 0 and vwap_above) or (lift < 0 and not vwap_above)
+            if abs(lift) >= 1.5:
+                fav_icon  = "★" if favorable else "⚠"
+                fav_label = "FAVORABLE" if favorable else "UNFAVORABLE"
+                if favorable:
+                    vwap_line = (
+                        f"\n📍 VWAP {direction} session — {fav_icon} {fav_label}"
+                        f" ({lift:+.1f}pp {sig_tag} edge)"
+                    )
+                else:
+                    opp = "above" if not vwap_above else "below"
+                    vwap_line = (
+                        f"\n📍 VWAP {direction} session — {fav_icon} {fav_label}"
+                        f" ({opp}-VWAP wins {abs(lift):.1f}pp {sig_tag})"
+                    )
+
     return (
         f"{emoji} <b>{signal}</b> — {ind['ticker']}\n"
         f"💰 Price: ${ind['price']:.2f} ({day_sign}{ind['day_chg_pct']:.1f}%)\n"
@@ -384,6 +459,7 @@ def fmt_alert(ind: dict, signal: str, tape: dict | None = None) -> str:
         f"{sr_line}"
         f"{tape_line}"
         f"{prime_line}"
+        f"{vwap_line}"
     )
 
 
@@ -476,6 +552,37 @@ def fetch_intraday_pct_b(tickers: list[str]) -> dict[str, float]:
         except Exception:
             pass
     return result
+
+
+def _fetch_vwap_position(ticker: str) -> bool | None:
+    """Return True if the latest 15-min close is above session VWAP, False if below.
+
+    Fallback for tickers where the tape reader's vwap_z is unavailable.
+    Uses yfinance 2d/15m bars (15-min delayed) — annotation-only, never used for
+    execution decisions. Returns None if data cannot be fetched or parsed.
+    """
+    try:
+        raw = yf.download(ticker, period="2d", interval="15m",
+                          progress=False, auto_adjust=True, threads=False)
+        if raw.empty:
+            return None
+        df = raw.copy()
+        if df.index.tz is None:
+            df.index = df.index.tz_localize("UTC")
+        df.index = df.index.tz_convert("America/New_York")
+        today_date = df.index.date[-1]
+        today_df = df[df.index.date == today_date].copy()
+        if len(today_df) < 2:
+            return None
+        vol = today_df["Volume"].replace(0, float("nan"))
+        typical = (today_df["High"] + today_df["Low"] + today_df["Close"]) / 3.0
+        vwap = (typical * vol).cumsum() / vol.cumsum()
+        vwap_val = float(vwap.iloc[-1])
+        if pd.isna(vwap_val) or vwap_val == 0:
+            return None
+        return float(today_df["Close"].iloc[-1]) > vwap_val
+    except Exception:
+        return None
 
 
 def load_hist_cache(tickers: list[str], batch_size: int = 50, backend_url: str = "") -> None:
@@ -1051,7 +1158,9 @@ def process_state_transitions(
             )
         lines.append("")
 
-    send_telegram(token, chat_id, "\n".join(lines).rstrip())
+    log.info("State transitions (logged, Telegram suppressed): %s",
+             " | ".join(f"{e} {l} {i['ticker']} {p}->{classify_state(i)}"
+                        for e, l, i, p, _ in transitions))
 
 
 def _get_state_context(ticker: str) -> dict:
@@ -1954,6 +2063,14 @@ def _main_loop():
                 # Fetch tape once per ticker (used in both POST and Telegram)
                 tape = fetch_tape_sentiment(backend_url, tk)
 
+                # VWAP position for per-ticker edge annotation (backtested tickers only)
+                if tk in VWAP_RULES:
+                    comp = (tape or {}).get("components", {})
+                    if "vwap_z" in comp and comp["vwap_z"] is not None:
+                        ind["vwap_above"] = float(comp["vwap_z"]) > 0
+                    else:
+                        ind["vwap_above"] = _fetch_vwap_position(tk)
+
                 # Attach state context so backend can persist it in alert_history
                 state_ctx = _get_state_context(tk)
                 ind.update(state_ctx)
@@ -2052,8 +2169,9 @@ def _main_loop():
                     msg += "\n⚠️ <i>Monday signal — historically weakest day (backtest avg -0.10%)</i>"
                 log.info("Alerting: %s %s (tape=%s, backend=%s)",
                          sig_type, tk, tape.get("label") if tape else "no data", action)
-                send_telegram(token, chat_id, msg)
-                time.sleep(0.3)   # Telegram rate limit: ~30 msg/s
+                if sig_type == "BREAKOUT":
+                    send_telegram(token, chat_id, msg)
+                    time.sleep(0.3)   # Telegram rate limit: ~30 msg/s
 
                 # Direct stock-trader + day-trader triggers (fast path — bypasses 5-min AT poll)
                 # Only fires on first alert per ticker per day, same gate as Telegram.

@@ -58,11 +58,16 @@ try {
     [void]$checks.Add("[WARN] IBKR: status check failed (backend may still be starting)")
 }
 
-# 3. Scanner running (port 47892 bound = exactly one instance active)
-$scannerPort = Get-NetTCPConnection -LocalPort 47892 -ErrorAction SilentlyContinue | Where-Object { $_.State -in "Listen","Bound" }
-if ($scannerPort) {
-    $scannerPid = $scannerPort.OwningProcess
-    [void]$checks.Add("[OK] Scanner: running (PID $scannerPid, port 47892)")
+# 3. Scanner running -- check the actual process, not port 47892. The scanner's
+# singleton guard only calls bind() as a mutex, never listen(), so the port never
+# appears in Get-NetTCPConnection (confirmed 2026-08-04: scanner alive and scanning
+# normally, port check still said NOT running -- a false positive from checking the
+# wrong thing, not an actual scanner problem).
+$scannerProc = Get-WmiObject Win32_Process -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -eq "python.exe" -and $_.CommandLine -match "breakout_scanner\.py" }
+if ($scannerProc) {
+    $scannerPid = ($scannerProc | Select-Object -First 1).ProcessId
+    [void]$checks.Add("[OK] Scanner: running (PID $scannerPid)")
 } else {
     $scannerPid = $null
     [void]$checks.Add("[FAIL] Scanner: NOT running")
@@ -145,8 +150,8 @@ try {
     $nextMacro  = $spxCal.upcoming | Where-Object { $_.date -gt $todayIso } | Select-Object -First 1
 
     if ($macroToday) {
-        [void]$checks.Add("[WARN] SPX 0DTE: TODAY is $($macroToday.reason) day ($todayIso) — NO TRADES")
-        [void]$issues.Add("SPX 0DTE auto-skip: $($macroToday.reason) today — system will not enter any trades")
+        [void]$checks.Add("[WARN] SPX 0DTE: TODAY is $($macroToday.reason) day ($todayIso) -- NO TRADES")
+        [void]$issues.Add("SPX 0DTE auto-skip: $($macroToday.reason) today -- system will not enter any trades")
     } elseif ($spx.enabled -eq $true) {
         $nextMacroNote = if ($nextMacro) { " | next skip: $($nextMacro.date) ($($nextMacro.reason))" } else { "" }
         [void]$checks.Add("[OK] SPX 0DTE: enabled | attempts=$spxAttempt | day_pnl=`$$spxPnl | stops=$spxTiers | floor=`$$spxFloor$nextMacroNote")
