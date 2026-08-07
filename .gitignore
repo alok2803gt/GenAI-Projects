@@ -33,6 +33,7 @@ ibkr_trader/backend/fx_trader_state.json
 ibkr_trader/backend/sig_trader_state.json
 ibkr_trader/backend/spx_0dte_state.json
 ibkr_trader/backend/spx_0dte_live_state.json
+ibkr_trader/backend/oversight_log.jsonl
 ibkr_trader/backend/backend_launchd.log
 ibkr_trader/backend/scanner_launchd.log
 ibkr_trader/backend/market_close_restart.log

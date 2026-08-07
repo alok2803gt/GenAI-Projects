@@ -4981,6 +4981,64 @@ def _spx_notify(text: str) -> None:
         ).start()
 
 
+# ── Oversight audit trail (added 2026-08-07, see portfolio-oversight skill) ──
+# Durable, cross-cutting record of every autonomous decision made under that
+# skill -- BOTH trading decisions (actor="trader": enabling/disabling a
+# strategy, sizing a position, closing a position on discretion) AND
+# programmer decisions (actor="programmer": a code change, a bug fix, a new
+# tool built). Distinct from the existing per-strategy decision logs
+# (_dt_log/_at_log/_st_log/_rm_log/...), which are strategy-scoped, in-memory,
+# and rotate (last 200) -- this is the durable, append-only, cross-strategy
+# ledger the skill's audit-trail requirement actually points at.
+OVERSIGHT_LOG_PATH = "oversight_log.jsonl"
+
+
+def _oversight_log(actor: str, category: str, summary: str, rationale: str = "",
+                    outcome: str = "", pnl_impact: Optional[float] = None) -> dict:
+    """Append one audit-trail entry. actor: "trader" | "programmer".
+    category examples: strategy_enable, strategy_disable, strategy_tune,
+    new_feature, bug_fix, risk_gate_change, market_call, capital_allocation.
+    Returns the entry that was written (callers can reuse it, e.g. for the
+    matching Telegram notification's text)."""
+    entry = {
+        "time":       _utcnow().isoformat(),
+        "actor":      actor,
+        "category":   category,
+        "summary":    summary,
+        "rationale":  rationale,
+        "outcome":    outcome,
+        "pnl_impact": pnl_impact,
+    }
+    try:
+        with open(OVERSIGHT_LOG_PATH, "a") as f:
+            f.write(json.dumps(entry, default=str) + "\n")
+    except Exception as exc:
+        log.warning("Oversight log write failed: %s", exc)
+    log.info("[OVERSIGHT] %s/%s: %s", actor, category, summary)
+    return entry
+
+
+def _oversight_notify(text: str, high_priority: bool = False) -> None:
+    """Fire-and-forget Telegram push for oversight decisions/alerts. Normal
+    notifications are informational (sent AFTER acting, never a permission
+    request). high_priority=True is reserved for: stuck/blocked, resource-
+    limited, or a decision that genuinely exceeds the skill's own authority
+    (see portfolio-oversight SKILL.md's escalation triggers) -- these get a
+    distinct, impossible-to-miss prefix rather than blending into routine
+    updates."""
+    import threading
+    token, chat_id = _load_telegram_creds()
+    if not (token and chat_id):
+        log.warning("Oversight notify: Telegram not configured — alert suppressed: %s", text)
+        return
+    prefix = "🚨🚨 HIGH PRIORITY — ACTION NEEDED 🚨🚨\n" if high_priority else "🛠️ Oversight update:\n"
+    threading.Thread(
+        target=_send_telegram_sync,
+        args=(token, chat_id, prefix + text),
+        daemon=True,
+    ).start()
+
+
 # ── Telegram inbound commands (added 2026-08-05) ──────────────────────────
 # Script-only skills (safe-income-screener, gex-vex-calculator) wired up as
 # on-demand Telegram commands. Deliberately NOT chartexpert or
@@ -8024,6 +8082,33 @@ if _technicals_router_ok and technicals_router is not None:
 else:
     import logging as _lg
     _lg.getLogger("main").warning("ibkr_technicals router failed to load — /technicals/{ticker} unavailable")
+
+
+@app.get("/oversight/log")
+def oversight_log_endpoint(limit: int = Query(200, ge=1, le=2000),
+                            actor: Optional[str] = None, category: Optional[str] = None):
+    """Recent autonomous-oversight audit trail entries (see portfolio-oversight
+    skill). Optional actor=trader|programmer and/or category filter."""
+    entries = []
+    try:
+        with open(OVERSIGHT_LOG_PATH) as f:
+            lines = f.readlines()
+    except FileNotFoundError:
+        lines = []
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            e = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if actor and e.get("actor") != actor:
+            continue
+        if category and e.get("category") != category:
+            continue
+        entries.append(e)
+    entries = entries[-limit:]
+    return {"entries": list(reversed(entries)), "total_returned": len(entries)}
 
 
 # ── Risk Monitor endpoints ────────────────────────────────────────────────────
