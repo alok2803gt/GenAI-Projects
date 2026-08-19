@@ -3712,7 +3712,7 @@ function PnLTab() {
   const [ordersData,  setOrdersData]  = useState(null);
   const [deltaOpen,   setDeltaOpen]   = useState(false);
   const [deltaLoading,setDeltaLoading]= useState(false);
-  const [modeFilter,  setModeFilter]  = useState("all");
+  const [modeFilter,  setModeFilter]  = useState("live");
   const INTERVAL = 15;
 
   const loadDelta = async () => {
@@ -6609,6 +6609,274 @@ function FXTraderTab() {
 }
 
 
+// ── Analyst Reports Tab ────────────────────────────────────────────────────────
+function ValueRangeBar({ low, mid, high, current, target }) {
+  if (low == null || high == null || high <= low) return null;
+  const span = high - low;
+  const pct = (v) => Math.max(0, Math.min(100, ((v - low) / span) * 100));
+  return (
+    <div style={{ position:"relative", height:40, marginTop:6 }}>
+      <div style={{ position:"absolute", top:16, left:0, right:0, height:6, background:C.card, border:`1px solid ${C.border}` }} />
+      {mid != null && (
+        <div style={{ position:"absolute", top:16, left:`${pct(mid)}%`, width:2, height:6, background:C.muted }} />
+      )}
+      {current != null && (
+        <div style={{ position:"absolute", top:2, left:`${pct(current)}%`, transform:"translateX(-50%)", textAlign:"center" }}>
+          <div style={{ ...mono, fontSize:9, color:C.text, whiteSpace:"nowrap" }}>now</div>
+          <div style={{ width:2, height:32, background:C.text, margin:"1px auto 0" }} />
+        </div>
+      )}
+      {target != null && (
+        <div style={{ position:"absolute", top:2, left:`${pct(target)}%`, transform:"translateX(-50%)", textAlign:"center" }}>
+          <div style={{ ...mono, fontSize:9, color:C.accent, whiteSpace:"nowrap" }}>PT</div>
+          <div style={{ width:2, height:32, background:C.accent, margin:"1px auto 0" }} />
+        </div>
+      )}
+      <div style={{ position:"absolute", top:26, left:0, ...mono, fontSize:10, color:C.muted }}>${low.toFixed(0)}</div>
+      <div style={{ position:"absolute", top:26, right:0, ...mono, fontSize:10, color:C.muted }}>${high.toFixed(0)}</div>
+    </div>
+  );
+}
+
+function MultipleCompareBars({ multiples }) {
+  if (!multiples || !multiples.length) return null;
+  const maxVal = Math.max(1, ...multiples.flatMap(m => [m.company || 0, m.peer_avg || 0])) * 1.15;
+  const Row = ({ label, val, color }) => (
+    <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:2 }}>
+      <div style={{ width:64, ...sans, fontSize:10, color:C.muted, textAlign:"right" }}>{label}</div>
+      <div style={{ flex:1, background:C.card, border:`1px solid ${C.border}`, height:14, position:"relative" }}>
+        <div style={{ position:"absolute", left:0, top:0, bottom:0, width:`${Math.min(100,((val||0)/maxVal)*100)}%`, background:color }} />
+      </div>
+      <div style={{ width:44, ...mono, fontSize:10, color:C.text }}>{val != null ? val.toFixed(1) : "—"}</div>
+    </div>
+  );
+  return (
+    <div>
+      {multiples.map((m, i) => (
+        <div key={i} style={{ marginBottom:10 }}>
+          <div style={{ ...sans, fontSize:11, fontWeight:600, color:C.text, marginBottom:4 }}>{m.label}</div>
+          <Row label="Company" val={m.company} color={C.accent} />
+          <Row label="Peer Avg" val={m.peer_avg} color={C.muted} />
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function AnalystReportsTab() {
+  const [reports, setReports] = useState([]);
+  const [selected, setSelected] = useState(null);
+  const [detail, setDetail] = useState(null);
+  const [detailLoading, setDetailLoading] = useState(false);
+
+  useEffect(() => {
+    const load = async () => {
+      try {
+        const r = await apiFetch("/research/reports");
+        setReports(r.reports || []);
+      } catch (_) {}
+    };
+    load();
+    const id = setInterval(load, 60000);
+    return () => clearInterval(id);
+  }, []);
+
+  useEffect(() => {
+    if (!selected) { setDetail(null); return; }
+    let cancelled = false;
+    setDetailLoading(true);
+    apiFetch(`/research/reports/${selected}`)
+      .then(d => { if (!cancelled) setDetail(d); })
+      .catch(() => { if (!cancelled) setDetail(null); })
+      .finally(() => { if (!cancelled) setDetailLoading(false); });
+    return () => { cancelled = true; };
+  }, [selected]);
+
+  const bySector = {};
+  reports.forEach(r => {
+    bySector[r.sector] = bySector[r.sector] || [];
+    bySector[r.sector].push(r);
+  });
+
+  const ratingColor = (rating) => {
+    if (!rating) return C.muted;
+    const r = rating.toLowerCase();
+    if (r.includes("buy")) return C.bull;
+    if (r.includes("sell")) return C.bear;
+    return C.neutral;
+  };
+
+  return (
+    <div style={{ padding:"0 4px", display:"grid", gridTemplateColumns: detail ? "1fr 1fr" : "1fr", gap:20 }}>
+      <div>
+        <div style={{ ...sans, fontSize:20, fontWeight:700, color:C.text, marginBottom:4 }}>Analyst Reports</div>
+        <div style={{ ...sans, fontSize:13, color:C.muted, marginBottom:18 }}>
+          Fair-value coverage across {reports.length || 20} names &nbsp;·&nbsp; refreshed daily
+        </div>
+
+        {Object.keys(bySector).length === 0 && (
+          <div style={{ ...sans, fontSize:13, color:C.muted }}>Loading coverage universe...</div>
+        )}
+
+        {Object.entries(bySector).map(([sector, rows]) => (
+          <div key={sector} style={{ marginBottom:24 }}>
+            <div style={{ ...sans, fontSize:11, textTransform:"uppercase", letterSpacing:"0.08em", color:C.muted, marginBottom:10 }}>
+              {sector} ({rows.length})
+            </div>
+            <div style={{ display:"flex", flexDirection:"column", gap:6 }}>
+              {rows.map(r => {
+                const isActive = r.ticker === selected;
+                const covered = r.status === "covered";
+                const upColor = r.upside_pct != null ? (r.upside_pct >= 0 ? C.bull : C.bear) : C.muted;
+                return (
+                  <div key={r.ticker} onClick={() => covered && setSelected(r.ticker)}
+                    style={{
+                      display:"flex", alignItems:"center", justifyContent:"space-between",
+                      background: isActive ? "#1c2333" : C.card,
+                      border:`1px solid ${isActive ? C.accent : C.border}`,
+                      padding:"10px 14px", cursor: covered ? "pointer" : "default", opacity: covered ? 1 : 0.55,
+                    }}>
+                    <div style={{ display:"flex", alignItems:"center", gap:10 }}>
+                      <div style={{ ...mono, fontSize:13, fontWeight:700, color:C.text, width:52 }}>{r.ticker}</div>
+                      <div style={{ ...sans, fontSize:12, color:C.muted }}>
+                        {covered ? (r.company_name || "") : "Pending initial coverage"}
+                      </div>
+                      {r.has_blockers && (
+                        <span title="Analyst hit a blocker on this name" style={{ ...sans, fontSize:10, color:C.orange, border:`1px solid ${C.orange}66`, padding:"1px 6px" }}>BLOCKED</span>
+                      )}
+                    </div>
+                    {covered && (
+                      <div style={{ display:"flex", alignItems:"center", gap:16 }}>
+                        <div style={{ textAlign:"right" }}>
+                          <div style={{ ...mono, fontSize:12, color:C.text }}>{r.current_price != null ? `$${r.current_price.toFixed(2)}` : "—"}</div>
+                          <div style={{ ...sans, fontSize:9, color:C.muted }}>current</div>
+                        </div>
+                        <div style={{ textAlign:"right" }}>
+                          <div style={{ ...mono, fontSize:12, color:C.accent }}>{r.price_target != null ? `$${r.price_target.toFixed(2)}` : "—"}</div>
+                          <div style={{ ...sans, fontSize:9, color:C.muted }}>target</div>
+                        </div>
+                        <div style={{ textAlign:"right", width:52 }}>
+                          <div style={{ ...mono, fontSize:12, fontWeight:700, color:upColor }}>
+                            {r.upside_pct != null ? `${r.upside_pct >= 0 ? "+" : ""}${r.upside_pct}%` : "—"}
+                          </div>
+                          <div style={{ ...sans, fontSize:9, color:C.muted }}>upside</div>
+                        </div>
+                        <div style={{ ...sans, fontSize:10, fontWeight:700, color: ratingColor(r.rating), border:`1px solid ${ratingColor(r.rating)}66`, padding:"3px 8px", minWidth:44, textAlign:"center" }}>
+                          {r.rating || "—"}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {detail && (
+        <div>
+          <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", marginBottom:10 }}>
+            <div>
+              <div style={{ ...sans, fontSize:18, fontWeight:700, color:C.text }}>{detail.ticker} — {detail.company_name}</div>
+              <div style={{ ...sans, fontSize:11, color:C.muted, marginTop:2 }}>Last updated {detail.last_updated ? new Date(detail.last_updated).toLocaleString() : "—"}</div>
+            </div>
+            <button onClick={() => setSelected(null)} style={{ ...sans, fontSize:12, color:C.muted, background:"transparent", border:`1px solid ${C.border}`, padding:"4px 10px", cursor:"pointer" }}>Close</button>
+          </div>
+
+          {detailLoading && <div style={{ ...sans, fontSize:13, color:C.muted }}>Loading report...</div>}
+
+          {!detailLoading && detail.blockers && detail.blockers.length > 0 && (
+            <div style={{ background:"#2a1300", border:`1px solid ${C.orange}66`, borderLeft:`3px solid ${C.orange}`, padding:"10px 14px", marginBottom:16, ...sans, fontSize:12, color:C.orange }}>
+              <b>Blocked on:</b> {detail.blockers.join("; ")} — routed to Secretary for CEO follow-up.
+            </div>
+          )}
+
+          {!detailLoading && (
+            <>
+              <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit,minmax(110px,1fr))", gap:10, marginBottom:18 }}>
+                {[
+                  { label:"Current",      val: detail.current_price  != null ? `$${detail.current_price.toFixed(2)}`  : "—", col:C.text },
+                  { label:"Fair Value",   val: detail.fair_value_mid != null ? `$${detail.fair_value_mid.toFixed(2)}` : "—", col:C.neutral },
+                  { label:"Price Target", val: detail.price_target   != null ? `$${detail.price_target.toFixed(2)}`   : "—", col:C.accent },
+                  { label:"Rating",       val: detail.rating || "—", col: ratingColor(detail.rating) },
+                ].map(s => (
+                  <div key={s.label} style={{ background:C.card, border:`1px solid ${C.border}`, padding:"10px 12px" }}>
+                    <div style={{ ...sans, fontSize:10, textTransform:"uppercase", letterSpacing:"0.08em", color:C.muted, marginBottom:4 }}>{s.label}</div>
+                    <div style={{ ...mono, fontSize:16, color:s.col }}>{s.val}</div>
+                  </div>
+                ))}
+              </div>
+
+              <div style={{ ...sans, fontSize:11, textTransform:"uppercase", letterSpacing:"0.08em", color:C.muted, marginBottom:6 }}>Fair Value Range</div>
+              <ValueRangeBar low={detail.fair_value_low} mid={detail.fair_value_mid} high={detail.fair_value_high} current={detail.current_price} target={detail.price_target} />
+
+              {detail.thesis && (
+                <div style={{ background:"#1a1200", border:`1px solid ${C.neutral}44`, borderLeft:`3px solid ${C.neutral}`, padding:"12px 16px", margin:"20px 0", ...sans, fontSize:13, color:"#fbbf24", lineHeight:1.6 }}>
+                  <b>Thesis:</b> {detail.thesis}
+                </div>
+              )}
+
+              {detail.methodology && detail.methodology.multiples && (
+                <>
+                  <div style={{ ...sans, fontSize:11, textTransform:"uppercase", letterSpacing:"0.08em", color:C.muted, margin:"18px 0 10px" }}>Valuation vs. Peers</div>
+                  <MultipleCompareBars multiples={detail.methodology.multiples} />
+                </>
+              )}
+
+              {detail.methodology && detail.methodology.dcf && (
+                <>
+                  <div style={{ ...sans, fontSize:11, textTransform:"uppercase", letterSpacing:"0.08em", color:C.muted, margin:"18px 0 10px" }}>DCF Assumptions</div>
+                  <div style={{ ...sans, fontSize:12, color:C.text, lineHeight:1.8 }}>
+                    {Object.entries(detail.methodology.dcf).map(([k, v]) => (
+                      <div key={k} style={{ display:"flex", justifyContent:"space-between", borderBottom:`1px solid ${C.border}`, padding:"4px 0" }}>
+                        <span style={{ color:C.muted }}>{k.replace(/_/g," ")}</span><span style={{ ...mono }}>{String(v)}</span>
+                      </div>
+                    ))}
+                  </div>
+                </>
+              )}
+
+              <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:16, margin:"18px 0" }}>
+                {detail.catalysts && detail.catalysts.length > 0 && (
+                  <div>
+                    <div style={{ ...sans, fontSize:11, textTransform:"uppercase", letterSpacing:"0.08em", color:C.bull, marginBottom:8 }}>Catalysts</div>
+                    <ul style={{ margin:0, paddingLeft:18, ...sans, fontSize:12, color:C.text, lineHeight:1.7 }}>
+                      {detail.catalysts.map((c, i) => <li key={i}>{c}</li>)}
+                    </ul>
+                  </div>
+                )}
+                {detail.risks && detail.risks.length > 0 && (
+                  <div>
+                    <div style={{ ...sans, fontSize:11, textTransform:"uppercase", letterSpacing:"0.08em", color:C.bear, marginBottom:8 }}>Risks</div>
+                    <ul style={{ margin:0, paddingLeft:18, ...sans, fontSize:12, color:C.text, lineHeight:1.7 }}>
+                      {detail.risks.map((r, i) => <li key={i}>{r}</li>)}
+                    </ul>
+                  </div>
+                )}
+              </div>
+
+              {detail.sources && detail.sources.length > 0 && (
+                <>
+                  <div style={{ ...sans, fontSize:11, textTransform:"uppercase", letterSpacing:"0.08em", color:C.muted, margin:"18px 0 8px" }}>Sources</div>
+                  <div style={{ ...sans, fontSize:11, color:C.muted, lineHeight:1.9 }}>
+                    {detail.sources.map((s, i) => (
+                      <div key={i}>
+                        {s.url ? <a href={s.url} target="_blank" rel="noopener noreferrer" style={{ color:C.accent }}>{s.title || s.url}</a> : (s.title || String(s))}
+                      </div>
+                    ))}
+                  </div>
+                </>
+              )}
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+
 // ── ORCL Research Tab ─────────────────────────────────────────────────────────
 function ORCLResearchTab() {
   const [mtStatus, setMtStatus] = useState(null);
@@ -7218,6 +7486,233 @@ function ManualTraderTab() {
             })}
           </div>
         </>
+      )}
+    </div>
+  );
+}
+
+
+// ── Alpaca Tab ────────────────────────────────────────────────────────────────
+// Read-only visibility into the Alpaca account. Orders go out via standalone
+// scripts, not this app -- no in-app placement, no journal, no monitor loop
+// for these positions. This tab exists so they show up SOMEWHERE in the app
+// instead of only being visible via a direct API call. See secretary_tasks.json
+// task 2026-08-12-005 for the full gap this is a minimal fix for.
+function AlpacaTab() {
+  const [data,    setData]    = useState(null);
+  const [error,   setError]   = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  const load = async () => {
+    try { setData(await apiFetch("/alpaca/positions")); setError(null); }
+    catch (e) { setError(e.message); }
+    finally { setLoading(false); }
+  };
+  useEffect(() => { load(); const id = setInterval(load, 15000); return () => clearInterval(id); }, []);
+
+  const pnlColor = v => v == null ? C.muted : v > 0 ? "#22c55e" : v < 0 ? "#ef4444" : C.muted;
+
+  if (loading) return <div style={{color:C.muted,...sans,fontSize:13}}>Loading...</div>;
+  if (error)   return <div style={{color:"#ef4444",...sans,fontSize:13}}>Alpaca unavailable: {error}</div>;
+  if (!data)   return <div style={{color:C.muted,...sans,fontSize:13}}>No data</div>;
+
+  const { account, positions } = data;
+  const totalPl = positions.reduce((s, p) => s + (p.unrealized_pl || 0), 0);
+
+  return (
+    <div>
+      <div style={{marginBottom:16}}>
+        <div style={{...sans, fontSize:17, fontWeight:700, color:C.white}}>Alpaca</div>
+        <div style={{...sans, fontSize:12, color:C.muted, marginTop:2}}>
+          Execution venue for new option orders (PDT workaround) -- data stays on IBKR
+        </div>
+        <div style={{...sans, fontSize:11, color:"#fb923c", marginTop:2}}>
+          Read-only. Not tracked in this app's journal or monitors -- orders are placed via standalone scripts.
+        </div>
+      </div>
+
+      {/* Account snapshot */}
+      <div style={{display:"flex", gap:24, flexWrap:"wrap", background:"#0f172a", border:"1px solid #1e3a5f", borderRadius:8, padding:14, marginBottom:20}}>
+        {[
+          ["Cash", fmt$(account.cash)],
+          ["Equity", fmt$(account.equity)],
+          ["Options Buying Power", fmt$(account.options_buying_power)],
+          ["Buying Power", fmt$(account.buying_power)],
+          ["Open Positions", String(positions.length)],
+        ].map(([label, value]) => (
+          <div key={label}>
+            <div style={{...sans, fontSize:11, color:C.muted, textTransform:"uppercase", letterSpacing:0.5}}>{label}</div>
+            <div style={{...sans, fontSize:16, fontWeight:700, color:C.white, marginTop:2}}>{value}</div>
+          </div>
+        ))}
+        <div>
+          <div style={{...sans, fontSize:11, color:C.muted, textTransform:"uppercase", letterSpacing:0.5}}>Total Unrealized P&L</div>
+          <div style={{...sans, fontSize:16, fontWeight:700, color:pnlColor(totalPl), marginTop:2}}>
+            {totalPl >= 0 ? "+" : ""}{totalPl.toFixed(2)}
+          </div>
+        </div>
+      </div>
+
+      {/* Positions */}
+      <div style={{...sans, fontSize:13, fontWeight:600, color:C.muted, marginBottom:8, textTransform:"uppercase", letterSpacing:1}}>
+        Positions ({positions.length})
+      </div>
+      {positions.length === 0 ? (
+        <div style={{...sans, fontSize:13, color:C.muted}}>No open Alpaca positions.</div>
+      ) : (
+        <div style={{overflowX:"auto"}}>
+          <table style={{width:"100%", borderCollapse:"collapse", fontSize:12, ...sans}}>
+            <thead>
+              <tr style={{color:C.muted, borderBottom:"1px solid #1e293b"}}>
+                {["Symbol","Side","Qty","Avg Entry","Current","Market Value","Unrealized P&L","%"].map(h=>(
+                  <th key={h} style={{textAlign:"left", padding:"5px 10px", whiteSpace:"nowrap"}}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {[...positions].sort((a,b)=>a.symbol.localeCompare(b.symbol)).map((p,i) => (
+                <tr key={i} style={{borderBottom:"1px solid #0f172a"}}>
+                  <td style={{padding:"5px 10px", color:C.white, fontFamily:mono.fontFamily}}>{p.symbol}</td>
+                  <td style={{padding:"5px 10px", color: p.side.toLowerCase().includes("long") ? "#4ade80" : "#f87171"}}>
+                    {p.side.replace("PositionSide.","")}
+                  </td>
+                  <td style={{padding:"5px 10px", color:C.white, fontVariantNumeric:"tabular-nums"}}>{p.qty}</td>
+                  <td style={{padding:"5px 10px", color:C.muted, fontVariantNumeric:"tabular-nums"}}>{fmt$(p.avg_entry_price)}</td>
+                  <td style={{padding:"5px 10px", color:C.muted, fontVariantNumeric:"tabular-nums"}}>{fmt$(p.current_price)}</td>
+                  <td style={{padding:"5px 10px", color:C.white, fontVariantNumeric:"tabular-nums"}}>{fmt$(p.market_value)}</td>
+                  <td style={{padding:"5px 10px", color:pnlColor(p.unrealized_pl), fontWeight:600, fontVariantNumeric:"tabular-nums"}}>
+                    {p.unrealized_pl >= 0 ? "+" : ""}{(p.unrealized_pl||0).toFixed(2)}
+                  </td>
+                  <td style={{padding:"5px 10px", color:pnlColor(p.unrealized_pl), fontVariantNumeric:"tabular-nums"}}>
+                    {p.unrealized_plpc != null ? `${p.unrealized_plpc >= 0 ? "+" : ""}${p.unrealized_plpc.toFixed(1)}%` : "—"}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+function SPY0DTETab() {
+  const [data,    setData]    = useState(null);
+  const [error,   setError]   = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  const load = async () => {
+    try { setData(await apiFetch("/spy-0dte/status")); setError(null); }
+    catch (e) { setError(e.message); }
+    finally { setLoading(false); }
+  };
+  useEffect(() => { load(); const id = setInterval(load, 15000); return () => clearInterval(id); }, []);
+
+  const actionColor = (action) => {
+    if (["ENTERED", "PROFIT_TARGET_HIT"].includes(action)) return "#4ade80";
+    if (["PAUSED", "ENTRY_INCOMPLETE", "HEALTH_CHECK_FAIL", "PRICING_ABORT", "STRIKES_MISSING"].includes(action)) return "#f87171";
+    if (action === "HARD_CLOSE") return "#fbbf24";
+    return C.muted; // NO_FIRE and anything else -- routine, not a problem
+  };
+
+  if (loading) return <div style={{color:C.muted,...sans,fontSize:13}}>Loading...</div>;
+  if (error)   return <div style={{color:"#ef4444",...sans,fontSize:13}}>SPY 0DTE unavailable: {error}</div>;
+  if (!data)   return <div style={{color:C.muted,...sans,fontSize:13}}>No data</div>;
+
+  const { paused, pause_reason, positions, closed, decisions, summary } = data;
+  const openList = Object.values(positions || {});
+
+  return (
+    <div>
+      <div style={{marginBottom:16}}>
+        <div style={{...sans, fontSize:17, fontWeight:700, color:C.white}}>SPY 0DTE Auto-Fire</div>
+        <div style={{...sans, fontSize:12, color:C.muted, marginTop:2}}>
+          Fully unattended daily iron condor, 09:43 ET weekdays, no manual confirmation gate (2026-08-17 CEO direction) --
+          fires only if conservative (worst-fill) credit clears $0.05/contract, qty fixed at 1.
+        </div>
+      </div>
+
+      {paused && (
+        <div style={{background:"#450a0a", border:"1px solid #7f1d1d", borderRadius:8, padding:12, marginBottom:16}}>
+          <div style={{...sans, fontSize:13, fontWeight:700, color:"#f87171"}}>&#128721; PAUSED -- will not attempt to fire</div>
+          <div style={{...sans, fontSize:12, color:"#fca5a5", marginTop:4, whiteSpace:"pre-wrap"}}>{pause_reason}</div>
+        </div>
+      )}
+
+      {/* Summary */}
+      <div style={{display:"flex", gap:24, flexWrap:"wrap", background:"#0f172a", border:"1px solid #1e3a5f", borderRadius:8, padding:14, marginBottom:20}}>
+        {[
+          ["Status", paused ? "Paused" : "Active"],
+          ["Open Positions", String(summary.open_positions)],
+          ["Closed Trades", String(summary.closed_trades)],
+          ["Last Action", summary.last_action ? `${summary.last_action.action} @ ${summary.last_action.time}` : "—"],
+        ].map(([label, value]) => (
+          <div key={label}>
+            <div style={{...sans, fontSize:11, color:C.muted, textTransform:"uppercase", letterSpacing:0.5}}>{label}</div>
+            <div style={{...sans, fontSize:16, fontWeight:700, color:C.white, marginTop:2}}>{value}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* Open positions */}
+      <div style={{...sans, fontSize:13, fontWeight:600, color:C.muted, marginBottom:8, textTransform:"uppercase", letterSpacing:1}}>
+        Open Positions ({openList.length})
+      </div>
+      {openList.length === 0 ? (
+        <div style={{...sans, fontSize:13, color:C.muted, marginBottom:20}}>None open right now.</div>
+      ) : (
+        <div style={{overflowX:"auto", marginBottom:20}}>
+          <table style={{width:"100%", borderCollapse:"collapse", fontSize:12, ...sans}}>
+            <thead>
+              <tr style={{color:C.muted, borderBottom:"1px solid #1e293b"}}>
+                {["Pos ID","Entry Credit","Max Risk","Profit Target","Entry Time"].map(h=>(
+                  <th key={h} style={{textAlign:"left", padding:"5px 10px", whiteSpace:"nowrap"}}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {openList.map((p,i) => (
+                <tr key={i} style={{borderBottom:"1px solid #0f172a"}}>
+                  <td style={{padding:"5px 10px", color:C.white, fontFamily:mono.fontFamily}}>{p.pos_id}</td>
+                  <td style={{padding:"5px 10px", color:"#4ade80", fontVariantNumeric:"tabular-nums"}}>{fmt$(p.net_entry_credit)}</td>
+                  <td style={{padding:"5px 10px", color:C.muted, fontVariantNumeric:"tabular-nums"}}>{fmt$(p.max_risk)}</td>
+                  <td style={{padding:"5px 10px", color:C.muted, fontVariantNumeric:"tabular-nums"}}>{fmt$(p.profit_target_usd)}</td>
+                  <td style={{padding:"5px 10px", color:C.muted}}>{p.entry_time}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {/* Decision log -- every fire-or-skip decision, not just fills */}
+      <div style={{...sans, fontSize:13, fontWeight:600, color:C.muted, marginBottom:8, textTransform:"uppercase", letterSpacing:1}}>
+        Decision Log ({decisions.length})
+      </div>
+      {decisions.length === 0 ? (
+        <div style={{...sans, fontSize:13, color:C.muted}}>No decisions logged yet.</div>
+      ) : (
+        <div style={{overflowX:"auto", maxHeight:400, overflowY:"auto"}}>
+          <table style={{width:"100%", borderCollapse:"collapse", fontSize:12, ...sans}}>
+            <thead>
+              <tr style={{color:C.muted, borderBottom:"1px solid #1e293b"}}>
+                {["Time","Action","Detail"].map(h=>(
+                  <th key={h} style={{textAlign:"left", padding:"5px 10px", whiteSpace:"nowrap"}}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {[...decisions].reverse().map((d,i) => (
+                <tr key={i} style={{borderBottom:"1px solid #0f172a"}}>
+                  <td style={{padding:"5px 10px", color:C.muted, whiteSpace:"nowrap", fontVariantNumeric:"tabular-nums"}}>{d.time}</td>
+                  <td style={{padding:"5px 10px", color:actionColor(d.action), fontWeight:700, whiteSpace:"nowrap"}}>{d.action}</td>
+                  <td style={{padding:"5px 10px", color:C.text}}>{d.detail}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
       )}
     </div>
   );
@@ -10019,7 +10514,12 @@ function RiskMonitorTab() {
   if (!data) return <div style={{...sans, color:C.muted, padding:32}}>
     {loading ? "Loading…" : "No data"}</div>;
 
-  const {violations=[], summary={}, log=[]} = data;
+  const {violations=[], summary={}, log=[], market_hours, last_check} = data;
+  // Rules only actually evaluate during market hours (see _risk_monitor_coro
+  // in main.py) -- previously last_check stayed null forever outside market
+  // hours/weekends while this tab still showed a reassuring green "all rules
+  // passing", indistinguishable from a real clean check (2026-08-17 review).
+  const notEvaluated = market_hours === false || !last_check;
 
   return (
     <div style={{maxWidth:900}}>
@@ -10076,7 +10576,9 @@ function RiskMonitorTab() {
       <div style={cardStyle}>
         <div style={{...sans, fontSize:12, color:C.muted, marginBottom:8, fontWeight:600,
           letterSpacing:"0.05em", textTransform:"uppercase"}}>Active Violations</div>
-        {violations.length === 0
+        {notEvaluated
+          ? <div style={{...sans, fontSize:13, color:C.muted}}>Market closed — rules not evaluated since last close. Not the same as a clean check.</div>
+          : violations.length === 0
           ? <div style={{...sans, fontSize:13, color:"#4ade80"}}>No active violations — all rules passing.</div>
           : violations.map((v, i) => (
             <div key={i} style={{borderLeft:`3px solid ${sevColor(v.severity)}`,
@@ -10325,6 +10827,7 @@ function App() {
   const [tab, setTab]         = useState("pnl");
   const [connected, setConn]  = useState(false);
   const [netDelta, setDelta]  = useState(null);
+  const [netLiq, setNetLiq]   = useState(null);
 
   useEffect(() => {
     const check = async () => {
@@ -10334,6 +10837,19 @@ function App() {
     const iv = setInterval(check, 10000);
     return () => clearInterval(iv);
   }, []);
+
+  // Net Liquidation -- the account's actual current worth. Given a permanent,
+  // prominent home in the navbar (visible on every tab) instead of being
+  // buried as subtext on one card of the P&L tab.
+  useEffect(() => {
+    if (!connected) return;
+    const load = async () => {
+      try { const a = await apiFetch("/account/summary"); setNetLiq(a.net_liquidation); } catch(_) {}
+    };
+    load();
+    const iv = setInterval(load, 30000);
+    return () => clearInterval(iv);
+  }, [connected]);
 
   useEffect(() => {
     if (!connected) return;
@@ -10352,19 +10868,22 @@ function App() {
       { id:"stocktrader", label:"Stock Trader"  },
       { id:"daytrader",   label:"Day Trader"    },
       { id:"spx0dte",     label:"SPX 0DTE"      },
+      { id:"spy0dte",     label:"SPY 0DTE"      },
       { id:"evc",         label:"Earnings"      },
       { id:"sigtrader",   label:"Sig Trader"    },
       { id:"fxtrader",      label:"FX Trader"     },
       { id:"manualtrader", label:"Manual Trader" },
+      { id:"alpaca",       label:"Alpaca"        },
       { id:"risk",        label:"Risk Monitor"  },
     ]},
     { id:"research", label:"Research", tabs: [
-      { id:"signals",   label:"Signals"    },
-      { id:"csp",       label:"CSP Scan"   },
-      { id:"leaps",     label:"LEAPs"      },
-      { id:"backtest",  label:"Backtest"   },
-      { id:"0dte",      label:"0DTE / EIV" },
-      { id:"orcl",      label:"ORCL"       },
+      { id:"signals",       label:"Signals"        },
+      { id:"csp",           label:"CSP Scan"       },
+      { id:"leaps",         label:"LEAPs"          },
+      { id:"backtest",      label:"Backtest"       },
+      { id:"0dte",          label:"0DTE / EIV"     },
+      { id:"orcl",          label:"ORCL"           },
+      { id:"analystreports",label:"Analyst Reports"},
     ]},
     { id:"market",   label:"Market Data", tabs: [
       { id:"watchlist",  label:"Watchlist"  },
@@ -10408,6 +10927,12 @@ function App() {
           </span>
         </div>
         <div style={{ display:"flex", gap:12, alignItems:"center" }}>
+          {netLiq != null && (
+            <div style={{ ...mono, fontSize:13, fontWeight:700, color:C.text,
+              padding:"3px 10px", borderRadius:12, background:`${C.accent}18`, border:`1px solid ${C.accent}40` }}>
+              Net Liq ${Number(netLiq).toLocaleString("en-US",{minimumFractionDigits:2,maximumFractionDigits:2})}
+            </div>
+          )}
           {netDelta != null && (
             <div style={{ ...mono, fontSize:12, fontWeight:700, color:deltaCol,
               padding:"3px 10px", borderRadius:12, background:`${deltaCol}18`, border:`1px solid ${deltaCol}40` }}>
@@ -10465,11 +10990,14 @@ function App() {
         <div style={{display: tab==="stocktrader"  ? "" : "none"}}><StockTraderTab /></div>
         <div style={{display: tab==="daytrader"    ? "" : "none"}}><DayTraderTab /></div>
         <div style={{display: tab==="spx0dte"      ? "" : "none"}}><SPX0DTETab /></div>
+        <div style={{display: tab==="spy0dte"      ? "" : "none"}}><SPY0DTETab /></div>
         <div style={{display: tab==="evc"          ? "" : "none"}}><EVCTab /></div>
         <div style={{display: tab==="sigtrader"    ? "" : "none"}}><SigTraderTab /></div>
         <div style={{display: tab==="fxtrader"      ? "" : "none"}}><FXTraderTab /></div>
         <div style={{display: tab==="manualtrader" ? "" : "none"}}><ManualTraderTab /></div>
+        <div style={{display: tab==="alpaca" ? "" : "none"}}><AlpacaTab /></div>
         <div style={{display: tab==="orcl"         ? "" : "none"}}><ORCLResearchTab /></div>
+        <div style={{display: tab==="analystreports" ? "" : "none"}}><AnalystReportsTab /></div>
         <div style={{display: tab==="risk"         ? "" : "none"}}><RiskMonitorTab /></div>
         <div style={{display: tab==="backtest"     ? "" : "none"}}><BacktestTab   connected={connected} /></div>
         <div style={{display: tab==="0dte"         ? "" : "none"}}><ZeroDTETab    connected={connected} /></div>

@@ -194,19 +194,35 @@ _DEFAULT_UNIVERSE: List[str] = list(CSP_UNIVERSE)
 # Candidate pool screened nightly → top 20-30 replace CSP_UNIVERSE dynamically
 CANDIDATE_POOL: List[str] = [
     # ── Mega-cap tech ────────────────────────────────────────────────────
-    "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "ORCL", "IBM", "CSCO",
+    "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "ORCL", "IBM",
+    # CSCO removed 2026-08-12 (temporary): already holds a real put credit
+    # spread placed via Alpaca earlier today (reports AH tonight). EVC's own
+    # dedup (_evc_scan_universe) only checks ev["positions"], which has no
+    # visibility into Alpaca-placed trades -- leaving CSCO in the pool risked
+    # EVC's 15:30 scan opening a second, independent CSCO condor via IBKR
+    # tonight, duplicating exposure the CEO explicitly said not to add to.
+    # Safe to re-add before CSCO's next earnings cycle (~3mo out) or once the
+    # Alpaca position registry gap (task 2026-08-12-005) is fixed.
     # ── Semiconductors ───────────────────────────────────────────────────
     "AMD", "INTC", "QCOM", "TXN", "AVGO", "MU", "AMAT", "LRCX", "KLAC",
     "MRVL", "SMCI", "ON", "MPWR", "MCHP", "ASML", "TER", "ENTG",
+    "LITE", "CBRS",
+    # COHR removed 2026-08-12 (temporary): CEO approved placing a manual
+    # $10-wide put credit spread via Alpaca (real credit/liquidity checked
+    # against CANDIDATE_POOL of choices -- see oversight_log.jsonl). Same
+    # double-entry risk as CSCO above -- pull before EVC's 15:30 scan, safe
+    # to re-add before COHR's next earnings cycle or once the Alpaca
+    # position registry gap (task 2026-08-12-005) is fixed.
     # ── Software / Cloud / AI ────────────────────────────────────────────
     "NOW", "CRM", "ADBE", "INTU", "SNOW", "PLTR", "UBER", "ABNB",
+    "CRWV", "NBIS",
     "NET", "DDOG", "ZS", "CRWD", "PANW", "FTNT", "OKTA", "S",
     "TEAM", "HUBS", "MDB", "GTLB", "ZM", "TWLO",
     # ── Financials — Money-center banks ──────────────────────────────────
     "JPM", "BAC", "WFC", "GS", "MS", "BLK", "C", "AXP", "V", "MA",
     "SCHW", "COF", "USB", "PNC", "TFC", "SPGI", "MCO",
     # ── Financials — Regional banks ──────────────────────────────────────
-    "FITB", "RF", "KEY", "HBAN", "CMA", "ZION", "WAL", "EWBC",
+    "FITB", "RF", "KEY", "HBAN", "ZION", "WAL", "EWBC",   # CMA removed 2026-08-12: delisted on yfinance (likely acquired)
     # ── Financials — Insurance ───────────────────────────────────────────
     "PGR", "ALL", "TRV", "CB", "MET", "PRU", "AFL", "AIG", "HIG", "L",
     # ── Financials — Fintech / Payments ──────────────────────────────────
@@ -222,7 +238,7 @@ CANDIDATE_POOL: List[str] = [
     "DVN", "FANG", "HES", "HAL", "BKR",
     # ── Materials / Chemicals / Mining ───────────────────────────────────
     "FCX", "NEM", "DOW", "LYB", "ALB", "NUE", "CF", "SHW", "PPG",
-    "ECL", "APD", "AA", "CLF", "MOS", "MP",
+    "ECL", "APD", "AA", "CLF", "MOS", "MP", "AMCR",
     # ── Utilities ────────────────────────────────────────────────────────
     "NEE", "D", "SO", "DUK", "AEP", "EXC", "XEL", "PCG", "ED",
     # ── Consumer Discretionary — Retail ──────────────────────────────────
@@ -244,7 +260,7 @@ CANDIDATE_POOL: List[str] = [
     # ── Industrials / Aerospace / Defense ────────────────────────────────
     "CAT", "DE", "BA", "HON", "GE", "LMT", "RTX", "NOC", "GD",
     "UPS", "FDX", "ETN", "EMR", "ITW", "PH", "ROK", "MMM",
-    "TDG", "AXON", "LHX", "HII", "LDOS", "FAST", "GWW",
+    "TDG", "AXON", "LHX", "HII", "LDOS", "FAST", "GWW", "TRMB",
     # ── Airlines / Transportation ────────────────────────────────────────
     "DAL", "UAL", "AAL", "LUV", "ALK", "JBHT", "SW",
     "JBLU", "HA", "SAVE",
@@ -279,6 +295,8 @@ STOCK_SECTOR_MAP: Dict[str, str] = {
     "LRCX":"Technology","KLAC":"Technology","MRVL":"Technology","PLTR":"Technology",
     "IBM":"Technology","CSCO":"Technology","INTU":"Technology","SMCI":"Technology",
     "ON":"Technology","MPWR":"Technology",
+    "LITE":"Technology","COHR":"Technology","CRWV":"Technology","NBIS":"Technology",
+    "TRMB":"Technology","CBRS":"Technology",
     # Consumer Discretionary
     "NKE":"Consumer Discretionary","HD":"Consumer Discretionary",
     "SBUX":"Consumer Discretionary","LOW":"Consumer Discretionary",
@@ -392,6 +410,13 @@ state: Dict = {
             "scan_types":        ["csp"],
             "csp_capital":       20000.0,
             "leap_capital":      5000.0,
+            # CSP leg structure: defined-risk put credit spread (short put + a
+            # protective long put further OTM), not a naked cash-secured put.
+            # Collateral = spread_width*100 instead of strike*100 -- see
+            # _at_place_csp_spread. csp_spread_width_pct sets the long leg's
+            # distance below the short strike as a fraction of the short strike.
+            "csp_spread_width_pct":      0.08,
+            "csp_spread_min_credit_frac":0.15,   # min acceptable credit as a fraction of spread width
             # Kelly criterion
             "use_kelly":         True,
             "total_capital":     50000.0,  # actual paper account balance
@@ -615,6 +640,12 @@ state: Dict = {
         "enabled": False,
         "config": {
             "max_positions":  3,
+            "max_positions_per_night": 3,  # separate cap on positions from ONE earnings
+                                            # night specifically -- added 2026-08-11 after
+                                            # external review flagged that the aggregate
+                                            # max_positions cap doesn't limit correlated
+                                            # same-night exposure when several names report
+                                            # together (e.g. multiple mega-caps one evening)
             "min_credit":     0.50,   # min net condor credit per spread ($)
             "wing_mult":      1.5,    # wing width = wing_mult x expected_move
             "entry_start":    "15:30",
@@ -696,10 +727,10 @@ state: Dict = {
     "risk_monitor": {
         "enabled": True,
         "config": {
-            "account_value":      50000.0,   # actual paper account balance
+            "account_value":      50000.0,   # fallback only -- _risk_monitor_coro pulls live net liq when connected
             "csp_stop_mult":      2.0,       # Rule 1: close CSP when loss >= N× premium
             "csp_warn_mult":      1.5,       # warn at 1.5× before hard stop
-            "leap_max_cost":      3000.0,    # Rule 2: flag LEAPs above this cost basis
+            "leap_max_cost":      200.0,     # Rule 2: flag LEAPs above this cost basis (matches AutoTrader's real leap_capital budget, not a stale $3,000 paper-account default)
             "vix_threshold":      25.0,      # Rule 3: disable day trader above this VIX
             "stock_stop_pct":     5.0,       # Rule 4: flag stock positions down >N% after 3d
             "max_position_pct":   5.0,       # Rule 5: flag any position > N% of account
@@ -1486,7 +1517,7 @@ async def streaming_loop_async() -> None:
                         ("day_trader",          _dt_save_state),
                         ("stock_trader",        _st_save_state),
                         ("spx_0dte",            _spx_save_state),
-                        ("earnings_vol_crush",  _evc_save_state),
+                        ("evc",                 _evc_save_state),
                         ("sig_trader",          _sigt_save_state),
                     ]:
                         if state.get(_tkey, {}).get("enabled"):
@@ -2711,6 +2742,15 @@ def _update_regime_cache_sync() -> None:
     """
     try:
         spy_hist  = yf.Ticker("SPY").history(period="1y")
+        # Same root cause as the nflx_bottom_monitor.py fix (2026-08-18):
+        # yfinance adds a placeholder row for the still-in-progress trading
+        # day with a NaN close. This function is deliberately called
+        # pre-market (9:08 ET, see docstring) -- iloc[-1] hit that NaN row
+        # every single time, producing a NaN spy_price/spy_sma200 that then
+        # crashed both /market/regime and /market/regime/refresh (raw NaN
+        # is invalid JSON, not caught by either endpoint's try/except since
+        # the crash happens during response serialization, after return).
+        spy_hist  = spy_hist.dropna(subset=["Close"])
         spy_c     = spy_hist["Close"].astype(float)
         spy_sma200 = float(spy_c.rolling(200).mean().iloc[-1])
         spy_price  = float(spy_c.iloc[-1])
@@ -3761,6 +3801,16 @@ def _capital_state(ib: IB, cfg: dict, at: dict) -> dict:
         if info.get("action") == "SELL":   # CSP
             consumed += float(info.get("strike", 0)) * float(info.get("qty", 1)) * 100
 
+    # CSP spread positions live in Manual Trader's position dict (reuses its
+    # proven 2-leg BAG combo engine -- see _at_place_csp_spread), not at["positions"].
+    # Prune entries whose MT position already closed so freed collateral comes
+    # back into deployable, then sum the still-open ones.
+    mt_open = state.get("manual_trader", {}).get("positions", {})
+    spread_positions = at.setdefault("csp_spread_positions", {})
+    for pos_id in [k for k, v in spread_positions.items() if v.get("mt_pos_id") not in mt_open]:
+        spread_positions.pop(pos_id, None)
+    consumed += sum(float(v.get("collateral", 0)) for v in spread_positions.values())
+
     deployable = max(0.0, max_deploy - consumed)
 
     # IBKR live floor
@@ -3898,9 +3948,10 @@ async def _autotrader_scan_and_trade_coro(ib: IB) -> None:
     # Use the positions DICT (not live portfolio) so Inactive orders still
     # consume slots — prevents duplicate orders that are accepted by TWS but
     # not visible in ib.portfolio() until exchange transmission.
-    dict_t   = {k.split("_")[0] for k in at["positions"]}
-    portf_t  = {item.contract.symbol for item in ib.portfolio()}
-    active_t = dict_t | portf_t
+    dict_t     = {k.split("_")[0] for k in at["positions"]}
+    portf_t    = {item.contract.symbol for item in ib.portfolio()}
+    spread_t   = {v["ticker"] for v in at.get("csp_spread_positions", {}).values()}
+    active_t   = dict_t | portf_t | spread_t
 
     # ── Capital-aware headroom ────────────────────────────────────────────────
     # Dual constraint: count headroom (sanity cap) AND capital headroom.
@@ -3911,10 +3962,13 @@ async def _autotrader_scan_and_trade_coro(ib: IB) -> None:
     # Kelly with max_positions=5 would have been capped at 2 positions even with
     # $40K deployable and 5 quality candidates — defeating capital-aware sizing.
     max_slots   = cfg["max_positions"]
-    cap         = _capital_state(ib, cfg, at)
-    count_slots = max_slots - len(at["positions"])
-    # Estimate the cheapest likely CSP (use $100 strike as conservative floor)
-    min_csp_cost = 100 * 100   # $10,000 for a $100-strike single-contract CSP
+    cap         = _capital_state(ib, cfg, at)   # also prunes closed csp_spread_positions
+    count_slots = max_slots - len(at["positions"]) - len(at.get("csp_spread_positions", {}))
+    # Estimate the cheapest likely CSP spread (screener price floor x wing pct,
+    # not full strike*100 -- the CSP leg is a defined-risk spread, see
+    # _at_place_csp_spread. $20 floor is the screener's own min_price.)
+    _wing_pct    = float(cfg.get("csp_spread_width_pct", 0.08))
+    min_csp_cost = max(50.0, 20 * _wing_pct * 100)
     capital_slots = int(cap["deployable"] / min_csp_cost) if cap["deployable"] > 0 else 0
     csp_slots = min(count_slots, capital_slots)
 
@@ -4023,9 +4077,15 @@ async def _autotrader_scan_and_trade_coro(ib: IB) -> None:
                                     f"leap_budget=${leap_budget:,.0f})")
                     continue
             else:
-                cost = float(row.get("strike", 0)) * float(row.get("qty", 1)) * 100
+                # CSP leg is a defined-risk put credit spread (see _at_place_csp_spread),
+                # so estimated cost is spread width, not full strike notional. This is
+                # a cheap pre-filter estimate only -- the exact strike/width/qty is
+                # computed for real inside _at_place_csp_spread, which has its own
+                # precise affordability gate right before placing the order.
+                est_width = float(row.get("strike", 0)) * float(cfg.get("csp_spread_width_pct", 0.08))
+                cost = est_width * 100   # qty=1 estimate, same convention as before
                 if cost > cap["deployable"]:
-                    _at_log("SCAN", f"Skip {row['ticker']}: position cost ${cost:,.0f} > "
+                    _at_log("SCAN", f"Skip {row['ticker']}: est. spread cost ${cost:,.0f} > "
                                     f"deployable ${cap['deployable']:,.0f}")
                     continue
             try:
@@ -4081,22 +4141,205 @@ async def _autotrader_scan_and_trade_coro(ib: IB) -> None:
             _at_log("ERROR", f"Hedge failed: {exc}")
 
 
+async def _at_place_csp_spread(ib: IB, row: dict, cfg: dict, regime: str = "BULL") -> None:
+    """
+    Place the CSP leg as a defined-risk put credit spread (short put + a
+    protective long put further OTM) instead of a naked cash-secured put.
+
+    Why: naked CSP collateral is strike*100 -- the broker charges the full
+    notional because a naked short put's max loss runs to (strike-0)*100.
+    A put credit spread caps collateral at (short_strike-long_strike)*100,
+    since the broker only has to cover the capped max loss. At this account's
+    csp_capital (~$900 as of 2026-08-11), naked CSPs are unaffordable across
+    the entire screener's $20-800 price range (min ~$1,700 needed for the
+    cheapest allowed stock) -- confirmed 9-17x more capital-efficient as a
+    spread on real live candidates the same day (CFO finding, see
+    cfo_ledger.json capital_roadmap.structural_finding_2026-08-11).
+
+    Execution reuses Manual Trader's already-proven 2-leg BAG combo order path
+    (_mt_place_order_coro) instead of rebuilding a whole new position lifecycle
+    (monitor/close/rotate) inside AutoTrader -- that engine already works
+    (MRVL/UNH/AAPL/ORCL all filled this way). AutoTrader tracks just enough
+    (ticker/qty/collateral/mt_pos_id) in state["autotrader"]["csp_spread_positions"]
+    for its own dedup and capital accounting -- see _capital_state, which prunes
+    entries once Manual Trader shows the position closed.
+    """
+    from zoneinfo import ZoneInfo
+
+    ticker  = row["ticker"]
+    expiry  = row["expiry"]
+    short_k = float(row["strike"])
+    spot    = float(row.get("stock_price") or row.get("spot") or 0)
+    if spot <= 0:
+        _at_log("SKIP", f"Spread gate: no stock price for {ticker} — aborting")
+        raise _FlowAbort(f"no stock price for {ticker}")
+
+    # ── Long (protective) strike: nearest real listed strike further OTM ───
+    wing_pct = float(cfg.get("csp_spread_width_pct", 0.08))
+    target_long = short_k * (1 - wing_pct)
+    cached = _chain_params_cache.get(ticker)
+    if not cached:
+        _at_log("SKIP", f"Spread gate: no cached option chain for {ticker} — aborting")
+        raise _FlowAbort(f"no cached option chain for {ticker}")
+    chain, _cache_date = cached
+    real_strikes = [s for s in chain.strikes if s < short_k]
+    if not real_strikes:
+        _at_log("SKIP", f"Spread gate: no listed strike below ${short_k} for {ticker} — aborting")
+        raise _FlowAbort(f"no protective strike available below {short_k} for {ticker}")
+    long_k = min(real_strikes, key=lambda s: abs(s - target_long))
+    width  = short_k - long_k
+    if width <= 0:
+        _at_log("SKIP", f"Spread gate: invalid strikes {long_k}/{short_k} for {ticker} — aborting")
+        raise _FlowAbort(f"invalid spread strikes for {ticker}")
+
+    # ── Sizing: half-Kelly capital slice, same regime scaling as _kelly_qty,
+    # but against spread width (collateral) instead of full strike notional ──
+    if cfg.get("use_kelly", True):
+        p  = float(cfg.get("assumed_win_rate", 0.85))
+        pt = float(cfg.get("profit_target_pct", 0.50))
+        sl = float(cfg.get("stop_loss_mult", 2.0))
+        b  = pt / sl if sl > 0 else pt / 5.0
+        kelly = (p * (b + 1) - 1) / b if b > 0 else 0.0
+        frac  = max(0.02, kelly * 0.5)
+        regime_scale = {"BULL": 1.0, "NEUTRAL": 0.6, "BEAR": 0.35, "UNKNOWN": 0.5}.get(regime, 0.5)
+        capital = float(cfg.get("csp_capital", 20000.0)) * frac * regime_scale
+        qty = max(1, int(capital / (width * 100)))
+    else:
+        qty = max(1, int(float(cfg.get("csp_capital", 20000.0)) / (width * 100)))
+
+    # ── Collateral-affordability gate (spread width, not full strike notional) ──
+    required = qty * width * 100
+    budget   = float(cfg.get("csp_capital", 20000.0))
+    if required > budget:
+        _abort_msg = (
+            f"Spread collateral ${required:,.0f} for {qty}x {ticker} ${short_k}/{long_k}P "
+            f"exceeds csp_capital budget ${budget:,.0f} -- skipping to avoid margin-deficit rejection"
+        )
+        _at_log("SKIP", f"Affordability gate: {_abort_msg}")
+        raise _FlowAbort(_abort_msg)
+
+    # ── Live IBKR quotes on both legs (real prices, not the scan snapshot) ──
+    short_c = Option(ticker, expiry, short_k, "P", "SMART")
+    long_c  = Option(ticker, expiry, long_k,  "P", "SMART")
+    await ib.qualifyContractsAsync(short_c, long_c)
+    if not short_c.conId or not long_c.conId:
+        raise ValueError(f"Could not qualify spread legs for {ticker} {expiry} {short_k}/{long_k}P")
+
+    td_s = ib.reqMktData(short_c, "", False, False)
+    td_l = ib.reqMktData(long_c,  "", False, False)
+    await asyncio.sleep(3)
+    s_bid, s_ask = _spx_safe_px(td_s.bid), _spx_safe_px(td_s.ask)
+    l_bid, l_ask = _spx_safe_px(td_l.bid), _spx_safe_px(td_l.ask)
+    ib.cancelMktData(short_c)
+    ib.cancelMktData(long_c)
+
+    if not (s_bid and s_ask and l_bid and l_ask):
+        raise ValueError(f"Missing live quotes on spread legs for {ticker} {short_k}/{long_k}P")
+
+    conservative_credit = round(s_bid - l_ask, 2)
+    s_mid = (s_bid + s_ask) / 2
+    l_mid = (l_bid + l_ask) / 2
+    target_credit = round((s_mid - (s_mid - s_bid) * 0.40) - (l_mid + (l_ask - l_mid) * 0.40), 2)
+    if target_credit <= 0 or conservative_credit <= 0:
+        raise ValueError(f"No positive credit available on {ticker} {short_k}/{long_k}P spread")
+
+    min_credit_frac = float(cfg.get("csp_spread_min_credit_frac", 0.15))
+    if conservative_credit < width * min_credit_frac:
+        _abort_msg = (
+            f"Conservative credit ${conservative_credit:.2f} on {ticker} {short_k}/{long_k}P "
+            f"below {min_credit_frac:.0%} of width (${width:.2f}) -- skipping, not worth the risk"
+        )
+        _at_log("SKIP", f"Credit gate: {_abort_msg}")
+        raise _FlowAbort(_abort_msg)
+
+    # ── Place via Manual Trader's proven 2-leg BAG combo engine ────────────
+    mt_req = MTEnterRequest(
+        ticker=ticker,
+        expiry=expiry,
+        legs=[
+            MTEnterLegRequest(action="SELL", strike=short_k, right="P"),
+            MTEnterLegRequest(action="BUY",  strike=long_k,  right="P"),
+        ],
+        limit_price=target_credit,
+        qty=qty,
+        name=f"{ticker} AutoTrader CSP Spread {expiry}",
+        strategy="vertical",
+        profit_target_usd=round(target_credit * qty * 100 * float(cfg.get("profit_target_pct", 0.50)), 2),
+        stop_loss_usd=-round(width * qty * 100 * 0.5, 2),
+    )
+    try:
+        result = await _mt_place_order_coro(ib, mt_req)
+    except ValueError as e:
+        _at_log("NO_FILL", f"Spread order for {ticker} did not fill: {e}")
+        raise _FlowAbort(f"spread order for {ticker} did not fill: {e}")
+
+    pos_id = result["pos_id"]
+
+    # Tag the Manual Trader position as AutoTrader-sourced so it can be
+    # reported separately (/autotrader/spread-positions) without duplicating
+    # Manual Trader's monitor/close/journal lifecycle for it.
+    mt_pos = state["manual_trader"]["positions"].get(pos_id)
+    if mt_pos is not None:
+        mt_pos["source"]          = "autotrader"
+        mt_pos["source_strategy"] = "csp_spread"
+        _mt_save_state()
+
+    at = state["autotrader"]
+    at.setdefault("csp_spread_positions", {})[pos_id] = {
+        "ticker":       ticker,
+        "mt_pos_id":    pos_id,
+        "short_strike": short_k,
+        "long_strike":  long_k,
+        "qty":          qty,
+        "collateral":   width * qty * 100,
+        "placed_at":    datetime.now(ZoneInfo("America/New_York")).isoformat(),
+        "score":        row.get("score", 0),
+    }
+    _at_log("TRADE", f"SPREAD {qty}x {ticker} SELL ${short_k}P / BUY ${long_k}P {expiry} "
+                     f"net_entry=${result['net_entry']:+.2f} (pos {pos_id}, via Manual Trader engine)")
+
+
 async def _autotrader_place_coro(ib: IB, row: dict, cfg: dict, regime: str = "BULL") -> None:
+    t = row.get("_type", "csp")
+    if t == "csp":
+        # CSP leg is a defined-risk put credit spread (short put + protective
+        # long put), not a naked cash-secured put -- see _at_place_csp_spread
+        # for why (collateral efficiency at this account's capital level).
+        await _at_place_csp_spread(ib, row, cfg, regime=regime)
+        return
+
     ticker = row["ticker"]
     expiry = row["expiry"]
     strike = float(row["strike"])
-    t      = row.get("_type", "csp")
-    right  = "P" if t == "csp" else "C"
-    action = "SELL" if t == "csp" else "BUY"
+    right  = "C"
+    action = "BUY"
     bid = float(row.get("bid", 0) or 0)
     ask = float(row.get("ask", 0) or 0)
     mid = (bid + ask) / 2 if ask > 0 else 5.0
     if cfg.get("use_kelly", True):
         qty = _kelly_qty(cfg, strike, t, mid, regime=regime)
-    elif t == "csp":
-        qty = max(1, int(float(cfg.get("csp_capital", 20000)) / (strike * 100)))
     else:
         qty = max(1, int(float(cfg.get("leap_capital", 5000)) / (mid * 100)))
+
+    # ── Collateral-affordability gate (LEAP: debit paid vs self-financed budget) ──
+    # qty above is floored at 1 by design (Kelly can round down to 0 contracts),
+    # but that floor never checks whether even 1 contract's debit actually fits
+    # inside the strategy's own budget. Left unchecked, an undersized budget
+    # reaches ib.placeOrder() and gets rejected live for margin deficit -- same
+    # failure class as the 2026-08-10 ORCL close. Abort here, before spending
+    # any IBKR API calls pricing a trade that can't be afforded. (CSP's own
+    # affordability gate lives inside _at_place_csp_spread, checked against
+    # spread width, not full strike -- see that function.)
+    required = qty * mid * 100
+    budget = max(0.0, state["autotrader"].get("leap_budget", 0.0)) or float(cfg.get("leap_capital", 5000.0))
+    if required > budget:
+        _abort_msg = (
+            f"Debit ${required:,.0f} for {qty}x {ticker} ${strike}C exceeds "
+            f"leap budget ${budget:,.0f} -- skipping to avoid margin-deficit rejection"
+        )
+        _at_log("SKIP", f"Affordability gate: {_abort_msg}")
+        raise _FlowAbort(_abort_msg)
+
     contract = Option(ticker, expiry, strike, right, "SMART")
     await ib.qualifyContractsAsync(contract)
     if not contract.conId:
@@ -7436,7 +7679,10 @@ TICKER_COMPANY_NAMES: Dict[str, list] = {
     "LRCX": ["Lam Research"], "KLAC": ["KLA Corp", "KLA-Tencor"], "MRVL": ["Marvell"],
     "PLTR": ["Palantir"], "CSCO": ["Cisco"], "INTU": ["Intuit"],
     "SMCI": ["Super Micro Computer", "Supermicro"], "ON": ["ON Semiconductor"],
-    "MPWR": ["Monolithic Power Systems"], "NKE": ["Nike"], "HD": ["Home Depot"],
+    "MPWR": ["Monolithic Power Systems"],
+    "LITE": ["Lumentum"], "COHR": ["Coherent"], "CRWV": ["CoreWeave"], "CBRS": ["Cerebras"],
+    "NBIS": ["Nebius"], "AMCR": ["Amcor"], "TRMB": ["Trimble"],
+    "NKE": ["Nike"], "HD": ["Home Depot"],
     "SBUX": ["Starbucks"], "LOW": ["Lowe's", "Lowes"], "TGT": ["Target"],
     "MCD": ["McDonald's", "McDonalds"], "BKNG": ["Booking Holdings", "Booking.com"],
     "LULU": ["Lululemon"], "RIVN": ["Rivian"], "RBLX": ["Roblox"], "UBER": ["Uber"],
@@ -7797,9 +8043,15 @@ async def _risk_monitor_coro():
     now_et = datetime.now(ZoneInfo("America/New_York"))
     mkt_open  = now_et.replace(hour=9,  minute=30, second=0, microsecond=0)
     mkt_close = now_et.replace(hour=16, minute=0,  second=0, microsecond=0)
-    if not (mkt_open <= now_et <= mkt_close):
-        return
-    if now_et.weekday() >= 5:
+    is_market_hours = (mkt_open <= now_et <= mkt_close) and now_et.weekday() < 5
+    # Stamp on every poll, even outside market hours, so the frontend can tell
+    # "not evaluated yet (market closed)" apart from "evaluated, all clear" --
+    # previously last_check only ever got set on the in-hours path below, so
+    # it stayed permanently null overnight/weekends while the UI still showed
+    # a reassuring green "all rules passing" (found in the 2026-08-17 frontend review).
+    rm["last_poll"] = now_et.isoformat()
+    rm["market_hours"] = is_market_hours
+    if not is_market_hours:
         return
 
     rm["last_check"] = now_et.isoformat()
@@ -7807,7 +8059,13 @@ async def _risk_monitor_coro():
     at  = state.get("autotrader", {})
     st  = state.get("stock_trader", {})
     dt  = state.get("day_trader", {})
-    acct_val = float(cfg.get("account_value", 100000.0))
+    # Live net liq, not the static config default -- account_value drifted
+    # stale multiple times this session (fixed via a runtime POST 2026-08-10,
+    # silently reverted to the 50000.0 code default on every subsequent
+    # restart since there's no persisted override). Pulling it live each
+    # check means Rule 5's concentration % is always sized against the real
+    # account, and can never go stale again the way a static number will.
+    acct_val = (_get_net_liq(ib) if ib and ib.isConnected() else None) or float(cfg.get("account_value", 100000.0))
 
     alerts = []  # collect for single Telegram batch
 
@@ -8111,6 +8369,105 @@ def oversight_log_endpoint(limit: int = Query(200, ge=1, le=2000),
     return {"entries": list(reversed(entries)), "total_returned": len(entries)}
 
 
+# ── Research / Analyst Reports endpoints ─────────────────────────────────────
+# Storage for the equity-research-analyst skill's daily-refreshed fair-value
+# reports. The backend is a dumb store+serve layer only — the actual research
+# (fundamentals, comps, DCF, qualitative sourcing) happens in Claude agents,
+# not in this process. See skill: equity-research-analyst.
+
+RESEARCH_REPORTS_DIR = "research_reports"
+os.makedirs(RESEARCH_REPORTS_DIR, exist_ok=True)
+
+RESEARCH_UNIVERSE = {
+    "Semiconductors": ["NVDA", "AVGO", "AMD", "QCOM", "TXN", "INTC", "AMAT", "MU", "LRCX", "ADI"],
+    "Software":       ["MSFT", "ORCL", "CRM", "ADBE", "INTU", "NOW", "PANW", "SNPS", "CDNS", "WDAY"],
+}
+
+
+class ResearchReportRequest(BaseModel):
+    sector:          str
+    company_name:    str
+    current_price:   Optional[float] = None
+    fair_value_low:  Optional[float] = None
+    fair_value_mid:  Optional[float] = None
+    fair_value_high: Optional[float] = None
+    price_target:    Optional[float] = None
+    rating:          Optional[str]   = None
+    methodology:     Optional[dict]  = None
+    thesis:          Optional[str]   = None
+    catalysts:       Optional[list]  = None
+    risks:           Optional[list]  = None
+    sources:         Optional[list]  = None
+    blockers:        Optional[list]  = None
+    chart_data:      Optional[dict]  = None
+
+
+@app.get("/research/universe")
+def research_universe():
+    """Fixed 20-ticker coverage universe for the equity-research-analyst skill."""
+    return RESEARCH_UNIVERSE
+
+
+@app.get("/research/reports")
+def research_reports_list():
+    """Summary of every stored analyst report — list view for the frontend."""
+    out = []
+    for sector, tickers in RESEARCH_UNIVERSE.items():
+        for ticker in tickers:
+            path = os.path.join(RESEARCH_REPORTS_DIR, f"{ticker}.json")
+            if not os.path.exists(path):
+                out.append({"ticker": ticker, "sector": sector, "status": "not_yet_covered"})
+                continue
+            try:
+                with open(path) as f:
+                    r = json.load(f)
+            except (json.JSONDecodeError, OSError):
+                out.append({"ticker": ticker, "sector": sector, "status": "error_reading_report"})
+                continue
+            upside_pct = None
+            if r.get("current_price") and r.get("price_target"):
+                upside_pct = round((r["price_target"] / r["current_price"] - 1) * 100, 2)
+            out.append({
+                "ticker": ticker, "sector": sector, "status": "covered",
+                "company_name":  r.get("company_name"),
+                "current_price": r.get("current_price"),
+                "fair_value_mid": r.get("fair_value_mid"),
+                "price_target":  r.get("price_target"),
+                "upside_pct":    upside_pct,
+                "rating":        r.get("rating"),
+                "last_updated":  r.get("last_updated"),
+                "has_blockers":  bool(r.get("blockers")),
+            })
+    return {"reports": out}
+
+
+@app.get("/research/reports/{ticker}")
+def research_report_detail(ticker: str):
+    ticker = ticker.upper()
+    path = os.path.join(RESEARCH_REPORTS_DIR, f"{ticker}.json")
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail=f"No report for {ticker} yet")
+    with open(path) as f:
+        return json.load(f)
+
+
+@app.post("/research/reports/{ticker}")
+def research_report_upsert(ticker: str, req: ResearchReportRequest):
+    """Analyst-desk agents call this to save/refresh a ticker's report."""
+    ticker = ticker.upper()
+    all_tickers = {t for tickers in RESEARCH_UNIVERSE.values() for t in tickers}
+    if ticker not in all_tickers:
+        raise HTTPException(status_code=400, detail=f"{ticker} is not in the research coverage universe")
+    report = req.model_dump()
+    report["ticker"] = ticker
+    report["last_updated"] = _utcnow().isoformat()
+    path = os.path.join(RESEARCH_REPORTS_DIR, f"{ticker}.json")
+    with open(path, "w") as f:
+        json.dump(report, f, indent=2, default=str)
+    log.info("[RESEARCH] Saved analyst report for %s (%s)", ticker, report.get("rating"))
+    return {"ok": True, "ticker": ticker, "last_updated": report["last_updated"]}
+
+
 # ── Risk Monitor endpoints ────────────────────────────────────────────────────
 
 class RiskConfigRequest(BaseModel):
@@ -8134,8 +8491,10 @@ def risk_status():
     critical   = [v for v in violations if v["severity"] == "CRITICAL"]
     warnings   = [v for v in violations if v["severity"] == "WARNING"]
     return {
-        "enabled":    rm["enabled"],
-        "last_check": rm.get("last_check"),
+        "enabled":      rm["enabled"],
+        "last_check":   rm.get("last_check"),
+        "last_poll":    rm.get("last_poll"),
+        "market_hours": rm.get("market_hours"),
         "vix":        rm.get("vix_latest"),
         "config":     cfg,
         "summary": {
@@ -10049,6 +10408,43 @@ async def close_position_manual(req: ClosePositionRequest):
     _at_log("SYSTEM", f"Manual close requested for {key}")
     await _autotrader_close_coro(ib, matching, info, key)
     return {"ok": True}
+
+
+@app.get("/autotrader/spread-positions")
+def autotrader_spread_positions():
+    """
+    Filtered view of AutoTrader-sourced CSP put-credit-spread positions.
+
+    These execute and are tracked inside Manual Trader's position dict (its
+    2-leg BAG combo engine is reused rather than duplicated -- see
+    _at_place_csp_spread), tagged source="autotrader" on entry. This endpoint
+    exists purely for attribution/reporting so AutoTrader's CSP performance
+    doesn't get lost inside Manual Trader's mixed manual+automated list.
+    """
+    mt_positions = state["manual_trader"]["positions"]
+    tagged = {k: v for k, v in mt_positions.items() if v.get("source") == "autotrader"}
+
+    open_pos   = {k: v for k, v in tagged.items() if v.get("phase") == "open"}
+    closed_pos = {k: v for k, v in tagged.items() if v.get("phase") != "open"}
+
+    spread_meta = state["autotrader"].get("csp_spread_positions", {})
+    open_collateral = sum(
+        float(spread_meta.get(k, {}).get("collateral", 0)) for k in open_pos
+    )
+    open_live_pnl   = sum(float(v.get("live_pnl", 0) or 0) for v in open_pos.values())
+    closed_pnl      = sum(float(v.get("close_pnl", 0) or 0) for v in closed_pos.values())
+    wins            = sum(1 for v in closed_pos.values() if float(v.get("close_pnl", 0) or 0) > 0)
+
+    return {
+        "open_count":       len(open_pos),
+        "closed_count":     len(closed_pos),
+        "open_collateral":  round(open_collateral, 2),
+        "open_live_pnl":    round(open_live_pnl, 2),
+        "closed_pnl":       round(closed_pnl, 2),
+        "win_rate_pct":     round(wins / len(closed_pos) * 100, 1) if closed_pos else None,
+        "open_positions":   open_pos,
+        "closed_positions": closed_pos,
+    }
 
 
 @app.get("/autotrader/decisions")
@@ -12320,7 +12716,20 @@ def market_regime():
     if not vix_ok:
         reason.append(f"VIX={vix_live:.1f} ≥ 25")
 
-    return {
+    def _clean(v):
+        # A raw NaN (vs None) somewhere in the regime cache crashes this
+        # endpoint entirely -- Python's default json encoder rejects NaN as
+        # "out of range" (ValueError, 500), unlike a real None which is
+        # valid JSON. Found 2026-08-18 during the hourly oversight sweep --
+        # this endpoint also gates breakout_scanner.py's F1 regime filter,
+        # so a crash here isn't just a monitoring nuisance.
+        if isinstance(v, float) and v != v:
+            return None
+        if isinstance(v, dict):
+            return {k: _clean(x) for k, x in v.items()}
+        return v
+
+    return _clean({
         "regime_ok":        spy_ok is not False and vix_ok,
         "spy_price":        regime.get("spy_price"),
         "spy_sma200":       regime.get("spy_sma200"),
@@ -12331,7 +12740,7 @@ def market_regime():
         "vix_threshold":    25,
         "reason":           " | ".join(reason) if reason else "ok",
         "updated":          regime.get("updated"),
-    }
+    })
 
 
 @app.get("/market/indexes")
@@ -12928,6 +13337,19 @@ def _dt_save_state() -> None:
                 "closed_today": dt.get("closed_today", [])[-100:],
                 "decisions":    dt.get("decisions", [])[-200:],
             }, f, indent=2, default=str)
+        # TEMPORARY diagnostic (2026-08-18): closed_today was found empty on
+        # disk only ~13 minutes after a real trade closed, with no restart in
+        # between and no other code path found that clears it -- every direct
+        # hypothesis (duplicate save/load site, mid-session reload, a second
+        # close-handling path, a shared daily-reset routine) was checked and
+        # ruled out via static code reading. Logging the caller + count on
+        # every save until the actual overwrite is caught live. Remove once
+        # task 2026-08-18-003 is closed.
+        import traceback as _tb
+        _caller = _tb.extract_stack()[-2]
+        log.info("[DT_SAVE_DIAG] closed_today=%d positions=%d caller=%s:%d(%s)",
+                  len(dt.get("closed_today", [])), len(dt.get("positions", {})),
+                  _caller.filename.split("\\")[-1], _caller.lineno, _caller.name)
     except Exception as e:
         log.warning("Day trader state save failed: %s", e)
 
@@ -16119,32 +16541,57 @@ async def _evc_place_condor(ib, quote: dict) -> bool:
         return False
 
     async def _work_leg(contract, action: str, schedule: list[float], name: str) -> float | None:
-        """Walk a passive-to-marketable limit ladder for one leg. Returns fill price or None."""
-        for i, px in enumerate(schedule):
-            ord_ = LimitOrder(action, 1, px)
-            ord_.tif = "DAY"
-            trade = ib.placeOrder(contract, ord_)
-            for _ in range(wait_s):
-                await asyncio.sleep(1)
-                if trade.orderStatus.status in _ENTRY_TERMINAL:
-                    break
-            if trade.orderStatus.status == "Filled" and float(trade.orderStatus.filled or 0) > 0:
-                fill_px = float(trade.orderStatus.avgFillPrice or px)
-                _evc_log("LEG_FILLED", ticker, f"{name} {action} 1 @ {fill_px:.2f}")
-                return fill_px
-            if trade.orderStatus.status not in _ENTRY_TERMINAL:
-                try:
-                    ib.cancelOrder(trade.order)
-                    for _ in range(5):
-                        await asyncio.sleep(1)
-                        if trade.orderStatus.status in _ENTRY_TERMINAL:
-                            break
-                except Exception:
-                    pass
-            if i < len(schedule) - 1:
-                _evc_log("LEG_REPRICE", ticker,
-                         f"{name} {action} step {i+1}/{len(schedule)} @ ${px:.2f} no fill — trying ${schedule[i+1]:.2f}")
-        return None
+        """Walk a passive-to-marketable limit ladder for one leg. Returns fill price or None.
+
+        Captures the REAL IBKR error text (if any) for each attempt -- EVC's
+        order placement previously had no per-order error listener at all, so
+        a genuine rejection reason (as opposed to a plain timeout) was never
+        distinguishable from the decision log. Manual Trader hit and fixed
+        this exact diagnostic gap on 2026-08-05 (a canned guess about
+        "Inactive" status turned out wrong); this mirrors that fix here.
+        """
+        ibkr_errors: list[str] = []
+
+        def _on_leg_error(reqId, errorCode, errorString, err_contract):
+            ibkr_errors.append(f"[{errorCode}] {errorString}")
+
+        ib.errorEvent += _on_leg_error
+        try:
+            for i, px in enumerate(schedule):
+                ibkr_errors.clear()
+                ord_ = LimitOrder(action, 1, px)
+                ord_.tif = "DAY"
+                trade = ib.placeOrder(contract, ord_)
+                for _ in range(wait_s):
+                    await asyncio.sleep(1)
+                    if trade.orderStatus.status in _ENTRY_TERMINAL:
+                        break
+                if trade.orderStatus.status == "Filled" and float(trade.orderStatus.filled or 0) > 0:
+                    fill_px = float(trade.orderStatus.avgFillPrice or px)
+                    _evc_log("LEG_FILLED", ticker, f"{name} {action} 1 @ {fill_px:.2f}")
+                    return fill_px
+                status_note = f" (status={trade.orderStatus.status}"
+                if ibkr_errors:
+                    status_note += f", IBKR: {'; '.join(ibkr_errors)}"
+                status_note += ")"
+                if trade.orderStatus.status not in _ENTRY_TERMINAL:
+                    try:
+                        ib.cancelOrder(trade.order)
+                        for _ in range(5):
+                            await asyncio.sleep(1)
+                            if trade.orderStatus.status in _ENTRY_TERMINAL:
+                                break
+                    except Exception:
+                        pass
+                if i < len(schedule) - 1:
+                    _evc_log("LEG_REPRICE", ticker,
+                             f"{name} {action} step {i+1}/{len(schedule)} @ ${px:.2f} no fill{status_note} — trying ${schedule[i+1]:.2f}")
+                else:
+                    _evc_log("LEG_REPRICE", ticker,
+                             f"{name} {action} step {i+1}/{len(schedule)} @ ${px:.2f} no fill{status_note} — out of steps")
+            return None
+        finally:
+            ib.errorEvent -= _on_leg_error
 
     async def _market_out(contract, action: str, name: str) -> None:
         """Unwind an already-filled leg with a marketable order — certainty over price."""
@@ -16353,9 +16800,16 @@ async def _evc_entry_coro(ib) -> None:
     ev["scanning"] = True
     try:
         candidates = await _evc_scan_universe(ib)
+        max_per_night = cfg.get("max_positions_per_night", cfg["max_positions"])
+        entered_this_run = 0
         for ticker in candidates:
             if len(ev["positions"]) >= cfg["max_positions"]:
                 break
+            if entered_this_run >= max_per_night:
+                _evc_log("SKIPPED", ticker,
+                         f"same-night cap reached ({entered_this_run}/{max_per_night}) -- "
+                         "correlated earnings-night exposure limit, not a quality gate")
+                continue
             if (ticker in ev["positions"]
                     or any(p["ticker"] == ticker for p in ev["positions"].values())
                     or any(r["ticker"] == ticker for r in ev.get("closed_today", []))):
@@ -16367,7 +16821,9 @@ async def _evc_entry_coro(ib) -> None:
                          f"EM={quote['expected_move']:.2f}  credit={quote['net_credit']:.2f}  "
                          f"strikes={quote['long_put']}/{quote['short_put']}P | "
                          f"{quote['short_call']}/{quote['long_call']}C")
-                await _evc_place_condor(ib, quote)
+                placed = await _evc_place_condor(ib, quote)
+                if placed:
+                    entered_this_run += 1
             except ValueError as ve:
                 _evc_log("SKIPPED", ticker, str(ve))
                 _evc_save_state()
@@ -16649,6 +17105,53 @@ def spx_0dte_status():
             "trade_targets":  cfg.get("trade_targets") or [cfg["daily_profit_target"]],
             "next_target":    (cfg.get("trade_targets") or [cfg["daily_profit_target"]])[sx.get("attempts_today", 0)]
                               if sx.get("attempts_today", 0) < len(cfg.get("trade_targets") or [cfg["daily_profit_target"]]) else None,
+        },
+    }
+
+
+@app.get("/spy-0dte/status")
+def spy_0dte_status():
+    """SPY 0DTE auto-fire status -- reads directly from the files
+    spy_0dte_auto.py (a standalone cron-launched script, not a main.py-
+    integrated strategy) writes to, since there's no in-memory state for
+    it here. Built 2026-08-19 after finding this strategy had zero
+    tracking anywhere in the system -- same class of gap the controller
+    skill exists to close for Alpaca-placed trades generally."""
+    try:
+        with open("spy_0dte_decisions.json") as f:
+            decisions = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        decisions = []
+
+    try:
+        with open("alpaca_0dte_positions.json") as f:
+            registry = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        registry = {"positions": {}, "closed": []}
+
+    open_positions = {k: v for k, v in registry.get("positions", {}).items()
+                       if v.get("strategy") == "iron_condor_0dte"}
+    closed = [p for p in registry.get("closed", []) if p.get("strategy") == "iron_condor_0dte"]
+
+    paused = os.path.exists("spy_0dte_auto_PAUSED.flag")
+    pause_reason = None
+    if paused:
+        try:
+            with open("spy_0dte_auto_PAUSED.flag") as f:
+                pause_reason = f.read()
+        except Exception:
+            pass
+
+    return {
+        "paused":        paused,
+        "pause_reason":  pause_reason,
+        "positions":      open_positions,
+        "closed":         closed[-50:],
+        "decisions":      decisions[-100:],
+        "summary": {
+            "open_positions":  len(open_positions),
+            "closed_trades":   len(closed),
+            "last_action":     decisions[-1] if decisions else None,
         },
     }
 
@@ -17120,7 +17623,8 @@ def _sigt_save_state() -> None:
         st = state["sig_trader"]
         with open(SIGT_STATE_PATH, "w") as f:
             json.dump({"config": st["config"], "positions": st["positions"],
-                       "closed_today": st["closed_today"]}, f, indent=2, default=str)
+                       "closed_today": st["closed_today"],
+                       "decisions": st.get("decisions", [])[-200:]}, f, indent=2, default=str)
     except Exception as e:
         log.warning("SIG_TRADER save_state error: %s", e)
 
@@ -17134,6 +17638,7 @@ def _sigt_load_state() -> None:
             saved = json.load(f)
         st = state["sig_trader"]
         st["config"].update(saved.get("config", {}))
+        st["decisions"] = saved.get("decisions", [])
         today     = datetime.now(_ZI("America/New_York")).strftime("%Y-%m-%d")
         today_ymd = today.replace("-", "")
         for pos_id, pos in saved.get("positions", {}).items():
@@ -17664,6 +18169,7 @@ def _mt_save_state() -> None:
                 "enabled":   mt["enabled"],
                 "positions": mt["positions"],
                 "closed":    mt["closed"][-100:],
+                "decisions": mt.get("decisions", [])[-199:],
             }, f, indent=2, default=str)
     except Exception as e:
         log.warning("MT save state failed: %s", e)
@@ -17678,6 +18184,7 @@ def _mt_load_state() -> None:
         mt = state["manual_trader"]
         mt["enabled"]   = saved.get("enabled", True)
         mt["closed"]    = saved.get("closed", [])
+        mt["decisions"] = saved.get("decisions", [])
         # Reload only open positions
         for pos_id, pos in saved.get("positions", {}).items():
             if pos.get("phase") == "open":
@@ -18709,6 +19216,68 @@ def mt_reconcile():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# ALPACA — read-only position visibility (execution venue, not tracked in-app)
+#
+# Orders currently go out via standalone scripts (alpaca_spread_test*.py,
+# nflx_bottom_monitor.py, alpaca_cohr_spread.py), not this backend -- there is
+# no in-app order placement, no journal entry, no monitor loop for these
+# positions (see oversight_log.jsonl / secretary_tasks.json task 2026-08-12-005
+# for the full gap and why it matters). This endpoint is the minimal fix:
+# read-only visibility into whatever is actually sitting in the Alpaca account
+# right now, queried live on every call, so it shows up somewhere in the app
+# instead of only being visible via a direct API call.
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/alpaca/positions")
+def alpaca_positions():
+    """Live positions + account snapshot from Alpaca. Read-only -- no order
+    placement lives here. Real trades go out via the standalone scripts."""
+    try:
+        from alpaca.trading.client import TradingClient
+    except ImportError:
+        raise HTTPException(503, "alpaca-py not installed")
+
+    cfg_path = os.path.join(os.path.dirname(__file__), "scanner_config.json")
+    with open(cfg_path) as f:
+        cfg = json.load(f)
+    api_key = cfg.get("alpaca_api_key")
+    secret_key = cfg.get("alpaca_secret_key")
+    base_url = cfg.get("alpaca_base_url")
+    if not api_key or not secret_key:
+        raise HTTPException(503, "Alpaca API keys not configured in scanner_config.json")
+
+    try:
+        client = TradingClient(api_key, secret_key, paper=False, url_override=base_url)
+        acct = client.get_account()
+        positions = client.get_all_positions()
+    except Exception as exc:
+        raise HTTPException(502, f"Alpaca API error: {exc}")
+
+    return {
+        "account": {
+            "cash":                 float(acct.cash),
+            "equity":               float(acct.equity),
+            "options_buying_power": float(acct.options_buying_power) if acct.options_buying_power else None,
+            "buying_power":         float(acct.buying_power),
+        },
+        "positions": [
+            {
+                "symbol":         p.symbol,
+                "asset_class":    str(p.asset_class),
+                "qty":            float(p.qty),
+                "side":           str(p.side),
+                "avg_entry_price": float(p.avg_entry_price) if p.avg_entry_price else None,
+                "current_price":  float(p.current_price) if p.current_price else None,
+                "market_value":   float(p.market_value) if p.market_value else None,
+                "unrealized_pl":  float(p.unrealized_pl) if p.unrealized_pl else None,
+                "unrealized_plpc": float(p.unrealized_plpc) * 100 if p.unrealized_plpc else None,
+            }
+            for p in positions
+        ],
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # FX TRADER — EMA(50) + 20-bar breakout on 4 major pairs, 08:00–12:00 ET
 # Strategy: 1H bars, ATR(14) stop (1.5×) + target (2×), OCA bracket orders
 # ══════════════════════════════════════════════════════════════════════════════
@@ -18729,7 +19298,8 @@ def _fx_save_state() -> None:
         with open(FX_STATE_PATH, "w") as f:
             json.dump({"enabled": fx["enabled"], "config": fx["config"],
                        "positions": fx["positions"],
-                       "closed_today": fx["closed_today"]}, f, indent=2, default=str)
+                       "closed_today": fx["closed_today"],
+                       "decisions": fx.get("decisions", [])[-200:]}, f, indent=2, default=str)
     except Exception as e:
         log.warning("FX_TRADER save_state error: %s", e)
 
@@ -18745,6 +19315,7 @@ def _fx_load_state() -> None:
         if saved.get("enabled") is not None:
             fx["enabled"] = bool(saved["enabled"])
         fx["config"].update(saved.get("config", {}))
+        fx["decisions"] = saved.get("decisions", [])
         today = datetime.now(_ZI("America/New_York")).strftime("%Y-%m-%d")
         for pair, pos in saved.get("positions", {}).items():
             if pos.get("phase") == "open" and pos.get("entry_time", "")[:10] == today:

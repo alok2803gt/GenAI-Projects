@@ -61,6 +61,45 @@ import time
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
+import yfinance as yf
+
+EARNINGS_BLACKOUT_DAYS = 2
+
+# ── Earnings blackout cache (mirrors breakout_scanner.py's own, independently --
+# this is a separate process, can't share main.py's or breakout_scanner's cache) ──
+_earnings_cache: dict[str, tuple[float, "int | None"]] = {}
+EARNINGS_CACHE_TTL_S = 6 * 3600
+
+
+def earnings_days_out(ticker: str) -> "int | None":
+    """Days until next earnings, or None if none found within 60 days.
+    Never raises -- a data hiccup should never silently suppress every candidate."""
+    now = time.time()
+    cached = _earnings_cache.get(ticker)
+    if cached and (now - cached[0]) < EARNINGS_CACHE_TTL_S:
+        return cached[1]
+    days: "int | None" = None
+    try:
+        import pandas as pd
+        cal = yf.Ticker(ticker).calendar
+        if cal:
+            if isinstance(cal, dict):
+                raw = cal.get("Earnings Date", [])
+                raw_dt = pd.to_datetime(raw[0]) if raw else None
+            elif hasattr(cal, "loc"):
+                raw_dt = pd.to_datetime(cal.loc["Earnings Date"].iloc[0])
+            else:
+                raw_dt = None
+            if raw_dt is not None:
+                today = datetime.now(ZoneInfo("America/New_York")).date()
+                d = raw_dt.date()
+                delta = (d - today).days
+                days = delta if 0 <= delta <= 60 else None
+    except Exception:
+        days = None
+    _earnings_cache[ticker] = (now, days)
+    return days
+
 import requests
 
 # ── Paths / logging ──────────────────────────────────────────────────────────
@@ -469,6 +508,19 @@ def run_daily_scan(cfg: dict) -> None:
         log.info("Sector cap (max %d/sector) dropped %d otherwise-qualifying candidates "
                   "from the submission batch (still ranked below, just concentration-limited).",
                   MAX_PER_SECTOR, n_dropped_by_cap)
+
+    # Earnings blackout -- added 2026-08-11 after external review flagged this
+    # scanner (like breakout_scanner.py before its own F10 fix) had no earnings
+    # awareness at all. A same-day mover into an earnings print is a materially
+    # different bet (event risk) than the technical/volatility setup this
+    # scanner is built to find. Checked here on the small post-cap list, not
+    # the full universe, to keep yfinance calendar lookups cheap.
+    n_before_earnings = len(capped)
+    capped = [c for c in capped if (earnings_days_out(c["ticker"]) or 999) > EARNINGS_BLACKOUT_DAYS]
+    n_dropped_earnings = n_before_earnings - len(capped)
+    if n_dropped_earnings:
+        log.info("Earnings blackout (<=%dd) dropped %d otherwise-qualifying candidates.",
+                  EARNINGS_BLACKOUT_DAYS, n_dropped_earnings)
 
     submitted = submit_candidates(capped, backend_url)
     n_ordered = sum(1 for s in submitted if s["submit_result"].get("status") == "ordered")

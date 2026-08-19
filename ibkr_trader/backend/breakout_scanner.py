@@ -38,6 +38,44 @@ import yfinance as yf
 # ── Paths ────────────────────────────────────────────────────────────────────
 SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
 
+# ── Earnings blackout cache (F10 gate) ──────────────────────────────────────
+# Standalone process -- can't share main.py's _earnings_days_out()/state cache,
+# so this mirrors the same yfinance-calendar approach independently, cached
+# 6h per ticker (same TTL main.py uses) to avoid re-hitting yfinance every
+# 3-min scan cycle for names that keep re-qualifying.
+_earnings_cache: dict[str, tuple[float, "int | None"]] = {}
+EARNINGS_CACHE_TTL_S = 6 * 3600
+
+
+def earnings_days_out(ticker: str) -> "int | None":
+    """Days until next earnings, or None if none found within 60 days.
+    Never raises -- returns None on any lookup failure so a data hiccup
+    doesn't silently suppress every signal."""
+    now = time.time()
+    cached = _earnings_cache.get(ticker)
+    if cached and (now - cached[0]) < EARNINGS_CACHE_TTL_S:
+        return cached[1]
+    days: "int | None" = None
+    try:
+        cal = yf.Ticker(ticker).calendar
+        if cal:
+            if isinstance(cal, dict):
+                raw = cal.get("Earnings Date", [])
+                raw_dt = pd.to_datetime(raw[0]) if raw else None
+            elif hasattr(cal, "loc"):
+                raw_dt = pd.to_datetime(cal.loc["Earnings Date"].iloc[0])
+            else:
+                raw_dt = None
+            if raw_dt is not None:
+                today = datetime.now(ZoneInfo("America/New_York")).date()
+                d = raw_dt.date()
+                delta = (d - today).days
+                days = delta if 0 <= delta <= 60 else None
+    except Exception:
+        days = None
+    _earnings_cache[ticker] = (now, days)
+    return days
+
 # ── Logging — writes directly to scanner.log (5 MB × 3 backups) ──────────────
 # Using RotatingFileHandler so the scanner owns its own log regardless of how
 # it is launched (Task Scheduler, terminal, watchdog). No PowerShell redirection
@@ -861,6 +899,7 @@ def compute_indicators(ticker: str, hist: pd.DataFrame) -> dict | None:
         vol_5d_avg  = float(volumes.iloc[-5:].mean())  if len(volumes) >= 5  else float(volumes.mean())
         vol_20d_avg = float(volumes.iloc[-20:].mean()) if len(volumes) >= 20 else float(volumes.mean())
         vol_trend   = round(vol_5d_avg / vol_20d_avg, 3) if vol_20d_avg > 0 else 1.0
+        avg_dollar_vol = round(vol_20d_avg * last_close, 0)
 
         # ADX(14) — trend strength; used by F8 gate
         highs_s = hist["High"].dropna()
@@ -937,6 +976,7 @@ def compute_indicators(ticker: str, hist: pd.DataFrame) -> dict | None:
             "prior_5d_ret": round(prior_5d_ret, 2),
             "vol_trend":    vol_trend,
             "bb_bwidth":    round(bb_bwidth, 2),
+            "avg_dollar_vol": avg_dollar_vol,   # 20d avg $ volume -- F9 liquidity floor
             # S/R levels (swing-based, 60-bar lookback, excl. today)
             "sr_resistance": sr_resistance,
             "sr_support":    sr_support,
@@ -1223,8 +1263,11 @@ def apply_quality_filters(candidates: list[dict], regime: dict, cfg: dict) -> li
     """
     spy_ret20 = regime.get("spy_ret20")
     adx_max   = cfg.get("adx_max", 35)
+    min_price = cfg.get("min_price", 10.0)
+    min_avg_dollar_vol = cfg.get("min_avg_dollar_vol", 5_000_000)
+    earnings_blackout_days = cfg.get("earnings_blackout_days", 2)
     kept      = []
-    n_f2 = n_f5 = n_f6 = n_f7 = n_f8 = 0
+    n_f2 = n_f5 = n_f6 = n_f7 = n_f8 = n_f9 = n_f10 = 0
 
     # Pre-compute 20d return for each sector benchmark ETF from the hist cache
     sector_etf_ret20: dict[str, float] = {}
@@ -1312,13 +1355,40 @@ def apply_quality_filters(candidates: list[dict], regime: dict, cfg: dict) -> li
             n_f8 += 1
             continue
 
+        # F9: liquidity floor -- price and dollar-volume, independent of the
+        # ratio-based vol_ratio/vol_90pct fields above. A ratio-based volume
+        # filter (e.g. "0.75x average") says nothing about ABSOLUTE liquidity:
+        # a thinly-traded name can pass on relative volume alone. Added
+        # 2026-08-11 after external review flagged nothing here stopped a
+        # low-priced, thin name from qualifying on %B/RSI/vol-ratio alone.
+        price = ind.get("price", 0.0)
+        dollar_vol = ind.get("avg_dollar_vol", 0.0)
+        if price < min_price or dollar_vol < min_avg_dollar_vol:
+            log.info("F9 liquidity gate dropped %s: price=$%.2f (min $%.2f), "
+                     "avg_$vol=$%.0f (min $%.0f)",
+                     tk, price, min_price, dollar_vol, min_avg_dollar_vol)
+            n_f9 += 1
+            continue
+
+        # F10: earnings blackout -- a name approaching earnings can trip %B/RSI/
+        # ADX/volume conditions for reasons that have nothing to do with the
+        # technical setup this scanner is trying to capture. Added 2026-08-11
+        # after external review flagged this scanner (unlike CSP screening,
+        # which already gates on earnings_days) had no earnings awareness at all.
+        e_days = earnings_days_out(tk)
+        if e_days is not None and e_days <= earnings_blackout_days:
+            log.info("F10 earnings-blackout gate dropped %s: earnings in %dd", tk, e_days)
+            n_f10 += 1
+            continue
+
         kept.append(ind)
 
-    if n_f2 or n_f5 or n_f6 or n_f7 or n_f8:
+    if n_f2 or n_f5 or n_f6 or n_f7 or n_f8 or n_f9 or n_f10:
         log.info(
             "Quality filters: dropped %d (F2 rel-str), %d (F5 close-qual), "
-            "%d (F6 gap-rev), %d (F7 intraday-RS), %d (F8 ADX)",
-            n_f2, n_f5, n_f6, n_f7, n_f8,
+            "%d (F6 gap-rev), %d (F7 intraday-RS), %d (F8 ADX), %d (F9 liquidity), "
+            "%d (F10 earnings)",
+            n_f2, n_f5, n_f6, n_f7, n_f8, n_f9, n_f10,
         )
     return kept
 
@@ -1910,7 +1980,17 @@ def _main_loop():
     if os.path.exists(_states_path):
         try:
             with open(_states_path, "r", encoding="utf-8") as _sf:
-                _ticker_states.update(json.load(_sf))
+                _loaded_states = json.load(_sf)
+            # since/pre_breakout_since/pre_breakout_last_seen were serialized as
+            # isoformat strings (see the save side's default= handler) -- parse
+            # them back to real datetime objects, since downstream code does
+            # (now - stored["since"]).total_seconds() arithmetic on these.
+            for _tk, _st in _loaded_states.items():
+                for _dtkey in ("since", "pre_breakout_since", "pre_breakout_last_seen"):
+                    _v = _st.get(_dtkey)
+                    if isinstance(_v, str):
+                        _st[_dtkey] = datetime.fromisoformat(_v)
+            _ticker_states.update(_loaded_states)
             state_first_scan = False
             log.info("#13 Restored _ticker_states: %d tickers from %s", len(_ticker_states), _states_path)
         except Exception as _exc:
@@ -2223,10 +2303,20 @@ def _main_loop():
             log.debug("Heartbeat write failed: %s", _hb_exc)
 
         # ── #13: Persist _ticker_states so restarts don't reset the state machine ──
+        # since/pre_breakout_since/pre_breakout_last_seen are real datetime objects
+        # (needed for the (now - stored[...]).total_seconds() arithmetic above) --
+        # json.dump() has no default encoder for them, so every save silently threw
+        # a TypeError partway through writing the FIRST ticker's "since" value,
+        # leaving a truncated, unparseable file every single scan cycle. Confirmed
+        # every ticker_states_*.json going back to 2026-07-01 was corrupted this way
+        # (found 2026-08-18 while trying to use this history for a signal-quality
+        # review). isoformat() preserves the tz offset so it round-trips correctly
+        # through the loader's fromisoformat() below.
         try:
             _sp = os.path.join(SCRIPT_DIR, f"ticker_states_{date.today().isoformat()}.json")
             with open(_sp, "w", encoding="utf-8") as _tsf:
-                json.dump(_ticker_states, _tsf)
+                json.dump(_ticker_states, _tsf,
+                          default=lambda o: o.isoformat() if isinstance(o, datetime) else str(o))
         except Exception as _ts_exc:
             log.debug("_ticker_states persist failed: %s", _ts_exc)
 

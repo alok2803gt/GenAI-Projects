@@ -34,6 +34,9 @@ ibkr_trader/backend/sig_trader_state.json
 ibkr_trader/backend/spx_0dte_state.json
 ibkr_trader/backend/spx_0dte_live_state.json
 ibkr_trader/backend/oversight_log.jsonl
+ibkr_trader/backend/secretary_tasks.json
+ibkr_trader/backend/research_reports/
+ibkr_trader/backend/cfo_ledger.json
 ibkr_trader/backend/backend_launchd.log
 ibkr_trader/backend/scanner_launchd.log
 ibkr_trader/backend/market_close_restart.log
@@ -42,6 +45,45 @@ ibkr_trader/frontend/frontend_launchd.log
 scanner.log
 scanner_out.log
 tape_data.db
+uvicorn_stderr.txt
+uvicorn_stdout.txt
+oversight_log.jsonl
+vix_history_check.txt
+
+# Runtime state / registries / caches (broader patterns -- lots of
+# per-strategy and per-analysis state accumulates here at runtime)
+ibkr_trader/backend/*_state.json
+ibkr_trader/backend/*_positions.json
+ibkr_trader/backend/*.db
+ibkr_trader/backend/*.log
+ibkr_trader/backend/*.log.*
+ibkr_trader/backend/*_cache.json
+ibkr_trader/backend/*_history.json
+ibkr_trader/backend/*_history.jsonl
+ibkr_trader/backend/*_history.jsonl.corrupted_backup_*
+ibkr_trader/backend/*_results.json
+ibkr_trader/backend/*_results.csv
+ibkr_trader/backend/*_stdout.txt
+ibkr_trader/backend/*_stdout.log
+ibkr_trader/backend/*_stderr.txt
+ibkr_trader/backend/*_stderr.log
+ibkr_trader/backend/*_bars.json
+ibkr_trader/backend/*_err.txt
+ibkr_trader/backend/*_out.txt
+ibkr_trader/backend/crash_watch_output.txt
+ibkr_trader/backend/crash_logs/
+ibkr_trader/backend/*.png
+ibkr_trader/backend/fundamentals.json
+ibkr_trader/backend/*_fundamentals.json
+ibkr_trader/backend/*_fundamentals_v2.json
+ibkr_trader/backend/*_research_data.json
+ibkr_trader/backend/*_report_body.json
+ibkr_trader/backend/*_peer_data.json
+ibkr_trader/backend/spy_cboe_chains*.json
+ibkr_trader/backend/spx_0dte_bars.json
+ibkr_trader/backend/*_baseline.json
+ibkr_trader/backend/*_candidates.json
+ibkr_trader/backend/schedules/session_schedules.json
 
 # Secrets / local config
 .env
