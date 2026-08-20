@@ -17,8 +17,11 @@ Architecture
 
 Signal definitions
 ------------------
-  BREAKOUT     — %B > 95 AND volume ≥ per-ticker 90th-pct ratio.
-  PRE-BREAKOUT — %B 75-95, RSI > 60, above SMA-20/50, volume building.
+  BREAKOUT     — %B > 95 AND volume ≥ per-ticker 95th-pct ratio (90th for
+                 SMCI/PLTR, see VOL_PERCENTILE_OVERRIDES).
+  PRE-BREAKOUT — cut 2026-08-19 (task 2026-08-19-003): no real edge as a
+                 standalone signal. State machine / F9-F10 gates still use
+                 it internally to validate BREAKOUT quality.
 """
 
 import json
@@ -143,7 +146,8 @@ DEFAULT_CONFIG = {
     "telegram_chat_id":       "",
     "scan_interval_minutes":  3,      # fast because scan is now in-memory
     "batch_size":             50,     # yfinance batch size (initial cache load only)
-    "alert_on":               ["BREAKOUT", "PRE-BREAKOUT"],
+    "alert_on":               ["BREAKOUT"],  # PRE-BREAKOUT cut 2026-08-19: confirmed no edge (49-51% WR,
+                                              # flat-to-negative return) across two backtests, 1yr then 2.5yr
     "breakout_pct_b_min":     95,
     "pre_breakout_pct_b_min": 65,
     "pre_breakout_rsi_min":   60,
@@ -489,7 +493,7 @@ def fmt_alert(ind: dict, signal: str, tape: dict | None = None) -> str:
     return (
         f"{emoji} <b>{signal}</b> — {ind['ticker']}\n"
         f"💰 Price: ${ind['price']:.2f} ({day_sign}{ind['day_chg_pct']:.1f}%)\n"
-        f"📊 %B: {ind['pct_b']:.1f}  |  Vol: {vol_str}{proj_note} (90th-pct: {ind['vol_90pct']:.2f}×){daily_state_str}\n"
+        f"📊 %B: {ind['pct_b']:.1f}  |  Vol: {vol_str}{proj_note} (vol-thr: {ind['vol_90pct']:.2f}×){daily_state_str}\n"
         f"📈 RSI: {ind['rsi']:.0f}  |  {sma_txt}"
         f"{intraday_line}"
         f"{quality_line}"
@@ -838,6 +842,18 @@ def _sr_quick(highs: np.ndarray, lows: np.ndarray, price: float,
             round(max(sup), 2) if sup else None)
 
 
+# Per-ticker exceptions to the production volume-percentile threshold (see
+# rationale in compute_indicators below) -- tickers whose own backtested win
+# rate got WORSE moving from 90th to 95th stay on 90th rather than take the
+# aggregate improvement. Confirmed 2026-08-19 via breakout_intraday_faithful_
+# backtest_rows.csv, n=8-10 each (thin but consistent enough to trust as a
+# real per-ticker exception rather than aggregate noise).
+VOL_PERCENTILE_OVERRIDES: dict = {
+    "SMCI": 0.90,  # 90th: 60.0% WR n=10  |  95th: 50.0% WR n=8
+    "PLTR": 0.90,  # 90th: 50.0% WR n=8   |  95th: 25.0% WR n=4
+}
+
+
 def compute_indicators(ticker: str, hist: pd.DataFrame) -> dict | None:
     """Compute breakout indicators from one year of daily OHLCV data."""
     try:
@@ -924,15 +940,24 @@ def compute_indicators(ticker: str, hist: pd.DataFrame) -> dict | None:
         sma50_v  = float(closes.rolling(50).mean().iloc[-1]) if len(closes) >= 50 else 0
         sma200_v = float(closes.rolling(200).mean().iloc[-1]) if len(closes) >= 200 else 0
 
-        # Volume: per-ticker 90th-percentile threshold + today ratio.
+        # Volume: per-ticker rolling-percentile threshold + today ratio.
         # Today's bar is partial during market hours — project it to a full-day
         # equivalent so early-session breakouts aren't suppressed by low raw volume.
         # Formula: projected = raw_today * (390 / minutes_elapsed_since_open).
         # Capped at 3× raw so pre-open or bad timestamps can't inflate infinitely.
+        #
+        # Percentile moved 0.90 -> 0.95 on 2026-08-19 (task 2026-08-19-003):
+        # intraday-faithful backtest (2.5yr, 80 tickers) found 95th is the
+        # real sweet spot (54.9% WR, +0.088% avg ret, n=122) vs 90th's weak
+        # zone (50.2% WR, -0.018% avg ret, n=259). SMCI/PLTR are the
+        # confirmed exceptions -- their win rate gets WORSE at 95th (SMCI
+        # 60%->50%, PLTR 50%->25%) even though the aggregate improves, so
+        # they stay on the old 90th threshold via VOL_PERCENTILE_OVERRIDES.
+        vol_pctl   = VOL_PERCENTILE_OVERRIDES.get(ticker, 0.95)
         roll_avg   = volumes.rolling(20).mean().shift(1)
         all_ratios = (volumes / roll_avg.replace(0, float("nan"))).dropna()
         recent     = all_ratios.iloc[-252:] if len(all_ratios) >= 252 else all_ratios
-        vol_90pct  = float(recent.quantile(0.90)) if len(recent) >= 20 else 1.5
+        vol_90pct  = float(recent.quantile(vol_pctl)) if len(recent) >= 20 else 1.5
         avg_vol    = float(volumes.iloc[-21:-1].mean())
         raw_today  = float(volumes.iloc[-1])
         # Time-of-day projection

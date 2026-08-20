@@ -50,6 +50,7 @@ from ib_insync import IB
 from alpaca_0dte_common import (
     load_config, alpaca_client, get_alpaca_symbols, place_condor_sequential,
     close_condor_sequential, register_position, close_position, now_et, target_px,
+    cro_cfo_capital_budget,
 )
 from alpaca_0dte_trader import CONFIG, price_legs, condor_mark, PROFIT_TARGET_PCT, HARD_CLOSE_TIME, QTY
 
@@ -116,6 +117,55 @@ def add_secretary_task(description, notes, due=None):
     with open("secretary_tasks.json", "w") as f:
         json.dump(d, f, indent=2)
     return new_id
+
+
+def pretrade_review(ib, client, strikes, conservative_credit, max_risk, cfg):
+    """Real-time CRO/CFO pre-trade review -- BLOCKING gate, same pattern as
+    EVC's (task 2026-08-20-003), extended here per task 2026-08-20-006.
+    CRO: what-if P&L at the short strikes and beyond the wings. CFO: this
+    trade's max_risk against the cross-strategy capital budget (this
+    strategy's own per-trade cap and total portfolio headroom --
+    cro_cfo_capital_budget, shared with Day Trader/EVC). Also verifies an
+    exit plan exists (force-close time / profit target configured -- this
+    strategy always has one, checked for consistency with the other
+    reviews, not because it's ever actually missing).
+    Returns {"approved": bool, "findings": [...], "scenarios": [...]}."""
+    findings = []
+    approved = True
+
+    lp, sp, sc, lc = strikes["long_put"], strikes["short_put"], strikes["short_call"], strikes["long_call"]
+    credit = conservative_credit
+
+    def payoff(px):
+        put_i = max(0.0, sp - px) - max(0.0, lp - px)
+        call_i = max(0.0, px - sc) - max(0.0, px - lc)
+        return round(credit * 100 * QTY - (put_i + call_i) * 100 * QTY, 2)
+
+    scenarios = [
+        {"case": f"below long put ({lp})", "price": lp - 1, "pnl": payoff(lp - 1)},
+        {"case": f"at short put ({sp})", "price": sp, "pnl": payoff(sp)},
+        {"case": "between shorts (max profit)", "price": round((sp + sc) / 2, 2), "pnl": payoff((sp + sc) / 2)},
+        {"case": f"at short call ({sc})", "price": sc, "pnl": payoff(sc)},
+        {"case": f"above long call ({lc})", "price": lc + 1, "pnl": payoff(lc + 1)},
+    ]
+
+    try:
+        budget = cro_cfo_capital_budget(ib, client)
+        findings.append(f"CFO: max risk ${max_risk:,.0f} vs per-strategy cap ${budget['per_strategy_cap']:,.0f}, "
+                         f"portfolio headroom ${budget['headroom']:,.0f} of ${budget['total_budget']:,.0f} budget")
+        if max_risk > budget["per_strategy_cap"]:
+            findings.append(f"EXCEEDS per-strategy cap (${budget['per_strategy_cap']:,.0f})")
+            approved = False
+        if max_risk > budget["headroom"]:
+            findings.append(f"EXCEEDS remaining portfolio headroom (${budget['headroom']:,.0f})")
+            approved = False
+    except Exception as exc:
+        findings.append(f"could not compute capital budget: {exc}")
+        approved = False
+
+    findings.append(f"exit plan: force-close by {HARD_CLOSE_TIME} ET, profit target {PROFIT_TARGET_PCT}%")
+
+    return {"approved": approved, "findings": findings, "scenarios": scenarios}
 
 
 def account_health_check():
@@ -206,8 +256,24 @@ def main():
                      f"< ${MIN_CONSERVATIVE_CREDIT:.2f} threshold")
         return
 
-    # ── Clears the gate -- fire, no manual confirmation (per 2026-08-17 CEO direction) ──
+    # ── Real-time CRO/CFO pre-trade review -- BLOCKING gate (task 2026-08-20-006) ──
+    # IB was already disconnected above (price_legs' finally block) -- pass None,
+    # cro_cfo_capital_budget degrades gracefully to Alpaca-only equity, which is
+    # already the dominant share of this account's capital (~$3,400 of ~$4,100).
     client = alpaca_client(cfg_obj)
+    review = pretrade_review(None, client, strikes, conservative_credit, max_risk, cfg)
+    review_summary = "CRO/CFO pre-trade review: " + " | ".join(review["findings"])
+    print(review_summary)
+    spy_0dte_log("PRETRADE_REVIEW", f"{'APPROVED' if review['approved'] else 'REJECTED'} — {review_summary}")
+    oversight_log("pretrade_review", f"SPY 0DTE: {review_summary}",
+                  outcome="APPROVED" if review["approved"] else "REJECTED — no order placed")
+    if not review["approved"]:
+        msg = f"SPY 0DTE auto: pre-trade review REJECTED -- {review_summary}. No order placed."
+        print(msg)
+        telegram(msg)
+        return
+
+    # ── Clears the gate -- fire, no manual confirmation (per 2026-08-17 CEO direction) ──
     put_by_strike, call_by_strike = get_alpaca_symbols(
         client, cfg["alpaca_underlying"], today_alp,
         strikes["long_put"] - 1, strikes["short_put"] + 1,

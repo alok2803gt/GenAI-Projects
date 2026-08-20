@@ -54,7 +54,9 @@ vix_history_check.txt
 # per-strategy and per-analysis state accumulates here at runtime)
 ibkr_trader/backend/*_state.json
 ibkr_trader/backend/*_positions.json
+ibkr_trader/backend/*_decisions.json
 ibkr_trader/backend/*.db
+ibkr_trader/backend/*_rows.csv
 ibkr_trader/backend/*.log
 ibkr_trader/backend/*.log.*
 ibkr_trader/backend/*_cache.json

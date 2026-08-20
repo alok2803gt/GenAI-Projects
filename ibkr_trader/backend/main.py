@@ -39,6 +39,16 @@ import yfinance as yf
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from ib_insync import IB, Index, LimitOrder, Option, Order, Stock, util
+from alpaca_0dte_common import (
+    alpaca_client as _alp_client, load_config as _alp_load_config,
+    get_alpaca_symbols as _alp_get_symbols, place_condor_sequential as _alp_place_condor,
+    close_condor_sequential as _alp_close_condor,
+    submit_bracket_buy as _alp_bracket_buy, submit_entry_buy as _alp_entry_buy,
+    submit_trailing_stop_sell as _alp_trailing_stop,
+    get_order as _alp_get_order, has_open_position as _alp_has_position,
+    get_last_closing_fill as _alp_last_closing_fill, close_stock_position_market as _alp_close_stock,
+    cro_cfo_capital_budget as _cro_cfo_capital_budget,
+)
 from pydantic import BaseModel
 from xgboost import XGBClassifier
 from sklearn.model_selection import TimeSeriesSplit
@@ -666,6 +676,9 @@ state: Dict = {
         "scan_date":        None, # date of last universe scan (avoid rescanning same day)
         "candidates_today": [],   # tickers found in today's scan
         "scanning":         False,# guard against concurrent scan+entry
+        "incomplete_attempts_today": [],  # tickers with a real partial fill this
+                                           # session -- dedup must never retry these
+                                           # automatically (real incident: DE 2026-08-19)
     },
     "sig_trader": {
         "enabled": False,
@@ -756,6 +769,9 @@ state: Dict = {
     "model_learned":   None,   # XGBoost trained on real trade outcomes
     "model_version":   0,
     "trades_since_retrain": 0,
+    # Unusual options activity -- periodic snapshot scan (see /options-flow/*)
+    "options_uoa_last_scan": None,
+    "options_uoa_universe_size": None,
 }
 
 TICKERS: List[str] = ["AAPL", "MSFT", "NVDA", "SPY"]
@@ -767,17 +783,17 @@ ST_SETUPS: dict = {
     # sma50_filter=True  → skip call entry when price is below 50-day SMA
     # sma50_filter=False → SMA50 trend not confirmed to help WR for this ticker; ignore
     # VWAP direction is already per-ticker via VWAP_RULES lift sign (computed in scanner)
-    "GOOG": {"signal": "PRE-BREAKOUT", "win_start": "10:30", "win_end": "12:00", "hold_mins": 240, "target_pct": 0.33, "stop_pct": 0.21, "sma50_filter": True},
-    "AAPL": {"signal": "PRE-BREAKOUT", "win_start": "09:30", "win_end": "10:30", "hold_mins": 120, "target_pct": 0.23, "stop_pct": 0.24, "sma50_filter": True},
+    #
+    # PRE-BREAKOUT signal cut 2026-08-19: a 2.5yr/80-ticker intraday-faithful
+    # backtest (task 2026-08-19-003) found PRE-BREAKOUT has no real edge in
+    # aggregate (49-51% WR, flat-to-negative return) and didn't have enough
+    # samples on GOOG/AAPL/MU/ASML/META/MSFT/LRCX/TSLA/WMT specifically to
+    # defend keeping their older (2026-07-22, hourly-bar) per-ticker PRE-BREAKOUT
+    # configs -- all 9 removed rather than left running on an unretested basis.
     "AMZN": {"signal": "BREAKOUT",     "win_start": "09:30", "win_end": "16:00", "hold_mins":  60, "target_pct": 0.19, "stop_pct": 0.28, "sma50_filter": True},
     "UNH":  {"signal": "BREAKOUT",     "win_start": "09:30", "win_end": "16:00", "hold_mins":  60, "target_pct": 0.30, "stop_pct": 0.30, "sma50_filter": False},  # healthcare, less trend-sensitive
     "SPXC": {"signal": "BREAKOUT",     "win_start": "12:00", "win_end": "14:00", "hold_mins": 240, "target_pct": 0.37, "stop_pct": 0.37, "sma50_filter": False},  # small-cap, SMA50 not validated
-    "MU":   {"signal": "PRE-BREAKOUT", "win_start": "12:00", "win_end": "14:00", "hold_mins":  60, "target_pct": 0.64, "stop_pct": 0.44, "sma50_filter": False},  # semi, high vol, SMA50 not validated
     "NFLX": {"signal": "BREAKOUT",     "win_start": "14:00", "win_end": "15:00", "hold_mins": 240, "target_pct": 0.31, "stop_pct": 0.28, "sma50_filter": True},
-    "ASML": {"signal": "PRE-BREAKOUT", "win_start": "10:30", "win_end": "12:00", "hold_mins": 240, "target_pct": 0.43, "stop_pct": 0.28, "sma50_filter": False},  # ADR, SMA50 not validated
-    "META": {"signal": "PRE-BREAKOUT", "win_start": "12:00", "win_end": "14:00", "hold_mins": 120, "target_pct": 0.32, "stop_pct": 0.30, "sma50_filter": True},
-    "MSFT": {"signal": "PRE-BREAKOUT", "win_start": "12:00", "win_end": "14:00", "hold_mins":  60, "target_pct": 0.24, "stop_pct": 0.18, "sma50_filter": True},
-    "LRCX": {"signal": "PRE-BREAKOUT", "win_start": "12:00", "win_end": "14:00", "hold_mins": 240, "target_pct": 0.49, "stop_pct": 0.38, "sma50_filter": False},  # semi equipment, SMA50 not validated
     "NVDA": {"signal": "BREAKOUT",     "win_start": "09:30", "win_end": "16:00", "hold_mins":  60, "target_pct": 0.45, "stop_pct": 0.35, "sma50_filter": True},
     # ── Added 2026-07-22: backtested on 2yr 1h bars (same BB/RSI/vol methodology) ──
     "CVX":  {"signal": "BREAKOUT",     "win_start": "15:00", "win_end": "16:00", "hold_mins":  60, "target_pct": 1.10, "stop_pct": 0.84, "sma50_filter": False},  # WR=90.0%  n=10
@@ -785,9 +801,7 @@ ST_SETUPS: dict = {
     "COST": {"signal": "BREAKOUT",     "win_start": "12:00", "win_end": "13:00", "hold_mins":  60, "target_pct": 0.54, "stop_pct": 0.87, "sma50_filter": True},   # WR=80.0%  n=10
     "JNJ":  {"signal": "BREAKOUT",     "win_start": "15:00", "win_end": "16:00", "hold_mins": 240, "target_pct": 0.87, "stop_pct": 1.11, "sma50_filter": True},   # WR=77.8%  n=18
     "GS":   {"signal": "BREAKOUT",     "win_start": "11:00", "win_end": "12:00", "hold_mins":  60, "target_pct": 0.29, "stop_pct": 0.44, "sma50_filter": False},  # WR=75.0%  n=28
-    "TSLA": {"signal": "PRE-BREAKOUT", "win_start": "12:00", "win_end": "13:00", "hold_mins":  60, "target_pct": 0.76, "stop_pct": 0.46, "sma50_filter": True},   # WR=73.9%  n=23
     "LLY":  {"signal": "BREAKOUT",     "win_start": "15:00", "win_end": "16:00", "hold_mins":  60, "target_pct": 1.67, "stop_pct": 0.72, "sma50_filter": True},   # WR=72.7%  n=11
-    "WMT":  {"signal": "PRE-BREAKOUT", "win_start": "09:30", "win_end": "10:00", "hold_mins": 240, "target_pct": 0.50, "stop_pct": 0.72, "sma50_filter": True},   # WR=70.3%  n=64
     "MS":   {"signal": "BREAKOUT",     "win_start": "12:00", "win_end": "13:00", "hold_mins": 240, "target_pct": 1.45, "stop_pct": 0.99, "sma50_filter": False},  # WR=70.0%  n=20
     "XOM":  {"signal": "BREAKOUT",     "win_start": "14:00", "win_end": "16:00", "hold_mins": 120, "target_pct": 0.74, "stop_pct": 0.69, "sma50_filter": False},  # WR=68.4%  n=19
     "HD":   {"signal": "BREAKOUT",     "win_start": "10:00", "win_end": "11:00", "hold_mins":  60, "target_pct": 0.30, "stop_pct": 0.43, "sma50_filter": True},   # WR=59.5%  n=42
@@ -1557,10 +1571,15 @@ async def streaming_loop_async() -> None:
             await _subscribe_vix(ib)
             # Subscribe tick-292 real-time news for monitored tickers.
             await _ibkr_news_setup(ib)
-            # Retry once — occasionally the first snapshot arrives before OPRA feed is warm
+            # Real, observed pattern (2026-08-19): a single 3s retry is nowhere
+            # near enough — OPRA can come back dead (bid=-1/ask=-1, "NOT
+            # SUBSCRIBED / DELAYED") for up to ~18 real minutes after a fresh
+            # connect, even while the usopt data farm itself reports healthy.
+            # A background poller closes that gap without blocking the rest
+            # of connection setup (tape preseed, VIX sub, news, regime cache,
+            # the heartbeat loop) on a warm-up that isn't on their critical path.
             if not state["opra_active"]:
-                await asyncio.sleep(3)
-                state["opra_active"] = await _check_opra_subscription(ib)
+                asyncio.create_task(_opra_warmup_poller(ib))
             # Prime regime cache on connect so filters are active from first scan.
             _loop = asyncio.get_event_loop()
             await _loop.run_in_executor(None, _update_regime_cache_sync)
@@ -2503,6 +2522,189 @@ async def _check_opra_subscription(ib: IB) -> bool:
     except Exception as e:
         log.warning(f"OPRA check failed: {e}", exc_info=True)
         return False
+
+
+async def _opra_warmup_poller(ib: IB) -> None:
+    """Poll every 30s (not the steady-state heartbeat's 4min) until OPRA
+    comes up or a real time budget is exhausted. Runs as a background task
+    so it never blocks connection setup -- state["opra_active"] just becomes
+    accurate sooner, which is what every OPRA-LIVE/OPRA-DELAYED fallback
+    check throughout this file actually reads.
+
+    Bound is 25 min (real observed warm-up was ~18min on 2026-08-19) -- if
+    it's still dead after that, something is genuinely wrong (not just a
+    slow warm-up) and this stops polling rather than spinning forever;
+    the regular 4min heartbeat re-check continues either way.
+    """
+    max_checks = 50   # 50 * 30s = 25 min
+    for i in range(max_checks):
+        await asyncio.sleep(30)
+        if not ib.isConnected():
+            return
+        try:
+            active = await _check_opra_subscription(ib)
+        except Exception as exc:
+            log.warning("OPRA warmup poll failed: %s", exc)
+            continue
+        state["opra_active"] = active
+        if active:
+            log.info("OPRA warmup: active after %ds -- poller done, heartbeat takes over", (i + 1) * 30)
+            return
+    log.warning(
+        "OPRA warmup: still NOT SUBSCRIBED / DELAYED after %dmin -- longer than the "
+        "~18min observed 2026-08-19, may be a real problem (not just a slow warm-up). "
+        "Steady-state 4min heartbeat re-check continues.", max_checks * 30 // 60,
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# UNUSUAL OPTIONS ACTIVITY — periodic snapshot scan, NOT live tick flow
+#
+# Built 2026-08-19 after confirming live via IBKR that neither L2 depth
+# (error 10092: "Deep market data is not supported for this combination of
+# security type/exchange") nor tick-by-tick trades (error 10189) are
+# available for SMART-routed options on this account -- a real IBKR API
+# limitation, not a subscription tier or code gap. A genuine live options
+# tape/order-book isn't buildable through this connection.
+#
+# What IS real and buildable: periodic snapshot polling of volume + open
+# interest per contract, flagging when today's cumulative volume is large
+# relative to that contract's own open interest -- the same core signal
+# commercial UOA tools use, and one that doesn't need historical per-
+# contract volume data (IBKR doesn't retain that for options anyway, same
+# wall already hit on the SOXL backtest data question).
+# ══════════════════════════════════════════════════════════════════════════════
+
+OPTIONS_UOA_STRIKES_EACH_SIDE = 1     # ATM ± 1 = 3 strikes per right = 6 contracts/ticker
+OPTIONS_UOA_RATIO_THRESHOLD   = 2.0   # volume >= 2x open interest flags "unusual"
+OPTIONS_UOA_SCAN_INTERVAL_S   = 1800  # 30 min -- a full scan of ~20 tickers takes real minutes
+# RESEARCH_UNIVERSE is semis + enterprise software only -- no mega-cap
+# consumer tech, no index ETFs, and (2026-08-19) doesn't even include GOOG,
+# a real currently-held position. Added on top, not instead of, the research
+# universe. CEO-picked default: the same names already prioritized elsewhere
+# in this account (CVD tape watchlist) plus GOOG.
+OPTIONS_UOA_EXTRA_TICKERS = ["AAPL", "AMZN", "META", "GOOG", "TSLA", "NFLX", "SPY", "QQQ"]
+
+
+async def _options_uoa_scan_ticker(ib, ticker: str) -> list[dict]:
+    """Snapshot-scan ATM ± N strikes, both rights, nearest listed expiry for
+    one ticker. Returns every contract scanned (not just flagged ones) --
+    the full record is the point; flagging is a filter on top."""
+    from ib_insync import Stock as IbStock, Option as IbOpt
+    rows: list[dict] = []
+    try:
+        stk = IbStock(ticker, "SMART", "USD")
+        await ib.qualifyContractsAsync(stk)
+        if not stk.conId:
+            return rows
+        td = ib.reqMktData(stk, "", False, False)
+        await asyncio.sleep(2)
+        spot = _spx_safe_px(td.marketPrice()) or _spx_safe_px(td.last) or _spx_safe_px(td.close)
+        ib.cancelMktData(stk)
+        if not spot:
+            return rows
+
+        expiry, strikes = await _evc_get_chain_params(ib, ticker)
+        atm = min(strikes, key=lambda s: abs(s - spot))
+        idx = strikes.index(atm)
+        lo  = max(0, idx - OPTIONS_UOA_STRIKES_EACH_SIDE)
+        hi  = min(len(strikes), idx + OPTIONS_UOA_STRIKES_EACH_SIDE + 1)
+        band = strikes[lo:hi]
+
+        scan_time    = _utcnow().isoformat()
+        session_date = date.today().isoformat()
+
+        for strike in band:
+            for right in ("C", "P"):
+                c = IbOpt(ticker, expiry, strike, right, "SMART")
+                await ib.qualifyContractsAsync(c)
+                if not c.conId:
+                    continue
+                ctd = ib.reqMktData(c, "101", False, False)
+                await asyncio.sleep(2)
+                bid  = _spx_safe_px(ctd.bid)
+                ask  = _spx_safe_px(ctd.ask)
+                last = _spx_safe_px(ctd.last)
+                volume = int(ctd.volume) if ctd.volume and ctd.volume == ctd.volume else 0
+                oi_raw = ctd.callOpenInterest if right == "C" else ctd.putOpenInterest
+                oi = int(oi_raw) if oi_raw and oi_raw == oi_raw and oi_raw > 0 else 0
+                ib.cancelMktData(c)
+                ratio = round(volume / oi, 2) if oi > 0 else None
+                rows.append({
+                    "scan_time": scan_time, "session_date": session_date, "ticker": ticker,
+                    "underlying_px": spot, "expiry": expiry, "strike": strike, "right": right,
+                    "volume": volume, "open_interest": oi, "vol_oi_ratio": ratio,
+                    "bid": bid, "ask": ask, "last": last,
+                    "is_unusual": 1 if (ratio is not None and ratio >= OPTIONS_UOA_RATIO_THRESHOLD) else 0,
+                })
+    except Exception as exc:
+        log.warning("Options UOA scan failed for %s: %s", ticker, exc)
+    return rows
+
+
+def _options_uoa_persist(rows: list[dict]) -> None:
+    if not rows:
+        return
+    con = sqlite3.connect(TAPE_DB_PATH, check_same_thread=False)
+    con.executemany("""
+        INSERT INTO options_unusual_activity
+            (scan_time, session_date, ticker, underlying_px, expiry, strike, right,
+             volume, open_interest, vol_oi_ratio, bid, ask, last, is_unusual)
+        VALUES (:scan_time, :session_date, :ticker, :underlying_px, :expiry, :strike, :right,
+                :volume, :open_interest, :vol_oi_ratio, :bid, :ask, :last, :is_unusual)
+    """, rows)
+    con.commit()
+    con.close()
+
+
+async def _options_uoa_scan_all(ib) -> None:
+    """Full scan across the equity-research-analyst desk's 20-name coverage
+    universe (already the account's own curated, prioritized list) plus
+    OPTIONS_UOA_EXTRA_TICKERS (mega-cap tech + index ETFs the research
+    universe doesn't cover, added 2026-08-19)."""
+    tickers = sorted({t for tickers in RESEARCH_UNIVERSE.values() for t in tickers} | set(OPTIONS_UOA_EXTRA_TICKERS))
+    total_rows = 0
+    flagged: list[dict] = []
+    for ticker in tickers:
+        rows = await _options_uoa_scan_ticker(ib, ticker)
+        _options_uoa_persist(rows)
+        total_rows += len(rows)
+        flagged.extend(r for r in rows if r["is_unusual"])
+    state["options_uoa_last_scan"] = _utcnow().isoformat()
+    state["options_uoa_universe_size"] = len(tickers)
+    log.info("Options UOA scan complete: %d contracts across %d tickers, %d flagged unusual",
+              total_rows, len(tickers), len(flagged))
+    if flagged:
+        lines = [f"  {r['ticker']} {r['expiry']} {r['strike']}{r['right']}: "
+                 f"vol={r['volume']} OI={r['open_interest']} ratio={r['vol_oi_ratio']}x"
+                 for r in flagged]
+        _oversight_notify("Unusual options activity flagged:\n" + "\n".join(lines))
+
+
+async def _options_uoa_loop() -> None:
+    """Background scheduler -- runs during market hours only, real IBKR
+    connection required. Mirrors _risk_monitor_loop's structure."""
+    from zoneinfo import ZoneInfo
+    while True:
+        await asyncio.sleep(OPTIONS_UOA_SCAN_INTERVAL_S)
+        if not state.get("connected") or not state.get("ib"):
+            continue
+        now_et = datetime.now(ZoneInfo("America/New_York"))
+        if now_et.weekday() >= 5:
+            continue
+        mkt_open  = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+        mkt_close = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+        if not (mkt_open <= now_et <= mkt_close):
+            continue
+        try:
+            # _run_in_streaming_loop is SYNCHRONOUS (blocks on future.result())
+            # -- must go through run_in_executor or it blocks this whole loop
+            # (and everything sharing it) for the full scan duration.
+            await asyncio.get_event_loop().run_in_executor(
+                None, lambda: _run_in_streaming_loop(_options_uoa_scan_all(state["ib"]), timeout=600),
+            )
+        except Exception as exc:
+            log.error("Options UOA scan error: %s", exc)
 
 
 def _liquidity_score(oi: int, vol: int, spread_pct: float) -> float:
@@ -4950,6 +5152,33 @@ def _tape_db_init() -> None:
             con.execute(f"ALTER TABLE alert_performance ADD COLUMN {col} {typedef}")
         except Exception:
             pass
+    # Unusual options activity -- periodic snapshot scan (NOT live tick flow;
+    # IBKR's API doesn't support tick-by-tick trades or L2 depth for SMART-
+    # routed options, confirmed 2026-08-19 via live error 10189/10092). Real
+    # signal instead: today's cumulative volume vs. that contract's own open
+    # interest, the same methodology real UOA tools use, and one that doesn't
+    # need historical per-contract volume data IBKR doesn't retain anyway.
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS options_unusual_activity (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            scan_time      TEXT    NOT NULL,
+            session_date   TEXT    NOT NULL,
+            ticker         TEXT    NOT NULL,
+            underlying_px  REAL,
+            expiry         TEXT    NOT NULL,
+            strike         REAL    NOT NULL,
+            right          TEXT    NOT NULL,
+            volume         INTEGER,
+            open_interest  INTEGER,
+            vol_oi_ratio   REAL,
+            bid            REAL,
+            ask            REAL,
+            last           REAL,
+            is_unusual     INTEGER NOT NULL
+        )
+    """)
+    con.execute("CREATE INDEX IF NOT EXISTS idx_uoa_ticker_date ON options_unusual_activity (ticker, session_date)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_uoa_scan_time ON options_unusual_activity (scan_time)")
     con.commit()
     con.close()
     log.info("Tape DB initialised at %s", TAPE_DB_PATH)
@@ -8299,6 +8528,8 @@ async def lifespan(app: FastAPI):
     log.info("Red-day watcher started (SPY <= -1.5%% -> Telegram)")
     asyncio.create_task(_risk_monitor_loop())
     log.info("Risk monitor loop started")
+    asyncio.create_task(_options_uoa_loop())
+    log.info("Options unusual-activity scan loop started")
     asyncio.create_task(_news_monitor_loop())
     log.info("News monitor loop started")
     asyncio.create_task(_ibkr_startup_reconcile())
@@ -8340,6 +8571,61 @@ if _technicals_router_ok and technicals_router is not None:
 else:
     import logging as _lg
     _lg.getLogger("main").warning("ibkr_technicals router failed to load — /technicals/{ticker} unavailable")
+
+
+@app.get("/options-flow/unusual")
+def options_uoa_unusual(limit: int = 50):
+    """Most recent flagged (vol/OI >= threshold) contracts, newest scan first."""
+    con = sqlite3.connect(TAPE_DB_PATH, check_same_thread=False)
+    con.row_factory = sqlite3.Row
+    rows = con.execute("""
+        SELECT * FROM options_unusual_activity
+        WHERE is_unusual = 1
+        ORDER BY scan_time DESC LIMIT ?
+    """, (limit,)).fetchall()
+    con.close()
+    return {
+        "last_scan": state.get("options_uoa_last_scan"),
+        "universe_size": state.get("options_uoa_universe_size"),
+        "threshold": OPTIONS_UOA_RATIO_THRESHOLD,
+        "flagged": [dict(r) for r in rows],
+    }
+
+
+@app.get("/options-flow/{ticker}")
+def options_uoa_ticker(ticker: str, limit: int = 50):
+    """Full recent scan history (flagged + not) for one ticker."""
+    con = sqlite3.connect(TAPE_DB_PATH, check_same_thread=False)
+    con.row_factory = sqlite3.Row
+    rows = con.execute("""
+        SELECT * FROM options_unusual_activity
+        WHERE ticker = ? ORDER BY scan_time DESC LIMIT ?
+    """, (ticker.upper(), limit)).fetchall()
+    con.close()
+    return {"ticker": ticker.upper(), "last_scan": state.get("options_uoa_last_scan"),
+            "threshold": OPTIONS_UOA_RATIO_THRESHOLD, "rows": [dict(r) for r in rows]}
+
+
+@app.post("/options-flow/scan-now")
+async def options_uoa_scan_now():
+    """Manually trigger a full scan immediately (don't wait for the 30min loop).
+    Runs in a background task so this endpoint returns immediately instead
+    of holding the HTTP request (and, via run_in_executor, the FastAPI
+    server's whole event loop) open for the ~5min scan duration."""
+    ib = state.get("ib")
+    if not ib or not state.get("connected"):
+        raise HTTPException(503, "Not connected to TWS")
+
+    async def _bg():
+        try:
+            await asyncio.get_event_loop().run_in_executor(
+                None, lambda: _run_in_streaming_loop(_options_uoa_scan_all(ib), timeout=600),
+            )
+        except Exception as exc:
+            log.error("Options UOA manual scan error: %s", exc)
+
+    asyncio.create_task(_bg())
+    return {"ok": True, "started": True, "note": "scan running in background, poll /options-flow/unusual for results"}
 
 
 @app.get("/oversight/log")
@@ -8451,6 +8737,33 @@ def research_report_detail(ticker: str):
         return json.load(f)
 
 
+RESEARCH_HISTORY_FILE = "research_ratings_history.jsonl"
+
+
+def _research_append_history(ticker: str, prior: dict | None, new_report: dict) -> None:
+    """Append-only ratings-history log -- the {ticker}.json snapshot gets
+    overwritten on every refresh (by design, it's "current state"), so
+    without this there's no way to answer "how has the desk's view of this
+    stock evolved" or "when did it flip Sell" after the next day's refresh
+    replaces it. One line per save, never rewritten."""
+    entry = {
+        "time":            _utcnow().isoformat(),
+        "ticker":          ticker,
+        "rating":          new_report.get("rating"),
+        "price_target":    new_report.get("price_target"),
+        "fair_value_mid":  new_report.get("fair_value_mid"),
+        "current_price":   new_report.get("current_price"),
+        "prior_rating":        prior.get("rating") if prior else None,
+        "prior_price_target":  prior.get("price_target") if prior else None,
+        "rating_changed":  bool(prior) and prior.get("rating") != new_report.get("rating"),
+    }
+    try:
+        with open(RESEARCH_HISTORY_FILE, "a") as f:
+            f.write(json.dumps(entry, default=str) + "\n")
+    except OSError as exc:
+        log.warning("[RESEARCH] Failed to append ratings history for %s: %s", ticker, exc)
+
+
 @app.post("/research/reports/{ticker}")
 def research_report_upsert(ticker: str, req: ResearchReportRequest):
     """Analyst-desk agents call this to save/refresh a ticker's report."""
@@ -8462,10 +8775,40 @@ def research_report_upsert(ticker: str, req: ResearchReportRequest):
     report["ticker"] = ticker
     report["last_updated"] = _utcnow().isoformat()
     path = os.path.join(RESEARCH_REPORTS_DIR, f"{ticker}.json")
+
+    prior = None
+    if os.path.exists(path):
+        try:
+            with open(path) as f:
+                prior = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            prior = None
+    _research_append_history(ticker, prior, report)
+
     with open(path, "w") as f:
         json.dump(report, f, indent=2, default=str)
     log.info("[RESEARCH] Saved analyst report for %s (%s)", ticker, report.get("rating"))
     return {"ok": True, "ticker": ticker, "last_updated": report["last_updated"]}
+
+
+@app.get("/research/reports/{ticker}/history")
+def research_report_history(ticker: str):
+    """Full ratings-history log for one ticker, oldest first -- the durable
+    record the {ticker}.json snapshot alone can't provide."""
+    ticker = ticker.upper()
+    entries = []
+    try:
+        with open(RESEARCH_HISTORY_FILE) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                e = json.loads(line)
+                if e.get("ticker") == ticker:
+                    entries.append(e)
+    except FileNotFoundError:
+        pass
+    return {"ticker": ticker, "history": entries}
 
 
 # ── Risk Monitor endpoints ────────────────────────────────────────────────────
@@ -13445,14 +13788,143 @@ def _close_dt_position(ticker: str, pos: dict, exit_px: float,
     _dt_save_state()
 
 
+def _dt_pretrade_review(ib, alp_client, ticker: str, shares: int, entry_price: float,
+                         cost: float, stop_price, profit_price, cfg: dict) -> dict:
+    """Real-time CRO/CFO pre-trade review for a Day Trader entry -- BLOCKING
+    gate, same pattern as EVC's (task 2026-08-20-003), extended here per
+    task 2026-08-20-006. CRO: what-if scenarios at stop/target/flat. CFO:
+    this trade's cost against the cross-strategy capital budget (both this
+    strategy's own per-trade cap and total portfolio headroom -- task
+    2026-08-20-006's cro_cfo_capital_budget). Also: options-flow/UOA
+    cross-check (informational) and an exit-plan verification (a stop or
+    trailing-stop must actually be configured for this entry).
+    Returns {"approved": bool, "findings": [...], "scenarios": [...]}."""
+    findings: list[str] = []
+    approved = True
+
+    # ── CRO: what-if scenarios ──────────────────────────────────────────
+    scenarios = []
+    if stop_price is not None and profit_price is not None:
+        stop_pnl = round((stop_price - entry_price) * shares, 2)
+        target_pnl = round((profit_price - entry_price) * shares, 2)
+        scenarios = [
+            {"case": "stop hit", "price": stop_price, "pnl": stop_pnl},
+            {"case": "flat", "price": entry_price, "pnl": 0.0},
+            {"case": "target hit", "price": profit_price, "pnl": target_pnl},
+        ]
+    else:
+        trail_pct = float(cfg.get("trailing_stop_pct", 0.3))
+        worst_pnl = round(-entry_price * (trail_pct / 100) * shares, 2)
+        scenarios = [{"case": f"trailing stop ({trail_pct}% worst-case from entry)",
+                      "price": round(entry_price * (1 - trail_pct / 100), 2), "pnl": worst_pnl}]
+        findings.append(f"trailing-stop mode: no fixed target, worst-case ~${worst_pnl:.0f} "
+                         f"if stopped immediately at {trail_pct}%")
+
+    # ── CFO: cost vs cross-strategy capital budget ──────────────────────
+    try:
+        budget = _cro_cfo_capital_budget(ib, alp_client)
+        findings.append(f"CFO: trade cost ${cost:,.0f} vs per-strategy cap ${budget['per_strategy_cap']:,.0f}, "
+                         f"portfolio headroom ${budget['headroom']:,.0f} of ${budget['total_budget']:,.0f} budget")
+        if cost > budget["per_strategy_cap"]:
+            findings.append(f"EXCEEDS per-strategy cap (${budget['per_strategy_cap']:,.0f})")
+            approved = False
+        if cost > budget["headroom"]:
+            findings.append(f"EXCEEDS remaining portfolio headroom (${budget['headroom']:,.0f})")
+            approved = False
+    except Exception as exc:
+        findings.append(f"could not compute capital budget: {exc}")
+        approved = False
+
+    # ── Options flow (UOA) cross-check -- informational, not a gate ─────
+    try:
+        con = sqlite3.connect(TAPE_DB_PATH, check_same_thread=False)
+        con.row_factory = sqlite3.Row
+        rows = con.execute("""
+            SELECT * FROM options_unusual_activity WHERE ticker = ?
+            ORDER BY scan_time DESC LIMIT 5
+        """, (ticker.upper(),)).fetchall()
+        con.close()
+        if rows:
+            flagged = [r for r in rows if r["is_unusual"]]
+            findings.append(f"options flow: {len(flagged)}/{len(rows)} recent scans flagged unusual for {ticker}")
+        else:
+            findings.append(f"options flow: no recent UOA scan data for {ticker}")
+    except Exception as exc:
+        findings.append(f"options flow check failed: {exc}")
+
+    # ── Exit-plan verification ──────────────────────────────────────────
+    if stop_price is None and not cfg.get("use_trailing_stop", True):
+        findings.append("NO EXIT PLAN: neither a fixed stop nor trailing stop configured")
+        approved = False
+    else:
+        findings.append(f"exit plan: {'trailing stop ' + str(cfg.get('trailing_stop_pct')) + '%' if stop_price is None else f'fixed stop @ {stop_price}'}")
+
+    return {"approved": approved, "findings": findings, "scenarios": scenarios}
+
+
 async def _day_trader_monitor_coro(ib) -> None:
-    """One monitor cycle: fill detection, profit target, stop, EOD force-close."""
+    """One monitor cycle: fill detection, profit target, stop, EOD force-close.
+
+    Migrated to Alpaca execution 2026-08-19 (CEO directive: all trading
+    moves off IBKR given the recurring PDT rejections) -- IBKR stays the
+    live-price data source (reqTickersAsync below, unchanged), but every
+    order now goes out via Alpaca. This is NOT a simple venue swap like
+    EVC's migration was: this exact coroutine is where the 2026-08-07
+    incident happened (9 real positions orphaned with no stop-loss, from a
+    timing bug in the old fill-detection/phase-transition logic) -- so the
+    redesign below deliberately favors robustness over cleverness:
+
+    - Fixed stop/target mode now submits ONE Alpaca BRACKET order at entry
+      (order_class=BRACKET, take_profit+stop_loss attached atomically) --
+      this is a real safety IMPROVEMENT over the old IBKR path, which had
+      a real gap between "fill detected" and "protective orders placed"
+      (exactly the gap 2026-08-07's bug lived in). Trailing-stop mode still
+      has that gap by necessity (the trail needs the real fill price as
+      its anchor, so it can only be placed AFTER the fill) -- same risk
+      shape as before for that mode specifically.
+    - Exit detection no longer tries to track/match individual Alpaca
+      bracket child-leg order ids (their exact shape wasn't verified live
+      before this shipped -- market was closed at build time). Instead it
+      polls whether the Alpaca POSITION still exists each cycle; once it's
+      gone, the protective order fired, and the real fill is recovered via
+      Alpaca's own closed-orders history. Simpler and more robust than
+      leg-id matching, at the cost of not knowing exactly which protective
+      order fired without an extra lookup (which the code below does).
+    - The old "fallback poll for positions that pre-date the OCA bracket"
+      branch is gone -- that existed only for IBKR positions from before
+      the bracket feature existed. Every Alpaca position here always has
+      real broker-side protection from the moment it fills, so there's no
+      legacy case to catch.
+
+    NOT yet live-fire-verified end-to-end (built with market closed) --
+    verify with a small real trade before trusting this at normal size.
+    """
     from zoneinfo import ZoneInfo
     dt  = state["day_trader"]
     cfg = dt["config"]
 
     if not dt["positions"] and not dt.get("watching"):
         return
+
+    # alpaca-py's TradingClient is synchronous (requests-based HTTP) --
+    # this coroutine runs on the shared IBKR streaming event loop
+    # (_run_in_streaming_loop), so every Alpaca call below is offloaded to
+    # a thread via run_in_executor rather than blocking that loop (which
+    # also carries real-time IBKR data for every other strategy).
+    _loop = asyncio.get_event_loop()
+
+    async def _dt_alp_call(func, *args):
+        return await _loop.run_in_executor(None, func, *args)
+
+    _alp_cfg_cached = None
+    _alp_client_cached = None
+
+    def _dt_alp_client():
+        nonlocal _alp_cfg_cached, _alp_client_cached
+        if _alp_client_cached is None:
+            _alp_cfg_cached = _alp_load_config()
+            _alp_client_cached = _alp_client(_alp_cfg_cached)
+        return _alp_client_cached
 
     now_et = datetime.now(ZoneInfo("America/New_York"))
 
@@ -13582,15 +14054,37 @@ async def _day_trader_monitor_coro(ib) -> None:
             buf_pct = 0.50 if (now_et.hour == 9 and now_et.minute < 45) else cfg["limit_buffer_pct"]
             lmt_px  = round(live_price * (1 + buf_pct / 100), 2)
 
+            use_trailing = cfg.get("use_trailing_stop", True)
+            stop_px_planned = profit_px_planned = None
+            if not use_trailing:
+                stop_px_planned   = round(lmt_px * (1 - cfg["hard_stop_pct"] / 100), 2)
+                profit_px_planned = round(lmt_px * (1 + cfg["profit_target_pct"] / 100), 2)
+
+            # ── Real-time CRO/CFO pre-trade review -- BLOCKING gate (task 2026-08-20-006) ──
+            alp_client = _dt_alp_client()
+            cost = round(shares * lmt_px, 2)
+            review = _dt_pretrade_review(ib, alp_client, ticker, shares, lmt_px, cost,
+                                          stop_px_planned, profit_px_planned, cfg)
+            review_summary = f"CRO/CFO pre-trade review for {ticker}: " + " | ".join(review["findings"])
+            _dt_log("PRETRADE_REVIEW", ticker,
+                    f"{'APPROVED' if review['approved'] else 'REJECTED'} — {review_summary}")
+            _oversight_log("risk_manager" if not review["approved"] else "trader",
+                            "pretrade_review", f"Day Trader {ticker}: {review_summary}",
+                            outcome="APPROVED" if review["approved"] else "REJECTED — no order placed")
+            if not review["approved"]:
+                _oversight_notify(f"Day Trader pre-trade review REJECTED {ticker}: {review_summary}", high_priority=False)
+                dt["watching"].pop(ticker, None)
+                continue
+
             try:
-                contract = Stock(ticker, "SMART", "USD")
-                await ib.qualifyContractsAsync(contract)
-                if not contract.conId:
-                    raise ValueError(f"Cannot qualify {ticker}")
-                buy_ord = LimitOrder("BUY", shares, lmt_px)
-                buy_ord.tif = "DAY"
-                trade = ib.placeOrder(contract, buy_ord)
-                await asyncio.sleep(0.5)
+                if use_trailing:
+                    # Protective order can't be attached yet -- it needs the
+                    # real fill price as its trail anchor, placed once filled.
+                    alp_order = await _dt_alp_call(_alp_entry_buy, alp_client, ticker, shares, lmt_px)
+                else:
+                    # ONE order: entry + native OCO stop/target attached
+                    # atomically -- no gap between fill and protection.
+                    alp_order = await _dt_alp_call(_alp_bracket_buy, alp_client, ticker, shares, lmt_px, stop_px_planned, profit_px_planned)
             except Exception as exc:
                 _dt_log("ERROR", ticker, f"confirmed entry order failed: {exc}")
                 dt["watching"].pop(ticker, None)
@@ -13601,11 +14095,12 @@ async def _day_trader_monitor_coro(ib) -> None:
                 "entry_price":       live_price,
                 "shares":            shares,
                 "cost":              round(shares * live_price, 2),
-                "buy_order_id":      trade.order.orderId,
+                "buy_order_id":      str(alp_order.id),
                 "stop_order_id":     None,
-                "stop_price":        None,
-                "profit_price":      None,
+                "stop_price":        stop_px_planned,
+                "profit_price":      profit_px_planned,
                 "phase":             0,
+                "venue":             "alpaca",
                 "alert_fired_at":    _utcnow().isoformat(),
                 "composite_score":   watch.get("composite_score"),
                 "vol_ratio":         watch.get("vol_ratio"),
@@ -13617,37 +14112,10 @@ async def _day_trader_monitor_coro(ib) -> None:
             _dt_log("CONFIRMED", ticker,
                     f"day_open={watch['day_open']:.2f} -> confirmed@{live_price:.2f} "
                     f"({(live_price/watch['day_open']-1)*100:+.2f}%, vol={interval_vol:.0f} "
-                    f"vs median={median_vol:.0f}) — LIMIT BUY {shares}sh @ {lmt_px:.2f} "
-                    f"(ord#{trade.order.orderId})")
+                    f"vs median={median_vol:.0f}) — LIMIT BUY {shares}sh @ {lmt_px:.2f} via Alpaca "
+                    f"(ord#{alp_order.id}, {'trailing' if use_trailing else 'bracket'})")
             dt["watching"].pop(ticker, None)
         _dt_save_state()
-
-    # Built here, AFTER the watching-confirmation block above, so any order
-    # placed by a confirmation this cycle is already reflected -- see the
-    # comment where this used to live (right after force_close_dt) for why
-    # building it earlier caused genuinely-filled buys to be misread as
-    # unfilled and dropped from tracking with no stop-loss protection.
-    #
-    # Uses ib.trades() (every trade this client has seen, done or not) rather
-    # than ib.openTrades() (pre-filtered to "still active" by ib_insync's own
-    # isDone() logic) -- confirmed live 2026-08-07: a PDT-rejected order's
-    # final observed status was 'Inactive', which ib_insync's client-side
-    # cache kept surfacing via openTrades() as still-open long after IBKR's
-    # own order book showed nothing (verified independently via a fresh
-    # connection). That left a phantom phase-0 position occupying the only
-    # max_positions slot with no real order behind it. Checking the status
-    # STRING explicitly against a known-still-working allowlist, instead of
-    # trusting openTrades()'s membership test, means any status we didn't
-    # anticipate (Inactive included) resolves immediately via the fill-or-
-    # lapsed branch below rather than silently parking the position for up
-    # to signal_freshness_min (30min).
-    trades_by_oid = {t.order.orderId: t for t in ib.trades()}
-    STILL_WORKING_STATUSES = {"PendingSubmit", "PreSubmitted", "Submitted", "ApiPending", "PendingCancel"}
-    fills_by_oid: dict = {}
-    for f in ib.fills():
-        oid = getattr(f.execution, "orderId", 0)
-        if oid and oid > 0:
-            fills_by_oid[oid] = f
 
     to_remove: list[str] = []
 
@@ -13673,15 +14141,22 @@ async def _day_trader_monitor_coro(ib) -> None:
             trail_pct = float(cfg.get("trailing_stop_pct", 0.3))
             pos["stop_price"] = round(pos["running_high"] * (1 - trail_pct / 100), 2)
 
+        ALP_STILL_WORKING = {"new", "partially_filled", "accepted", "pending_new",
+                             "pending_review", "held", "calculated", "accepted_for_bidding"}
+
         # ── Phase 0: waiting for buy fill ─────────────────────────────────
         if phase == 0:
             buy_oid = pos.get("buy_order_id")
             if not buy_oid:
                 continue
-            trade = trades_by_oid.get(buy_oid)
-            status = trade.orderStatus.status if trade else None
-            if status in STILL_WORKING_STATUSES:
-                # Cancel stale pending buys (genuinely still working at IBKR)
+            try:
+                order = await _dt_alp_call(_alp_get_order, _dt_alp_client(), buy_oid)
+            except Exception as exc:
+                log.debug("Day trader Alpaca order poll failed %s: %s", ticker, exc)
+                continue
+            status = str(getattr(order.status, "value", order.status))
+            if status in ALP_STILL_WORKING:
+                # Cancel stale pending buys (genuinely still working at Alpaca)
                 try:
                     alert_ts = pos.get("alert_fired_at", "")
                     at = _parse_utc(alert_ts) if alert_ts else None
@@ -13689,190 +14164,127 @@ async def _day_trader_monitor_coro(ib) -> None:
                 except Exception:
                     age_min = 0
                 if age_min > cfg.get("signal_freshness_min", 30):
-                    ib.cancelOrder(trade.order)
-                    await asyncio.sleep(0.5)
+                    try:
+                        await _dt_alp_call(_dt_alp_client().cancel_order_by_id, buy_oid)
+                    except Exception:
+                        pass
                     _dt_log("BUY_CANCELLED", ticker,
                             f"stale after {age_min:.0f}min — cancelled, slot freed")
                     to_remove.append(ticker)
                 continue
-            fill = fills_by_oid.get(buy_oid)
-            if fill:
-                fill_px = round(float(fill.execution.avgPrice), 4)
-                pos["entry_price"]  = fill_px
-                pos["phase"]        = 1
-                contract = Stock(ticker, "SMART", "USD")
+            if status == "filled" and order.filled_qty and float(order.filled_qty) > 0:
+                fill_px = round(float(order.filled_avg_price), 4)
+                pos["entry_price"] = fill_px
+                pos["phase"]       = 1
 
                 if cfg.get("use_trailing_stop", True):
-                    # Native IBKR TRAIL order replaces the fixed target/stop pair
-                    # entirely -- validated 2026-08-07 on real 1-min bars: the old
-                    # fixed 0.25%/1.0% pair measured a real 67.3% win rate against
-                    # an 80% breakeven requirement (-0.16%/trade); trailing at the
-                    # empirically-best 0.3% width flipped this to +0.14%/trade on
-                    # the same sample. IBKR trails server-side tick-by-tick, which
-                    # is at least as responsive as the minute-bar model this was
-                    # tested against. See trailing_stop_pct's config comment for
-                    # the full backtest (daytrader_intraday_backtest.py).
+                    # Trailing stop needs the real fill price as its anchor,
+                    # so it's placed now, AFTER the fill -- validated
+                    # 2026-08-07 on real 1-min bars: the old fixed 0.25%/1.0%
+                    # pair measured a real 67.3% win rate against an 80%
+                    # breakeven requirement (-0.16%/trade); trailing at the
+                    # empirically-best 0.3% width flipped this to
+                    # +0.14%/trade on the same sample. See trailing_stop_pct's
+                    # config comment for the full backtest.
                     trail_pct = float(cfg.get("trailing_stop_pct", 0.3))
                     init_stop_px = round(fill_px * (1 - trail_pct / 100), 2)
-                    pos["is_trailing"]   = True
-                    pos["running_high"]  = fill_px
-                    pos["stop_price"]    = init_stop_px
-                    pos["profit_price"]  = None   # no fixed target when trailing
-
-                    trail_ord = Order()
-                    trail_ord.orderType       = "TRAIL"
-                    trail_ord.action          = "SELL"
-                    trail_ord.totalQuantity   = pos["shares"]
-                    trail_ord.trailingPercent = trail_pct
-                    trail_ord.trailStopPrice  = init_stop_px
-                    trail_ord.tif             = "DAY"
-                    trail_ord.outsideRth      = False
-                    trail_trade = ib.placeOrder(contract, trail_ord)
-                    await asyncio.sleep(0.5)
-                    pos["stop_order_id"]   = trail_trade.order.orderId
-                    pos["target_order_id"] = None
-                    _dt_log("FILLED", ticker,
-                            f"fill={fill_px:.2f} x{pos['shares']}sh "
-                            f"TRAILING STOP {trail_pct}% (init={init_stop_px:.2f}, "
-                            f"ord#{trail_trade.order.orderId})")
+                    pos["is_trailing"]  = True
+                    pos["running_high"] = fill_px
+                    pos["stop_price"]   = init_stop_px
+                    pos["profit_price"] = None
+                    try:
+                        trail_order = await _dt_alp_call(_alp_trailing_stop, _dt_alp_client(), ticker, pos["shares"], trail_pct)
+                        pos["stop_order_id"] = str(trail_order.id)
+                        _dt_log("FILLED", ticker,
+                                f"fill={fill_px:.2f} x{pos['shares']}sh via Alpaca "
+                                f"TRAILING STOP {trail_pct}% (init={init_stop_px:.2f}, ord#{trail_order.id})")
+                    except Exception as exc:
+                        _dt_log("ERROR", ticker,
+                                f"TRAILING STOP placement failed after real fill: {exc} — "
+                                f"POSITION IS UNPROTECTED, CHECK ALPACA NOW")
+                        _oversight_notify(
+                            f"Day Trader/Alpaca: {ticker} filled but trailing-stop placement FAILED "
+                            f"({exc}) — position unprotected, check Alpaca NOW.", high_priority=True)
+                        _oversight_log("trader", "execution_issue",
+                                        f"Day Trader/Alpaca {ticker} trailing-stop placement failed post-fill: {exc}",
+                                        outcome="needs immediate manual review — unprotected position")
                     _dt_save_state()
                     continue
 
-                stop_px   = round(fill_px * (1 - cfg["hard_stop_pct"] / 100), 2)
-                profit_px = round(fill_px * (1 + cfg["profit_target_pct"] / 100), 2)
-                pos["stop_price"]   = stop_px
-                pos["profit_price"] = profit_px
-                oca_group = f"DT_{ticker}_{buy_oid}"
-
-                # Stop-loss: native STP order — fires immediately at IBKR
-                stop_ord = Order()
-                stop_ord.orderType     = "STP"
-                stop_ord.action        = "SELL"
-                stop_ord.totalQuantity = pos["shares"]
-                stop_ord.auxPrice      = stop_px
-                stop_ord.tif           = "DAY"
-                stop_ord.outsideRth    = False
-                stop_ord.ocaGroup      = oca_group
-                stop_ord.ocaType       = 1   # cancel remaining on fill
-                stp_trade = ib.placeOrder(contract, stop_ord)
-
-                # Profit target: native LMT order — fires immediately at IBKR
-                # No polling needed; IBKR cancels the STP when this fills
-                lmt_ord = Order()
-                lmt_ord.orderType     = "LMT"
-                lmt_ord.action        = "SELL"
-                lmt_ord.totalQuantity = pos["shares"]
-                lmt_ord.lmtPrice      = profit_px
-                lmt_ord.tif           = "DAY"
-                lmt_ord.outsideRth    = False
-                lmt_ord.ocaGroup      = oca_group
-                lmt_ord.ocaType       = 1
-                lmt_trade = ib.placeOrder(contract, lmt_ord)
-
-                await asyncio.sleep(0.5)
-                pos["stop_order_id"]   = stp_trade.order.orderId
-                pos["target_order_id"] = lmt_trade.order.orderId
+                # Fixed mode: stop/target were already attached atomically as
+                # part of the bracket order at entry -- nothing more to place.
                 _dt_log("FILLED", ticker,
-                        f"fill={fill_px:.2f} x{pos['shares']}sh "
-                        f"stop@{stop_px:.2f} (ord#{stp_trade.order.orderId}) "
-                        f"target@{profit_px:.2f} (ord#{lmt_trade.order.orderId})")
+                        f"fill={fill_px:.2f} x{pos['shares']}sh via Alpaca BRACKET "
+                        f"stop@{pos.get('stop_price')} target@{pos.get('profit_price')} "
+                        f"(protected atomically at entry)")
                 _dt_save_state()
             else:
                 _dt_log("BUY_LAPSED", ticker, f"buy not filled (status={status}) — removing")
                 to_remove.append(ticker)
             continue
 
-        # ── Phase 3: MKT sell in flight ────────────────────────────────────
+        # ── Phase 3: MKT sell (EOD force-close) in flight ──────────────────
         if phase == 3:
-            sell_oid   = pos.get("stop_order_id")
-            sell_trade = trades_by_oid.get(sell_oid) if sell_oid else None
-            sell_status = sell_trade.orderStatus.status if sell_trade else None
-            if sell_oid and sell_status not in STILL_WORKING_STATUSES:
-                fill    = fills_by_oid.get(sell_oid)
-                exit_px = round(float(fill.execution.avgPrice), 4) if fill else pos.get("entry_price", 0)
+            sell_oid = pos.get("stop_order_id")
+            if not sell_oid:
+                continue
+            try:
+                order = await _dt_alp_call(_alp_get_order, _dt_alp_client(), sell_oid)
+            except Exception as exc:
+                log.debug("Day trader Alpaca close-order poll failed %s: %s", ticker, exc)
+                continue
+            status = str(getattr(order.status, "value", order.status))
+            if status not in ALP_STILL_WORKING:
+                exit_px = round(float(order.filled_avg_price), 4) if order.filled_avg_price else pos.get("entry_price", 0)
                 pnl     = round((exit_px - pos["entry_price"]) * pos["shares"], 2)
                 exit_type = pos.get("pending_exit_type", "force_close")
-                comm    = _commission_for_orders(ib, pos.get("buy_order_id", 0), sell_oid)
-                _close_dt_position(ticker, pos, exit_px, exit_type, pnl, commission=comm)
+                _close_dt_position(ticker, pos, exit_px, exit_type, pnl, commission=0.0)
                 to_remove.append(ticker)
             continue
 
-        # ── Phase 1: active intraday position ─────────────────────────────
-        stop_oid   = pos.get("stop_order_id")
-        target_oid = pos.get("target_order_id")
-        stop_trade   = trades_by_oid.get(stop_oid) if stop_oid else None
-        target_trade = trades_by_oid.get(target_oid) if target_oid else None
-        stop_status   = stop_trade.orderStatus.status if stop_trade else None
-        target_status = target_trade.orderStatus.status if target_trade else None
-
-        # Profit target LMT filled? (IBKR OCA cancels the STP automatically)
-        if target_oid and target_status not in STILL_WORKING_STATUSES:
-            fill    = fills_by_oid.get(target_oid)
-            exit_px = round(float(fill.execution.avgPrice), 4) if fill else pos.get("profit_price", pos["entry_price"])
-            pnl     = round((exit_px - pos["entry_price"]) * pos["shares"], 2)
-            comm    = _commission_for_orders(ib, pos.get("buy_order_id", 0), target_oid)
-            _close_dt_position(ticker, pos, exit_px, "profit_target", pnl, commission=comm)
+        # ── Phase 1: active intraday position ──────────────────────────────
+        # Protective order (bracket OCO pair or trailing stop) lives at
+        # Alpaca, not here -- poll whether the POSITION still exists rather
+        # than trying to track/match individual child-leg order ids (not
+        # verified live before this shipped; existence-based detection is
+        # simpler and doesn't depend on getting that shape exactly right).
+        alp_pos = await _dt_alp_call(_alp_has_position, _dt_alp_client(), ticker)
+        if alp_pos is None:
+            closing = await _dt_alp_call(_alp_last_closing_fill, _dt_alp_client(), ticker)
+            if closing:
+                exit_px      = round(float(closing.filled_avg_price), 4)
+                closed_qty   = float(closing.filled_qty or pos["shares"])
+                pnl          = round((exit_px - pos["entry_price"]) * closed_qty, 2)
+            else:
+                # Shouldn't happen, but fail safe with the best estimate on hand
+                exit_px = pos.get("stop_price") or pos.get("entry_price", 0)
+                pnl     = round((exit_px - pos["entry_price"]) * pos["shares"], 2)
+            exit_type = ("trailing_stop" if pos.get("is_trailing")
+                         else ("profit_target" if pnl >= 0 else "hard_stop"))
+            _close_dt_position(ticker, pos, exit_px, exit_type, pnl, commission=0.0)
             to_remove.append(ticker)
             continue
-
-        # Stop loss STP/TRAIL filled? (IBKR OCA cancels the LMT automatically;
-        # trailing positions have no OCA partner, this is their only exit order)
-        if stop_oid and stop_status not in STILL_WORKING_STATUSES:
-            fill    = fills_by_oid.get(stop_oid)
-            exit_px = round(float(fill.execution.avgPrice), 4) if fill else pos.get("stop_price", pos["entry_price"])
-            pnl     = round((exit_px - pos["entry_price"]) * pos["shares"], 2)
-            comm    = _commission_for_orders(ib, pos.get("buy_order_id", 0), stop_oid)
-            exit_type = "trailing_stop" if pos.get("is_trailing") else "hard_stop"
-            _close_dt_position(ticker, pos, exit_px, exit_type, pnl, commission=comm)
-            to_remove.append(ticker)
-            continue
-
-        # Fallback poll for positions that pre-date the OCA bracket (no target_order_id).
-        # New positions exit via the native LMT order above; this catches legacy ones.
-        # Trailing positions never have a fixed profit_price (None), so they must be
-        # excluded here too -- their only exit is the native TRAIL order above.
-        if not target_oid and not pos.get("is_trailing"):
-            live_px = pos.get("live_price") or 0
-            if live_px and live_px >= pos.get("profit_price", float("inf")):
-                for oid in (stop_oid,):
-                    ot = trades_by_oid.get(oid) if oid else None
-                    if oid and ot and ot.orderStatus.status in STILL_WORKING_STATUSES:
-                        ib.cancelOrder(ot.order)
-                await asyncio.sleep(0.5)
-                contract = Stock(ticker, "SMART", "USD")
-                mkt_ord = Order()
-                mkt_ord.orderType = "MKT"; mkt_ord.action = "SELL"
-                mkt_ord.totalQuantity = pos["shares"]; mkt_ord.tif = "DAY"
-                t = ib.placeOrder(contract, mkt_ord)
-                await asyncio.sleep(0.5)
-                pos["phase"] = 3; pos["stop_order_id"] = t.order.orderId
-                pos["pending_exit_type"] = "profit_target"
-                _dt_log("PROFIT_TARGET", ticker,
-                        f"poll: live={live_px:.2f} >= target={pos['profit_price']:.2f} (ord#{t.order.orderId})")
-                _dt_save_state()
-                continue
 
         # Force-close time reached?
         if now_et >= force_close_dt:
-            # Cancel both OCA legs before placing MKT override
-            for oid in (stop_oid, target_oid):
-                ot = trades_by_oid.get(oid) if oid else None
-                if oid and ot and ot.orderStatus.status in STILL_WORKING_STATUSES:
-                    ib.cancelOrder(ot.order)
-            await asyncio.sleep(0.5)
-            contract = Stock(ticker, "SMART", "USD")
-            mkt_ord = Order()
-            mkt_ord.orderType     = "MKT"
-            mkt_ord.action        = "SELL"
-            mkt_ord.totalQuantity = pos["shares"]
-            mkt_ord.tif           = "DAY"
-            trade = ib.placeOrder(contract, mkt_ord)
-            await asyncio.sleep(0.5)
+            try:
+                closing_order = await _dt_alp_call(_alp_close_stock, _dt_alp_client(), ticker)
+            except Exception as exc:
+                _dt_log("ERROR", ticker, f"EOD force-close order failed: {exc} — CHECK ALPACA MANUALLY")
+                _oversight_notify(
+                    f"Day Trader/Alpaca: {ticker} EOD force-close FAILED ({exc}) — check Alpaca manually NOW.",
+                    high_priority=True)
+                continue
+            if closing_order is None:
+                # Already flat (protective order fired between the existence
+                # check above and now) -- next cycle's phase-1 branch won't
+                # run since alp_pos will be None; nothing more to do here.
+                continue
             pos["phase"]             = 3
-            pos["stop_order_id"]     = trade.order.orderId
+            pos["stop_order_id"]     = str(closing_order.id)
             pos["pending_exit_type"] = "force_close"
             _dt_log("FORCE_CLOSE", ticker,
-                    f"EOD force-close @ {cfg['force_close_time']} ET, MKT SELL (ord#{trade.order.orderId})")
+                    f"EOD force-close @ {cfg['force_close_time']} ET via Alpaca (ord#{closing_order.id})")
             _dt_save_state()
 
     for ticker in to_remove:
@@ -14846,6 +15258,7 @@ def _evc_save_state() -> None:
                 "decisions":        ev["decisions"][-50:],
                 "scan_date":        ev["scan_date"],
                 "candidates_today": ev.get("candidates_today", []),
+                "incomplete_attempts_today": ev.get("incomplete_attempts_today", []),
                 "date":             date.today().isoformat(),
             }, f, default=str)
     except Exception as e:
@@ -14872,8 +15285,11 @@ def _evc_load_state() -> None:
         ev["closed_today"] = [r for r in saved.get("closed_today", []) if r.get("date") == today]
         ev["scan_date"]        = saved.get("scan_date") if saved.get("date") == today else None
         ev["candidates_today"] = saved.get("candidates_today", []) if saved.get("date") == today else []
-        log.info("EVC state restored: %d open positions, %d candidates today",
-                 len(ev["positions"]), len(ev["candidates_today"]))
+        ev["incomplete_attempts_today"] = (
+            saved.get("incomplete_attempts_today", []) if saved.get("date") == today else []
+        )
+        log.info("EVC state restored: %d open positions, %d candidates today, %d incomplete attempts",
+                 len(ev["positions"]), len(ev["candidates_today"]), len(ev["incomplete_attempts_today"]))
     except Exception as e:
         log.warning("EVC state load failed: %s", e)
 
@@ -16446,64 +16862,183 @@ def _evc_reprice_schedule(quote: dict, cfg: dict) -> list[float]:
     ]
 
 
-def _evc_leg_schedule(start_px: float, cfg: dict, im_pct: float, spread_pct: float, concede_down: bool) -> list[float]:
+def _evc_pretrade_review(ticker: str, quote: dict, ibkr_net_liq: float,
+                          alpaca_equity: float, cfg: dict) -> dict:
     """
-    GLFT-inspired price ladder for ONE leg (generalizes _evc_reprice_schedule,
-    which walks a combo's net credit, to a single leg walking toward the
-    opposite side of its own book). concede_down=True is a SELL leg walking
-    from the bid downward; False is a BUY leg walking from the ask upward.
-    Capped at 25% regardless of the combo-oriented max_reprice_concession
-    config, since that value was tuned for a small net-credit number and
-    would be an unreasonably large give-up applied to a single leg's price.
+    Real-time CRO/CFO pre-trade review -- BLOCKING gate run before any EVC
+    order is placed. Built 2026-08-20 (task 2026-08-20-003) after the DE
+    incident (2026-08-19): a manual, after-the-fact version of exactly this
+    analysis found DE needed a historically-atypical move to profit (1/12
+    quarters) and was 31.6% of combined net liq. This runs the same analysis
+    BEFORE entry instead of after the fact.
+
+    CRO: what-if P&L scenarios across a range of moves, and the ticker's own
+         historical earnings-move hit-rate against these specific breakevens.
+    CFO: position size vs the account's own max_position_pct ceiling, using
+         COMBINED (IBKR + Alpaca) net liq since that's where real capital is.
+    Also: options-flow/UOA cross-check (informational) and an exit-plan
+    (max_loss_pct monitor) verification.
+
+    Returns {"approved": bool, "findings": [...], "scenarios": [...], ...}.
     """
-    concession = 0.10 + 0.5 * im_pct + 2.0 * spread_pct
-    concession = min(0.25, float(cfg.get("max_reprice_concession", 0.35)), max(0.10, concession))
-    n_steps = max(1, int(cfg.get("reprice_steps", 4)))
-    end_px = start_px * ((1 - concession) if concede_down else (1 + concession))
-    return [round(max(0.01, start_px + i * (end_px - start_px) / n_steps), 2) for i in range(n_steps + 1)]
+    findings: list[str] = []
+    approved = True
 
+    spot   = quote["spot"]
+    em     = quote["expected_move"]
+    credit = quote["net_credit"]
+    short_put, long_put   = quote["short_put"], quote["long_put"]
+    short_call, long_call = quote["short_call"], quote["long_call"]
+    put_width  = short_put - long_put
+    call_width = long_call - short_call
+    max_risk = round(min(put_width, call_width) * 100 - credit * 100, 2)
+    breakeven_low  = round(short_put - credit, 2)
+    breakeven_high = round(short_call + credit, 2)
 
-def _evc_rel_spread(b: float, a: float) -> float:
-    if b > 0 and a > 0 and (a + b) > 0:
-        return (a - b) / ((a + b) / 2)
-    return 0.0
+    # ── CRO: what-if scenarios across a range of moves ──────────────────────
+    scenarios = []
+    for mult in (-1.5, -1.0, -0.5, 0.0, 0.5, 1.0, 1.5):
+        px = round(spot + mult * em, 2)
+        put_intrinsic  = max(0.0, short_put - px) - max(0.0, long_put - px)
+        call_intrinsic = max(0.0, px - short_call) - max(0.0, px - long_call)
+        pnl = round(credit * 100 - (put_intrinsic + call_intrinsic) * 100, 2)
+        scenarios.append({"move": f"{mult:+.1f}xEM", "price": px, "pnl": pnl})
+
+    # ── CRO: ticker's own historical earnings-move hit-rate vs these breakevens ──
+    try:
+        import yfinance as yf
+        t = yf.Ticker(ticker)
+        cal  = t.get_earnings_dates(limit=9)
+        hist = t.history(period="3y", interval="1d")
+        hist.index = hist.index.tz_localize(None)
+        moves = []
+        if cal is not None and len(hist):
+            for ed in cal.index[1:]:   # skip row 0 -- the upcoming report, no Reported EPS yet
+                ed_naive = ed.tz_localize(None) if ed.tzinfo else ed
+                idx = hist.index.searchsorted(ed_naive)
+                if 0 < idx < len(hist):
+                    prior = hist["Close"].iloc[idx - 1]
+                    react = hist["Close"].iloc[idx]
+                    moves.append(react / prior - 1)
+        if moves:
+            # A SHORT/credit condor profits when price stays WITHIN the
+            # breakevens (containment), not when it moves beyond them --
+            # opposite payoff shape from a naked long strangle. Real bug
+            # found 2026-08-20 (ROST): this previously counted moves
+            # OUTSIDE the range and labeled it "would_profit", inverting
+            # the result (reported 1/11 "hit rate" when the real contained
+            # rate was 10/11 -- rejected a structure that should have been
+            # approved). Fixed to count containment correctly.
+            would_profit = sum(1 for m in moves if breakeven_low <= spot * (1 + m) <= breakeven_high)
+            hit_rate = would_profit / len(moves)
+            findings.append(
+                f"historical: {would_profit}/{len(moves)} of last {len(moves)} earnings moves "
+                f"stayed within breakevens (${breakeven_low:.0f}/${breakeven_high:.0f}) -- condor would have profited"
+            )
+            if hit_rate < 0.50:
+                findings.append(f"LOW historical containment rate ({hit_rate:.0%}) -- structure breaches its own breakevens too often historically")
+                approved = False
+        else:
+            findings.append("no usable historical earnings-move data (insufficient history)")
+    except Exception as exc:
+        findings.append(f"could not fetch historical earnings-move data: {exc}")
+
+    # ── CFO: position size vs combined (IBKR + Alpaca) net liq ──────────────
+    combined_net_liq = (ibkr_net_liq or 0) + (alpaca_equity or 0)
+    max_pct = float(cfg.get("max_position_pct", 5.0)) / 100
+    pct_of_acct = (max_risk / combined_net_liq) if combined_net_liq else 1.0
+    findings.append(f"CFO: max risk ${max_risk:,.0f} = {pct_of_acct:.1%} of combined net liq ${combined_net_liq:,.0f}")
+    if pct_of_acct > max_pct:
+        findings.append(f"EXCEEDS {max_pct:.0%} position-size ceiling (config.max_position_pct)")
+        approved = False
+
+    # ── Options tape/flow (UOA) cross-check -- informational, not a gate ────
+    try:
+        con = sqlite3.connect(TAPE_DB_PATH, check_same_thread=False)
+        con.row_factory = sqlite3.Row
+        rows = con.execute("""
+            SELECT * FROM options_unusual_activity WHERE ticker = ?
+            ORDER BY scan_time DESC LIMIT 5
+        """, (ticker.upper(),)).fetchall()
+        con.close()
+        if rows:
+            flagged = [r for r in rows if r["is_unusual"]]
+            findings.append(f"options flow: {len(flagged)}/{len(rows)} recent scans flagged unusual for {ticker}")
+        else:
+            findings.append(f"options flow: no recent UOA scan data for {ticker} (outside scan universe)")
+    except Exception as exc:
+        findings.append(f"options flow check failed: {exc}")
+
+    # ── Exit-plan verification (this account manages exits via the monitor
+    # loop's max_loss_pct check, not a resting broker-side stop order) ──────
+    if not cfg.get("max_loss_pct"):
+        findings.append("NO EXIT PLAN: max_loss_pct not configured")
+        approved = False
+    else:
+        findings.append(f"exit plan: monitor loop closes at max_loss_pct={cfg['max_loss_pct']}% of credit")
+
+    return {
+        "approved":         approved,
+        "findings":         findings,
+        "scenarios":        scenarios,
+        "max_risk":         max_risk,
+        "breakeven_low":    breakeven_low,
+        "breakeven_high":   breakeven_high,
+        "combined_net_liq": round(combined_net_liq, 2),
+    }
 
 
 async def _evc_place_condor(ib, quote: dict) -> bool:
     """
-    Place the iron condor as 4 SEQUENTIAL individual-leg orders instead of a
-    single 4-leg BAG combo order.
+    Place the iron condor via ALPACA (sequential-leg execution: BUY both
+    long legs first, THEN SELL both short legs -- same proven mechanism as
+    alpaca_earnings_condor.py/GOOG weekly condor/COHR/CSCO), not IBKR.
 
-    Why: a BAG combo needs a market maker willing to cross all legs at once
-    as one package. Single-name equity options essentially never have that
-    for bespoke condor strikes (unlike index options, which do) — confirmed
-    2026-08-03 when 12/12 EVC condors sat unfilled as BAG orders that same
-    afternoon, even after conceding up to 60% off the starting credit. The
-    individual legs are perfectly liquid on their own (sequential-leg manual
-    trades filled the same day in under 2 minutes), so legging in one order
-    at a time works where the all-at-once combo didn't.
+    Migrated 2026-08-19 after repeated real IBKR PDT rejections (LOW, TJX,
+    2026-08-18 -- [201] Potential Pattern Day Trade) blocked EVC from
+    entering real candidates it found. Alpaca's Intraday Margin Framework
+    has no PDT gate (2026-08-11 architecture decision: Alpaca for orders,
+    IBKR stays the data source). IBKR is still used below for live
+    quotes/pricing and the conservative-credit safety gate -- only the
+    actual order placement moved venues.
 
-    Order: BUY long_put, BUY long_call FIRST (defined-risk legs — a plain
-    cash purchase, no margin concern), THEN SELL short_put, SELL short_call
-    (now each is protected by its long leg, so margin is spread-width-minus-
-    credit, not naked-option margin). Never sell a short leg before its long
-    leg has filled.
-
-    Trade-off vs. the combo: legging risk. If the market moves between
-    fills, realized net credit can differ from the quote, and a leg that
-    fails to fill after others are already on requires unwinding — handled
-    below with marketable orders (certainty over price) back to flat.
+    Unlike the old IBKR version, this does NOT actively unwind a partial
+    fill (buy back/sell off whatever already filled). It follows the same
+    established pattern as spy_0dte_auto.py instead: log ENTRY_INCOMPLETE,
+    alert high-priority, and leave whatever filled as a real (if
+    incomplete) position for manual review -- stacking a second round of
+    algorithmic unwind orders on top of an already-abnormal fill is its own
+    risk, and Alpaca fills have been fast/reliable in every live test this
+    account has run so far (COHR, CSCO, GOOG, LOW, TJX all filled clean).
     """
-    from ib_insync import Option as IbOpt, MarketOrder
+    from ib_insync import Option as IbOpt
     ticker = quote["ticker"]
     ev     = state["evc"]
     ev_cfg = ev["config"]
-    im_pct = quote.get("im_pct", 0.05)
-    # "Submitted" means the order reached the exchange, NOT that it filled — treating
-    # it as success recorded unfilled orders as open positions (same failure mode as
-    # the SPX 0DTE force-close bug).
-    _ENTRY_TERMINAL = {"Filled", "Cancelled", "ApiCancelled", "Inactive"}
-    wait_s = max(3, int(ev_cfg.get("reprice_wait_s", 15)))
+
+    # ── Real-time CRO/CFO pre-trade review — BLOCKING gate (task 2026-08-20-003) ──
+    try:
+        alp_cfg = _alp_load_config()
+        client  = _alp_client(alp_cfg)
+        alpaca_equity = float(client.get_account().equity)
+    except Exception as exc:
+        _evc_log("NO_FILL", ticker, f"pre-trade review: could not fetch Alpaca account state: {exc} — aborting")
+        return False
+    ibkr_net_liq = _get_net_liq(ib) if ib and ib.isConnected() else 0.0
+
+    review = _evc_pretrade_review(ticker, quote, ibkr_net_liq, alpaca_equity, ev_cfg)
+    review_summary = f"CRO/CFO pre-trade review for {ticker}: " + " | ".join(review["findings"])
+    scenario_summary = "  ".join(f"{s['move']}(${s['price']}): {s['pnl']:+.0f}" for s in review["scenarios"])
+    _evc_log("PRETRADE_REVIEW", ticker,
+             f"{'APPROVED' if review['approved'] else 'REJECTED'} — {review_summary}  ||  scenarios: {scenario_summary}")
+    _oversight_log("risk_manager" if not review["approved"] else "trader",
+                    "pretrade_review",
+                    f"EVC {ticker}: {review_summary}",
+                    rationale=f"scenarios: {scenario_summary}",
+                    outcome="APPROVED" if review["approved"] else "REJECTED — no orders placed")
+    if not review["approved"]:
+        _oversight_notify(f"EVC pre-trade review REJECTED {ticker}: {review_summary}", high_priority=False)
+        return False
 
     contracts = {
         "long_put":   IbOpt(ticker, quote["expiry"], quote["long_put"],   "P", "SMART", "100", "USD"),
@@ -16540,105 +17075,100 @@ async def _evc_place_condor(ib, quote: dict) -> bool:
                  f"{ev_cfg['min_credit']:.2f} — aborting before any orders placed")
         return False
 
-    async def _work_leg(contract, action: str, schedule: list[float], name: str) -> float | None:
-        """Walk a passive-to-marketable limit ladder for one leg. Returns fill price or None.
+    # 40%-toward-market concession from mid, same convention as every other
+    # Alpaca condor script this account runs (alpaca_earnings_condor.py etc).
+    lp_mid, lc_mid, sp_mid, sc_mid = (lp_a+lp_b)/2, (lc_a+lc_b)/2, (sp_a+sp_b)/2, (sc_a+sc_b)/2
+    entry_limits = {
+        "long_put":   round(lp_a - (lp_a - lp_mid) * 0.40, 2),
+        "long_call":  round(lc_a - (lc_a - lc_mid) * 0.40, 2),
+        "short_put":  round(sp_b + (sp_mid - sp_b) * 0.40, 2),
+        "short_call": round(sc_b + (sc_mid - sc_b) * 0.40, 2),
+    }
 
-        Captures the REAL IBKR error text (if any) for each attempt -- EVC's
-        order placement previously had no per-order error listener at all, so
-        a genuine rejection reason (as opposed to a plain timeout) was never
-        distinguishable from the decision log. Manual Trader hit and fixed
-        this exact diagnostic gap on 2026-08-05 (a canned guess about
-        "Inactive" status turned out wrong); this mirrors that fix here.
-        """
-        ibkr_errors: list[str] = []
-
-        def _on_leg_error(reqId, errorCode, errorString, err_contract):
-            ibkr_errors.append(f"[{errorCode}] {errorString}")
-
-        ib.errorEvent += _on_leg_error
-        try:
-            for i, px in enumerate(schedule):
-                ibkr_errors.clear()
-                ord_ = LimitOrder(action, 1, px)
-                ord_.tif = "DAY"
-                trade = ib.placeOrder(contract, ord_)
-                for _ in range(wait_s):
-                    await asyncio.sleep(1)
-                    if trade.orderStatus.status in _ENTRY_TERMINAL:
-                        break
-                if trade.orderStatus.status == "Filled" and float(trade.orderStatus.filled or 0) > 0:
-                    fill_px = float(trade.orderStatus.avgFillPrice or px)
-                    _evc_log("LEG_FILLED", ticker, f"{name} {action} 1 @ {fill_px:.2f}")
-                    return fill_px
-                status_note = f" (status={trade.orderStatus.status}"
-                if ibkr_errors:
-                    status_note += f", IBKR: {'; '.join(ibkr_errors)}"
-                status_note += ")"
-                if trade.orderStatus.status not in _ENTRY_TERMINAL:
-                    try:
-                        ib.cancelOrder(trade.order)
-                        for _ in range(5):
-                            await asyncio.sleep(1)
-                            if trade.orderStatus.status in _ENTRY_TERMINAL:
-                                break
-                    except Exception:
-                        pass
-                if i < len(schedule) - 1:
-                    _evc_log("LEG_REPRICE", ticker,
-                             f"{name} {action} step {i+1}/{len(schedule)} @ ${px:.2f} no fill{status_note} — trying ${schedule[i+1]:.2f}")
-                else:
-                    _evc_log("LEG_REPRICE", ticker,
-                             f"{name} {action} step {i+1}/{len(schedule)} @ ${px:.2f} no fill{status_note} — out of steps")
-            return None
-        finally:
-            ib.errorEvent -= _on_leg_error
-
-    async def _market_out(contract, action: str, name: str) -> None:
-        """Unwind an already-filled leg with a marketable order — certainty over price."""
-        try:
-            trade = ib.placeOrder(contract, MarketOrder(action, 1))
-            for _ in range(20):
-                await asyncio.sleep(1)
-                if trade.orderStatus.status in _ENTRY_TERMINAL:
-                    break
-            _evc_log("UNWIND", ticker, f"{name} {action} 1 -> status={trade.orderStatus.status}")
-        except Exception as exc:
-            _evc_log("UNWIND_FAILED", ticker, f"{name} {action} 1 -> {exc} — CHECK TWS MANUALLY")
-
-    # ---- Phase 1: BUY the long (defined-risk) legs first ----
-    lp_sched = _evc_leg_schedule(lp_a, ev_cfg, im_pct, _evc_rel_spread(lp_b, lp_a), concede_down=False)
-    lp_fill = await _work_leg(contracts["long_put"], "BUY", lp_sched, "long_put")
-    if lp_fill is None:
-        _evc_log("NO_FILL", ticker, "long_put did not fill — aborting, no legs committed")
+    expiry_alp = f"{quote['expiry'][:4]}-{quote['expiry'][4:6]}-{quote['expiry'][6:]}"
+    try:
+        # client already created above for the pre-trade review's equity check
+        put_by_strike, call_by_strike = _alp_get_symbols(
+            client, ticker, expiry_alp,
+            quote["long_put"] - 1, quote["short_put"] + 1,
+            quote["short_call"] - 1, quote["long_call"] + 1,
+        )
+    except Exception as exc:
+        _evc_log("NO_FILL", ticker, f"Alpaca symbol lookup failed: {exc} — aborting, no orders placed")
         return False
 
-    lc_sched = _evc_leg_schedule(lc_a, ev_cfg, im_pct, _evc_rel_spread(lc_b, lc_a), concede_down=False)
-    lc_fill = await _work_leg(contracts["long_call"], "BUY", lc_sched, "long_call")
-    if lc_fill is None:
-        _evc_log("NO_FILL", ticker, "long_call did not fill — unwinding long_put, aborting")
-        await _market_out(contracts["long_put"], "SELL", "long_put")
+    missing = [k for k in (quote["short_put"], quote["long_put"]) if k not in put_by_strike] + \
+              [k for k in (quote["short_call"], quote["long_call"]) if k not in call_by_strike]
+    if missing:
+        _evc_log("NO_FILL", ticker, f"strikes not listed on Alpaca: {missing} — aborting, no orders placed")
         return False
 
-    # ---- Phase 2: SELL the short legs (now protected — spread margin, not naked) ----
-    sp_sched = _evc_leg_schedule(sp_b, ev_cfg, im_pct, _evc_rel_spread(sp_b, sp_a), concede_down=True)
-    sp_fill = await _work_leg(contracts["short_put"], "SELL", sp_sched, "short_put")
-    if sp_fill is None:
-        _evc_log("NO_FILL", ticker, "short_put did not fill — unwinding both longs, aborting")
-        await _market_out(contracts["long_put"], "SELL", "long_put")
-        await _market_out(contracts["long_call"], "SELL", "long_call")
+    syms = {
+        "long_put":   put_by_strike[quote["long_put"]],  "short_put":  put_by_strike[quote["short_put"]],
+        "long_call":  call_by_strike[quote["long_call"]], "short_call": call_by_strike[quote["short_call"]],
+    }
+
+    # ── Collateral-affordability gate ───────────────────────────────────────
+    # Real incident (DE, 2026-08-19, task 2026-08-19-005): nothing checked
+    # whether there was enough buying power for the FULL structure before
+    # buying the long legs, so a retry loop kept committing more real cash to
+    # new long legs each cycle even as buying power shrank toward zero, each
+    # time failing on the same underfunded short legs. Mirrors AutoTrader's
+    # existing pattern (task 2026-08-10-001, _at_place_csp_spread) — compute
+    # the worst-case capital commitment and abort BEFORE placing any order,
+    # not after a partial fill already happened.
+    try:
+        acct = client.get_account()
+        avail_bp = float(acct.options_buying_power) if acct.options_buying_power else 0.0
+    except Exception as exc:
+        _evc_log("NO_FILL", ticker, f"could not fetch live Alpaca buying power: {exc} — aborting, no orders placed")
         return False
 
-    sc_sched = _evc_leg_schedule(sc_b, ev_cfg, im_pct, _evc_rel_spread(sc_b, sc_a), concede_down=True)
-    sc_fill = await _work_leg(contracts["short_call"], "SELL", sc_sched, "short_call")
-    if sc_fill is None:
-        _evc_log("NO_FILL", ticker, "short_call did not fill — unwinding short_put and both longs, aborting")
-        await _market_out(contracts["short_put"], "BUY", "short_put")
-        await _market_out(contracts["long_put"], "SELL", "long_put")
-        await _market_out(contracts["long_call"], "SELL", "long_call")
+    long_leg_cost = (entry_limits["long_put"] + entry_limits["long_call"]) * 100
+    put_width  = quote["short_put"]  - quote["long_put"]
+    call_width = quote["long_call"] - quote["short_call"]
+    est_required = long_leg_cost + (put_width + call_width) * 100  # conservative: full width both sides
+    if est_required > avail_bp:
+        _evc_log("NO_FILL", ticker,
+                 f"affordability gate: est. required ${est_required:,.0f} "
+                 f"(long legs ${long_leg_cost:,.0f} + worst-case short collateral ${(put_width+call_width)*100:,.0f}) "
+                 f"exceeds live options buying power ${avail_bp:,.0f} — aborting before any orders placed")
         return False
 
-    filled_credit = round((sp_fill + sc_fill) - (lp_fill + lc_fill), 2)
-    order_id = None  # no single combo order id under sequential execution
+    # place_condor_sequential() is a blocking call (time.sleep-based fill
+    # polling) — run it off the event loop so ib_insync's heartbeat and
+    # every other coroutine keep running while Alpaca fills. Wrapped in
+    # try/except as defense-in-depth: place_leg() itself now catches API-level
+    # rejections internally (2026-08-19 fix), but if anything else here still
+    # raises, the safest assumption is that we don't know the real fill state
+    # — treat it as incomplete/unknown rather than letting it escape uncaught.
+    try:
+        ok, fills, fill_state = await asyncio.get_event_loop().run_in_executor(
+            None, _alp_place_condor, client, syms, entry_limits, 1)
+    except Exception as exc:
+        ok, fills, fill_state = False, {}, f"unexpected_exception: {exc}"
+
+    if not ok:
+        msg = f"EVC/Alpaca: {ticker} condor ENTRY INCOMPLETE (state={fill_state}, fills={fills}) — check Alpaca positions manually NOW."
+        _evc_log("ENTRY_INCOMPLETE", ticker, msg)
+        _oversight_notify(msg, high_priority=True)
+        _oversight_log("trader", "execution_issue",
+                        f"EVC/Alpaca {ticker} entry incomplete: state={fill_state} fills={fills}",
+                        outcome="needs manual review — possible naked leg")
+        # Only a state ending "_nothing_on" means no real order was ever
+        # placed -- every other state (including an unexpected exception,
+        # where the real fill state is simply unknown) means we cannot be
+        # sure nothing is open, so this ticker must never be auto-retried
+        # until a human resolves it (real incident: DE 2026-08-19, task
+        # 2026-08-19-005).
+        if not fill_state.endswith("_nothing_on"):
+            ev.setdefault("incomplete_attempts_today", [])
+            if ticker not in ev["incomplete_attempts_today"]:
+                ev["incomplete_attempts_today"].append(ticker)
+            _evc_save_state()
+        return False
+
+    filled_credit = round((fills["short_put"] + fills["short_call"]) - (fills["long_put"] + fills["long_call"]), 2)
     pos_id = f"{ticker}_{date.today().strftime('%Y%m%d')}"
     pos = {
         "pos_id":        pos_id,
@@ -16658,12 +17188,11 @@ async def _evc_place_condor(ib, quote: dict) -> bool:
             "short_call": quote["short_call_conid"],
             "long_call":  quote["long_call_conid"],
         },
-        "order_id":   order_id,
+        "alpaca_symbols": syms,
+        "venue":      "alpaca",
+        "order_id":   None,
         "net_credit": round(filled_credit, 2),
-        "leg_fills": {
-            "long_put": lp_fill, "long_call": lc_fill,
-            "short_put": sp_fill, "short_call": sc_fill,
-        },
+        "leg_fills":  fills,
         "phase":      "open",
         "live_pnl":   0.0,
         "entry_time": datetime.now(timezone.utc).isoformat(),
@@ -16672,8 +17201,8 @@ async def _evc_place_condor(ib, quote: dict) -> bool:
     _evc_log("ENTERED", ticker,
              f"condor {quote['long_put']}/{quote['short_put']}P | "
              f"{quote['short_call']}/{quote['long_call']}C  "
-             f"EM={quote['expected_move']:.2f}  credit={filled_credit:.2f}  "
-             f"(sequential legs: LP={lp_fill:.2f} LC={lc_fill:.2f} SP={sp_fill:.2f} SC={sc_fill:.2f})")
+             f"EM={quote['expected_move']:.2f}  credit={filled_credit:.2f}  via Alpaca "
+             f"(LP={fills['long_put']:.2f} LC={fills['long_call']:.2f} SP={fills['short_put']:.2f} SC={fills['short_call']:.2f})")
     # Journal insert
     try:
         con = sqlite3.connect(JOURNAL_DB_PATH, check_same_thread=False)
@@ -16692,7 +17221,13 @@ async def _evc_place_condor(ib, quote: dict) -> bool:
 
 
 async def _evc_close_position(ib, pos_id: str, reason: str) -> None:
-    """Market-close all 4 legs of the condor and record result."""
+    """Close all 4 legs via Alpaca -- two-phase, BUY BACK shorts first
+    (removes risk), THEN SELL longs, matching this account's standing rule
+    for every spread close. Migrated 2026-08-19 alongside entry (see
+    _evc_place_condor's docstring) -- every EVC position is Alpaca-executed
+    now, so there's no longer an IBKR order-placement path to keep here.
+    IBKR is still used for live close-pricing quotes only (data stays on
+    IBKR)."""
     from ib_insync import Option as IbOpt
     ev  = state["evc"]
     pos = ev["positions"].get(pos_id)
@@ -16702,43 +17237,59 @@ async def _evc_close_position(ib, pos_id: str, reason: str) -> None:
     ticker = pos["ticker"]
     expiry = pos["expiry"]
     qty    = pos["qty"]
+    syms   = pos["alpaca_symbols"]
 
-    # Close condor: BUY short legs (cost +), SELL long legs (proceeds −)
-    leg_defs = [
-        (pos["long_put"],   "P", pos["conids"]["long_put"],   "SELL", -1),
-        (pos["short_put"],  "P", pos["conids"]["short_put"],  "BUY",  +1),
-        (pos["short_call"], "C", pos["conids"]["short_call"], "BUY",  +1),
-        (pos["long_call"],  "C", pos["conids"]["long_call"],  "SELL", -1),
-    ]
-    _TERMINAL = {"Filled", "Cancelled", "ApiCancelled", "Inactive"}
+    contracts = {
+        "long_put":   IbOpt(ticker, expiry, pos["long_put"],   "P", "SMART", "100", "USD"),
+        "long_call":  IbOpt(ticker, expiry, pos["long_call"],  "C", "SMART", "100", "USD"),
+        "short_put":  IbOpt(ticker, expiry, pos["short_put"],  "P", "SMART", "100", "USD"),
+        "short_call": IbOpt(ticker, expiry, pos["short_call"], "C", "SMART", "100", "USD"),
+    }
+    await ib.qualifyContractsAsync(*contracts.values())
 
-    # Submit all 4 legs simultaneously
-    submitted: list[tuple] = []   # (trade, sign, right, strike)
-    for strike, right, conid, action, sign in leg_defs:
-        try:
-            c = IbOpt(ticker, expiry, strike, right, "SMART", "100", "USD")
-            c.conId = conid
-            mkt = Order()
-            mkt.orderType = "MKT"; mkt.action = action
-            mkt.totalQuantity = qty; mkt.tif = "DAY"
-            submitted.append((ib.placeOrder(c, mkt), sign, right, strike))
-        except Exception as exc:
-            log.warning("EVC close place %s%s: %s", right, strike, exc)
+    async def _live_bid_ask(contract):
+        td = ib.reqMktData(contract, "", False, False)
+        await asyncio.sleep(3)
+        b, a = _spx_safe_px(td.bid), _spx_safe_px(td.ask)
+        ib.cancelMktData(contract)
+        return b, a
 
-    # Poll until every leg reaches a terminal status (max 30 s)
-    for _ in range(60):
-        await asyncio.sleep(0.5)
-        if all(t.orderStatus.status in _TERMINAL for t, *_ in submitted):
-            break
+    quotes = {name: await _live_bid_ask(c) for name, c in contracts.items()}
+    close_limits = {}
+    for name, (b, a) in quotes.items():
+        if b > 0 and a > 0:
+            mid = (a + b) / 2
+            # closing a long = SELL (cross toward bid); closing a short = BUY (cross toward ask)
+            close_limits[name] = round(b + (mid - b) * 0.40, 2) if name.startswith("long") \
+                else round(a - (a - mid) * 0.40, 2)
+        else:
+            close_limits[name] = pos["leg_fills"][name]  # stale/missing quote -- anchor on entry fill
 
-    # Collect confirmed fill prices + commissions
+    try:
+        alp_cfg = _alp_load_config()
+        client  = _alp_client(alp_cfg)
+    except Exception as exc:
+        _evc_log("CLOSE_FAILED", ticker, f"Alpaca client init failed: {exc} — CHECK ALPACA MANUALLY")
+        _oversight_notify(f"EVC/Alpaca: {ticker} close FAILED to start (client init: {exc}) — CHECK ALPACA MANUALLY.", high_priority=True)
+        pos["phase"] = "open"
+        return
+
+    ok, fills = await asyncio.get_event_loop().run_in_executor(
+        None, _alp_close_condor, client, syms, close_limits, qty)
+
+    if not ok:
+        msg = f"EVC/Alpaca: {ticker} close INCOMPLETE (fills={fills}) — check Alpaca positions manually NOW."
+        _evc_log("CLOSE_INCOMPLETE", ticker, msg)
+        _oversight_notify(msg, high_priority=True)
+        _oversight_log("trader", "execution_issue", f"EVC/Alpaca {ticker} close incomplete: fills={fills}",
+                        outcome="needs manual review — position left phase=closing, will not auto-retry")
+        return  # leave phase="closing" -- needs a human look, not an auto-retry
+
     close_cost = 0.0
-    close_oids = [t.order.orderId for t, *_ in submitted]
-    for trade, sign, right, strike in submitted:
-        fill_px = float(trade.orderStatus.avgFillPrice or 0)
+    for name, sign in (("long_put", -1), ("short_put", 1), ("short_call", 1), ("long_call", -1)):
+        fill_px = fills.get(name) or 0.0
         if fill_px == 0:
-            log.warning("EVC close %s %s%s: no fill after 30s (status=%s)",
-                        ticker, right, strike, trade.orderStatus.status)
+            log.warning("EVC close %s %s: no fill (Alpaca)", ticker, name)
         close_cost += sign * fill_px
     net_credit = pos["net_credit"]
     pnl        = round((net_credit - close_cost) * qty * 100, 2)
@@ -16771,21 +17322,20 @@ async def _evc_close_position(ib, pos_id: str, reason: str) -> None:
             " AND closed_at IS NULL ORDER BY id DESC LIMIT 1",
             (ticker,)).fetchone()
         if row:
-            entry_oids = list(pos.get("entry_order_ids") or [])
-            comm = _commission_for_orders(ib, *entry_oids, *close_oids)
+            # Alpaca commissions aren't visible via _commission_for_orders (IBKR-only) --
+            # left unchanged here, same honest gap already tracked in cfo_ledger.json.
             con.execute("""
                 UPDATE trade_journal
-                SET closed_at=?, exit_price=?, pnl=?, pnl_pct=?, win=?, exit_reason=?,
-                    commission=commission+?
+                SET closed_at=?, exit_price=?, pnl=?, pnl_pct=?, win=?, exit_reason=?
                 WHERE id=?
             """, (date.today().isoformat(), round(close_cost, 2),
-                  pnl, pnl_pct, win, reason, round(comm, 4), row[0]))
+                  pnl, pnl_pct, win, reason, row[0]))
         con.commit()
         con.close()
     except Exception as exc:
         log.warning("EVC journal update failed: %s", exc)
 
-    _evc_log("CLOSED", ticker, f"exit={reason}  P&L=${pnl:.2f} ({pnl_pct:.1f}%)")
+    _evc_log("CLOSED", ticker, f"exit={reason}  P&L=${pnl:.2f} ({pnl_pct:.1f}%) via Alpaca")
     _evc_save_state()
 
 
@@ -16812,7 +17362,8 @@ async def _evc_entry_coro(ib) -> None:
                 continue
             if (ticker in ev["positions"]
                     or any(p["ticker"] == ticker for p in ev["positions"].values())
-                    or any(r["ticker"] == ticker for r in ev.get("closed_today", []))):
+                    or any(r["ticker"] == ticker for r in ev.get("closed_today", []))
+                    or ticker in ev.get("incomplete_attempts_today", [])):
                 continue
             try:
                 _evc_log("QUOTING", ticker, "requesting condor quote")
@@ -17156,6 +17707,42 @@ def spy_0dte_status():
     }
 
 
+@app.get("/goog-condor/status")
+def goog_condor_status():
+    """GOOG weekly iron-condor status -- same pattern as /spy-0dte/status:
+    reads directly from the files alpaca_goog_weekly_condor.py (a
+    standalone, explicitly-invoked script, not a main.py-integrated
+    strategy) writes to. Built 2026-08-19 alongside the script itself so
+    this strategy has visibility from day one rather than needing a
+    later gap-fix like SPY 0DTE did."""
+    try:
+        with open("goog_condor_decisions.json") as f:
+            decisions = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        decisions = []
+
+    try:
+        with open("alpaca_0dte_positions.json") as f:
+            registry = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        registry = {"positions": {}, "closed": []}
+
+    open_positions = {k: v for k, v in registry.get("positions", {}).items()
+                       if v.get("strategy") == "iron_condor_weekly"}
+    closed = [p for p in registry.get("closed", []) if p.get("strategy") == "iron_condor_weekly"]
+
+    return {
+        "positions":      open_positions,
+        "closed":         closed[-50:],
+        "decisions":      decisions[-100:],
+        "summary": {
+            "open_positions":  len(open_positions),
+            "closed_trades":   len(closed),
+            "last_action":     decisions[-1] if decisions else None,
+        },
+    }
+
+
 @app.get("/spx-0dte/history")
 def spx_0dte_history(limit: int = 50):
     """All closed SPX 0DTE spreads from trade_journal, newest first."""
@@ -17304,6 +17891,32 @@ def evc_status():
             "today_pnl":        today_pnl,
             "scan_date":        ev.get("scan_date"),
         },
+    }
+
+
+@app.get("/earnings-vol-crush/scan-candidates")
+async def evc_scan_candidates():
+    """Read-only: run EVC's real earnings-timing scan (tonight AH + tomorrow
+    BMO, same CANDIDATE_POOL/logic the live strategy uses) without entering
+    anything -- EVC can stay disabled. Useful for 'what's reporting
+    tonight/tomorrow' without flipping on live auto-trading."""
+    ib = state.get("ib")
+    if not ib or not state.get("connected"):
+        raise HTTPException(503, "Not connected to TWS")
+    candidates = await asyncio.get_event_loop().run_in_executor(
+        None, lambda: _run_in_streaming_loop(_evc_scan_universe(ib), timeout=300),
+    )
+    ev = state["evc"]
+    today = date.today().isoformat()
+    by_timing: dict = {}
+    for d in ev.get("decisions", []):
+        if d.get("action") == "CANDIDATE" and d.get("ticker") in candidates:
+            by_timing[d["ticker"]] = d.get("detail", "")
+    return {
+        "scan_date": today,
+        "candidates": candidates,
+        "timing": by_timing,
+        "note": "today_ah = reports after today's close (tonight); tomorrow_bmo = reports before tomorrow's open",
     }
 
 
