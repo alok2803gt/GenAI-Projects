@@ -7719,6 +7719,120 @@ function SPY0DTETab() {
 }
 
 
+// ── GOOG Weekly Condor Tab ───────────────────────────────────────────────────
+function GOOGCondorTab() {
+  const [data,    setData]    = useState(null);
+  const [error,   setError]   = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  const load = async () => {
+    try { setData(await apiFetch("/goog-condor/status")); setError(null); }
+    catch (e) { setError(e.message); }
+    finally { setLoading(false); }
+  };
+  useEffect(() => { load(); const id = setInterval(load, 15000); return () => clearInterval(id); }, []);
+
+  const actionColor = (action) => {
+    if (["ENTERED", "DRY_RUN_CLEAR"].includes(action)) return "#4ade80";
+    if (["ENTRY_INCOMPLETE", "PRICING_ABORT", "STRIKES_MISSING"].includes(action)) return "#f87171";
+    return C.muted; // NO_FIRE and anything else -- routine, not a problem
+  };
+
+  if (loading) return <div style={{color:C.muted,...sans,fontSize:13}}>Loading...</div>;
+  if (error)   return <div style={{color:"#ef4444",...sans,fontSize:13}}>GOOG Condor unavailable: {error}</div>;
+  if (!data)   return <div style={{color:C.muted,...sans,fontSize:13}}>No data</div>;
+
+  const { positions, closed, decisions, summary } = data;
+  const openList = Object.values(positions || {});
+
+  return (
+    <div>
+      <div style={{marginBottom:16}}>
+        <div style={{...sans, fontSize:17, fontWeight:700, color:C.white}}>GOOG Weekly Condor</div>
+        <div style={{...sans, fontSize:12, color:C.muted, marginTop:2}}>
+          Weekly premium collection, explicitly-invoked (not auto-fired). 5% OTM / ~1.5% width, snapped to real
+          listed strikes. Backtest (2026-08-18, earnings-excluded, 3yr): 85.8% win rate, +5.3% avg return/week.
+          Holds to expiry -- no early profit-take automated.
+        </div>
+      </div>
+
+      {/* Summary */}
+      <div style={{display:"flex", gap:24, flexWrap:"wrap", background:"#0f172a", border:"1px solid #1e3a5f", borderRadius:8, padding:14, marginBottom:20}}>
+        {[
+          ["Open Positions", String(summary.open_positions)],
+          ["Closed Trades", String(summary.closed_trades)],
+          ["Last Action", summary.last_action ? `${summary.last_action.action} @ ${summary.last_action.time}` : "—"],
+        ].map(([label, value]) => (
+          <div key={label}>
+            <div style={{...sans, fontSize:11, color:C.muted, textTransform:"uppercase", letterSpacing:0.5}}>{label}</div>
+            <div style={{...sans, fontSize:16, fontWeight:700, color:C.white, marginTop:2}}>{value}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* Open positions */}
+      <div style={{...sans, fontSize:13, fontWeight:600, color:C.muted, marginBottom:8, textTransform:"uppercase", letterSpacing:1}}>
+        Open Positions ({openList.length})
+      </div>
+      {openList.length === 0 ? (
+        <div style={{...sans, fontSize:13, color:C.muted, marginBottom:20}}>None open right now.</div>
+      ) : (
+        <div style={{overflowX:"auto", marginBottom:20}}>
+          <table style={{width:"100%", borderCollapse:"collapse", fontSize:12, ...sans}}>
+            <thead>
+              <tr style={{color:C.muted, borderBottom:"1px solid #1e293b"}}>
+                {["Pos ID","Entry Credit","Max Risk","Entry Time"].map(h=>(
+                  <th key={h} style={{textAlign:"left", padding:"5px 10px", whiteSpace:"nowrap"}}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {openList.map((p,i) => (
+                <tr key={i} style={{borderBottom:"1px solid #0f172a"}}>
+                  <td style={{padding:"5px 10px", color:C.white, fontFamily:mono.fontFamily}}>{p.pos_id}</td>
+                  <td style={{padding:"5px 10px", color:"#4ade80", fontVariantNumeric:"tabular-nums"}}>{fmt$(p.net_entry_credit)}</td>
+                  <td style={{padding:"5px 10px", color:C.muted, fontVariantNumeric:"tabular-nums"}}>{fmt$(p.max_risk)}</td>
+                  <td style={{padding:"5px 10px", color:C.muted}}>{p.entry_time}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {/* Decision log */}
+      <div style={{...sans, fontSize:13, fontWeight:600, color:C.muted, marginBottom:8, textTransform:"uppercase", letterSpacing:1}}>
+        Decision Log ({decisions.length})
+      </div>
+      {decisions.length === 0 ? (
+        <div style={{...sans, fontSize:13, color:C.muted}}>No decisions logged yet.</div>
+      ) : (
+        <div style={{overflowX:"auto", maxHeight:400, overflowY:"auto"}}>
+          <table style={{width:"100%", borderCollapse:"collapse", fontSize:12, ...sans}}>
+            <thead>
+              <tr style={{color:C.muted, borderBottom:"1px solid #1e293b"}}>
+                {["Time","Action","Detail"].map(h=>(
+                  <th key={h} style={{textAlign:"left", padding:"5px 10px", whiteSpace:"nowrap"}}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {[...decisions].reverse().map((d,i) => (
+                <tr key={i} style={{borderBottom:"1px solid #0f172a"}}>
+                  <td style={{padding:"5px 10px", color:C.muted, whiteSpace:"nowrap", fontVariantNumeric:"tabular-nums"}}>{d.time}</td>
+                  <td style={{padding:"5px 10px", color:actionColor(d.action), fontWeight:700, whiteSpace:"nowrap"}}>{d.action}</td>
+                  <td style={{padding:"5px 10px", color:C.text}}>{d.detail}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+
 // ── Day Trader Tab ────────────────────────────────────────────────────────────
 function DayTraderTab() {
   const [status,   setStatus]   = useState(null);
@@ -8910,6 +9024,138 @@ function TapeTab() {
 
 
 // ── Institutional Flow Tab ────────────────────────────────────────────────
+function OptionsFlowTab() {
+  const [data,    setData]    = useState(null);
+  const [error,   setError]   = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [scanning, setScanning] = useState(false);
+  const [sortCol, setSortCol] = useState("vol_oi_ratio");
+  const [sortDir, setSortDir] = useState(-1);
+
+  const load = async () => {
+    try { setData(await apiFetch("/options-flow/unusual?limit=100")); setError(null); }
+    catch (e) { setError(e.message); }
+    finally { setLoading(false); }
+  };
+  useEffect(() => { load(); const id = setInterval(load, 60000); return () => clearInterval(id); }, []);
+
+  const [scanMsg, setScanMsg] = useState(null);
+  const scanNow = async () => {
+    setScanning(true);
+    setScanMsg(null);
+    try {
+      await apiFetch("/options-flow/scan-now", { method: "POST" });
+      const uSize = data?.universe_size;
+      setScanMsg(`Scan started in background (~5-10 min for the full ${uSize ? uSize + "-name" : ""} universe) -- this view auto-refreshes every 60s.`);
+    } catch (e) {
+      setScanMsg(`Failed to start: ${e.message}`);
+    } finally {
+      setScanning(false);
+    }
+  };
+
+  const Th = ({ col, label }) => (
+    <th onClick={() => { if (sortCol === col) setSortDir(d => -d); else { setSortCol(col); setSortDir(-1); } }}
+      style={{ ...mono, fontSize:10, color: sortCol===col ? C.accent : C.muted, fontWeight:600,
+        textTransform:"uppercase", letterSpacing:0.5, padding:"8px 10px", whiteSpace:"nowrap",
+        borderBottom:`1px solid ${C.border}`, cursor:"pointer", userSelect:"none" }}>
+      {label}{sortCol===col ? (sortDir<0 ? " ↓" : " ↑") : ""}
+    </th>
+  );
+
+  if (loading) return <div style={{color:C.muted,...sans,fontSize:13}}>Loading...</div>;
+  if (error)   return <div style={{color:"#ef4444",...sans,fontSize:13}}>Options flow unavailable: {error}</div>;
+
+  const flagged = data?.flagged || [];
+  const sorted = [...flagged].sort((a, b) => {
+    const av = a[sortCol] ?? 0, bv = b[sortCol] ?? 0;
+    return sortDir * (typeof av === "string" ? av.localeCompare(bv) : bv - av) * -1;
+  });
+
+  return (
+    <div>
+      <div style={{marginBottom:16, display:"flex", justifyContent:"space-between", alignItems:"flex-start"}}>
+        <div>
+          <div style={{...sans, fontSize:17, fontWeight:700, color:C.white}}>Unusual Options Activity</div>
+          <div style={{...sans, fontSize:12, color:C.muted, marginTop:2, maxWidth:600}}>
+            Periodic snapshot scan (volume vs. open interest), not live tick flow -- IBKR doesn't support
+            L2 depth or tick-by-tick trades for SMART-routed options (confirmed 2026-08-19). Scans
+            {data?.universe_size ? ` ${data.universe_size} names` : " the research-desk + mega-cap tech universe"}
+            (research-desk coverage + mega-cap tech/index ETFs), ATM ± 1 strike both rights, every 30 min
+            during market hours.
+          </div>
+        </div>
+        <button onClick={scanNow} disabled={scanning}
+          style={{...sans, fontSize:12, fontWeight:600, color:C.white, background:C.accent, border:"none",
+            borderRadius:6, padding:"7px 14px", cursor: scanning ? "default" : "pointer", opacity: scanning ? 0.6 : 1,
+            whiteSpace:"nowrap"}}>
+          {scanning ? "Starting..." : "Scan Now"}
+        </button>
+      </div>
+
+      {scanMsg && (
+        <div style={{...sans, fontSize:12, color:C.accent, background:"#0f172a", border:"1px solid #1e3a5f",
+          borderRadius:6, padding:"8px 12px", marginBottom:16}}>{scanMsg}</div>
+      )}
+
+      <div style={{display:"flex", gap:24, flexWrap:"wrap", background:"#0f172a", border:"1px solid #1e3a5f", borderRadius:8, padding:14, marginBottom:20}}>
+        {[
+          ["Last Scan", data?.last_scan ? new Date(data.last_scan).toLocaleTimeString() : "—"],
+          ["Threshold", `${data?.threshold ?? 2.0}× OI`],
+          ["Flagged", String(flagged.length)],
+        ].map(([label, value]) => (
+          <div key={label}>
+            <div style={{...sans, fontSize:11, color:C.muted, textTransform:"uppercase", letterSpacing:0.5}}>{label}</div>
+            <div style={{...sans, fontSize:16, fontWeight:700, color:C.white, marginTop:2}}>{value}</div>
+          </div>
+        ))}
+      </div>
+
+      {sorted.length === 0 ? (
+        <div style={{...sans, fontSize:13, color:C.muted}}>No unusual activity flagged in the most recent scans.</div>
+      ) : (
+        <div style={{overflowX:"auto"}}>
+          <table style={{width:"100%", borderCollapse:"collapse", fontSize:12, ...sans}}>
+            <thead>
+              <tr>
+                <Th col="ticker" label="Ticker" />
+                <Th col="expiry" label="Expiry" />
+                <Th col="strike" label="Strike" />
+                <Th col="right" label="Right" />
+                <Th col="volume" label="Volume" />
+                <Th col="open_interest" label="OI" />
+                <Th col="vol_oi_ratio" label="Vol/OI" />
+                <Th col="bid" label="Bid" />
+                <Th col="ask" label="Ask" />
+                <Th col="underlying_px" label="Spot" />
+                <Th col="scan_time" label="Scan Time" />
+              </tr>
+            </thead>
+            <tbody>
+              {sorted.map((r, i) => (
+                <tr key={i} style={{borderBottom:"1px solid #0f172a"}}>
+                  <td style={{padding:"5px 10px", color:C.white, fontWeight:600}}>{r.ticker}</td>
+                  <td style={{padding:"5px 10px", color:C.muted}}>{r.expiry}</td>
+                  <td style={{padding:"5px 10px", color:C.text, fontVariantNumeric:"tabular-nums"}}>{r.strike}</td>
+                  <td style={{padding:"5px 10px", color: r.right==="C" ? "#4ade80" : "#f87171"}}>{r.right}</td>
+                  <td style={{padding:"5px 10px", color:C.text, fontVariantNumeric:"tabular-nums"}}>{r.volume}</td>
+                  <td style={{padding:"5px 10px", color:C.text, fontVariantNumeric:"tabular-nums"}}>{r.open_interest}</td>
+                  <td style={{padding:"5px 10px", color:"#fbbf24", fontWeight:700, fontVariantNumeric:"tabular-nums"}}>{r.vol_oi_ratio}×</td>
+                  <td style={{padding:"5px 10px", color:C.muted, fontVariantNumeric:"tabular-nums"}}>{r.bid ?? "—"}</td>
+                  <td style={{padding:"5px 10px", color:C.muted, fontVariantNumeric:"tabular-nums"}}>{r.ask ?? "—"}</td>
+                  <td style={{padding:"5px 10px", color:C.muted, fontVariantNumeric:"tabular-nums"}}>{r.underlying_px}</td>
+                  <td style={{padding:"5px 10px", color:C.muted, whiteSpace:"nowrap"}}>{new Date(r.scan_time).toLocaleTimeString()}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+
 function InstFlowTab() {
   const today = new Date().toISOString().slice(0, 10);
   const [date,    setDate]    = useState(today);
@@ -10869,6 +11115,7 @@ function App() {
       { id:"daytrader",   label:"Day Trader"    },
       { id:"spx0dte",     label:"SPX 0DTE"      },
       { id:"spy0dte",     label:"SPY 0DTE"      },
+      { id:"googcondor",  label:"GOOG Condor"   },
       { id:"evc",         label:"Earnings"      },
       { id:"sigtrader",   label:"Sig Trader"    },
       { id:"fxtrader",      label:"FX Trader"     },
@@ -10889,6 +11136,7 @@ function App() {
       { id:"watchlist",  label:"Watchlist"  },
       { id:"tape",       label:"Live Tape"  },
       { id:"instflow",   label:"Inst. Flow" },
+      { id:"optionsflow",label:"Options Flow" },
       { id:"gexvex",     label:"GEX/VEX"    },
       { id:"technicals", label:"Technicals" },
       { id:"news",       label:"News Feed"  },
@@ -10991,6 +11239,7 @@ function App() {
         <div style={{display: tab==="daytrader"    ? "" : "none"}}><DayTraderTab /></div>
         <div style={{display: tab==="spx0dte"      ? "" : "none"}}><SPX0DTETab /></div>
         <div style={{display: tab==="spy0dte"      ? "" : "none"}}><SPY0DTETab /></div>
+        <div style={{display: tab==="googcondor"   ? "" : "none"}}><GOOGCondorTab /></div>
         <div style={{display: tab==="evc"          ? "" : "none"}}><EVCTab /></div>
         <div style={{display: tab==="sigtrader"    ? "" : "none"}}><SigTraderTab /></div>
         <div style={{display: tab==="fxtrader"      ? "" : "none"}}><FXTraderTab /></div>
@@ -11008,6 +11257,7 @@ function App() {
         <div style={{display: tab==="watchlist"    ? "" : "none"}}><WatchlistTab /></div>
         <div style={{display: tab==="tape"         ? "" : "none"}}><TapeTab /></div>
         <div style={{display: tab==="instflow"     ? "" : "none"}}><InstFlowTab /></div>
+        <div style={{display: tab==="optionsflow"  ? "" : "none"}}><OptionsFlowTab /></div>
         <div style={{display: tab==="gexvex"       ? "" : "none"}}><GexVexTab /></div>
         <div style={{display: tab==="news"         ? "" : "none"}}><NewsMonitorTab /></div>
         <div style={{display: tab==="alerts"       ? "" : "none"}}><AlertsTab /></div>
