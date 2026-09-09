@@ -1,0 +1,74 @@
+{
+  "CRM": {
+    "entry_date": "2026-08-26",
+    "spot": 205.03,
+    "em": 14.72,
+    "old_short_call": 220.0,
+    "long_call": 227.5,
+    "put_leg_credit": 0.27,
+    "new_short_call_strike": 225.0,
+    "old_short_call_px": 2.5,
+    "new_short_call_px": 1.5,
+    "long_call_px": 1.25
+  },
+  "CRWD": {
+    "entry_date": "2026-08-26",
+    "spot": 190.26,
+    "em": 15.77,
+    "old_short_call": 205.0,
+    "long_call": 215.0,
+    "put_leg_credit": 0.32000000000000006,
+    "new_short_call_strike": 210.0,
+    "old_short_call_px": 2.7,
+    "new_short_call_px": 1.85,
+    "long_call_px": 1.2
+  },
+  "NVDA": {
+    "entry_date": "2026-08-26",
+    "spot": 210.33,
+    "em": 12.17,
+    "old_short_call": 222.5,
+    "long_call": 230.0,
+    "put_leg_credit": null,
+    "new_short_call_strike": 225.0,
+    "old_short_call_px": 2.13,
+    "new_short_call_px": 1.68,
+    "long_call_px": 1.01
+  },
+  "MRVL": {
+    "entry_date": "2026-08-27",
+    "spot": 243.63,
+    "em": 24.0,
+    "old_short_call": 267.5,
+    "long_call": 270.0,
+    "put_leg_credit": 0.31000000000000005,
+    "new_short_call_strike": 275.0,
+    "old_short_call_px": 4.32,
+    "new_short_call_px": 3.09,
+    "long_call_px": 3.85
+  },
+  "AFRM": {
+    "entry_date": "2026-08-27",
+    "spot": 76.88,
+    "em": 8.0,
+    "old_short_call": 85.0,
+    "long_call": 86.0,
+    "put_leg_credit": 0.09000000000000008,
+    "new_short_call_strike": 87.0,
+    "old_short_call_px": 1.6,
+    "new_short_call_px": 1.26,
+    "long_call_px": 1.5
+  },
+  "ULTA": {
+    "entry_date": "2026-08-27",
+    "spot": 536.5,
+    "em": 45.5,
+    "old_short_call": 580.0,
+    "long_call": 582.5,
+    "put_leg_credit": 0.3500000000000001,
+    "new_short_call_strike": 595.0,
+    "old_short_call_px": 7.4,
+    "new_short_call_px": 4.1,
+    "long_call_px": 5.52
+  }
+}

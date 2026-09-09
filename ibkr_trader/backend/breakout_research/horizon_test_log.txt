@@ -1,0 +1,74 @@
+1107 alerts, 177 unique tickers, 2026-06-25 to 2026-08-24
+Saved 1107 rows to indicator_horizon_joined.csv
+
+=== horizon: EOD ===
+  ALL (baseline)                   n=1107 win_rate= 52.9% avg=+0.048% median=+0.043%
+ -- RSI --
+  RSI < 60                         n= 428 win_rate= 54.0% avg=+0.058% median=+0.078%
+  RSI 60-70                        n= 518 win_rate= 51.9% avg=+0.029% median=+0.030%
+  RSI >= 70 (overbought)           n=  72 win_rate= 52.8% avg=-0.066% median=+0.041%
+ -- pct_b --
+  pct_b 50-95 (not extended)       n=1026 win_rate= 52.9% avg=+0.038% median=+0.042%
+  pct_b 95-100 (fresh breakout)    n=  13 win_rate= 69.2% avg=+0.396% median=+0.542%
+  pct_b >= 100 (extended)          n=  66 win_rate= 48.5% avg=-0.131% median=-0.023%
+ -- vol_ratio --
+  vol_ratio < 0.5                  n= 825 win_rate= 53.8% avg=+0.043% median=+0.057%
+  vol_ratio 0.5-1.5                n= 200 win_rate= 48.0% avg=-0.031% median=-0.026%
+  vol_ratio >= 1.5 (confirmed)     n=  80 win_rate= 55.0% avg=+0.070% median=+0.162%
+ -- combined lead: RSI<70 AND pct_b<100 AND vol_ratio>=0.5 --
+  combo filter passes              n= 160 win_rate= 50.0% avg=+0.009% median=-0.001%
+  combo filter fails (rest)        n= 947 win_rate= 53.4% avg=+0.054% median=+0.057%
+
+=== horizon: +1d ===
+  ALL (baseline)                   n=1091 win_rate= 48.7% avg=-0.095% median=-0.062%
+ -- RSI --
+  RSI < 60                         n= 424 win_rate= 46.9% avg=-0.015% median=-0.116%
+  RSI 60-70                        n= 508 win_rate= 50.6% avg=+0.040% median=+0.021%
+  RSI >= 70 (overbought)           n=  70 win_rate= 47.1% avg=-0.196% median=-0.055%
+ -- pct_b --
+  pct_b 50-95 (not extended)       n=1012 win_rate= 48.7% avg=-0.099% median=-0.052%
+  pct_b 95-100 (fresh breakout)    n=  13 win_rate= 46.2% avg=-0.157% median=-0.148%
+  pct_b >= 100 (extended)          n=  64 win_rate= 46.9% avg=-0.264% median=-0.317%
+ -- vol_ratio --
+  vol_ratio < 0.5                  n= 812 win_rate= 49.3% avg=+0.033% median=-0.037%
+  vol_ratio 0.5-1.5                n= 199 win_rate= 44.7% avg=-0.401% median=-0.317%
+  vol_ratio >= 1.5 (confirmed)     n=  78 win_rate= 51.3% avg=-0.850% median=+0.043%
+ -- combined lead: RSI<70 AND pct_b<100 AND vol_ratio>=0.5 --
+  combo filter passes              n= 159 win_rate= 47.2% avg=-0.136% median=-0.086%
+  combo filter fails (rest)        n= 932 win_rate= 48.9% avg=-0.088% median=-0.050%
+
+=== horizon: +3d ===
+  ALL (baseline)                   n=1053 win_rate= 52.8% avg=+0.120% median=+0.250%
+ -- RSI --
+  RSI < 60                         n= 416 win_rate= 52.9% avg=+0.380% median=+0.307%
+  RSI 60-70                        n= 481 win_rate= 53.2% avg=-0.008% median=+0.276%
+  RSI >= 70 (overbought)           n=  67 win_rate= 35.8% avg=-0.462% median=-0.621%
+ -- pct_b --
+  pct_b 50-95 (not extended)       n= 976 win_rate= 52.3% avg=+0.090% median=+0.217%
+  pct_b 95-100 (fresh breakout)    n=  12 win_rate= 91.7% avg=+3.811% median=+3.264%
+  pct_b >= 100 (extended)          n=  63 win_rate= 52.4% avg=-0.180% median=+0.045%
+ -- vol_ratio --
+  vol_ratio < 0.5                  n= 786 win_rate= 52.7% avg=+0.139% median=+0.281%
+  vol_ratio 0.5-1.5                n= 189 win_rate= 49.7% avg=+0.059% median=-0.022%
+  vol_ratio >= 1.5 (confirmed)     n=  76 win_rate= 60.5% avg=+0.017% median=+0.597%
+ -- combined lead: RSI<70 AND pct_b<100 AND vol_ratio>=0.5 --
+  combo filter passes              n= 148 win_rate= 48.0% avg=+0.233% median=-0.334%
+  combo filter fails (rest)        n= 905 win_rate= 53.6% avg=+0.101% median=+0.290%
+
+=== horizon: +5d ===
+  ALL (baseline)                   n= 984 win_rate= 52.1% avg=+0.110% median=+0.190%
+ -- RSI --
+  RSI < 60                         n= 386 win_rate= 53.6% avg=+0.632% median=+0.431%
+  RSI 60-70                        n= 445 win_rate= 53.0% avg=+0.011% median=+0.376%
+  RSI >= 70 (overbought)           n=  64 win_rate= 39.1% avg=-0.599% median=-0.596%
+ -- pct_b --
+  pct_b 50-95 (not extended)       n= 909 win_rate= 52.1% avg=+0.090% median=+0.175%
+  pct_b 95-100 (fresh breakout)    n=  12 win_rate= 75.0% avg=+2.888% median=+2.129%
+  pct_b >= 100 (extended)          n=  61 win_rate= 45.9% avg=-0.185% median=-0.279%
+ -- vol_ratio --
+  vol_ratio < 0.5                  n= 726 win_rate= 51.7% avg=+0.086% median=+0.144%
+  vol_ratio 0.5-1.5                n= 181 win_rate= 53.6% avg=+0.370% median=+0.421%
+  vol_ratio >= 1.5 (confirmed)     n=  75 win_rate= 52.0% avg=-0.320% median=+0.300%
+ -- combined lead: RSI<70 AND pct_b<100 AND vol_ratio>=0.5 --
+  combo filter passes              n= 141 win_rate= 56.7% avg=+1.130% median=+1.211%
+  combo filter fails (rest)        n= 843 win_rate= 51.4% avg=-0.060% median=+0.114%

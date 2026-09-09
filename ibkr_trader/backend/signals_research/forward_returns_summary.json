@@ -1,0 +1,198 @@
+{
+  "AAPL": {
+    "n_labeled_bars": 111965,
+    "CSP_5d": {
+      "BUY": {
+        "n": 29706,
+        "mean_pct": 0.3201,
+        "median_pct": 0.3967,
+        "std_pct": 2.9077,
+        "pct_positive": 58.06
+      },
+      "SELL": {
+        "n": 53206,
+        "mean_pct": 0.2274,
+        "median_pct": 0.2986,
+        "std_pct": 2.4992,
+        "pct_positive": 56.6
+      },
+      "HOLD": {
+        "n": 28663,
+        "mean_pct": 0.2896,
+        "median_pct": 0.3286,
+        "std_pct": 2.6054,
+        "pct_positive": 57.28
+      }
+    },
+    "LEAP_63d": {
+      "BUY": {
+        "n": 28001,
+        "mean_pct": 3.6204,
+        "median_pct": 3.9204,
+        "std_pct": 7.4728,
+        "pct_positive": 72.29
+      },
+      "SELL": {
+        "n": 51741,
+        "mean_pct": 2.711,
+        "median_pct": 2.0472,
+        "std_pct": 8.095,
+        "pct_positive": 60.2
+      },
+      "HOLD": {
+        "n": 27309,
+        "mean_pct": 3.1742,
+        "median_pct": 3.0109,
+        "std_pct": 8.1345,
+        "pct_positive": 65.24
+      }
+    }
+  },
+  "MSFT": {
+    "n_labeled_bars": 104668,
+    "CSP_5d": {
+      "BUY": {
+        "n": 35922,
+        "mean_pct": 0.0048,
+        "median_pct": -0.0651,
+        "std_pct": 2.6468,
+        "pct_positive": 48.74
+      },
+      "SELL": {
+        "n": 41414,
+        "mean_pct": 0.1544,
+        "median_pct": 0.2434,
+        "std_pct": 2.5704,
+        "pct_positive": 55.11
+      },
+      "HOLD": {
+        "n": 26942,
+        "mean_pct": 0.1677,
+        "median_pct": 0.1498,
+        "std_pct": 2.6702,
+        "pct_positive": 53.14
+      }
+    },
+    "LEAP_63d": {
+      "BUY": {
+        "n": 35049,
+        "mean_pct": 1.0855,
+        "median_pct": -0.9451,
+        "std_pct": 10.1241,
+        "pct_positive": 45.31
+      },
+      "SELL": {
+        "n": 38892,
+        "mean_pct": 1.5523,
+        "median_pct": 0.1959,
+        "std_pct": 10.0201,
+        "pct_positive": 50.98
+      },
+      "HOLD": {
+        "n": 25813,
+        "mean_pct": 1.8776,
+        "median_pct": 0.5922,
+        "std_pct": 10.4774,
+        "pct_positive": 53.4
+      }
+    }
+  },
+  "NVDA": {
+    "n_labeled_bars": 115766,
+    "CSP_5d": {
+      "BUY": {
+        "n": 31230,
+        "mean_pct": 0.6987,
+        "median_pct": 0.7192,
+        "std_pct": 4.448,
+        "pct_positive": 57.16
+      },
+      "SELL": {
+        "n": 49090,
+        "mean_pct": 0.2504,
+        "median_pct": 0.2887,
+        "std_pct": 3.7657,
+        "pct_positive": 53.38
+      },
+      "HOLD": {
+        "n": 35056,
+        "mean_pct": 0.3932,
+        "median_pct": 0.4667,
+        "std_pct": 4.0489,
+        "pct_positive": 54.91
+      }
+    },
+    "LEAP_63d": {
+      "BUY": {
+        "n": 30230,
+        "mean_pct": 5.0093,
+        "median_pct": 2.5992,
+        "std_pct": 14.3011,
+        "pct_positive": 58.81
+      },
+      "SELL": {
+        "n": 47061,
+        "mean_pct": 5.3629,
+        "median_pct": 3.3335,
+        "std_pct": 13.1713,
+        "pct_positive": 60.93
+      },
+      "HOLD": {
+        "n": 33561,
+        "mean_pct": 4.6761,
+        "median_pct": 2.5217,
+        "std_pct": 13.5213,
+        "pct_positive": 60.2
+      }
+    }
+  },
+  "SPY": {
+    "n_labeled_bars": 114611,
+    "CSP_5d": {
+      "BUY": {
+        "n": 32621,
+        "mean_pct": 0.2016,
+        "median_pct": 0.2709,
+        "std_pct": 1.5335,
+        "pct_positive": 59.35
+      },
+      "SELL": {
+        "n": 49983,
+        "mean_pct": 0.1275,
+        "median_pct": 0.2037,
+        "std_pct": 1.1368,
+        "pct_positive": 58.85
+      },
+      "HOLD": {
+        "n": 31617,
+        "mean_pct": 0.1487,
+        "median_pct": 0.2503,
+        "std_pct": 1.3865,
+        "pct_positive": 59.51
+      }
+    },
+    "LEAP_63d": {
+      "BUY": {
+        "n": 31177,
+        "mean_pct": 2.7358,
+        "median_pct": 3.0363,
+        "std_pct": 4.9172,
+        "pct_positive": 76.29
+      },
+      "SELL": {
+        "n": 47997,
+        "mean_pct": 1.828,
+        "median_pct": 2.0173,
+        "std_pct": 3.6105,
+        "pct_positive": 73.21
+      },
+      "HOLD": {
+        "n": 30523,
+        "mean_pct": 1.7507,
+        "median_pct": 2.0455,
+        "std_pct": 4.3978,
+        "pct_positive": 70.08
+      }
+    }
+  }
+}

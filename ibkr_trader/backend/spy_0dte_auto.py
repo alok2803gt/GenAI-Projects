@@ -48,9 +48,11 @@ import requests
 from ib_insync import IB
 
 from alpaca_0dte_common import (
-    load_config, alpaca_client, get_alpaca_symbols, place_condor_sequential,
-    close_condor_sequential, register_position, close_position, now_et, target_px,
+    load_config, spy_option, register_position, close_position, now_et, target_px,
     cro_cfo_capital_budget,
+)
+from ibkr_0dte_common import (
+    ibkr_place_condor_sequential, ibkr_close_condor_sequential, ibkr_has_open_position, occ_symbol,
 )
 from alpaca_0dte_trader import CONFIG, price_legs, condor_mark, PROFIT_TARGET_PCT, HARD_CLOSE_TIME, QTY
 
@@ -119,7 +121,7 @@ def add_secretary_task(description, notes, due=None):
     return new_id
 
 
-def pretrade_review(ib, client, strikes, conservative_credit, max_risk, cfg):
+def pretrade_review(ib, strikes, conservative_credit, max_risk, cfg, max_risk_override=None):
     """Real-time CRO/CFO pre-trade review -- BLOCKING gate, same pattern as
     EVC's (task 2026-08-20-003), extended here per task 2026-08-20-006.
     CRO: what-if P&L at the short strikes and beyond the wings. CFO: this
@@ -150,11 +152,16 @@ def pretrade_review(ib, client, strikes, conservative_credit, max_risk, cfg):
     ]
 
     try:
-        budget = cro_cfo_capital_budget(ib, client)
-        findings.append(f"CFO: max risk ${max_risk:,.0f} vs per-strategy cap ${budget['per_strategy_cap']:,.0f}, "
+        budget = cro_cfo_capital_budget(ib)
+        effective_cap = budget["per_strategy_cap"]
+        if max_risk_override is not None:
+            findings.append(f"CEO OVERRIDE: per-strategy cap set to ${max_risk_override:,.0f} for this run "
+                             f"only (default 5% cap would have been ${budget['per_strategy_cap']:,.0f})")
+            effective_cap = max_risk_override
+        findings.append(f"CFO: max risk ${max_risk:,.0f} vs per-strategy cap ${effective_cap:,.0f}, "
                          f"portfolio headroom ${budget['headroom']:,.0f} of ${budget['total_budget']:,.0f} budget")
-        if max_risk > budget["per_strategy_cap"]:
-            findings.append(f"EXCEEDS per-strategy cap (${budget['per_strategy_cap']:,.0f})")
+        if max_risk > effective_cap:
+            findings.append(f"EXCEEDS per-strategy cap (${effective_cap:,.0f})")
             approved = False
         if max_risk > budget["headroom"]:
             findings.append(f"EXCEEDS remaining portfolio headroom (${budget['headroom']:,.0f})")
@@ -193,10 +200,14 @@ def account_health_check():
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ticker", required=True, choices=["spy"])
+    ap.add_argument("--max-risk-override", type=float, default=None,
+                     help="explicit per-strategy $ cap for THIS run only, overriding the default "
+                          "5%%-of-combined-net-liq CRO/CFO cap. One-time CEO decision (2026-09-02: "
+                          "raised to $500 -- real max_risk here is $300/contract, the default cap "
+                          "was fluctuating $85-$188 and blocked every attempt this morning).")
     args = ap.parse_args()
     ticker = args.ticker
     cfg = CONFIG[ticker]
-    cfg_obj = load_config()
 
     print(f"=== {ticker.upper()} 0DTE AUTO -- {now_et().isoformat()} ===")
 
@@ -220,7 +231,6 @@ def main():
         return
 
     today_ibkr = date.today().strftime("%Y%m%d")
-    today_alp = date.today().strftime("%Y-%m-%d")
 
     ib = IB()
     ib.errorEvent += lambda reqId, code, msg, contract: None
@@ -237,9 +247,6 @@ def main():
         oversight_log("execution_issue", msg, outcome="no order placed")
         spy_0dte_log("PRICING_ABORT", "missing live bid/ask on one or more legs")
         return
-    finally:
-        if ib.isConnected():
-            ib.disconnect()
 
     print(f"conservative credit: ${conservative_credit:.2f}  max_risk: ${max_risk:.0f}  "
           f"threshold: ${MIN_CONSERVATIVE_CREDIT:.2f}")
@@ -254,14 +261,17 @@ def main():
         spy_0dte_log("NO_FIRE", f"condor {strikes['long_put']}/{strikes['short_put']}P.."
                      f"{strikes['short_call']}/{strikes['long_call']}C, conservative_credit=${conservative_credit:.2f} "
                      f"< ${MIN_CONSERVATIVE_CREDIT:.2f} threshold")
+        ib.disconnect()
         return
 
     # ── Real-time CRO/CFO pre-trade review -- BLOCKING gate (task 2026-08-20-006) ──
-    # IB was already disconnected above (price_legs' finally block) -- pass None,
-    # cro_cfo_capital_budget degrades gracefully to Alpaca-only equity, which is
-    # already the dominant share of this account's capital (~$3,400 of ~$4,100).
-    client = alpaca_client(cfg_obj)
-    review = pretrade_review(None, client, strikes, conservative_credit, max_risk, cfg)
+    # `ib` stays connected now (migrated from Alpaca 2026-09-07) -- previously
+    # disconnected right after pricing and passed None here, meaning this check
+    # used to see ONLY Alpaca equity, missing this account's real IBKR net liq
+    # entirely. Passing the real connected ib fixes that as a side effect of
+    # removing Alpaca, not a separate change.
+    review = pretrade_review(ib, strikes, conservative_credit, max_risk, cfg,
+                              max_risk_override=args.max_risk_override)
     review_summary = "CRO/CFO pre-trade review: " + " | ".join(review["findings"])
     print(review_summary)
     spy_0dte_log("PRETRADE_REVIEW", f"{'APPROVED' if review['approved'] else 'REJECTED'} — {review_summary}")
@@ -271,49 +281,44 @@ def main():
         msg = f"SPY 0DTE auto: pre-trade review REJECTED -- {review_summary}. No order placed."
         print(msg)
         telegram(msg)
+        ib.disconnect()
         return
 
     # ── Clears the gate -- fire, no manual confirmation (per 2026-08-17 CEO direction) ──
-    put_by_strike, call_by_strike = get_alpaca_symbols(
-        client, cfg["alpaca_underlying"], today_alp,
-        strikes["long_put"] - 1, strikes["short_put"] + 1,
-        strikes["short_call"] - 1, strikes["long_call"] + 1,
-    )
-    missing = [k for k in (strikes["short_put"], strikes["long_put"]) if k not in put_by_strike] + \
-              [k for k in (strikes["short_call"], strikes["long_call"]) if k not in call_by_strike]
-    if missing:
-        msg = f"SPY 0DTE auto: strikes not listed on Alpaca: {missing} -- no order placed."
-        print(msg)
-        telegram(msg, high_priority=True)
-        oversight_log("execution_issue", msg, outcome="no order placed")
-        spy_0dte_log("STRIKES_MISSING", f"not listed on Alpaca: {missing}")
-        return
-
-    syms = {
-        "short_put": put_by_strike[strikes["short_put"]], "long_put": put_by_strike[strikes["long_put"]],
-        "short_call": call_by_strike[strikes["short_call"]], "long_call": call_by_strike[strikes["long_call"]],
+    # IBKR sequential legs (migrated from Alpaca 2026-09-07) -- reuses the
+    # already-qualified leg contracts built during pricing.
+    contracts = {
+        "short_put": spy_option(today_ibkr, strikes["short_put"], "P"),
+        "long_put": spy_option(today_ibkr, strikes["long_put"], "P"),
+        "short_call": spy_option(today_ibkr, strikes["short_call"], "C"),
+        "long_call": spy_option(today_ibkr, strikes["long_call"], "C"),
     }
+    ib.qualifyContracts(*contracts.values())
+    syms = {k: occ_symbol("SPY", strikes[k], "P" if "put" in k else "C",
+                           date.today().strftime("%y%m%d")) for k in contracts}
     telegram(f"SPY 0DTE auto: FIRING. condor {strikes['long_put']}/{strikes['short_put']}P.."
              f"{strikes['short_call']}/{strikes['long_call']}C, conservative_credit=${conservative_credit:.2f}, "
              f"qty={QTY}, max_risk=${max_risk:.0f}")
 
-    ok, fills, state = place_condor_sequential(client, syms, entry_limits, QTY)
+    ok, fills, state = ibkr_place_condor_sequential(ib, contracts, entry_limits, QTY)
     if not ok:
         with open(PAUSE_FLAG_FILE, "w") as f:
             f.write(f"{now_et().isoformat()}: entry incomplete, state={state}, fills={fills}")
         msg = (f"SPY 0DTE auto: ENTRY INCOMPLETE (state={state}, fills={fills}). "
                f"Automation PAUSED via {PAUSE_FLAG_FILE} until manually reviewed and cleared -- "
-               f"check Alpaca positions NOW for a possible naked/uncovered leg.")
+               f"check IBKR positions NOW for a possible naked/uncovered leg.")
         print(msg)
         telegram(msg, high_priority=True)
         oversight_log("execution_issue", msg, outcome="PAUSED -- possible partial fill, needs manual review")
         spy_0dte_log("ENTRY_INCOMPLETE", f"state={state} fills={fills} -- automation now PAUSED")
         add_secretary_task(
             "SPY 0DTE auto-fire entry incomplete -- review and clear pause flag",
-            f"state={state} fills={fills}. Check Alpaca positions for a naked leg before doing anything else. "
+            f"state={state} fills={fills}. Check IBKR positions for a naked leg before doing anything else. "
             f"Automation will not attempt to fire again until {PAUSE_FLAG_FILE} is deleted.",
         )
+        ib.disconnect()
         return
+    ib.disconnect()
 
     net_entry_credit = round((fills["short_put"] + fills["short_call"]) - (fills["long_put"] + fills["long_call"]), 2)
     entry_time = now_et()
@@ -351,7 +356,7 @@ def main():
                 print(f"[{now.strftime('%H:%M:%S')}] condor_value=${value:.2f} live_pnl=${live_pnl:+.2f} target=${profit_target_usd:.2f}")
                 if live_pnl >= profit_target_usd:
                     close_limits = {k: target_px(mon_quotes[k], not k.startswith("short")) for k in mon_quotes}
-                    ok, close_fills = close_condor_sequential(client, syms, close_limits, QTY)
+                    ok, close_fills = ibkr_close_condor_sequential(ib2, contracts, close_limits, QTY)
                     close_position(pos_id, "profit_target_hit", live_pnl)
                     msg = f"SPY 0DTE auto: PROFIT TARGET HIT, closed. pnl=${live_pnl:+.2f} fills={close_fills}"
                     print(msg)
@@ -360,17 +365,36 @@ def main():
                     spy_0dte_log("PROFIT_TARGET_HIT", f"pos_id={pos_id} pnl=${live_pnl:+.2f} fills={close_fills}")
                     return
             if now >= hard_close_dt:
+                # Real safety-net change, IBKR migration 2026-09-07: Alpaca used to
+                # auto-close any still-open 0DTE position at 15:45 ET on its own;
+                # IBKR has no equivalent broker-side auto-close for single-leg
+                # equity options, so this now attempts a real close directly rather
+                # than "verifying" a broker action that will never happen. SPY
+                # options are physically settled -- an ITM leg left open risks real
+                # auto-exercise, not just expiring worthless.
+                still_open = any(ibkr_has_open_position(ib2, contracts[k]) for k in contracts)
+                if not still_open:
+                    msg = "SPY 0DTE auto: already flat at hard-close time -- no manual close needed."
+                    print(msg)
+                    telegram(msg)
+                    oversight_log("position_closed", msg, outcome="already_flat")
+                    spy_0dte_log("ALREADY_FLAT_AT_HARD_CLOSE", f"pos_id={pos_id}")
+                    close_position(pos_id, "already_flat_at_hard_close", None)
+                    return
                 _, mon_quotes = condor_mark(ib2, ticker, today_ibkr, strikes)
                 close_limits = {k: target_px(mon_quotes[k], not k.startswith("short")) for k in mon_quotes} if mon_quotes else entry_limits
-                ok, close_fills = close_condor_sequential(client, syms, close_limits, QTY)
+                ok, close_fills = ibkr_close_condor_sequential(ib2, contracts, close_limits, QTY)
                 final_value, _ = condor_mark(ib2, ticker, today_ibkr, strikes)
                 final_pnl = (net_entry_credit - final_value) * QTY * 100 if final_value else None
                 close_position(pos_id, "hard_close", final_pnl)
-                msg = f"SPY 0DTE auto: HARD CLOSE. pnl={final_pnl} fills={close_fills}"
+                msg = f"SPY 0DTE auto: hard-close reached, closed. pnl={final_pnl} fills={close_fills}"
                 print(msg)
                 telegram(msg)
-                oversight_log("position_closed", msg, outcome="closed at hard close", pnl_impact=final_pnl)
+                oversight_log("position_closed", msg, outcome="closed at hard-close time", pnl_impact=final_pnl)
                 spy_0dte_log("HARD_CLOSE", f"pos_id={pos_id} pnl={final_pnl} fills={close_fills}")
+                if not ok:
+                    telegram(f"SPY 0DTE auto: hard-close did NOT fully confirm (fills={close_fills}) -- "
+                             f"CHECK IBKR POSITIONS MANUALLY NOW.", high_priority=True)
                 return
             time.sleep(MONITOR_INTERVAL_S)
     finally:

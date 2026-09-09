@@ -1,0 +1,119 @@
+<title>Signals Model Trading-Edge Backtest</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,500;0,9..144,600;1,9..144,500&family=Source+Sans+3:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+
+<style>
+  :root{
+    --bg: #EFEDE6;
+    --surface: #FBFAF6;
+    --surface-2: #E2DFD3;
+    --border: #D2CDBC;
+    --ink: #211D16;
+    --muted: #665F4E;
+    --accent: #3D6B52;
+    --accent-ink: #2A4C3A;
+    --pass: #2C6E49;
+    --reject: #A23B2B;
+  }
+  @media (prefers-color-scheme: dark){
+    :root:not([data-theme="light"]){
+      --bg: #12140F; --surface: #1A1D15; --surface-2: #23261C; --border: #35392A;
+      --ink: #E9E8DD; --muted: #A6AC96; --accent: #74B599; --accent-ink: #98D0B8;
+      --pass: #5FAE7E; --reject: #DD7A63;
+    }
+  }
+  :root[data-theme="dark"]{
+    --bg: #12140F; --surface: #1A1D15; --surface-2: #23261C; --border: #35392A;
+    --ink: #E9E8DD; --muted: #A6AC96; --accent: #74B599; --accent-ink: #98D0B8;
+    --pass: #5FAE7E; --reject: #DD7A63;
+  }
+  *{ box-sizing: border-box; }
+  body{ background: var(--bg); color: var(--ink); font-family: "Source Sans 3", system-ui, sans-serif; margin: 0; padding: 2.5rem 1.25rem 5rem; line-height: 1.55; }
+  @media (prefers-reduced-motion: reduce){ *{ animation: none !important; transition: none !important; } }
+  .page{ max-width: 980px; margin: 0 auto; }
+  header.hero{ margin-bottom: 2rem; padding-bottom: 1.5rem; border-bottom: 1px solid var(--border); }
+  .eyebrow{ font-family: "IBM Plex Mono", monospace; font-size: 0.72rem; letter-spacing: 0.12em; text-transform: uppercase; color: var(--reject); margin: 0 0 0.6rem; }
+  h1{ font-family: "Fraunces", Georgia, serif; font-weight: 600; font-size: clamp(1.9rem, 4.6vw, 2.5rem); line-height: 1.1; margin: 0 0 0.7rem; text-wrap: balance; letter-spacing: -0.01em; }
+  .dek{ font-size: 1.02rem; color: var(--muted); max-width: 70ch; margin: 0; }
+  h2{ font-family: "Fraunces", Georgia, serif; font-weight: 600; font-style: italic; font-size: 1.3rem; margin: 0 0 0.9rem; }
+  section{ margin-bottom: 2.5rem; }
+  .callout{ background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 1.1rem 1.3rem; font-size: 0.92rem; color: var(--muted); }
+  .callout b{ color: var(--ink); font-weight: 600; }
+  .headline{ background: var(--surface); border: 1px solid var(--border); border-left: 4px solid var(--reject); border-radius: 12px; padding: 1.6rem 1.8rem; }
+  .headline .tag{ font-family: "IBM Plex Mono", monospace; font-size: 0.72rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--reject); margin: 0 0 0.5rem; }
+  .headline h3{ font-family: "Fraunces", Georgia, serif; font-weight: 600; font-size: 1.3rem; margin: 0 0 0.6rem; text-wrap: balance; }
+  .headline p{ margin: 0.5rem 0; color: var(--muted); max-width: 70ch; }
+  .headline p b{ color: var(--ink); }
+  .table-wrap{ overflow-x: auto; border: 1px solid var(--border); border-radius: 12px; }
+  table.data{ width: 100%; border-collapse: collapse; font-size: 0.88rem; background: var(--surface); }
+  table.data th, table.data td{ text-align: left; padding: 0.6rem 0.9rem; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  table.data th{ font-family: "IBM Plex Mono", monospace; font-size: 0.68rem; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); background: var(--surface-2); }
+  table.data td.num{ font-family: "IBM Plex Mono", monospace; font-variant-numeric: tabular-nums; font-weight: 600; }
+  table.data tr:last-child td{ border-bottom: none; }
+  table.data tr.baseline td{ background: color-mix(in srgb, var(--pass) 10%, var(--surface)); }
+  .pos{ color: var(--pass); } .neg{ color: var(--reject); }
+  footer{ margin-top: 3rem; padding-top: 1.25rem; border-top: 1px solid var(--border); font-size: 0.8rem; color: var(--muted); }
+  footer code{ font-family: "IBM Plex Mono", monospace; font-size: 0.82em; }
+</style>
+
+<div class="page">
+
+  <header class="hero">
+    <p class="eyebrow">Research complete · negative result · Phase B (live execution) not started</p>
+    <h1>Signals Model Trading-Edge Backtest</h1>
+    <p class="dek">The Signals tab's live XGBoost BUY/SELL/HOLD classifier (AAPL/MSFT/NVDA/SPY) has been display-only since it was built and had never been tested as an actual trading rule. This asks the question honestly, across 2.5 years of real 5-min bars, before any execution code gets written.</p>
+  </header>
+
+  <section>
+    <h2>Not starting from a blank page</h2>
+    <p class="callout">The live model (<code>main.py</code>'s <code>build_features()</code> / <code>train_model()</code> / <code>predict()</code>) turned out to have real, previously-unknown limitations: it's a <b>single classifier shared across all 4 tickers</b> rather than one per ticker, trained on just <b>5 days</b> of 5-min bars, predicting <b>next-5-min-bar direction</b>. It already quietly feeds the CSP scanner's ranking and the LEAP scanner's hard filter — not purely cosmetic. This backtest reimplements that exact model verbatim (same features, same hyperparameters, same 0.55/0.45 thresholds) against 2.5 years of real Alpaca 5-min bars, testing both the as-deployed shared-model design and a fixed per-ticker version, across 3 training-window sizes.</p>
+  </section>
+
+  <section>
+    <h2>The result</h2>
+    <div class="headline">
+      <p class="tag">6 configurations · 4 tickers · 2.5 years of real 5-min bars · 388,449 simulated trades total</p>
+      <h3>No configuration has real edge — all six lose money after realistic costs, and have ~zero edge before them</h3>
+      <div class="table-wrap" style="margin-top:1rem">
+        <table class="data">
+          <tr><th>Config</th><th>Trades</th><th>Win rate</th><th>Avg ret/trade</th><th>Pre-cost edge</th></tr>
+          <tr><td>Shared model, 5d window</td><td class="num">77,089</td><td class="num neg">31.4%</td><td class="num neg">−0.058%</td><td class="num">+0.002%</td></tr>
+          <tr><td>Shared model, 20d window</td><td class="num">55,440</td><td class="num neg">33.5%</td><td class="num neg">−0.058%</td><td class="num">+0.002%</td></tr>
+          <tr><td>Shared model, 60d window</td><td class="num">42,667</td><td class="num neg">36.6%</td><td class="num neg">−0.055%</td><td class="num">+0.005%</td></tr>
+          <tr><td>Per-ticker, 5d window</td><td class="num">92,215</td><td class="num neg">29.6%</td><td class="num neg">−0.057%</td><td class="num">+0.003%</td></tr>
+          <tr><td>Per-ticker, 20d window</td><td class="num">71,948</td><td class="num neg">32.1%</td><td class="num neg">−0.055%</td><td class="num">+0.005%</td></tr>
+          <tr><td>Per-ticker, 60d window</td><td class="num">49,090</td><td class="num neg">34.7%</td><td class="num neg">−0.055%</td><td class="num">+0.005%</td></tr>
+          <tr class="baseline"><td><b>Day Trader (live, validated)</b></td><td class="num">—</td><td class="num pos">~50.5%</td><td class="num pos">+0.137%</td><td class="num pos">—</td></tr>
+        </table>
+      </div>
+      <p style="margin-top:1rem">"Pre-cost edge" = avg return + the 6bps round-trip cost assumption — i.e. what the edge would be if trading were free. All six land under +0.005%, statistically indistinguishable from zero across tens of thousands of trades each. Every configuration's win rate sits 14-20 points below Day Trader's already-live, already-validated strategy — this isn't "worse," it's a different sign entirely.</p>
+    </div>
+  </section>
+
+  <section>
+    <h2>What the parameter grid resolved</h2>
+    <div class="table-wrap">
+      <table class="data">
+        <tr><th>Question going in</th><th>What the data actually shows</th></tr>
+        <tr><td>Does more training data help?</td><td>Barely. 60-day windows (11,000+ rows) are marginally less bad than 5-day windows (matching what's live today), but walk-forward CV accuracy sat in a <b>0.48-0.53 band at every single retrain point, regardless of window size</b>, across the whole 2.5-year run. The model isn't starved for data — there's close to nothing in these 9 features that predicts next-5-min-bar direction at any size tested.</td></tr>
+        <tr><td>Is the shared-model architecture the problem?</td><td>No. Going in, "one classifier reused across all 4 tickers" looked like an obvious flaw. Fixing it (independent per-ticker models) doesn't rescue the strategy — results are statistically indistinguishable from the shared-model runs, sometimes marginally worse. There was no edge for the architecture to be losing.</td></tr>
+        <tr><td>Does it work in some regime?</td><td>No. Split on SPY's own rolling realized volatility, both HIGH_VOL and LOW_VOL periods are negative in every configuration.</td></tr>
+        <tr><td>Any ticker where it works?</td><td>No — SPY is consistently the worst (18-25% win rate), the other three cluster in the low-to-mid 30s. Consistent with SPY being the most efficiently-priced instrument tested, leaving least room for a generic technical classifier.</td></tr>
+      </table>
+    </div>
+  </section>
+
+  <section>
+    <h2>A real bug caught along the way</h2>
+    <p class="callout">The first full run used Alpaca's default unadjusted prices and produced a phantom <b>+90% single-trade "return"</b> on NVDA — priced straight across NVDA's real 2024-06-07 10-for-1 stock split (~$1208 pre-split vs. ~$120 post-split, same underlying value, zero real return). Caught by inspecting the actual trade record rather than trusting the summary number, fixed by requesting split+dividend-adjusted prices, and the entire grid was re-run from scratch. The conclusion didn't change; the corrected numbers are what's reported here.</p>
+  </section>
+
+  <section>
+    <h2>Honest scope</h2>
+    <p class="callout">This tests one specific thing: these 9 features, this model class/hyperparameters, next-5-min-bar direction as the target, and a reversal-on-opposite-signal trade rule — not whether any signal could ever be built from similar data. A materially different feature set, prediction horizon, or model architecture would be a new research question. <b>Phase B (live execution) is not being started</b> — it was explicitly gated on this result, and a negative result is being reported as one rather than as a prompt to tune parameters until something looks better.</p>
+  </section>
+
+  <footer>
+    New infrastructure only, in <code>ibkr_trader/backend/signals_research/</code> — the live Signals tab, <code>main.py</code>, and every other live strategy untouched. Full trace: <code>RESEARCH_LOG.md</code> in the same directory.
+  </footer>
+
+</div>

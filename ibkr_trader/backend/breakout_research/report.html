@@ -1,0 +1,294 @@
+<title>Breakout Signal Quality</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,500;0,9..144,600;1,9..144,500&family=Source+Sans+3:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+
+<style>
+  :root{
+    --bg: #EFEDE6;
+    --surface: #FBFAF6;
+    --surface-2: #E2DFD3;
+    --border: #D2CDBC;
+    --ink: #211D16;
+    --muted: #665F4E;
+    --accent: #A8642A;
+    --accent-ink: #7A481C;
+    --pass: #2C6E49;
+    --reject: #A23B2B;
+    --neutral-tag: #3D6B80;
+  }
+  @media (prefers-color-scheme: dark){
+    :root:not([data-theme="light"]){
+      --bg: #15130F;
+      --surface: #1D1A14;
+      --surface-2: #26221A;
+      --border: #3A3428;
+      --ink: #EDE8DD;
+      --muted: #A79E8A;
+      --accent: #DDA15E;
+      --accent-ink: #F0C085;
+      --pass: #5FAE7E;
+      --reject: #DD7A63;
+      --neutral-tag: #7FB0C4;
+    }
+  }
+  :root[data-theme="dark"]{
+    --bg: #15130F;
+    --surface: #1D1A14;
+    --surface-2: #26221A;
+    --border: #3A3428;
+    --ink: #EDE8DD;
+    --muted: #A79E8A;
+    --accent: #DDA15E;
+    --accent-ink: #F0C085;
+    --pass: #5FAE7E;
+    --reject: #DD7A63;
+    --neutral-tag: #7FB0C4;
+  }
+
+  *{ box-sizing: border-box; }
+  body{
+    background: var(--bg);
+    color: var(--ink);
+    font-family: "Source Sans 3", system-ui, sans-serif;
+    margin: 0;
+    padding: 2.5rem 1.25rem 5rem;
+    line-height: 1.55;
+  }
+  @media (prefers-reduced-motion: reduce){ *{ animation: none !important; transition: none !important; } }
+
+  .page{ max-width: 960px; margin: 0 auto; }
+
+  header.hero{ margin-bottom: 2rem; padding-bottom: 1.5rem; border-bottom: 1px solid var(--border); }
+  .eyebrow{
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 0.72rem; letter-spacing: 0.12em; text-transform: uppercase;
+    color: var(--accent-ink); margin: 0 0 0.6rem;
+  }
+  h1{
+    font-family: "Fraunces", Georgia, serif; font-weight: 600;
+    font-size: clamp(1.9rem, 4.6vw, 2.5rem); line-height: 1.1; margin: 0 0 0.7rem;
+    text-wrap: balance; letter-spacing: -0.01em;
+  }
+  .dek{ font-size: 1.02rem; color: var(--muted); max-width: 66ch; margin: 0; }
+
+  h2{
+    font-family: "Fraunces", Georgia, serif; font-weight: 600; font-style: italic;
+    font-size: 1.3rem; margin: 0 0 0.9rem; letter-spacing: -0.005em;
+  }
+  section{ margin-bottom: 2.5rem; }
+
+  /* Headline callout */
+  .headline{
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-left: 4px solid var(--accent);
+    border-radius: 12px;
+    padding: 1.6rem 1.8rem;
+  }
+  .headline .tag{
+    font-family: "IBM Plex Mono", monospace; font-size: 0.72rem; letter-spacing: 0.08em;
+    text-transform: uppercase; color: var(--accent-ink); margin: 0 0 0.5rem;
+  }
+  .headline h3{
+    font-family: "Fraunces", Georgia, serif; font-weight: 600; font-size: 1.35rem;
+    margin: 0 0 0.6rem; text-wrap: balance;
+  }
+  .headline p{ margin: 0.5rem 0; color: var(--muted); max-width: 68ch; }
+  .headline p b{ color: var(--ink); font-weight: 600; }
+
+  .split{
+    display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-top: 1.2rem;
+  }
+  @media (max-width: 640px){ .split{ grid-template-columns: 1fr; } }
+  .split-card{ border-radius: 10px; padding: 1rem 1.2rem; }
+  .split-card.pass{ background: color-mix(in srgb, var(--pass) 12%, var(--surface)); border: 1px solid var(--pass); }
+  .split-card.fail{ background: color-mix(in srgb, var(--reject) 10%, var(--surface)); border: 1px solid var(--reject); }
+  .split-card .label{ font-family: "IBM Plex Mono", monospace; font-size: 0.75rem; letter-spacing: 0.05em; text-transform: uppercase; }
+  .split-card.pass .label{ color: var(--pass); }
+  .split-card.fail .label{ color: var(--reject); }
+  .split-card .n{ font-size: 0.85rem; color: var(--muted); margin: 0.15rem 0 0.7rem; }
+  .split-card table{ width: 100%; border-collapse: collapse; font-size: 0.86rem; }
+  .split-card td{ padding: 0.25rem 0; font-variant-numeric: tabular-nums; }
+  .split-card td:first-child{ color: var(--muted); }
+  .split-card td:last-child{ text-align: right; font-family: "IBM Plex Mono", monospace; font-weight: 600; }
+
+  /* Standard tables */
+  .table-wrap{ overflow-x: auto; border: 1px solid var(--border); border-radius: 12px; }
+  table.data{ width: 100%; border-collapse: collapse; font-size: 0.88rem; background: var(--surface); }
+  table.data th, table.data td{ text-align: left; padding: 0.6rem 0.9rem; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  table.data th{
+    font-family: "IBM Plex Mono", monospace; font-size: 0.68rem; letter-spacing: 0.06em;
+    text-transform: uppercase; color: var(--muted); background: var(--surface-2);
+  }
+  table.data td.num{ font-family: "IBM Plex Mono", monospace; font-variant-numeric: tabular-nums; font-weight: 600; }
+  table.data tr:last-child td{ border-bottom: none; }
+  .pos{ color: var(--pass); } .neg{ color: var(--reject); }
+
+  .pill{
+    display: inline-block; font-family: "IBM Plex Mono", monospace; font-size: 0.68rem;
+    letter-spacing: 0.04em; padding: 0.15rem 0.55rem; border-radius: 999px; font-weight: 600;
+  }
+  .pill.validated{ background: color-mix(in srgb, var(--pass) 18%, transparent); color: var(--pass); border: 1px solid var(--pass); }
+  .pill.modest{ background: color-mix(in srgb, var(--neutral-tag) 18%, transparent); color: var(--neutral-tag); border: 1px solid var(--neutral-tag); }
+  .pill.ruled-out{ background: color-mix(in srgb, var(--reject) 15%, transparent); color: var(--reject); border: 1px solid var(--reject); }
+
+  /* Volume impact bars */
+  .impact{ display: flex; flex-direction: column; gap: 0.9rem; }
+  .bar-row{ display: grid; grid-template-columns: 140px 1fr 90px; align-items: center; gap: 0.8rem; }
+  .bar-row .rlabel{ font-size: 0.85rem; color: var(--muted); }
+  .bar-track{ background: var(--surface-2); border-radius: 6px; height: 1.6rem; overflow: hidden; border: 1px solid var(--border); }
+  .bar-fill{ height: 100%; border-radius: 5px 0 0 5px; }
+  .bar-fill.before{ background: var(--muted); }
+  .bar-fill.after{ background: var(--accent); }
+  .bar-row .rval{ font-family: "IBM Plex Mono", monospace; font-weight: 600; text-align: right; font-variant-numeric: tabular-nums; }
+
+  .callout{ background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 1.1rem 1.3rem; font-size: 0.92rem; color: var(--muted); }
+  .callout b{ color: var(--ink); }
+
+  footer{ margin-top: 3rem; padding-top: 1.25rem; border-top: 1px solid var(--border); font-size: 0.8rem; color: var(--muted); }
+  footer code{ font-family: "IBM Plex Mono", monospace; font-size: 0.82em; }
+</style>
+
+<div class="page">
+
+  <header class="hero">
+    <p class="eyebrow">Research in progress · new infrastructure only, live scanner untouched</p>
+    <h1>Breakout Signal Quality</h1>
+    <p class="dek">breakout_scanner.py sends ~28 alerts/day (range 10–51) at a 52.9% win rate and +0.05% average return — essentially noise. This is a running log of real, backtested candidate filters to fix that, including the ones that didn't hold up.</p>
+  </header>
+
+  <section>
+    <h2>The headline finding</h2>
+    <div class="headline">
+      <p class="tag">Validated on 3 independent real datasets · not yet live</p>
+      <h3>Exclude PRE-BREAKOUT alerts with %B 75–85, and RSI ≥80</h3>
+      <p>PRE-BREAKOUT is <b>89% of all simulated alert volume</b> and consistently the weaker signal type. Within it, %B turns out to be <b>non-monotonic</b> — the 75–85 band is a real "dead zone," worse than either the 65–75 or 85–95 bands flanking it. Excluding that dead zone, plus dropping RSI≥80 entries, was tested three ways:</p>
+      <div class="split">
+        <div class="split-card pass">
+          <div class="label">Passes filter</div>
+          <div class="n">319 of 537 real live PRE-BREAKOUT alerts (59.4%)</div>
+          <table>
+            <tr><td>Same-day</td><td class="pos">54.5% win · +0.09%</td></tr>
+            <tr><td>+1 day</td><td class="pos">49.8% win · +0.03%</td></tr>
+            <tr><td>+3 days</td><td class="pos">54.9% win · +0.40%</td></tr>
+            <tr><td>+5 days</td><td class="pos">59.0% win · +0.88%</td></tr>
+          </table>
+        </div>
+        <div class="split-card fail">
+          <div class="label">Fails filter</div>
+          <div class="n">218 of 537 real live PRE-BREAKOUT alerts (40.6%)</div>
+          <table>
+            <tr><td>Same-day</td><td class="neg">46.8% win · −0.09%</td></tr>
+            <tr><td>+1 day</td><td class="neg">44.0% win · −0.53%</td></tr>
+            <tr><td>+3 days</td><td class="neg">47.2% win · −0.28%</td></tr>
+            <tr><td>+5 days</td><td class="neg">45.7% win · −0.37%</td></tr>
+          </table>
+        </div>
+      </div>
+      <p style="margin-top:1.1rem">That split is on the <b>real live alert population</b> (2026-06-25 to 2026-08-24), not a simulation — the filter cleanly separates a solidly-positive cohort from a solidly-negative one, at every horizon tested.</p>
+    </div>
+  </section>
+
+  <section>
+    <h2>Real daily-volume impact</h2>
+    <div class="impact">
+      <div class="bar-row">
+        <div class="rlabel">Before</div>
+        <div class="bar-track"><div class="bar-fill before" style="width:100%"></div></div>
+        <div class="rval">28.4/day</div>
+      </div>
+      <div class="bar-row">
+        <div class="rlabel">After this filter</div>
+        <div class="bar-track"><div class="bar-fill after" style="width:77%"></div></div>
+        <div class="rval">~22/day</div>
+      </div>
+    </div>
+    <p class="callout" style="margin-top:1rem">BREAKOUT alerts (~14.3/day) are left untouched by this specific filter — it only tightens PRE-BREAKOUT, which drops from ~13.1/day to ~7.8/day. A <b>~22% cut</b> in daily count, concentrated entirely in the alert type that was underperforming, with what remains flipping from marginal to solidly positive.</p>
+  </section>
+
+  <section>
+    <h2>Other findings this session</h2>
+    <div class="table-wrap">
+      <table class="data">
+        <tr><th>Finding</th><th>Status</th><th>Real numbers</th><th>Note</th></tr>
+        <tr>
+          <td>RSI ≥80 at entry is bad</td>
+          <td><span class="pill validated">Validated</span></td>
+          <td class="num">Win rate 43%→36%, avg −1.71% by +5d (n=28)</td>
+          <td>Monotonic across all 4 horizons, gate-accurate 2.5y backtest</td>
+        </tr>
+        <tr>
+          <td>Near 52-week high performs better</td>
+          <td><span class="pill modest">Modest</span></td>
+          <td class="num">+5d: 54.8% win / +0.75% vs 46–43% / +0.06–0.86%</td>
+          <td>Real tilt, not a hard filter — only 933/1420 alerts affected</td>
+        </tr>
+        <tr>
+          <td>Gap-down entries are weak</td>
+          <td><span class="pill ruled-out">Ruled out</span></td>
+          <td class="num">Live data: +1.22% avg / 60% win by +5d (opposite)</td>
+          <td>Looked real on a naive proxy; reversed on 2 real datasets — do not filter on this</td>
+        </tr>
+        <tr>
+          <td>RSI≥70 (broad) predicts poorly</td>
+          <td><span class="pill modest">Refined</span></td>
+          <td class="num">Only the ≥80 tail is clean; 70–80 is fine-to-good</td>
+          <td>Original live-data lead was directionally right but too broad</td>
+        </tr>
+      </table>
+    </div>
+  </section>
+
+  <section>
+    <h2>Methodology</h2>
+    <p class="callout">
+      Three real, escalating rigor levels: (1) mined the 8 fields breakout_scanner already
+      captures per alert against the real 2-month live population (1,107 alerts); (2) built a
+      naive 5-year "raw Bollinger transition" proxy across the full 112-ticker universe to test
+      genuinely new features — <b>found this proxy gives misleading answers</b> once cross-checked
+      against real live outcomes, because it ignores the scanner's own F2/F5/F6/F7/F8/F9/F10
+      gates; (3) extended the account's own already-validated intraday-faithful simulation
+      (real Alpaca minute bars, exact gate replication, today's real production settings) across
+      2.5 years / 86 tickers — 1,420 properly-gated alerts — then cross-validated every candidate
+      finding directly against the real live alert stream before trusting it.
+    </p>
+  </section>
+
+  <section>
+    <h2>BREAKOUT-type alerts: no filter needed</h2>
+    <p class="callout">
+      Tested the same features against BREAKOUT alerts specifically (n=150). Smaller sample,
+      more mixed picture — real leads (ADX&lt;30 beats ADX≥30 at 55–57% vs 45–49% win rate; a
+      non-monotonic confirmation-time pattern) but none as clean as the PRE-BREAKOUT finding, and
+      not yet cross-validated against live data. <b>Conclusion: BREAKOUT doesn't need aggressive
+      filtering</b> — it's already a smaller share of volume (~11%) and a meaningfully better
+      performer on its own (avg +1.75–1.83% vs PRE-BREAKOUT's +0.34–0.51%). Flagging the ADX lead
+      as a real thread, not a validated result.
+    </p>
+  </section>
+
+  <section>
+    <h2>Ranking within PREFER: most to least promising</h2>
+    <p class="dek" style="margin-bottom:1rem">A smooth numeric score was tried first and rejected — with these features and this sample size it produced only 16 distinct values, one bucket driven to a −7% average by just 13 outlier alerts. A 3-level ranking is what the data actually supports, and it's clean: monotonic on both the 3-day and 5-day horizon.</p>
+    <div class="table-wrap">
+      <table class="data">
+        <tr><th>Sub-tier</th><th>n</th><th>Win rate (3d → 5d)</th><th>Avg return</th><th>Median</th></tr>
+        <tr><td><b>PREFER-HIGH</b></td><td class="num">316–320</td><td class="num pos">57.6% → 59.9%</td><td class="num pos">+1.09% → +1.39%</td><td class="num pos">+0.68% → +0.84%</td></tr>
+        <tr><td>PREFER-MID</td><td class="num">376–377</td><td class="num">55.6% → 54.5%</td><td class="num pos">+0.47% → +0.82%</td><td class="num pos">+0.19% → +0.25%</td></tr>
+        <tr><td>PREFER-LOW</td><td class="num">63</td><td class="num neg">42.9% → 46.0%</td><td class="num neg">−0.08% → −0.59%</td><td class="num neg">−0.54% → −0.47%</td></tr>
+      </table>
+    </div>
+    <p class="callout" style="margin-top:1rem">Honest finding, not smoothed over: <b>PREFER-LOW is actually negative</b> — worse than NEUTRAL, despite clearing the coarse PREFER bar. The boundary from the first pass was a bit loose at the edges; rather than quietly re-drawing it, PREFER-LOW is now its own visible tag. HIGH is built from real, validated components: for BREAKOUT, ADX&lt;30; for PRE-BREAKOUT (already near the 52-week high), clearing ≥2 of 3 checks — %B in the 65–75 sweet spot, within 2% of the 52-week high, and volume confirmation ≥1.5×.</p>
+  </section>
+
+  <section>
+    <h2>Now running: live out-of-sample validation</h2>
+    <p class="callout">
+      <code>shadow_filter_monitor.py</code> tags every new live alert with the full 5-level tier (AVOID / NEUTRAL / PREFER-LOW / PREFER-MID / PREFER-HIGH) in real time — read-only against breakout_scanner's real alert table, no Telegram, nothing wired to anything live. One real engineering wrinkle handled honestly: ADX and distance-from-52-week-high aren't columns the live scanner captures, so the monitor computes both itself from a real intraday price pull per ticker at tagging time. A retroactive test run against all 1,168 historical alerts confirmed the code executes correctly, but also surfaced a real limitation worth stating plainly: that retroactive run used <i>today's</i> price data for old alerts rather than each alert's own historical date, so it isn't a valid backtest — only a plumbing check. Going forward, real-time computation is exactly correct, since "today's data" is the right timeframe for a live alert. Log is running clean from here.
+    </p>
+  </section>
+
+  <footer>
+    New infrastructure only, in <code>ibkr_trader/backend/breakout_research/</code> — <code>breakout_scanner.py</code> and live config untouched. Full trace: <code>RESEARCH_LOG.md</code> in the same directory.
+  </footer>
+
+</div>

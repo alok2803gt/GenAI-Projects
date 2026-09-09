@@ -1,0 +1,111 @@
+<title>Day-Trading Strategy Comparison</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,500;0,9..144,600;1,9..144,500&family=Source+Sans+3:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+
+<style>
+  :root{
+    --bg: #EFEDE6;
+    --surface: #FBFAF6;
+    --surface-2: #E2DFD3;
+    --border: #D2CDBC;
+    --ink: #211D16;
+    --muted: #665F4E;
+    --accent: #3D6B52;
+    --accent-ink: #2A4C3A;
+    --pass: #2C6E49;
+    --reject: #A23B2B;
+  }
+  @media (prefers-color-scheme: dark){
+    :root:not([data-theme="light"]){
+      --bg: #12140F; --surface: #1A1D15; --surface-2: #23261C; --border: #35392A;
+      --ink: #E9E8DD; --muted: #A6AC96; --accent: #74B599; --accent-ink: #98D0B8;
+      --pass: #5FAE7E; --reject: #DD7A63;
+    }
+  }
+  :root[data-theme="dark"]{
+    --bg: #12140F; --surface: #1A1D15; --surface-2: #23261C; --border: #35392A;
+    --ink: #E9E8DD; --muted: #A6AC96; --accent: #74B599; --accent-ink: #98D0B8;
+    --pass: #5FAE7E; --reject: #DD7A63;
+  }
+  *{ box-sizing: border-box; }
+  body{ background: var(--bg); color: var(--ink); font-family: "Source Sans 3", system-ui, sans-serif; margin: 0; padding: 2.5rem 1.25rem 5rem; line-height: 1.55; }
+  @media (prefers-reduced-motion: reduce){ *{ animation: none !important; transition: none !important; } }
+  .page{ max-width: 960px; margin: 0 auto; }
+  header.hero{ margin-bottom: 2rem; padding-bottom: 1.5rem; border-bottom: 1px solid var(--border); }
+  .eyebrow{ font-family: "IBM Plex Mono", monospace; font-size: 0.72rem; letter-spacing: 0.12em; text-transform: uppercase; color: var(--accent-ink); margin: 0 0 0.6rem; }
+  h1{ font-family: "Fraunces", Georgia, serif; font-weight: 600; font-size: clamp(1.9rem, 4.6vw, 2.5rem); line-height: 1.1; margin: 0 0 0.7rem; text-wrap: balance; letter-spacing: -0.01em; }
+  .dek{ font-size: 1.02rem; color: var(--muted); max-width: 68ch; margin: 0; }
+  h2{ font-family: "Fraunces", Georgia, serif; font-weight: 600; font-style: italic; font-size: 1.3rem; margin: 0 0 0.9rem; }
+  section{ margin-bottom: 2.5rem; }
+  .callout{ background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 1.1rem 1.3rem; font-size: 0.92rem; color: var(--muted); }
+  .callout b{ color: var(--ink); font-weight: 600; }
+  .headline{ background: var(--surface); border: 1px solid var(--border); border-left: 4px solid var(--accent); border-radius: 12px; padding: 1.6rem 1.8rem; }
+  .headline .tag{ font-family: "IBM Plex Mono", monospace; font-size: 0.72rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--accent-ink); margin: 0 0 0.5rem; }
+  .headline h3{ font-family: "Fraunces", Georgia, serif; font-weight: 600; font-size: 1.3rem; margin: 0 0 0.6rem; text-wrap: balance; }
+  .headline p{ margin: 0.5rem 0; color: var(--muted); max-width: 68ch; }
+  .headline p b{ color: var(--ink); }
+  .table-wrap{ overflow-x: auto; border: 1px solid var(--border); border-radius: 12px; }
+  table.data{ width: 100%; border-collapse: collapse; font-size: 0.88rem; background: var(--surface); }
+  table.data th, table.data td{ text-align: left; padding: 0.6rem 0.9rem; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  table.data th{ font-family: "IBM Plex Mono", monospace; font-size: 0.68rem; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); background: var(--surface-2); }
+  table.data td.num{ font-family: "IBM Plex Mono", monospace; font-variant-numeric: tabular-nums; font-weight: 600; }
+  table.data tr:last-child td{ border-bottom: none; }
+  table.data tr.winner td{ background: color-mix(in srgb, var(--pass) 10%, var(--surface)); }
+  .pos{ color: var(--pass); } .neg{ color: var(--reject); }
+  footer{ margin-top: 3rem; padding-top: 1.25rem; border-top: 1px solid var(--border); font-size: 0.8rem; color: var(--muted); }
+  footer code{ font-family: "IBM Plex Mono", monospace; font-size: 0.82em; }
+</style>
+
+<div class="page">
+
+  <header class="hero">
+    <p class="eyebrow">Research complete · new infrastructure only, live Day Trader untouched</p>
+    <h1>Day-Trading Strategy Comparison</h1>
+    <p class="dek">Four genuinely different intraday strategy archetypes, backtested against real IBKR minute bars on the exact same 820-candidate opportunity set the live scanner would have selected — compared honestly against what's already deployed.</p>
+  </header>
+
+  <section>
+    <h2>Not starting from zero</h2>
+    <p class="callout">The account's live Day Trader config already went through real validation: a 5-year sizing backtest found the original blind-entry design catastrophic, a 1-minute-bar study resolved the ambiguity for real and found <b>confirmation-gate + 0.3% trailing stop</b> flips it to a positive edge (+0.137%/trade, 50.5% win rate), and an ATR-relative confirmation threshold was tested and lost to the flat one. <b>That exact config is live right now</b> (confirmed via <code>/day-trader/status</code>). This project's job was checking whether anything genuinely different beats it — not rediscovering what already exists.</p>
+  </section>
+
+  <section>
+    <h2>The result</h2>
+    <div class="headline">
+      <p class="tag">820 real candidates · 82 trading days · 100 tickers · real IBKR minute bars</p>
+      <h3>Nothing tested beats the strategy already running live</h3>
+      <div class="table-wrap" style="margin-top:1rem">
+        <table class="data">
+          <tr><th>Strategy</th><th>n</th><th>Win rate</th><th>Avg return</th><th>Total</th></tr>
+          <tr class="winner"><td><b>BASELINE (live config)</b></td><td class="num">581</td><td class="num pos">52.7%</td><td class="num pos">+0.154%</td><td class="num pos">+89.55%</td></tr>
+          <tr><td>Opening Range Breakout (15min)</td><td class="num">495</td><td class="num">47.7%</td><td class="num pos">+0.079%</td><td class="num pos">+39.24%</td></tr>
+          <tr><td>Opening Range Breakout (30min)</td><td class="num">415</td><td class="num">44.6%</td><td class="num pos">+0.045%</td><td class="num pos">+18.50%</td></tr>
+          <tr><td>VWAP mean-reversion</td><td class="num">774</td><td class="num neg">37.7%</td><td class="num neg">−0.089%</td><td class="num neg">−69.11%</td></tr>
+          <tr><td>Gap-fade</td><td class="num">294</td><td class="num neg">27.6%</td><td class="num">+0.070%*</td><td class="num">+20.55%*</td></tr>
+        </table>
+      </div>
+      <p style="margin-top:1rem">*Gap-fade's average is <b>not robust</b> — see below. On every metric that matters, the strategy already running live wins, and on a sample roughly 4-5x larger than its own original validation, its edge held up (slightly stronger, if anything: 52.7%/+0.154% here vs. 50.5%/+0.137% on the original 15-day study).</p>
+    </div>
+  </section>
+
+  <section>
+    <h2>Why each alternative fell short</h2>
+    <div class="table-wrap">
+      <table class="data">
+        <tr><th>Strategy</th><th>Real finding</th></tr>
+        <tr><td>ORB (both widths)</td><td>Degrades monotonically as the range widens — 15min beats 30min on every metric. A tighter range is a more selective, information-dense breakout signal, but neither width closes the gap to baseline.</td></tr>
+        <tr><td>VWAP mean-reversion</td><td>Clean, real loser. These candidates are ATR-selected momentum names — chosen because they're already moving. Betting on reversion against a population selected for the opposite quality fights the selection criteria itself.</td></tr>
+        <tr><td>Gap-fade</td><td><b>Investigated further before accepting the positive average.</b> Median return is exactly −1.00% (the stop level) — the typical trade is a real loser. 210/294 (71%) hit the stop; only 70/294 (24%) hit the actual gap-fill target. Removing the single largest winner (CSGP +16.56%, one trade) collapses avg return from +0.070% to +0.014% and total from +20.55% to +3.98%. Outlier-dependent, not a repeatable edge — rejected rather than reported as a false positive.</td></tr>
+      </table>
+    </div>
+  </section>
+
+  <section>
+    <h2>Honest caveats</h2>
+    <p class="callout">All 4 alternatives were tested at a single reasonable parameterization each — unlike the existing strategy's own multi-round validation (sizing → intraday-ambiguity resolution → ATR-relative confirmation test), these weren't tuned across a real parameter grid. The gap to baseline is large enough (especially VWAP reversion's clearly negative edge) that grid-tuning is unlikely to close it, but a more exhaustive pass remains possible if there's appetite for it.</p>
+  </section>
+
+  <footer>
+    New infrastructure only, in <code>ibkr_trader/backend/daytrader_research/</code> — <code>daytrader_scanner.py</code>, Day Trader live code, and config all untouched. Full trace: <code>RESEARCH_LOG.md</code> in the same directory.
+  </footer>
+
+</div>

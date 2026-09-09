@@ -1,0 +1,3 @@
+Fetching real minute bars for 820 (ticker, date) pairs...
+Requested 820, returned 820
+Saved minute_bars.json

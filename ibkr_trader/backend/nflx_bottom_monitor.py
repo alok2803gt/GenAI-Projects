@@ -14,13 +14,26 @@ clean entry as-is (RSI already hot off the bottom). CIO's own criteria for
 a real entry: "either a real breakout confirmation above the 200-day, or a
 fresh pullback that resets RSI."
 
-Two signal tiers (either one fires the trade):
+Three signal tiers (any one fires the trade):
   SIGNAL A (earlier, lower-confidence): RSI-14 cools to <=45 from today's
     67.2 elevated level, AND price holds above the 52wk low ($67.60, with
     a small buffer) -- i.e. the bounce forms a higher low instead of
     breaking down. Base-building confirmation.
   SIGNAL B (later, higher-confidence): price closes above the 200-day SMA.
     Real trend-reversal confirmation, not just a bounce.
+  SIGNAL C (added 2026-08-21, task 2026-08-21-001): SMA20 basing breakout
+    -- price closes above its own 20-day SMA today, after closing BELOW
+    that SMA on each of the prior 5 trading days. A genuine trend-following
+    entry (catches a sustained move off a base with no RSI reset or 200sma
+    reclaim required) -- built specifically because NFLX ran from the low
+    $70s to ~$80 in 2026-08 with neither A nor B ever firing. Backtested
+    2021-2026 (nflx_trend_backtest.py): N=24 occurrences, 87.5% win rate,
+    avg P&L +$9.78/trade (1.0x realized-vol premium estimate, conservative)
+    to +$22.68/trade (1.3x, more realistic) -- the only signal (existing or
+    candidate) with a positive edge under both vol assumptions tested. See
+    nflx_trend_backtest_summary.csv for full per-year detail and stated
+    approximations. Modest edge -- kept at QTY=1, not scaled up, pending
+    more live data.
 
 Trade if triggered: put credit spread, short ~11% OTM, width=2 (narrow --
 CFO's sizing call: a 5-wide spread was ~half of IBKR's available cash in
@@ -49,6 +62,7 @@ from alpaca.trading.requests import GetOptionContractsRequest, LimitOrderRequest
 TICKER        = "NFLX"
 RSI_RESET_MAX = 45.0     # Signal A: RSI must cool to this or below
 LOW_BUFFER    = 0.98     # Signal A: price must stay above 52wk_low * this (2% buffer)
+SMA20_BASING_DAYS = 5    # Signal C: prior trading days that must close below sma20
 SHORT_OTM_PCT = 0.11     # ~11% OTM short, matches todays consult
 WIDTH         = 2.0      # narrow width per CFO sizing (not the wider 5pt version)
 QTY           = 1
@@ -106,12 +120,26 @@ def check_signals() -> dict:
     signal_a = rsi <= RSI_RESET_MAX and price >= low_52wk * LOW_BUFFER
     signal_b = price > sma200
 
+    sma20_series = hist["Close"].rolling(20).mean()
+    sma20 = float(sma20_series.iloc[-1])
+    below20 = hist["Close"] < sma20_series
+    prior5_below20 = bool(below20.iloc[-1 - SMA20_BASING_DAYS:-1].all()) if len(below20) > SMA20_BASING_DAYS else False
+    signal_c = price > sma20 and prior5_below20
+
+    which = None
+    if signal_a:
+        which = "A (RSI reset, held above low)"
+    elif signal_b:
+        which = "B (200sma breakout)"
+    elif signal_c:
+        which = "C (SMA20 basing breakout)"
+
     return {
         "price": round(price, 2), "sma200": round(sma200, 2), "sma50": round(sma50, 2),
-        "rsi14": round(rsi, 1), "low_52wk": round(low_52wk, 2),
-        "signal_a": signal_a, "signal_b": signal_b,
-        "triggered": signal_a or signal_b,
-        "which": "A (RSI reset, held above low)" if signal_a else ("B (200sma breakout)" if signal_b else None),
+        "sma20": round(sma20, 2), "rsi14": round(rsi, 1), "low_52wk": round(low_52wk, 2),
+        "signal_a": signal_a, "signal_b": signal_b, "signal_c": signal_c,
+        "triggered": signal_a or signal_b or signal_c,
+        "which": which,
     }
 
 
@@ -296,10 +324,11 @@ def main():
     sig = check_signals()
     state["checks"] = state.get("checks", 0) + 1
     print(f"[{datetime.now(timezone.utc).isoformat()}] check #{state['checks']}")
-    print(f"  price=${sig['price']} sma200=${sig['sma200']} sma50=${sig['sma50']} "
+    print(f"  price=${sig['price']} sma200=${sig['sma200']} sma50=${sig['sma50']} sma20=${sig['sma20']} "
           f"rsi14={sig['rsi14']} 52wk_low=${sig['low_52wk']}")
     print(f"  Signal A (RSI<={RSI_RESET_MAX} + held low): {sig['signal_a']}")
     print(f"  Signal B (price > 200sma): {sig['signal_b']}")
+    print(f"  Signal C (SMA20 basing breakout): {sig['signal_c']}")
 
     if not sig["triggered"]:
         save_state(state)

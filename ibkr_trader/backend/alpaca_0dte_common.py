@@ -72,15 +72,33 @@ PER_STRATEGY_CAP_PCT  = 0.05   # max fraction any SINGLE strategy may commit to 
                                  # both already 5%. Was 0.15 at launch, inconsistent with EVC
                                  # by design oversight -- reconciled after CEO caught the gap.
 
+# CEO can temporarily raise the TOTAL portfolio budget (not any one strategy's
+# own cap -- see cap_pct above for that) for a single day via this file, same
+# self-expiring pattern as ashleyklieu_contracts_override.json: only honored
+# if the stored date matches today, so it silently reverts to the normal 50%
+# tomorrow without anyone needing to remember. Added 2026-09-03 (CEO wanted
+# up to $2000 total deployed for the day, well above the ~$1418 the standard
+# 50% ceiling allowed against that day's real net liq).
+TOTAL_BUDGET_OVERRIDE_FILE = "total_risk_budget_override.json"
 
-def cro_cfo_capital_budget(ib: IB, client) -> dict:
+
+def _total_budget_override_usd() -> float | None:
+    try:
+        with open(TOTAL_BUDGET_OVERRIDE_FILE) as f:
+            o = json.load(f)
+        if o.get("date") == now_et().date().isoformat():
+            return float(o["total_budget_usd"])
+    except (FileNotFoundError, json.JSONDecodeError, KeyError, ValueError, TypeError):
+        pass
+    return None
+
+
+def cro_cfo_capital_budget(ib: IB, client=None, cap_pct: float = None) -> dict:
     """Cross-strategy capital allocation view (CRO/CFO), shared by every
-    strategy's pre-trade review. Computes combined (IBKR + Alpaca) net liq,
-    total capital currently committed across every open option position on
-    Alpaca (the account's real execution venue since 2026-08-11) plus IBKR's
-    own gross position value, and the resulting headroom against a total
+    strategy's pre-trade review. Computes combined net liq, total capital
+    currently committed, and the resulting headroom against a total
     portfolio risk budget. Built 2026-08-20 (task 2026-08-20-006) -- until
-    now every strategy's own capital config (csp_capital, position_size,
+    then every strategy's own capital config (csp_capital, position_size,
     etc.) was set independently, with nothing checking the SUM against the
     real account. "Capital committed" per Alpaca option leg is
     |qty * avg_entry_price * 100| -- a consistent proxy for capital at risk
@@ -88,7 +106,21 @@ def cro_cfo_capital_budget(ib: IB, client) -> dict:
     max_risk formula.
 
     ib: a connected IB() instance (sync ib_insync calls, matches this
-        module's existing style). client: an Alpaca TradingClient.
+        module's existing style). client: an optional Alpaca TradingClient
+        -- when given, folds in Alpaca's real equity/option-position
+        exposure for a genuinely combined cross-broker view (still used by
+        strategies that actually execute on Alpaca). When omitted (None,
+        the default), this is an IBKR-only view -- deliberate for
+        strategies fully migrated off Alpaca (2026-09-07: Ashley,
+        Butterflies, GOOG Condor) that should have zero runtime dependency
+        on it, not just zero order placement.
+    cap_pct: override the per-trade cap for THIS call only (e.g. 0.15 for
+        GOOG weekly condor, CEO decision 2026-08-24 -- that strategy's
+        validated structure runs ~$500 max risk per contract, above the
+        default 5% cap on this account's real size). Defaults to the
+        shared PER_STRATEGY_CAP_PCT (5%) used by every other strategy's
+        pre-trade review when not given -- this does NOT change the
+        default for anyone else.
     """
     ibkr_net_liq = 0.0
     ibkr_deployed = 0.0
@@ -102,20 +134,23 @@ def cro_cfo_capital_budget(ib: IB, client) -> dict:
 
     alpaca_equity = 0.0
     total_deployed_alpaca = 0.0
-    try:
-        acct = client.get_account()
-        alpaca_equity = float(acct.equity)
-        for p in client.get_all_positions():
-            if getattr(p, "asset_class", None) and "OPTION" in str(p.asset_class):
-                total_deployed_alpaca += abs(float(p.qty) * float(p.avg_entry_price) * 100)
-    except Exception:
-        pass
+    if client is not None:
+        try:
+            acct = client.get_account()
+            alpaca_equity = float(acct.equity)
+            for p in client.get_all_positions():
+                if getattr(p, "asset_class", None) and "OPTION" in str(p.asset_class):
+                    total_deployed_alpaca += abs(float(p.qty) * float(p.avg_entry_price) * 100)
+        except Exception:
+            pass
 
     combined_net_liq = ibkr_net_liq + alpaca_equity
     total_deployed = ibkr_deployed + total_deployed_alpaca
-    total_budget = combined_net_liq * TOTAL_RISK_BUDGET_PCT
+    budget_override = _total_budget_override_usd()
+    total_budget = budget_override if budget_override is not None else combined_net_liq * TOTAL_RISK_BUDGET_PCT
     headroom = max(0.0, total_budget - total_deployed)
-    per_strategy_cap = combined_net_liq * PER_STRATEGY_CAP_PCT
+    effective_cap_pct = cap_pct if cap_pct is not None else PER_STRATEGY_CAP_PCT
+    per_strategy_cap = combined_net_liq * effective_cap_pct
 
     return {
         "combined_net_liq": round(combined_net_liq, 2),
@@ -123,10 +158,11 @@ def cro_cfo_capital_budget(ib: IB, client) -> dict:
         "alpaca_equity": round(alpaca_equity, 2),
         "total_deployed": round(total_deployed, 2),
         "total_budget": round(total_budget, 2),
+        "total_budget_override_active": budget_override is not None,
         "headroom": round(headroom, 2),
         "per_strategy_cap": round(per_strategy_cap, 2),
         "total_risk_budget_pct": TOTAL_RISK_BUDGET_PCT,
-        "per_strategy_cap_pct": PER_STRATEGY_CAP_PCT,
+        "per_strategy_cap_pct": effective_cap_pct,
     }
 
 
@@ -141,6 +177,37 @@ def get_quote(ib: IB, contract) -> dict:
     return {"bid": bid, "ask": ask, "mid": (bid + ask) / 2 if bid and ask else None}
 
 
+def get_quotes_batch(ib: IB, contracts: dict) -> dict:
+    """Same shape as get_quote() (dict of name -> {bid, ask, mid}), but for
+    several contracts at once -- qualifies and requests market data for ALL
+    of them up front, sleeps ONCE, then reads every ticker. Real latency
+    fix 2026-09-07: get_quote() called once per leg in a loop paid its own
+    full 3s settle-sleep each time (measured live: 9.4s for a 3-leg
+    butterfly, ~12-13s for a 4-leg condor) -- but IBKR streams market data
+    for every contract it's been asked to watch concurrently regardless of
+    how many separate reqMktData calls were made. The only thing serial
+    about the old code was OUR OWN sleep, not IBKR's response time. Same
+    3s settle window as get_quote() (already proven sufficient for regular
+    bid/ask, unlike OI/greeks which need longer -- see compute_live_gex's
+    own batched settle time for that case).
+    contracts: dict of name -> Contract (not yet qualified)."""
+    items = list(contracts.items())
+    conts = [c for _, c in items]
+    ib.qualifyContracts(*conts)
+    unqualified = [name for name, c in items if not c.conId]
+    if unqualified:
+        raise ValueError(f"could not qualify: {unqualified}")
+    tickers = {name: ib.reqMktData(c, "", False, False) for name, c in items}
+    ib.sleep(3)
+    quotes = {}
+    for name, td in tickers.items():
+        bid, ask = safe_px(td.bid), safe_px(td.ask)
+        quotes[name] = {"bid": bid, "ask": ask, "mid": (bid + ask) / 2 if bid and ask else None}
+    for c in conts:
+        ib.cancelMktData(c)
+    return quotes
+
+
 def spx_option(expiry_ibkr, strike, right):
     c = Option("SPX", expiry_ibkr, strike, right, "SMART", "100", "USD")
     c.tradingClass = "SPXW"   # PM-settled weekly (0DTE) -- required by IBKR, proven pattern (main.py)
@@ -149,6 +216,39 @@ def spx_option(expiry_ibkr, strike, right):
 
 def spy_option(expiry_ibkr, strike, right):
     return Option("SPY", expiry_ibkr, strike, right, "SMART")
+
+
+def etf_option(symbol, expiry_ibkr, strike, right):
+    """Generalized spy_option() for any plain equity/ETF-listed option
+    (SPY/QQQ/IWM) -- no special tradingClass needed, unlike SPX/SPXW."""
+    return Option(symbol, expiry_ibkr, strike, right, "SMART")
+
+
+def etf_spot(ib, symbol):
+    """Generalized spy_spot() for any equity/ETF underlying. Same
+    bid/ask-can-legitimately-be-nan fallback chain as spy_spot()."""
+    c = Stock(symbol, "SMART", "USD")
+    ib.qualifyContracts(c)
+    td = ib.reqMktData(c, "", False, False)
+    ib.sleep(3)
+    bid, ask = safe_px(td.bid), safe_px(td.ask)
+    mid = (bid + ask) / 2 if bid and ask else None
+    px = mid or bid or ask or safe_px(td.last) or safe_px(td.close) or safe_px(td.marketPrice())
+    ib.cancelMktData(c)
+    return px
+
+
+def get_real_strikes_0dte(ib, symbol, expiry_ibkr):
+    """Real listed strikes for symbol's SAME-DAY expiry, via
+    reqContractDetails (sync -- this module's scripts are plain sync
+    ib_insync callers, not main.py's async event loop, so this is the
+    sync sibling of main.py's _real_strikes() pattern, not a copy of it)."""
+    put_c = Option(symbol, expiry_ibkr, 0, "P", "SMART")
+    call_c = Option(symbol, expiry_ibkr, 0, "C", "SMART")
+    put_details = ib.reqContractDetails(put_c)
+    call_details = ib.reqContractDetails(call_c)
+    strikes = {d.contract.strike for d in put_details} | {d.contract.strike for d in call_details}
+    return sorted(strikes)
 
 
 def spx_spot(ib):
@@ -218,7 +318,32 @@ def place_leg(client, symbol, side, limit_price, label, qty=1):
         client.cancel_order_by_id(order.id)
     except Exception:
         pass
-    print("    did not fill in time -- cancelled")
+    # Wait for the cancel to actually SETTLE before returning, not just fire
+    # the request and move on. Built 2026-08-30 after a real, repeated race:
+    # cancel_order_by_id only REQUESTS a cancel (async on Alpaca's side) --
+    # the very next ladder step used to submit a fresh order for the same
+    # symbol immediately, and if Alpaca's internal "held_for_orders" qty
+    # hadn't released yet, that new order got rejected with "insufficient
+    # qty available for order" even though the position was genuinely free
+    # a moment later (confirmed live 2026-08-27/28 on CRWD, GOOG, and ULTA --
+    # every case cleared on an immediate manual retry, which is exactly what
+    # this settle-wait now does automatically). Also handles the mirror race
+    # where the order actually FILLED in the gap between our timeout check
+    # and this cancel request -- polling here catches that too instead of
+    # reporting a fill as a failure.
+    for _ in range(5):
+        time.sleep(1)
+        try:
+            chk = client.get_order_by_id(order.id)
+        except Exception:
+            continue
+        status = str(chk.status)
+        if status == "OrderStatus.FILLED":
+            print(f"    actually FILLED @ ${chk.filled_avg_price} (raced the cancel)")
+            return True, float(chk.filled_avg_price)
+        if status in ("OrderStatus.CANCELED", "OrderStatus.REJECTED", "OrderStatus.EXPIRED"):
+            break
+    print("    did not fill in time -- cancelled (settled)")
     return False, None
 
 
@@ -229,17 +354,27 @@ def price_ladder(side, bid, ask, mid):
     mid = the standard fallback price.
     aggressive = crosses to the opposite side -- guarantees a fill.
     Falls back to whatever single side exists if there's no two-sided market
-    (mid is None)."""
+    (mid is None).
+
+    Every returned price is rounded to 2 decimals -- Alpaca rejects a limit
+    price with more precision (real bug hit 2026-08-24, PDD close: an
+    unrounded `mid` like $0.21000000000000002, a plain binary-floating-point
+    representation artifact of (bid+ask)/2, got a real 42210000 rejection
+    and burned a full ladder step for no reason). `favorable`/`aggressive`
+    were already rounded when derived from arithmetic, but `mid` itself and
+    the raw bid/ask pass-throughs were not -- fixed here, once, for every
+    caller instead of trusting each input to already be clean."""
     if mid is None:
         fallback = ask if side == OrderSide.SELL else bid
         fallback = fallback or 0.01
         return [round(fallback, 2)] * 3
+    mid = round(mid, 2)
     if side == OrderSide.SELL:
         favorable = round(mid + (ask - mid) * 0.75, 2)
-        aggressive = bid if bid else round(mid * 0.5, 2)
+        aggressive = round(bid, 2) if bid else round(mid * 0.5, 2)
     else:  # BUY (to close a short)
         favorable = round(mid - (mid - bid) * 0.75, 2) if bid else round(mid * 0.75, 2)
-        aggressive = ask
+        aggressive = round(ask, 2)
     return [favorable, mid, aggressive]
 
 
@@ -267,28 +402,52 @@ def place_leg_with_ladder(client, symbol, side, label, qty, bid, ask, mid):
 def place_condor_sequential(client, syms, limits, qty=1):
     """syms/limits: dict with keys long_put, long_call, short_put, short_call.
     Returns (ok: bool, fills: dict of leg->fill_price or None, state: str
-    describing how far it got, for safe error handling by the caller)."""
+    describing how far it got, for safe error handling by the caller).
+
+    `limits[leg]` accepts either a flat price (float -- original behavior,
+    one limit order via place_leg, no retry if it misses) or a
+    (bid, ask, mid) tuple, which instead walks the same 3-step
+    favorable->mid->aggressive ladder place_leg_with_ladder() uses for
+    closes. Real incident 2026-08-26 (EVC/DG): a flat 40%-toward-market
+    entry limit on the short_put leg missed its 20s fill window and got
+    cancelled -- since this function stops at the first leg failure, the
+    two already-filled long legs were left uncovered (a real, unintended
+    long-straddle-ish position) needing manual completion. Also found:
+    _evc_reprice_schedule existed in main.py as an apparent retry
+    mechanism but was never actually wired into any call site -- entries
+    had NO real retry at all until this fix. EVC's entries now pass
+    (bid, ask, mid) tuples for exactly this reason; other callers
+    (alpaca_0dte_trader.py, spy_0dte_auto.py) still pass flat floats and
+    are unaffected."""
     fills = {}
+
+    def _leg(name, side, label):
+        val = limits[name]
+        if isinstance(val, (tuple, list)):
+            bid, ask, mid = val
+            return place_leg_with_ladder(client, syms[name], side, label, qty, bid, ask, mid)
+        return place_leg(client, syms[name], side, val, label, qty)
+
     print("\n--- Leg 1/4: BUY long put ---")
-    ok, px = place_leg(client, syms["long_put"], OrderSide.BUY, limits["long_put"], "long put", qty)
+    ok, px = _leg("long_put", OrderSide.BUY, "long put")
     fills["long_put"] = px
     if not ok:
         return False, fills, "long_put_failed_nothing_on"
 
     print("--- Leg 2/4: BUY long call ---")
-    ok, px = place_leg(client, syms["long_call"], OrderSide.BUY, limits["long_call"], "long call", qty)
+    ok, px = _leg("long_call", OrderSide.BUY, "long call")
     fills["long_call"] = px
     if not ok:
         return False, fills, "long_call_failed_long_put_naked_long"
 
     print("--- Leg 3/4: SELL short put (covered by long put) ---")
-    ok, px = place_leg(client, syms["short_put"], OrderSide.SELL, limits["short_put"], "short put", qty)
+    ok, px = _leg("short_put", OrderSide.SELL, "short put")
     fills["short_put"] = px
     if not ok:
         return False, fills, "short_put_failed_both_longs_uncovered"
 
     print("--- Leg 4/4: SELL short call (covered by long call) ---")
-    ok, px = place_leg(client, syms["short_call"], OrderSide.SELL, limits["short_call"], "short call", qty)
+    ok, px = _leg("short_call", OrderSide.SELL, "short call")
     fills["short_call"] = px
     if not ok:
         return False, fills, "short_call_failed_3_of_4_on"
@@ -298,25 +457,119 @@ def place_condor_sequential(client, syms, limits, qty=1):
 
 def close_condor_sequential(client, syms, limits, qty=1):
     """Two-phase close: BUY BACK shorts first (removes risk), THEN SELL longs.
-    Matches this account's standing rule (feedback_ibkr_spread_execution)."""
+    Matches this account's standing rule (feedback_ibkr_spread_execution).
+
+    `limits[leg]` accepts either a flat price (float -- original behavior:
+    one limit order via place_leg, no retry if it misses) or a
+    (bid, ask, mid) tuple, which instead walks the same 3-step
+    favorable->mid->aggressive ladder place_leg_with_ladder() already uses
+    for the GOOG/PDD one-off closes -- guarantees a fill instead of leaving
+    a leg stranded. Real incident 2026-08-26 (EVC/INTU): a flat limit
+    anchored on a stale/missing-quote fallback (the entry fill price) for a
+    wing that had decayed toward zero never filled, was never retried, and
+    left the position stuck at phase="closing" with one leg stranded for
+    hours until a human closed it manually. EVC and the SPY weekly condor
+    now pass (bid, ask, mid) tuples for exactly this reason; any caller
+    still passing flat floats (alpaca_0dte_trader.py, spy_0dte_auto.py,
+    close_baba_de_mid.py) is unaffected."""
     fills = {}
+
+    def _close_leg(name, side, label):
+        val = limits[name]
+        if isinstance(val, (tuple, list)):
+            bid, ask, mid = val
+            return place_leg_with_ladder(client, syms[name], side, label, qty, bid, ask, mid)
+        return place_leg(client, syms[name], side, val, label, qty)
+
     print("\n--- Close 1/4: BUY TO CLOSE short call ---")
-    ok, px = place_leg(client, syms["short_call"], OrderSide.BUY, limits["short_call"], "close short call", qty)
+    ok, px = _close_leg("short_call", OrderSide.BUY, "close short call")
     fills["short_call"] = px
 
     print("--- Close 2/4: BUY TO CLOSE short put ---")
-    ok2, px = place_leg(client, syms["short_put"], OrderSide.BUY, limits["short_put"], "close short put", qty)
+    ok2, px = _close_leg("short_put", OrderSide.BUY, "close short put")
     fills["short_put"] = px
 
     print("--- Close 3/4: SELL TO CLOSE long call ---")
-    ok3, px = place_leg(client, syms["long_call"], OrderSide.SELL, limits["long_call"], "close long call", qty)
+    ok3, px = _close_leg("long_call", OrderSide.SELL, "close long call")
     fills["long_call"] = px
 
     print("--- Close 4/4: SELL TO CLOSE long put ---")
-    ok4, px = place_leg(client, syms["long_put"], OrderSide.SELL, limits["long_put"], "close long put", qty)
+    ok4, px = _close_leg("long_put", OrderSide.SELL, "close long put")
     fills["long_put"] = px
 
     return all([ok, ok2, ok3, ok4]), fills
+
+
+def place_butterfly_sequential(client, syms, limits, qty=1):
+    """3-leg long butterfly, sequential orders (same MLEG-combo-rejects
+    workaround as place_condor_sequential -- task 2026-08-12-003). The 2x
+    body leg is just ONE order with qty=2*qty -- no combo/ratio order type
+    needed, Alpaca accepts any plain integer quantity on a single-leg order.
+
+    syms/limits keys: wing_lo (buy 1x, lower strike), wing_hi (buy 1x,
+    upper strike), body (sell 2x, center strike).
+
+    Sequencing matches this account's standing rule (feedback_ibkr_spread_
+    execution): buy the long, unhedged-but-risk-capped wings FIRST (paying
+    a debit has no margin/uncovered-short concern), THEN sell the body --
+    by the time the short body leg goes out, it's already fully covered by
+    both wings, same logic as the condor's long-legs-first ordering."""
+    fills = {}
+
+    def _leg(name, side, label, leg_qty):
+        val = limits[name]
+        if isinstance(val, (tuple, list)):
+            bid, ask, mid = val
+            return place_leg_with_ladder(client, syms[name], side, label, leg_qty, bid, ask, mid)
+        return place_leg(client, syms[name], side, val, label, leg_qty)
+
+    print("\n--- Leg 1/3: BUY wing_lo ---")
+    ok, px = _leg("wing_lo", OrderSide.BUY, "wing_lo", qty)
+    fills["wing_lo"] = px
+    if not ok:
+        return False, fills, "wing_lo_failed_nothing_on"
+
+    print("--- Leg 2/3: BUY wing_hi ---")
+    ok, px = _leg("wing_hi", OrderSide.BUY, "wing_hi", qty)
+    fills["wing_hi"] = px
+    if not ok:
+        return False, fills, "wing_hi_failed_wing_lo_naked_long"
+
+    print("--- Leg 3/3: SELL body 2x (covered by both wings) ---")
+    ok, px = _leg("body", OrderSide.SELL, "body", qty * 2)
+    fills["body"] = px
+    if not ok:
+        return False, fills, "body_failed_both_wings_uncovered_long"
+
+    return True, fills, "all_3_filled"
+
+
+def close_butterfly_sequential(client, syms, limits, qty=1):
+    """Two-phase close: BUY BACK the short body FIRST (removes the only
+    short-side risk), THEN sell both long wings -- mirrors
+    close_condor_sequential()'s same standing rule."""
+    fills = {}
+
+    def _leg(name, side, label, leg_qty):
+        val = limits[name]
+        if isinstance(val, (tuple, list)):
+            bid, ask, mid = val
+            return place_leg_with_ladder(client, syms[name], side, label, leg_qty, bid, ask, mid)
+        return place_leg(client, syms[name], side, val, label, leg_qty)
+
+    print("\n--- Close 1/3: BUY TO CLOSE body 2x ---")
+    ok, px = _leg("body", OrderSide.BUY, "close body", qty * 2)
+    fills["body"] = px
+
+    print("--- Close 2/3: SELL TO CLOSE wing_lo ---")
+    ok2, px = _leg("wing_lo", OrderSide.SELL, "close wing_lo", qty)
+    fills["wing_lo"] = px
+
+    print("--- Close 3/3: SELL TO CLOSE wing_hi ---")
+    ok3, px = _leg("wing_hi", OrderSide.SELL, "close wing_hi", qty)
+    fills["wing_hi"] = px
+
+    return all([ok, ok2, ok3]), fills
 
 
 def get_alpaca_symbols(client, ticker, expiry_alp, put_lo, put_hi, call_lo, call_hi):

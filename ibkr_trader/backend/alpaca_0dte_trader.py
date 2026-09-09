@@ -43,7 +43,7 @@ from ib_insync import IB
 from alpaca_0dte_common import (
     load_config, alpaca_client, get_quote, spx_option, spy_option, spx_spot, spy_spot,
     target_px, place_condor_sequential, close_condor_sequential, get_alpaca_symbols,
-    register_position, close_position, now_et,
+    register_position, close_position, now_et, has_open_position,
 )
 
 TWS_PORT = 7496
@@ -60,7 +60,16 @@ CONFIG = {
     },
 }
 PROFIT_TARGET_PCT = 0.50
-HARD_CLOSE_TIME = "15:45"
+HARD_CLOSE_TIME = "15:47"   # Alpaca auto-closes 0DTE option positions at 15:45 ET on its
+                             # own (real, confirmed 2026-09-02 via the butterfly strategy's
+                             # first live fire -- its close attempt at the then-15:55 target
+                             # failed all legs because the position no longer existed).
+                             # 15:47 verifies the auto-close happened rather than racing it;
+                             # a manual close only fires if the position is unexpectedly
+                             # still open. Applies here too even though this file also
+                             # handles SPX/SPXW (cash-settled, no physical-assignment reason
+                             # for Alpaca to auto-close) -- verify-first is strictly safer
+                             # either way, so the same fix is used uniformly for both tickers.
 QTY = 1
 MONITOR_INTERVAL_S = 60
 FILL_CHECK_WINDOW_S = 20
@@ -98,7 +107,18 @@ def price_legs(ib, ticker, cfg, expiry_ibkr):
         "short_call": opt_fn(expiry_ibkr, short_call_k, "C"),
         "long_call": opt_fn(expiry_ibkr, long_call_k, "C"),
     }
-    quotes = {name: get_quote(ib, c) for name, c in legs.items()}
+    # Real bug found 2026-09-07 (testing on a market holiday exposed it):
+    # get_quote() raises a bare ValueError when a contract can't be
+    # qualified at all (e.g. no 0DTE expiry listed today) -- previously
+    # uncaught here, crashing the whole script with a traceback instead of
+    # the clean, designed abort path below. Real production runs only ever
+    # hit this on an actual trading day (0DTE always listed), which is why
+    # it was never seen before.
+    try:
+        quotes = {name: get_quote(ib, c) for name, c in legs.items()}
+    except ValueError as exc:
+        print(f"ERROR: could not qualify one or more legs ({exc}) -- aborting.")
+        sys.exit(1)
     for name, q in quotes.items():
         print(f"  {name}: bid={q['bid']} ask={q['ask']}")
     if any(not (q["bid"] and q["ask"]) for q in quotes.values()):
@@ -237,7 +257,16 @@ def main():
                     print(f"Closed. ok={ok} fills={close_fills}")
                     return
             if now >= hard_close_dt:
-                print(f"\n{HARD_CLOSE_TIME} HARD CLOSE -- closing regardless of P&L.")
+                print(f"\n{HARD_CLOSE_TIME} check -- verifying whether Alpaca's own 15:45 "
+                      f"auto-close already handled this (expected, not a manual close race).")
+                still_open = any(has_open_position(client, syms[k]) for k in syms)
+                if not still_open:
+                    print("CONFIRMED: Alpaca auto-closed all legs at 15:45 as expected. "
+                          "No manual close needed -- check Alpaca order history for real fill prices.")
+                    close_position(pos_id, "alpaca_auto_close_1545", None)
+                    return
+                print("UNEXPECTED: position still open past Alpaca's normal 15:45 auto-close window -- "
+                      "falling back to manual close now.")
                 _, mon_quotes = condor_mark(ib2, ticker, today_ibkr, strikes)
                 if mon_quotes:
                     close_limits = {k: target_px(mon_quotes[k], not k.startswith("short")) for k in mon_quotes}
@@ -246,7 +275,7 @@ def main():
                 ok, close_fills = close_condor_sequential(client, syms, close_limits, args.qty)
                 final_value, _ = condor_mark(ib2, ticker, today_ibkr, strikes)
                 final_pnl = (net_entry_credit - final_value) * args.qty * 100 if final_value else None
-                close_position(pos_id, "hard_close", final_pnl)
+                close_position(pos_id, "manual_close_fallback", final_pnl)
                 print(f"Closed. ok={ok} fills={close_fills} final_pnl={final_pnl}")
                 return
             time.sleep(MONITOR_INTERVAL_S)

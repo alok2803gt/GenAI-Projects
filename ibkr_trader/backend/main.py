@@ -13,9 +13,11 @@ import asyncio
 import concurrent.futures
 import json
 import logging
+import subprocess
 import math
 import sqlite3
 import threading
+import uuid
 import traceback
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
@@ -36,19 +38,33 @@ import pandas as pd
 import requests
 import uvicorn
 import yfinance as yf
-from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from ib_insync import IB, Index, LimitOrder, Option, Order, Stock, util
 from alpaca_0dte_common import (
     alpaca_client as _alp_client, load_config as _alp_load_config,
     get_alpaca_symbols as _alp_get_symbols, place_condor_sequential as _alp_place_condor,
     close_condor_sequential as _alp_close_condor,
-    submit_bracket_buy as _alp_bracket_buy, submit_entry_buy as _alp_entry_buy,
-    submit_trailing_stop_sell as _alp_trailing_stop,
-    get_order as _alp_get_order, has_open_position as _alp_has_position,
-    get_last_closing_fill as _alp_last_closing_fill, close_stock_position_market as _alp_close_stock,
+    has_open_position as _alp_has_position,
     cro_cfo_capital_budget as _cro_cfo_capital_budget,
+    place_leg_with_ladder as _alp_leg_ladder,
 )
+# NOTE: _alp_get_symbols/_alp_place_condor/_alp_close_condor/_alp_has_position/
+# _alp_leg_ladder above are still real, live dependencies of EVC (out of scope
+# for the 2026-09-07 IBKR migration) -- do not remove without checking EVC's
+# own call sites first. submit_bracket_buy/submit_entry_buy/
+# submit_trailing_stop_sell/get_order/get_last_closing_fill/
+# close_stock_position_market were removed from this import 2026-09-07 --
+# confirmed zero real call sites anywhere in this file (Day Trader's own
+# execution moved off Alpaca entirely on 2026-09-06, and SPY Weekly Condor's
+# migration below doesn't use them either).
+from ibkr_0dte_common import (
+    ibkr_place_condor_sequential_async as _ibkr_place_spy_condor,
+    ibkr_close_condor_sequential_async as _ibkr_close_spy_condor,
+    ibkr_has_open_position as _ibkr_has_position,
+)
+from alpaca.trading.enums import OrderSide as _AlpOrderSide, QueryOrderStatus
+from alpaca.trading.requests import GetOrdersRequest
 from pydantic import BaseModel
 from xgboost import XGBClassifier
 from sklearn.model_selection import TimeSeriesSplit
@@ -171,6 +187,13 @@ ST_STATE_PATH       = "stock_state.json"        # stock trader state (persisted)
 DT_STATE_PATH       = "day_trader_state.json"   # day trader state (persisted)
 SPX_STATE_PATH      = "spx_0dte_state.json"     # SPX 0DTE trader state (persisted)
 EVC_STATE_PATH      = "earnings_vol_crush_state.json"  # Earnings Vol Crush state (persisted)
+# Shared between _evc_quote_condor's wing-selection walk and _evc_pretrade_review's
+# liquidity gate so the two can never drift apart -- the walk tries to find a wing
+# choice that already clears this bar; the gate is the backstop that rejects the
+# trade outright if nothing on the real chain ever does. Built 2026-08-30 after
+# ULTA (see conservative_credit comments below for the incident).
+EVC_LIQUIDITY_MIN_FRACTION = 0.30
+SPY_CONDOR_AGENT_URL = "http://localhost:8011"  # standalone agent, extracted from main.py 2026-09-07
 SIGT_STATE_PATH     = "sig_trader_state.json"          # Signal Trader state (persisted)
 FX_STATE_PATH       = "fx_trader_state.json"           # FX Trader state (persisted)
 MT_STATE_PATH       = "manual_trader_state.json"       # Manual Trader state (persisted)
@@ -378,9 +401,13 @@ state: Dict = {
     "model": None,
     "model_accuracy": None,
     "bars": {},
+    "bars_1m": {},   # independent 1-min bar stream (charting only, no model) -- 2026-09-08
     "signals": {},
     "last_update": {},
     "subscriptions": {},
+    "subscriptions_1m": {},
+    "chart_alerts": {"alerts": []},   # price alerts, 2026-09-09 -- see CHART_ALERTS_PATH
+    "harami_1m_alerted": {},          # ticker -> last-alerted bar time, dedup for _check_harami_1m
     "error": None,
     # Scanner
     "streaming_loop": None,   # event loop of the streaming thread
@@ -470,86 +497,9 @@ state: Dict = {
         "decisions":    [],   # plain-English decision log (last 200)
         "rotation_log": [],   # outcome-tracking for rotation decisions
     },
-    "day_trader": {
-        "enabled": False,
-        "config": {
-            "position_size":        5000,    # fixed $ per trade (overridden when position_size_pct > 0)
-            "position_size_pct":    10.0,    # % of account net liquidation per trade (0 = use fixed $)
-            "max_positions":        10,      # intraday concurrent cap — quality over quantity
-            "hard_stop_pct":        3.0,     # intraday stop loss — 2:1 R/R with 2% target
-            "profit_target_pct":    2.0,     # take profit at +2.0% — 5yr backtest: only config that makes money
-            "force_close_time":     "15:45", # force MKT sell all positions at HH:MM ET
-            "signal_freshness_min": 30,      # skip alerts older than this
-            "limit_buffer_pct":     0.10,    # LIMIT entry = last_price × (1 + buffer/100)
-            "daily_profit_target":  200.0,   # $ goal for the day (for goal calculator)
-            # expected_return_pct: AVERAGE NET return per trade (wins and losses already
-            # blended/probability-weighted), used directly by /day-trader/goal's EV calc --
-            # NOT a "win-side only" number. Set 2026-08-07 to the real backtested figure
-            # from daytrader_intraday_backtest.py's 0.3%-trail confirm+trail simulation
-            # (109 real trades on actual IBKR 1-min bars, 2026-07-17 to 2026-08-06):
-            # avg_ret_pct=+0.1369%. The old default (2.0%) was a placeholder that predated
-            # any of this system's real backtesting and made the goal calculator wildly
-            # optimistic (implied ~8x the real per-trade edge).
-            "expected_return_pct":  0.1369,
-            "win_rate_est":         0.505,   # same backtest: 50.5% win rate -- informational display only, not used in the EV calc (see expected_return_pct)
-            "min_composite_score":  75.0,    # skip signals below this score (0 = disabled)
-            "use_entry_filters":    True,    # ATR + 23-DMA + 3.7σ entry confirmation
-            "atr_period":           14,      # ATR period (bars)
-            "atr_multiplier":       1.8,     # today's range must be ≥ this × ATR to confirm entry
-            "std_dev_period":       20,      # look-back for daily-return std dev
-            "std_dev_threshold":    3.7,     # today's move must be ≥ this many σ to pass
-            # ── DT volatility-character gate (added 2026-08-06) ───────────────
-            # atr_mult/std_score above confirm TODAY's move is already unusually
-            # large; this instead gates on the ticker's own PERSISTENT volatility
-            # (ATR14 as % of price, known before today's open) -- the single
-            # dominant predictor of a >=0.5% open->close day found in a 500-ticker,
-            # 5yr, 609,859-ticker-day S&P 500 study (sp500_daytrade_study.py):
-            # 43.6% of RandomForest feature importance, monotonic decile lift from
-            # -7.9pt (bottom decile, ATR%<1.6) to +7.7pt (top decile, ATR%>4.2) vs
-            # the 35.9% base rate. Existing trend/momentum quality filters (%B,
-            # RSI, SMA position, ADX) scored NEAR ZERO OR NEGATIVE lift on this
-            # specific same-day target -- they were validated for multi-day swing
-            # continuation, not a fast intraday pop. 2.5% chosen as roughly the
-            # point decile lift turns consistently positive (deciles 6-10, i.e.
-            # top ~50% of the universe by ATR%); raise toward the ~4.2% top-decile
-            # cutoff for a stricter, higher-conviction gate.
-            "use_vol_filter":       True,     # DT-VOL gate on/off
-            "min_atr_pct":          2.5,      # required ATR14 as % of price (own volatility character)
-            # ── Confirmation gate + trailing stop (added 2026-08-07) ──────────
-            # Validated on a real 147-trade recent sample using actual IBKR 1-min
-            # bars (daytrader_intraday_backtest.py), NOT daily-bar approximation:
-            # the OLD blind-entry/fixed-target mechanic (buy at the open, exit at
-            # +0.25% target or -1.0% stop, whichever IBKR minute bar hits first)
-            # measured a REAL 67.3% win rate against an 80% breakeven requirement
-            # -- a genuine -0.16%/trade edge, -23.25% total across the sample.
-            # Waiting for the move to actually show up (price + volume) before
-            # buying, then protecting it with a trailing stop instead of a fixed
-            # target too small to mean anything, flipped this to +0.14%/trade,
-            # +14.92% total on the same period. Trailing width was picked by
-            # testing 0.3/0.4/0.5/0.6/0.8% head-to-head on real minute bars --
-            # 0.3% won clearly (tighter widths lock in the confirmed move before
-            # it can give it back; wider ones bled the edge away).
-            "use_confirmation_gate": True,    # False = revert to old blind-entry behavior
-            "confirm_pct":           0.35,    # price must be up this much from today's open to confirm
-            "confirm_window_min":    60,      # only watch for confirmation in the first N minutes (9:30-10:30 ET)
-            "use_trailing_stop":     True,    # False = revert to fixed profit_target_pct/hard_stop_pct exit
-            "trailing_stop_pct":     0.3,     # stop trails this far below the running high since entry
-            # ── Sizing floor guard (added 2026-08-07) ──────────────────────────
-            # shares = max(1, int(position_size/price)) has no ceiling: for a
-            # $900 stock, "1 share minimum" costs 3x an intended ~$295 position.
-            # Confirmed live 2026-08-07: COHR (~$375) and LITE (~$900) each
-            # bought as a forced 1-share minimum, deploying ~$1,280 against
-            # $726 available funds -- real margin usage the position-sizing
-            # target was supposed to prevent. max_price_multiple caps how far
-            # a single share's cost may exceed the target position size before
-            # the candidate is skipped entirely instead of force-bought.
-            "max_price_multiple":   1.5,
-        },
-        "positions":    {},   # ticker → position dict
-        "watching":     {},   # ticker → candidate awaiting confirmation (not yet bought)
-        "closed_today": [],   # closed trade summaries (reset each day)
-        "decisions":    [],   # decision log (last 200)
-    },
+    # day_trader was extracted to a standalone process 2026-08-27 (see
+    # day_trader_agent.py) -- state now lives in day_trader_state.json,
+    # not here. /day-trader/* endpoints below proxy to that process.
     "spx_0dte": {
         "enabled": False,
         "config": {
@@ -658,6 +608,18 @@ state: Dict = {
                                             # together (e.g. multiple mega-caps one evening)
             "min_credit":     0.50,   # min net condor credit per spread ($)
             "wing_mult":      1.5,    # wing width = wing_mult x expected_move
+            # Short-strike cushion, independently tunable per side -- added
+            # 2026-08-25 after finding INTU's default short put (1.0x EM)
+            # sat directly on its largest negative-gamma wall, on top of a
+            # real put-side skew (smirk) and a documented history of violent
+            # downside moves. Both default to 1.0 (= today's exact behavior,
+            # spot -/+ 1.0x EM) -- only change one side deliberately, e.g.
+            # put_cushion_mult=1.2 pushes the short put further OTM without
+            # touching the call side. NOT auto-applied based on skew/GEX --
+            # manual, per-trade judgment call until there's enough real
+            # outcome data to consider automating it.
+            "put_cushion_mult":  1.0,
+            "call_cushion_mult": 1.0,
             "entry_start":    "15:30",
             "entry_cutoff":   "15:50",
             "exit_start":     "09:31",
@@ -680,6 +642,10 @@ state: Dict = {
                                            # session -- dedup must never retry these
                                            # automatically (real incident: DE 2026-08-19)
     },
+    # spy_weekly_condor extracted to its own standalone process 2026-09-07
+    # (spy_weekly_condor_agent.py, port 8011) -- same pattern as Day Trader's
+    # 2026-08-27 extraction. main.py's /spy-condor/* routes are now thin
+    # proxies to that process; no in-process state lives here anymore.
     "sig_trader": {
         "enabled": False,
         "config": {
@@ -776,6 +742,25 @@ state: Dict = {
 
 TICKERS: List[str] = ["AAPL", "MSFT", "NVDA", "SPY"]
 _tickers_lock = threading.Lock()
+
+# Independent 1-min bar stream for charting only (2026-09-08) -- deliberately
+# NOT the same pipe as TICKERS/BAR_SIZE above. That 5-min stream feeds
+# build_features()'s RSI-14/SMA-5/SMA-14/etc., all tuned and (informally)
+# validated at 5-min granularity; shrinking BAR_SIZE globally to 1-min would
+# silently change every one of those lookback windows (14 bars of 1-min =
+# 14 real minutes vs 70) with no re-validation. This list is empty by
+# default -- populated only on demand (POST /add_ticker_1m), same "queued,
+# streaming loop subscribes within ~10s" pattern as TICKERS/add_ticker.
+ONE_MIN_TICKERS: List[str] = []
+_tickers_1m_lock = threading.Lock()
+ONE_MIN_BAR_SIZE = "1 min"
+ONE_MIN_HISTORY_DURATION = "3 D"
+# A full extended session (4am pre-market -> 8pm after-hours close) is ~16h
+# = 960 one-min bars; retain a bit more so pre-market doesn't get pushed out
+# by a single day's regular+after-hours volume (found 2026-09-09: the
+# original 500-bar cap only reached back to 11:40am on an already-active
+# session, cutting off that morning's pre-market entirely).
+ONE_MIN_RETENTION_BARS = 1200
 
 # ── Signal Trader: per-ticker prime-window setups ──────────────────────────
 # Derived from 2yr/1h + 60d/15m intraday backtest (win rates 57–72%).
@@ -883,7 +868,15 @@ def predict(model, df: pd.DataFrame) -> dict:
         "confidence": round(conf, 4),
         "features": {k: round(float(v), 4) for k, v in feat.items()},
         "close": round(float(df["close"].iloc[-1]), 4),
-        "timestamp": _utcnow().isoformat() + "Z",
+        # _utcnow() is already timezone-aware, so .isoformat() ends in
+        # "+00:00" -- appending "Z" on top produced a double-timezone
+        # string ("...+00:00Z") that JS's Date parser rejects outright,
+        # rendering as "Invalid Date" in the frontend's Signal History
+        # table for every row (confirmed live 2026-09-07). Same latent bug
+        # exists at 7 other call sites in this file (autotrader last_run,
+        # scanner scanned_at, a couple others) -- not touched here since
+        # none of them were the one actually under verification this pass.
+        "timestamp": _utcnow().isoformat(),
     }
 
 
@@ -919,6 +912,7 @@ def on_bar_update(ticker: str, bars, has_new_bar: bool) -> None:
             if hasattr(t, "isoformat"):
                 b["time"] = t.isoformat()
         state["bars"][ticker] = bars_list
+        _check_chart_alerts(ticker, float(df["close"].iloc[-1]))
 
         if state["model"] is None and len(df) >= 60:
             try:
@@ -985,6 +979,156 @@ async def subscribe_ticker(ib: IB, ticker: str) -> None:
         state["tape_sentiment"][ticker]["sub_active"] = True
         tape_tkr.updateEvent += _make_tape_callback(ticker)
         log.info("Tape sentiment subscribed for %s (avg_vol_per_bar=%.0f)", ticker, avg_per_min)
+
+
+def on_bar_update_1m(ticker: str, bars, has_new_bar: bool) -> None:
+    """Charting-only sibling of on_bar_update() -- no model train/predict,
+    just keeps state['bars_1m'][ticker] current. Deliberately isolated from
+    the 5-min pipe (see ONE_MIN_TICKERS comment)."""
+    try:
+        df = _bars_to_df(bars)
+        if df.empty:
+            return
+        bars_list = df.tail(ONE_MIN_RETENTION_BARS).to_dict(orient="records")
+        for b in bars_list:
+            t = b.get("time")
+            if hasattr(t, "isoformat"):
+                b["time"] = t.isoformat()
+        state["bars_1m"][ticker] = bars_list
+        # Checked on every update (not just has_new_bar) so an alert fires as
+        # soon as the still-forming bar's live price crosses, not up to a
+        # minute late waiting for that bar to close.
+        _check_chart_alerts(ticker, float(df["close"].iloc[-1]))
+        # Harami check only on a genuinely CLOSED bar (has_new_bar means the
+        # PREVIOUS bar just finalized) -- a candlestick pattern isn't
+        # meaningful on a still-forming candle the way a price-cross alert is.
+        if has_new_bar:
+            _check_harami_1m(ticker, bars_list)
+    except Exception as e:
+        log.warning(f"on_bar_update_1m error [{ticker}]: {e}", exc_info=True)
+
+
+async def subscribe_ticker_1m(ib: IB, ticker: str) -> None:
+    """Independent 1-min real-time bar subscription for charting (Signal
+    Trader / any tab), separate from the 5-min TICKERS pipe that feeds the
+    ML model -- see ONE_MIN_TICKERS's module-level comment for why."""
+    contract = Stock(ticker, "SMART", "USD")
+    await ib.qualifyContractsAsync(contract)
+    bars = await ib.reqHistoricalDataAsync(
+        contract,
+        endDateTime="",
+        durationStr=ONE_MIN_HISTORY_DURATION,
+        barSizeSetting=ONE_MIN_BAR_SIZE,
+        whatToShow="TRADES",
+        useRTH=False,
+        formatDate=1,
+        keepUpToDate=True,
+    )
+    state["subscriptions_1m"][ticker] = bars
+    bars.updateEvent += lambda b, h: on_bar_update_1m(ticker, b, h)
+    on_bar_update_1m(ticker, bars, False)
+    log.info(f"Streaming (1m)  {ticker}  ({len(bars)} bars seeded)")
+
+
+# ── Chart price alerts (2026-09-09) ─────────────────────────────────────────
+# Display/notification utility, not a trading signal -- no backtest needed
+# (unlike a BUY/SELL/HOLD marker, which was correctly deferred earlier this
+# session pending real validation). Checked on every new bar from EITHER
+# bar pipe (on_bar_update_1m for Signal Trader's chart, on_bar_update for
+# the ML Signals tab's 4 tickers) so an alert works on any chartable ticker.
+CHART_ALERTS_PATH = "chart_alerts.json"
+_chart_alerts_lock = threading.Lock()
+
+
+def _chart_alerts_load() -> None:
+    if not os.path.exists(CHART_ALERTS_PATH):
+        return
+    try:
+        with open(CHART_ALERTS_PATH) as f:
+            state["chart_alerts"] = json.load(f)
+    except Exception as e:
+        log.warning("chart_alerts load error: %s", e)
+
+
+def _chart_alerts_save() -> None:
+    try:
+        with open(CHART_ALERTS_PATH, "w") as f:
+            json.dump(state["chart_alerts"], f, indent=2, default=str)
+    except Exception as e:
+        log.warning("chart_alerts save error: %s", e)
+
+
+def _check_chart_alerts(ticker: str, close_price: float) -> None:
+    with _chart_alerts_lock:
+        alerts = state["chart_alerts"]["alerts"]
+        remaining, fired = [], []
+        for a in alerts:
+            if a["ticker"] != ticker:
+                remaining.append(a)
+                continue
+            hit = (a["direction"] == "above" and close_price >= a["price"]) or \
+                  (a["direction"] == "below" and close_price <= a["price"])
+            (fired if hit else remaining).append(a)
+        if fired:
+            state["chart_alerts"]["alerts"] = remaining
+    for a in fired:
+        _fire_chart_alert(a, close_price)
+    if fired:
+        _chart_alerts_save()
+
+
+def _fire_chart_alert(alert: dict, price: float) -> None:
+    text = (f"\U0001F514 Price Alert: {alert['ticker']} crossed {alert['direction']} "
+            f"${alert['price']:.2f} (now ${price:.2f})")
+    if alert.get("note"):
+        text += f" -- {alert['note']}"
+    _oversight_notify(text)
+    _oversight_log("trader", "chart_alert_fired", text,
+                    rationale=f"User-set price alert on {alert['ticker']} (id={alert['id']}) triggered.",
+                    outcome="Telegram sent, alert removed from active list.")
+
+
+# ── 1-min bullish harami detection (2026-09-09) ─────────────────────────────
+# IMPORTANT DISTINCTION: candlestick_pattern_research/ validated bullish
+# harami + downtrend context (SMA20/SMA50) at a DAILY bar, 5-TRADING-DAY
+# HOLD (real backtest, p=0.00007 vs a matched baseline). This checks for the
+# bare pattern shape (no downtrend filter, no hold-period claim) on 1-MINUTE
+# bars -- a completely different, UNTESTED timeframe. This is a visibility
+# tool for what the user explicitly asked for ("any time there is a bullish
+# harami candle" on the chart), not a claim that the validated daily edge
+# applies here. Every alert says so explicitly so it can't be mistaken for
+# the researched signal.
+_harami_1m_lock = threading.Lock()
+
+
+def _check_harami_1m(ticker: str, bars_list: list) -> None:
+    if len(bars_list) < 3:
+        return
+    prior, current = bars_list[-3], bars_list[-2]
+    prior_bearish = prior["close"] < prior["open"]
+    current_bullish = current["close"] > current["open"]
+    contained = (current["open"] > prior["close"]) and (current["close"] < prior["open"])
+    if not (prior_bearish and current_bullish and contained):
+        return
+
+    with _harami_1m_lock:
+        last = state["harami_1m_alerted"].get(ticker)
+        if last == current["time"]:
+            return
+        state["harami_1m_alerted"][ticker] = current["time"]
+
+    text = (
+        f"\U0001F56F️ 1-min Bullish Harami: {ticker} at {current['time']}\n"
+        f"Prior candle: {prior['open']:.2f} -> {prior['close']:.2f} (bearish)\n"
+        f"This candle: {current['open']:.2f} -> {current['close']:.2f} (bullish, inside prior body)\n"
+        f"NOTE: this is the bare pattern on a 1-min candle, NOT the validated daily "
+        f"5-day-hold research (candlestick_pattern_research/, p=0.00007) -- that was "
+        f"tested on daily bars with a downtrend-context filter, not here. Visibility only."
+    )
+    _oversight_notify(text)
+    _oversight_log("trader", "harami_1m_detected", text,
+                    rationale=f"Bare bullish harami pattern matched on {ticker}'s 1-min chart.",
+                    outcome="Telegram sent. Unvalidated at this timeframe -- reference only.")
 
 
 # ── CVD Tape Sentiment helpers ─────────────────────────────────────────────
@@ -1250,6 +1394,17 @@ async def _subscribe_pending(ib: IB, known: set) -> set:
     return current
 
 
+async def _subscribe_pending_1m(ib: IB, known: set) -> set:
+    with _tickers_1m_lock:
+        current = set(ONE_MIN_TICKERS)
+    for ticker in current - known:
+        try:
+            await subscribe_ticker_1m(ib, ticker)
+        except Exception as e:
+            log.warning(f"1m subscribe failed [{ticker}]: {e}")
+    return current
+
+
 async def _tape_preseed_subscribe(ib: IB, ticker: str) -> None:
     """Tape-only subscription for pre-seeding — no keepUpToDate bars, just CVD sentiment.
     Does NOT add to TICKERS or state['subscriptions']; only fills a tape slot."""
@@ -1467,12 +1622,14 @@ async def streaming_loop_async() -> None:
     while True:
         try:
             ib = IB()
-            ctx = {"known": set()}
+            ctx = {"known": set(), "known_1m": set()}
 
             def _on_ib_error(reqId, errorCode, errorString, contract):
                 if errorCode == 1102:
                     ctx["known"] = set()
+                    ctx["known_1m"] = set()
                     state["subscriptions"].clear()
+                    state["subscriptions_1m"].clear()
                     # Tape subscriptions are on the same connection — mark inactive so
                     # subscribe_ticker re-subscribes them as tickers are re-added.
                     state["tape_subs"].clear()
@@ -1528,7 +1685,6 @@ async def streaming_loop_async() -> None:
                     _disabled = []
                     for _tkey, _save_fn in [
                         ("autotrader",          _at_save_state),
-                        ("day_trader",          _dt_save_state),
                         ("stock_trader",        _st_save_state),
                         ("spx_0dte",            _spx_save_state),
                         ("evc",                 _evc_save_state),
@@ -1538,6 +1694,16 @@ async def streaming_loop_async() -> None:
                             state[_tkey]["enabled"] = False
                             _save_fn()
                             _disabled.append(_tkey)
+                    # Day Trader deliberately EXCLUDED from this gate (2026-09-02,
+                    # CEO decision) -- it runs as its own standalone process
+                    # (day_trader_agent.py) with its own independent IBKR
+                    # connection, so the paper-session-state-bleeding risk this
+                    # gate exists to prevent doesn't apply to it the way it does
+                    # to the in-process strategies below (which share main.py's
+                    # own connection/session state). Day Trader's own entry/exit
+                    # decisions and per-trade risk controls (ATR filter,
+                    # confirmation gate, trailing/hard stops) are its own
+                    # responsibility now, not main.py's to police on reconnect.
                     if _disabled:
                         log.warning(
                             "LIVE SAFETY GATE: disabled %d trader(s) that were enabled in paper session: %s",
@@ -1559,6 +1725,7 @@ async def streaming_loop_async() -> None:
                 _at_log("SYSTEM", f"Cleared {len(stale)} stale Inactive orders on reconnect (reqGlobalCancel)")
 
             ctx["known"] = await _subscribe_pending(ib, ctx["known"])
+            ctx["known_1m"] = await _subscribe_pending_1m(ib, ctx["known_1m"])
 
             # Wait briefly so the options data farm is fully ready before probing.
             # Without this, reqTickersAsync races with bar subscriptions and returns nan.
@@ -1590,6 +1757,7 @@ async def streaming_loop_async() -> None:
             _heartbeat_tick = 0
             while ib.isConnected():
                 ctx["known"] = await _subscribe_pending(ib, ctx["known"])
+                ctx["known_1m"] = await _subscribe_pending_1m(ib, ctx["known_1m"])
                 # After 1102 reconnect tape_subs is cleared — re-preseed open slots.
                 # Also fills slots lazily as universe scores update throughout the day.
                 if len(state["tape_subs"]) < TAPE_SENTIMENT_MAX_TICKERS:
@@ -2576,7 +2744,19 @@ async def _opra_warmup_poller(ib: IB) -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 
 OPTIONS_UOA_STRIKES_EACH_SIDE = 1     # ATM ± 1 = 3 strikes per right = 6 contracts/ticker
-OPTIONS_UOA_RATIO_THRESHOLD   = 2.0   # volume >= 2x open interest flags "unusual"
+# History note 2026-08-30: the original flat 2.0x flagged 30.2% of ALL 9,788
+# real scanned rows -- barely above the real median (p50=0.76x), not a
+# rare-event filter by any reasonable definition. First fix tried a single
+# recalibrated flat value (10.0x, ~pooled p90) -- but checked per-ticker
+# (CEO question: "why would a flat threshold be common for every ticker?"),
+# that was WRONG too: real per-ticker percentiles for 10.0x ranged from p47.3
+# (TSLA) to p100.0 (LRCX/ORCL/QCOM/... -- 10x essentially never happens for
+# these). Vol/OI ratio is not scale-invariant across tickers the way it looks
+# on paper. Fixed properly: _options_uoa_relative_threshold() now uses each
+# ticker's OWN real historical p90, computed fresh from accumulated scan
+# history -- this constant is now ONLY the fallback for a ticker with too
+# little history yet (<30 real scanned rows) to compute its own baseline.
+OPTIONS_UOA_RATIO_THRESHOLD   = 10.0  # fallback only -- see _options_uoa_relative_threshold
 OPTIONS_UOA_SCAN_INTERVAL_S   = 1800  # 30 min -- a full scan of ~20 tickers takes real minutes
 # RESEARCH_UNIVERSE is semis + enterprise software only -- no mega-cap
 # consumer tech, no index ETFs, and (2026-08-19) doesn't even include GOOG,
@@ -2584,6 +2764,39 @@ OPTIONS_UOA_SCAN_INTERVAL_S   = 1800  # 30 min -- a full scan of ~20 tickers tak
 # universe. CEO-picked default: the same names already prioritized elsewhere
 # in this account (CVD tape watchlist) plus GOOG.
 OPTIONS_UOA_EXTRA_TICKERS = ["AAPL", "AMZN", "META", "GOOG", "TSLA", "NFLX", "SPY", "QQQ"]
+
+
+def _options_uoa_relative_threshold(ticker: str, min_history: int = 30, percentile: float = 0.90) -> float:
+    """This ticker's OWN historical vol/OI ratio at the given percentile,
+    from its real accumulated scan history -- falls back to the flat
+    OPTIONS_UOA_RATIO_THRESHOLD when there isn't enough history yet (a new
+    or rarely-scanned ticker).
+
+    Real bug found 2026-08-30 (CEO question: "why would a flat threshold be
+    common for every ticker?"): checked, and it isn't. A single flat 10.0x
+    cutoff lands anywhere from real p47.3 (TSLA -- 10x is BELOW its own
+    median vol/OI ratio, so more than half its real activity would be
+    "unusual") to real p100.0 (LRCX/ORCL/QCOM/PANW/TXN/WDAY/GOOG/NFLX/CDNS/
+    SNPS/INTU/ADI/AMAT -- 10x essentially never happens for these names at
+    all). Worse, proportionally, than the flat-share-count problem found the
+    same day for the equity tape -- vol/OI ratio is NOT scale-invariant
+    across tickers the way it looks on paper; real differences in each
+    ticker's typical open-interest depth and retail-vs-institutional options
+    activity drive genuinely different baseline ratios.
+    """
+    con = sqlite3.connect(TAPE_DB_PATH, check_same_thread=False)
+    try:
+        rows = con.execute(
+            "SELECT vol_oi_ratio FROM options_unusual_activity WHERE ticker=? AND vol_oi_ratio IS NOT NULL",
+            (ticker,),
+        ).fetchall()
+    finally:
+        con.close()
+    ratios = sorted(r[0] for r in rows)
+    if len(ratios) < min_history:
+        return OPTIONS_UOA_RATIO_THRESHOLD
+    idx = min(len(ratios) - 1, int(len(ratios) * percentile))
+    return ratios[idx]
 
 
 async def _options_uoa_scan_ticker(ib, ticker: str) -> list[dict]:
@@ -2613,6 +2826,7 @@ async def _options_uoa_scan_ticker(ib, ticker: str) -> list[dict]:
 
         scan_time    = _utcnow().isoformat()
         session_date = date.today().isoformat()
+        rel_threshold = _options_uoa_relative_threshold(ticker)
 
         for strike in band:
             for right in ("C", "P"):
@@ -2635,7 +2849,11 @@ async def _options_uoa_scan_ticker(ib, ticker: str) -> list[dict]:
                     "underlying_px": spot, "expiry": expiry, "strike": strike, "right": right,
                     "volume": volume, "open_interest": oi, "vol_oi_ratio": ratio,
                     "bid": bid, "ask": ask, "last": last,
-                    "is_unusual": 1 if (ratio is not None and ratio >= OPTIONS_UOA_RATIO_THRESHOLD) else 0,
+                    "is_unusual": 1 if (ratio is not None and ratio >= rel_threshold) else 0,
+                    "threshold_used": rel_threshold,  # in-memory only, for the Telegram alert text
+                                                        # below -- not a DB column, _options_uoa_persist
+                                                        # uses named placeholders so this extra key is
+                                                        # harmlessly ignored on insert.
                 })
     except Exception as exc:
         log.warning("Options UOA scan failed for %s: %s", ticker, exc)
@@ -2657,6 +2875,175 @@ def _options_uoa_persist(rows: list[dict]) -> None:
     con.close()
 
 
+DIRECTIONAL_READ_LOOKBACK_MINUTES = 60  # see _options_flow_directional_read / _lit_tape_directional_read
+
+
+def _within_lookback(iso_ts: str, minutes: int) -> bool:
+    try:
+        ts = datetime.fromisoformat(iso_ts.replace("Z", "+00:00"))
+    except Exception:
+        return False
+    return (_utcnow() - ts).total_seconds() <= minutes * 60
+
+
+def _options_flow_directional_read(ticker: str) -> dict:
+    """Real bullish/bearish read for a ticker's recent options flow, from
+    Unusual Whales' real per-alert ask-side/bid-side premium split (genuine
+    trade-side classification -- NOT an approximation from a noisy IBKR
+    bid/ask/last snapshot). Built 2026-08-30 (CEO question: "does options
+    UOA flag bullish vs bearish").
+
+    Standard options-flow convention (describes what real trades actually
+    did -- NOT validated as predictive of future price, same epistemic
+    status as every other informational signal in this codebase):
+      call, majority ask-side  -> bullish   (aggressive call buying)
+      call, majority bid-side  -> bearish-leaning (call selling/writing --
+                                   genuinely ambiguous, could be covered)
+      put,  majority ask-side  -> bearish   (aggressive put buying)
+      put,  majority bid-side  -> bullish-leaning (put selling -- cash-
+                                   secured-put convention, also ambiguous)
+      roughly balanced (40-60% either side) -> neutral, not counted either way
+
+    Fixed real-clock lookback window (DIRECTIONAL_READ_LOOKBACK_MINUTES), NOT
+    a fixed alert count. Real check 2026-08-30: "last 100 alerts" covered
+    2h43m of real time for NVDA but 29 DAYS for ADI and 9 days for WDAY --
+    a side-by-side "current" comparison across tickers was comparing wildly
+    different real time windows without saying so. Now every ticker's read
+    covers the SAME actual clock window; a quiet ticker with nothing in that
+    window honestly fails closed instead of reaching back a month to
+    manufacture a number. Fetches up to 200 (the real API max) and filters
+    to the lookback client-side, since the API's own newer_than filter
+    format isn't verified here.
+
+    Weighted by real premium per alert (not alert count) so one large sweep
+    isn't diluted by several tiny ones. Fails closed (available=False) on
+    any fetch error or no classifiable data -- never guesses.
+    """
+    try:
+        from unusual_whales_client import UnusualWhalesClient
+        raw_alerts = UnusualWhalesClient().flow_alerts(ticker, limit=200)
+    except Exception as exc:
+        return {"available": False, "reason": f"flow-alerts fetch failed: {exc}"}
+    if not raw_alerts:
+        return {"available": False, "reason": "no recent real flow alerts for this ticker"}
+    alerts = [a for a in raw_alerts if a.get("created_at") and
+              _within_lookback(a["created_at"], DIRECTIONAL_READ_LOOKBACK_MINUTES)]
+    if len(alerts) < 5:
+        return {"available": False,
+                "reason": f"only {len(alerts)} real flow alerts in the last "
+                          f"{DIRECTIONAL_READ_LOOKBACK_MINUTES}min -- too little recent activity to trust"}
+
+    bullish_prem = bearish_prem = neutral_prem = 0.0
+    n_sweep = n_opening = 0
+    for a in alerts:
+        ask_prem = float(a.get("total_ask_side_prem") or 0)
+        bid_prem = float(a.get("total_bid_side_prem") or 0)
+        total = ask_prem + bid_prem
+        if total <= 0:
+            continue
+        ask_pct = ask_prem / total
+        right = (a.get("type") or "").lower()
+        if a.get("has_sweep"):
+            n_sweep += 1
+        if a.get("all_opening_trades"):
+            n_opening += 1
+        if 0.4 <= ask_pct <= 0.6:
+            neutral_prem += total
+            continue
+        ask_side = ask_pct > 0.6
+        if (right == "call" and ask_side) or (right == "put" and not ask_side):
+            bullish_prem += total
+        elif (right == "put" and ask_side) or (right == "call" and not ask_side):
+            bearish_prem += total
+
+    if bullish_prem + bearish_prem + neutral_prem <= 0:
+        return {"available": False, "reason": "no classifiable real premium in recent alerts"}
+
+    net_lean = ("bullish" if bullish_prem > bearish_prem * 1.3 else
+                "bearish" if bearish_prem > bullish_prem * 1.3 else "mixed/neutral")
+    return {
+        "available": True, "n_alerts": len(alerts),
+        "bullish_premium": round(bullish_prem, 0), "bearish_premium": round(bearish_prem, 0),
+        "neutral_premium": round(neutral_prem, 0), "n_sweeps": n_sweep, "n_all_opening": n_opening,
+        "net_lean": net_lean,
+    }
+
+
+def _lit_tape_directional_read(ticker: str) -> dict:
+    """Real lit-market (visible exchange) order-flow read for a ticker, from
+    Unusual Whales' /api/lit-flow/{ticker} -- standard aggressor-side
+    classification (trade price vs. real NBBO bid/ask at execution) computed
+    fresh from real recent trades. Built 2026-08-30 as an independent
+    stock-tape cross-check for the options-flow lean above.
+
+    Deliberately NOT sourced from this account's own tape_prints table --
+    that only has real coverage when a live WS tape session happened to be
+    open for that specific ticker (sparse for most names most of the time).
+    This is always available for any real ticker, real-time.
+
+    Regular-session, continuous-trading prints only. Real checks 2026-08-30:
+    (1) unfiltered, this produced absurd 98%+ one-sided splits on both NVDA
+    (sell-side) and TSLA (buy-side, the OPPOSITE extreme) -- both driven by
+    thin, noisy after-hours prints (109/200 sampled trades were extended-
+    hours) rather than a genuine read. ext_hour_sold_codes is real,
+    API-provided (not inferred), so this excludes those directly. (2) Even
+    after that fix, NVDA and TSLA still showed a perfect 0%/100% split --
+    every "regular-session" row left was trade_code="closing_print" /
+    sale_cond_codes="cross_trade": the closing auction, reported as many
+    per-allocation fragments of ONE clearing event, not independent
+    continuous trades. The closing cross has a totally different price-
+    formation mechanism (order-imbalance clearing, not bid/ask crossing) --
+    classifying it against the pre-close NBBO mid is simply the wrong
+    methodology, not a real signal. Excluded too. Fails closed (honestly,
+    not with a misleading number) if too few real continuous trades remain.
+
+    Fixed real-clock lookback window (DIRECTIONAL_READ_LOOKBACK_MINUTES),
+    NOT a fixed trade count -- same reasoning and same real evidence
+    (NVDA/ADI/WDAY's wildly different "last N" time spans) as
+    _options_flow_directional_read above; kept consistent so both halves of
+    a directional read always describe the same real clock window.
+    """
+    try:
+        from unusual_whales_client import UnusualWhalesClient
+        raw_trades = UnusualWhalesClient().lit_flow(ticker, limit=500)
+    except Exception as exc:
+        return {"available": False, "reason": f"lit-flow fetch failed: {exc}"}
+    if not raw_trades:
+        return {"available": False, "reason": "no recent real lit-tape data"}
+    trades = [t for t in raw_trades if t.get("executed_at") and
+              _within_lookback(t["executed_at"], DIRECTIONAL_READ_LOOKBACK_MINUTES)]
+    if not trades:
+        return {"available": False,
+                "reason": f"no real lit-tape trades in the last {DIRECTIONAL_READ_LOOKBACK_MINUTES}min"}
+
+    buy_prem = sell_prem = 0.0
+    n_used = 0
+    for t in trades:
+        if t.get("canceled") or t.get("ext_hour_sold_codes"):
+            continue
+        if t.get("trade_code") in ("closing_print", "opening_print") or t.get("sale_cond_codes") == "cross_trade":
+            continue
+        price, bid, ask = float(t.get("price") or 0), float(t.get("nbbo_bid") or 0), float(t.get("nbbo_ask") or 0)
+        prem = float(t.get("premium") or 0)
+        if price <= 0 or bid <= 0 or ask <= 0 or prem <= 0 or ask <= bid:
+            continue
+        n_used += 1
+        mid = (bid + ask) / 2
+        if price >= mid:
+            buy_prem += prem
+        else:
+            sell_prem += prem
+    total = buy_prem + sell_prem
+    if n_used < 20 or total <= 0:
+        return {"available": False,
+                "reason": f"only {n_used} classifiable continuous-session trades in the last "
+                          f"{DIRECTIONAL_READ_LOOKBACK_MINUTES}min ({len(trades)} real prints total "
+                          f"in that window) -- too thin to trust"}
+    buy_pct = buy_prem / total * 100
+    lean = "buy-side" if buy_pct > 55 else "sell-side" if buy_pct < 45 else "balanced"
+    return {"available": True, "n_trades": n_used, "buy_pct": round(buy_pct, 1), "lean": lean}
+
+
 async def _options_uoa_scan_all(ib) -> None:
     """Full scan across the equity-research-analyst desk's 20-name coverage
     universe (already the account's own curated, prioritized list) plus
@@ -2675,10 +3062,39 @@ async def _options_uoa_scan_all(ib) -> None:
     log.info("Options UOA scan complete: %d contracts across %d tickers, %d flagged unusual",
               total_rows, len(tickers), len(flagged))
     if flagged:
+        # Real gap found 2026-08-30: this used to show the ratio with no
+        # reference point -- meant nothing on its own once the threshold
+        # became per-ticker relative instead of one flat global number.
+        # Now shows what this SPECIFIC ticker's own real threshold was, so
+        # the alert is self-explanatory instead of requiring a lookup.
         lines = [f"  {r['ticker']} {r['expiry']} {r['strike']}{r['right']}: "
-                 f"vol={r['volume']} OI={r['open_interest']} ratio={r['vol_oi_ratio']}x"
+                 f"vol={r['volume']} OI={r['open_interest']} ratio={r['vol_oi_ratio']}x "
+                 f"(this ticker's own threshold: {r['threshold_used']:.2f}x)"
                  for r in flagged]
-        _oversight_notify("Unusual options activity flagged:\n" + "\n".join(lines))
+
+        # Real directional read added 2026-08-30 (CEO question: "does options
+        # UOA flag bullish vs bearish, does it consider stock tape") -- one
+        # real UW flow-alerts lookup + one real lit-flow lookup per UNIQUE
+        # flagged ticker (not per contract), bounding the added API cost.
+        # Both fail closed (available=False) rather than guess.
+        flagged_tickers = sorted({r["ticker"] for r in flagged})
+        directional_lines = []
+        for t in flagged_tickers:
+            opt = _options_flow_directional_read(t)
+            tape = _lit_tape_directional_read(t)
+            opt_str = (f"{opt['net_lean']} (${opt['bullish_premium']:,.0f} bullish vs "
+                       f"${opt['bearish_premium']:,.0f} bearish real premium, "
+                       f"{opt['n_sweeps']} sweeps, {opt['n_all_opening']} all-opening)"
+                       if opt["available"] else f"n/a ({opt['reason']})")
+            tape_str = (f"{tape['lean']} ({tape['buy_pct']}% buy-side of real recent lit volume)"
+                        if tape["available"] else f"n/a ({tape['reason']})")
+            directional_lines.append(f"  {t}: options flow lean = {opt_str} | stock tape = {tape_str}")
+
+        msg = ("Unusual options activity flagged:\n" + "\n".join(lines)
+               + "\n\nReal directional read (options-flow ask/bid-side split + lit-tape "
+                 "cross-check -- describes what real trades did, NOT validated as "
+                 "predictive of future price):\n" + "\n".join(directional_lines))
+        _oversight_notify(msg)
 
 
 async def _options_uoa_loop() -> None:
@@ -5459,7 +5875,8 @@ def _spx_notify(text: str) -> None:
 # strategy, sizing a position, closing a position on discretion) AND
 # programmer decisions (actor="programmer": a code change, a bug fix, a new
 # tool built). Distinct from the existing per-strategy decision logs
-# (_dt_log/_at_log/_st_log/_rm_log/...), which are strategy-scoped, in-memory,
+# (_at_log/_st_log/_rm_log/... -- Day Trader's own dt_log lives in the
+# standalone day_trader_agent.py process since 2026-08-27), strategy-scoped,
 # and rotate (last 200) -- this is the durable, append-only, cross-strategy
 # ledger the skill's audit-trail requirement actually points at.
 OVERSIGHT_LOG_PATH = "oversight_log.jsonl"
@@ -5574,11 +5991,15 @@ def _telegram_format_screener_json(data: dict) -> str:
         vol = f"{r['realized_vol_pct']:.0f}%" if r.get("realized_vol_pct") is not None else "n/a"
         vol_flag = " \u26a0\ufe0fHIGH VOL" if (r.get("realized_vol_pct") or 0) >= 40 else ""
         regime = (r.get("gex_regime") or "n/a").replace("_", " ")
+        wall = (f"{r['wall_strike']:.0f}({r['wall_dist_pct']:+.1f}%)"
+                if r.get("wall_strike") is not None else "n/a")
+        dp_wall = (f"{r['dp_wall_price']:.0f}({r['dp_wall_dist_pct']:+.1f}%)"
+                   if r.get("dp_wall_price") is not None else "n/a")
         lines.append(
             f"\ud83d\udcc8 <b>{r['ticker']}</b> {struct} ({r['dte']}d)\n"
             f"Credit ${r['cons_credit']:.2f} | Risk ${r['max_risk']:.0f} | ROI {r['roi_pct']:.1f}%\n"
             f"Cushion {r['cushion_pct']:.1f}% | Prob {prob} | Vol {vol}{vol_flag}\n"
-            f"Regime: {regime}"
+            f"Regime: {regime} | GammaWall: {wall} | DarkPoolWall: {dp_wall}"
         )
     if len(results) > MAX_CARDS:
         lines.append(f"\n...and {len(results) - MAX_CARDS} more not shown (message length)")
@@ -7848,6 +8269,39 @@ _NEWS_NOISE_BLOCKLIST = [
     "things you didn't know", "things to know about your", "things everyone should know",
     "best credit cards", "best savings account", "best mortgage rate",
     "how to negotiate", "how to ask for a raise",
+    # Personal-advice columns (MarketWatch's "Moneyist" and similar syndicated
+    # Q&A columns) -- real false positive caught 2026-08-27: "'The relationship
+    # quickly deteriorated': My friend's lawyer settled his injury case without
+    # his consent. What can he do?" hit the HIGH-severity "settlement"/"lawsuit"
+    # keywords and got sent to Telegram as if it were corporate/legal news. The
+    # possessive-relationship + "what can/should X do" question format is a
+    # reliable tell for this genre regardless of which HIGH/CRITICAL keyword
+    # the underlying anecdote happens to mention.
+    "moneyist",
+    "my friend's", "my brother's", "my sister's", "my husband's", "my wife's",
+    "my mother's", "my father's", "my neighbor's", "my coworker's",
+    "my boyfriend's", "my girlfriend's", "my ex's", "my roommate's", "my in-law's",
+    "what can he do?", "what can she do?", "what can i do?", "what should i do?",
+    "am i wrong?", "am i the jerk",
+    # Plaintiff law-firm shareholder-lawsuit solicitation wire spam -- real
+    # false positive found 2026-09-01 via the August news backfill test:
+    # 41.6% of everything that cleared the CRITICAL/HIGH severity filter
+    # that month was this exact genre, tripping the "lawsuit"/"class
+    # action"/"settlement"/"investigation" HIGH-severity keywords despite
+    # being 100% client-solicitation boilerplate with zero trading
+    # relevance (same bug class as the Moneyist fix above, different
+    # genre). These templated phrases are shared across the ~10-15 firms
+    # that mass-produce these releases (Rosen, Robbins, Pomerantz, Bragar
+    # Eagel, Glancy Prongay, Levi & Korsinsky, Kessler Topaz, Halper
+    # Sadeh, Kahn Swick, Johnson Fistel, Schall Law Firm, Faruqi, etc.) --
+    # matching the boilerplate phrasing generalizes far better than
+    # maintaining a firm-name list.
+    "suffered losses", "have suffered losses", "secure counsel",
+    "lead plaintiff deadline", "before important deadline", "deadline alert",
+    "class action reminder", "shareholder alert", "investor rights law firm",
+    "trusted investor counsel", "recognized investor counsel",
+    "is investigating whether", "encourages investors",
+    "reminds investors", "if you have losses",
 ]
 
 
@@ -7951,6 +8405,37 @@ TICKER_COMPANY_NAMES: Dict[str, list] = {
 }
 
 
+# Tickers that collide with common English words -- matching them via the
+# bare word-boundary loop below produces false positives from ordinary
+# prose (confirmed live 2026-09-01 via the August news backfill test:
+# "...now trades near 2021 SPAC merger levels" wrongly tagged $NOW on a
+# story about an unrelated company; same pattern reproduced for "stayed
+# low through the quarter" -> $LOW and "cat and mouse" -> $CAT). Real
+# mentions of these companies are still caught via an explicit "$TICKER"
+# reference (the loop above) or TICKER_COMPANY_NAMES (all already have
+# entries: ServiceNow/Lowe's/Caterpillar/Cloudflare/Costco/Shopify, below)
+# -- so excluding them here only removes the unreliable bare-symbol path,
+# not real detection. Found live 2026-09-01/09-02 via two passes of the
+# August news backfill test -- first pass caught NOW/LOW/CAT; a second,
+# more systematic word-list check (rather than a handful of hand-picked
+# sentences) caught NET/COST/SHOP too, after a sent digest already showed
+# real mistagged examples (Escalade/Gibraltar/QUBT/Upstart all wrongly
+# tagged $NET, a Hebrew-language press release tagged $COST). Lesson: test
+# the full ticker list systematically, not a small hand-picked sample.
+_NM_AMBIGUOUS_TICKERS = {"NOW", "LOW", "CAT", "NET", "COST", "SHOP"}
+
+# Company names that are themselves common English words -- the bare-word
+# guard above doesn't help here since the match comes from a real company
+# name (TICKER_COMPANY_NAMES), not the ticker symbol. "Target" the company
+# vs. "target" as in "acquisition target"/"price target" is the confirmed
+# live case (found the same backfill run as the NET/COST/SHOP fix above).
+# Mitigation: require these specific names to appear capitalized-as-written
+# in the ORIGINAL text, not case-insensitively -- reduces (doesn't
+# eliminate -- a sentence-initial "Target" is still ambiguous) the generic
+# lowercase usage that accounts for most of the real false positives.
+_NM_CASE_SENSITIVE_NAMES = {"Target"}
+
+
 def _nm_extract_tickers(text: str) -> list:
     text_upper = text.upper()
     found = []
@@ -7959,13 +8444,19 @@ def _nm_extract_tickers(text: str) -> list:
         if t in STOCK_SECTOR_MAP and t not in found:
             found.append(t)
     for tk in STOCK_SECTOR_MAP:
+        if tk in _NM_AMBIGUOUS_TICKERS:
+            continue
         if len(tk) >= 3 and _re_news.search(r"\b" + tk + r"\b", text_upper) and tk not in found:
             found.append(tk)
     for tk, names in TICKER_COMPANY_NAMES.items():
         if tk in found:
             continue
         for name in names:
-            if _re_news.search(r"\b" + _re_news.escape(name.upper()) + r"\b", text_upper):
+            if name in _NM_CASE_SENSITIVE_NAMES:
+                if _re_news.search(r"\b" + _re_news.escape(name) + r"\b", text):
+                    found.append(tk)
+                    break
+            elif _re_news.search(r"\b" + _re_news.escape(name.upper()) + r"\b", text_upper):
                 found.append(tk)
                 break
     return found[:8]
@@ -8031,6 +8522,185 @@ def _nm_fetch_source(source: dict) -> list:
     except Exception as exc:
         log.debug("News fetch %s: %s", source["name"], exc)
         return []
+
+
+NEWS_MONITOR_STATE_PATH = "news_monitor_state.json"
+
+
+def _nm_save_state() -> None:
+    """Persist the already-alerted fingerprint set so a backend restart
+    doesn't forget what's already been sent to Telegram. Real bug found
+    2026-08-27: nm["seen"] was purely in-memory -- every restart wiped it
+    back to empty, and any story still inside max_age_minutes (120 min) at
+    the next poll got re-evaluated as new and re-sent. On a day with many
+    real restarts (several unrelated fixes deployed today), this meant the
+    same story could hit Telegram repeatedly, once per restart."""
+    nm = state["news_monitor"]
+    try:
+        with open(NEWS_MONITOR_STATE_PATH, "w") as f:
+            json.dump({"seen": nm.get("seen", [])[-2000:]}, f)
+    except Exception as e:
+        log.warning("News monitor state save failed: %s", e)
+
+
+def _nm_load_state() -> None:
+    if not os.path.exists(NEWS_MONITOR_STATE_PATH):
+        return
+    try:
+        with open(NEWS_MONITOR_STATE_PATH, "r") as f:
+            saved = json.load(f)
+        state["news_monitor"]["seen"] = saved.get("seen", [])
+        log.info("News monitor state restored: %d previously-alerted fingerprints",
+                  len(state["news_monitor"]["seen"]))
+    except Exception as e:
+        log.warning("News monitor state load failed: %s", e)
+
+
+# ── FinBERT sentiment + real portfolio-relevance verdict (2026-09-01) ──────
+# CEO instruction: stop sending raw news links; parse each story, decide
+# real portfolio impact/significance/urgency/trade-worthiness, send ONE
+# line + the link. Built with a free, local model (ProsusAI/finbert, CPU
+# inference, no per-call cost) instead of a paid LLM API after the
+# account's anthropic_api_key turned out to be dead too -- CEO explicitly
+# asked "any other ideas before spending any more dollars" first.
+#
+# Real, tested limitation (found before shipping, not after): FinBERT
+# scored "Nvidia guidance smashes estimates, stock surges on AI demand" as
+# 90% NEGATIVE -- it keys off aggressive-sounding verbs ("smashes",
+# "crushes") rather than parsing that beating estimates is positive. Real
+# test set: 8/10 correct on common headline phrasings, both misses were
+# this exact pattern. _NM_SENTIMENT_OVERRIDES below catches the known
+# failure mode; FinBERT's own read is used everywhere else, and its
+# output is only ONE input into the final verdict (combined with the
+# existing keyword-severity tier and real portfolio-relevance), never the
+# sole voice -- a single model quirk can't flip the whole verdict alone.
+_NM_SENTIMENT_OVERRIDES = [
+    (_re_news.compile(r"\b(smash|smashes|smashed|crush|crushes|crushed|top|tops|topped|"
+                       r"beat|beats|blow(?:s|n)? past|exceed|exceeds|exceeded)\b.{0,25}"
+                       r"\b(estimate|estimates|expectation|expectations|guidance|forecast)\b", _re_news.I),
+     "positive"),
+    (_re_news.compile(r"\b(miss|misses|missed|fall short of|falls short of|below)\b.{0,25}"
+                       r"\b(estimate|estimates|expectation|expectations|guidance|forecast)\b", _re_news.I),
+     "negative"),
+    (_re_news.compile(r"\b(cut|cuts|slash(?:es)?|lower(?:s|ed)?|withdraw(?:s|n)?)\b.{0,20}\bguidance\b", _re_news.I),
+     "negative"),
+    (_re_news.compile(r"\b(raise(?:s|d)?|boost(?:s|ed)?|hike(?:s|d)?|lift(?:s|ed)?)\b.{0,20}\bguidance\b", _re_news.I),
+     "positive"),
+]
+
+_nm_finbert = {"tokenizer": None, "model": None, "labels": ["positive", "negative", "neutral"], "load_failed": False}
+
+
+def _nm_load_finbert() -> bool:
+    """Lazy-load once, cache globally -- loading takes real time, inference is fast."""
+    if _nm_finbert["model"] is not None:
+        return True
+    if _nm_finbert["load_failed"]:
+        return False
+    try:
+        from transformers import AutoTokenizer, AutoModelForSequenceClassification
+        _nm_finbert["tokenizer"] = AutoTokenizer.from_pretrained("ProsusAI/finbert")
+        _nm_finbert["model"] = AutoModelForSequenceClassification.from_pretrained("ProsusAI/finbert")
+        _nm_finbert["model"].eval()
+        log.info("FinBERT loaded for news sentiment scoring.")
+        return True
+    except Exception as exc:
+        log.error("FinBERT load failed, news alerts will fall back to keyword-only: %s", exc)
+        _nm_finbert["load_failed"] = True
+        return False
+
+
+def _nm_sentiment(text: str) -> tuple[str, float]:
+    """Returns (label, confidence). Deterministic override checked first for
+    the known "aggressive verb" failure mode; FinBERT's own read otherwise."""
+    for pattern, label in _NM_SENTIMENT_OVERRIDES:
+        if pattern.search(text):
+            return label, 0.99
+    if not _nm_load_finbert():
+        return "neutral", 0.0
+    import torch
+    tok, model, labels = _nm_finbert["tokenizer"], _nm_finbert["model"], _nm_finbert["labels"]
+    inputs = tok(text[:512], return_tensors="pt", truncation=True)
+    with torch.no_grad():
+        logits = model(**inputs).logits
+    probs = torch.nn.functional.softmax(logits, dim=-1)[0]
+    result = {labels[i]: float(probs[i]) for i in range(3)}
+    top = max(result, key=result.get)
+    return top, round(result[top], 3)
+
+
+def _nm_real_open_position_tickers() -> set:
+    """Real current open-position tickers across every in-process strategy,
+    plus Day Trader (separate process since 2026-08-27, one lightweight
+    HTTP call). Best-effort -- a failure here degrades to an empty set
+    rather than blocking the whole news cycle."""
+    tickers = set()
+
+    def _extract(key, pos):
+        if isinstance(pos, dict):
+            for field in ("ticker", "symbol", "underlying"):
+                v = pos.get(field)
+                if isinstance(v, str) and v:
+                    return v.upper()
+        if isinstance(key, str) and key.isalpha() and key.isupper() and 1 <= len(key) <= 5:
+            return key
+        return None
+
+    for strat_key in ("stock_trader", "evc", "manual_trader", "autotrader", "spx_0dte"):
+        try:
+            for k, pos in state.get(strat_key, {}).get("positions", {}).items():
+                tk = _extract(k, pos)
+                if tk:
+                    tickers.add(tk)
+        except Exception:
+            pass
+
+    try:
+        r = requests.get("http://localhost:8010/day-trader/status", timeout=3)
+        if r.ok:
+            for k, pos in r.json().get("positions", {}).items():
+                tk = _extract(k, pos)
+                if tk:
+                    tickers.add(tk)
+    except Exception:
+        pass
+
+    return tickers
+
+
+def _nm_build_verdict(title: str, excerpt: str, tickers: list, severity: str, n_sources: int) -> str:
+    """The actual ask: parse the news, decide portfolio impact + significance
+    + urgency + trade-worthiness, return ONE line (caller appends the URL)."""
+    text = f"{title} {excerpt}"
+    label, conf = _nm_sentiment(text)
+    open_tickers = _nm_real_open_position_tickers()
+    held = [t for t in tickers if t in open_tickers]
+
+    sent_word = {"positive": "Bullish", "negative": "Bearish", "neutral": "Neutral"}[label]
+    sent_tag = f"{sent_word} ({conf:.0%})" if label != "neutral" or conf > 0 else "Unclear sentiment"
+
+    if held:
+        # Real $ at stake right now -- highest-relevance tier regardless of severity keyword.
+        icon = "🚨" if (label != "neutral" and severity in ("CRITICAL", "HIGH")) else "⚠️"
+        action = ("review this open position now" if label == "negative"
+                  else "positive catalyst on a live holding -- no action needed unless taking profit"
+                  if label == "positive" else "no clear direction -- monitor, no action indicated")
+        who = "/".join(f"${t}" for t in held)
+        return f"{icon} HELD {who}: {sent_tag}, {severity.lower()} -- {action}"
+
+    watched = [t for t in tickers if t not in open_tickers]
+    if watched:
+        icon = "🟠" if severity in ("CRITICAL", "HIGH") else "🔵"
+        action = ("worth a look for entry/exit" if severity in ("CRITICAL", "HIGH") and label != "neutral"
+                  else "informational, no action indicated")
+        who = "/".join(f"${t}" for t in watched)
+        return f"{icon} WATCHED {who}: {sent_tag}, {severity.lower()} -- {action}"
+
+    # No specific ticker matched -- market-wide/macro story.
+    if severity == "CRITICAL":
+        return f"🔴 MARKET-WIDE: {sent_tag}, critical -- check overall portfolio exposure"
+    icon = "🟠" if severity == "HIGH" else "⚪"
+    return f"{icon} MARKET-WIDE: {sent_tag}, {severity.lower()} -- informational, no action indicated"
 
 
 async def _news_monitor_coro():
@@ -8174,20 +8844,25 @@ async def _news_monitor_coro():
         nm["alerts"] = (nm["alerts"] + [entry])[-200:]
         seen_set.add(fp)
 
-        sev_icon   = {"CRITICAL": "🔴", "HIGH": "🟠", "NORMAL": "⚪"}.get(sev, "⚪")
-        verify_tag = " ✅ VERIFIED" if verified else ""
-        src_str    = ", ".join(story["sources"][:3])
-        if n > 3:
-            src_str += f" +{n-3}"
-        ticker_str = " ".join(f"${t}" for t in story["tickers"]) if story["tickers"] else ""
-
-        msg = f"{sev_icon} BREAKING NEWS{verify_tag}\n{story['title']}\n\n"
-        msg += f"Sources ({n}): {src_str}\n"
-        if ticker_str:
-            msg += f"Tickers: {ticker_str}\n"
-        msg += f"Time: {time_str}"
-        if story["url"]:
-            msg += f"\n{story['url']}"
+        # Real change 2026-09-01 (CEO instruction): stop sending raw
+        # headline+link dumps. Parse the story, decide real portfolio
+        # impact/significance/urgency/trade-worthiness (FinBERT sentiment +
+        # a real open-position check + the existing keyword-severity tier),
+        # send ONE line + the link. Falls back to the old simple format if
+        # the verdict pipeline throws, so a model/analysis issue degrades
+        # gracefully instead of silently killing news alerts entirely.
+        try:
+            verdict = _nm_build_verdict(story["title"], story.get("excerpt", ""),
+                                         story["tickers"], sev, n)
+            msg = verdict
+            if story["url"]:
+                msg += f"\n{story['url']}"
+        except Exception as exc:
+            log.error("News verdict build failed, falling back to plain format: %s", exc)
+            sev_icon = {"CRITICAL": "🔴", "HIGH": "🟠", "NORMAL": "⚪"}.get(sev, "⚪")
+            msg = f"{sev_icon} {story['title']} (analysis unavailable)"
+            if story["url"]:
+                msg += f"\n{story['url']}"
 
         _rm_telegram(msg)
         log.info("NEWS [%s] verified=%s src=%d: %s", sev, verified, n, story["title"][:70])
@@ -8196,6 +8871,8 @@ async def _news_monitor_coro():
             break
 
     nm["seen"] = list(seen_set)[-2000:]
+    if sent > 0:
+        _nm_save_state()
 
 
 async def _news_monitor_loop():
@@ -8287,7 +8964,6 @@ async def _risk_monitor_coro():
     ib  = state.get("ib")
     at  = state.get("autotrader", {})
     st  = state.get("stock_trader", {})
-    dt  = state.get("day_trader", {})
     # Live net liq, not the static config default -- account_value drifted
     # stale multiple times this session (fixed via a runtime POST 2026-08-10,
     # silently reverted to the 50000.0 code default on every subsequent
@@ -8373,12 +9049,17 @@ async def _risk_monitor_coro():
 
     vix_thresh = float(cfg.get("vix_threshold", 25.0))
     if vix_val and vix_val > vix_thresh:
-        detail = f"VIX={vix_val:.1f} > threshold {vix_thresh:.0f}. Day trader disabled."
-        _rm_log("WARNING", 3, "VIX", detail, "dt_disabled")
-        if cfg.get("auto_disable_dt") and dt.get("enabled"):
-            dt["enabled"] = False
-            _dt_save_state()
-            detail += " (auto-disabled)"
+        # Day Trader auto-disable REMOVED (2026-09-02, CEO decision) -- it
+        # runs as its own standalone process with its own entry/exit
+        # decisions and per-trade risk controls (ATR filter, confirmation
+        # gate, trailing/hard stops); a portfolio-level VIX kill-switch from
+        # main.py is no longer this strategy's responsibility to police.
+        # Note this REMOVES the only volatility-based circuit breaker Day
+        # Trader had -- it now relies entirely on its own per-trade controls,
+        # not a regime-level one. The warning below still fires either way,
+        # informational only now for this rule.
+        detail = f"VIX={vix_val:.1f} > threshold {vix_thresh:.0f}."
+        _rm_log("WARNING", 3, "VIX", detail, "warning_only")
         existing = [v for v in rm["violations"] if v["rule"] == 3]
         if not existing:
             alerts.append(f"RULE 3 WARNING - HIGH VIX\n{detail}")
@@ -8429,9 +9110,17 @@ async def _risk_monitor_coro():
             pos.get("shares", 0) or pos.get("qty", 0))
         _check_concentration(ticker, cost)
 
-    for ticker, pos in dt.get("positions", {}).items():
-        cost = float(pos.get("entry_price", 0)) * int(pos.get("shares", 1))
-        _check_concentration(f"DT:{ticker}", cost)
+    # Day Trader concentration check REMOVED (found 2026-09-07): referenced a
+    # bare `dt` that was never defined anywhere in this file -- a dangling
+    # reference left over from Day Trader's 2026-08-27 extraction into its
+    # own standalone process. Every check cycle that reached this line threw
+    # NameError, which the caller's except Exception swallowed -- silently
+    # dropping the batched Telegram alert for that ENTIRE cycle whenever
+    # Rules 1-4 or this rule's autotrader/stock-trader checks had already
+    # found something worth alerting on. Same reasoning as Rule 3's own
+    # 2026-09-02 update above: Day Trader manages its own per-trade risk
+    # controls now: a portfolio-level concentration check from main.py is
+    # no longer this strategy's responsibility to police.
 
     # ── Send batched Telegram alert ───────────────────────────────────────
     if alerts:
@@ -8471,14 +9160,21 @@ async def lifespan(app: FastAPI):
     # Restore stock trader state from last shutdown
     _st_load_state()
 
-    # Restore day trader state from last shutdown
-    _dt_load_state()
+    # Day trader state is owned by the standalone day_trader_agent.py
+    # process since 2026-08-27 -- nothing to restore here.
 
     # Restore SPX 0DTE state from last shutdown
     _spx_load_state()
 
     # Restore Earnings Vol Crush state from last shutdown
     _evc_load_state()
+    # SPY weekly condor state is now owned by its own standalone process
+    # (spy_weekly_condor_agent.py) -- nothing to restore here since 2026-09-07.
+    # Restore news monitor's already-alerted fingerprints from last shutdown
+    # -- without this, a restart re-sends every still-fresh story to Telegram
+    _nm_load_state()
+    # Restore chart price alerts from last shutdown
+    _chart_alerts_load()
     # Restore Signal Trader state from last shutdown
     _sigt_load_state()
     # Restore FX Trader state from last shutdown
@@ -8510,14 +9206,18 @@ async def lifespan(app: FastAPI):
     log.info("Auto-trader background task started")
     asyncio.create_task(_stock_monitor_loop())
     log.info("Stock trader monitor loop started")
-    asyncio.create_task(_day_trader_monitor_loop())
-    log.info("Day trader monitor loop started")
+    # Day trader monitor loop runs in its own standalone process since
+    # 2026-08-27 (day_trader_agent.py, port 8010) -- see that file's
+    # docstring for why (main.py's own restart instability dropped a real
+    # entry signal on 2026-08-27).
     asyncio.create_task(_spx_monitor_loop())
     log.info("SPX 0DTE monitor loop started")
     asyncio.create_task(_evc_monitor_loop())
     log.info("Earnings Vol Crush monitor loop started")
     asyncio.create_task(_evc_preflight_loop())
     log.info("EVC preflight loop started (morning scan + 3:15 PM reminder)")
+    # SPY weekly condor's monitor loop now runs in its own standalone process
+    # (spy_weekly_condor_agent.py, port 8011) -- extracted 2026-09-07.
     asyncio.create_task(_sigt_monitor_loop())
     log.info("Signal Trader monitor loop started")
     asyncio.create_task(_fx_monitor_loop())
@@ -8528,6 +9228,8 @@ async def lifespan(app: FastAPI):
     log.info("Red-day watcher started (SPY <= -1.5%% -> Telegram)")
     asyncio.create_task(_risk_monitor_loop())
     log.info("Risk monitor loop started")
+    asyncio.create_task(_live_snapshot_broadcaster())
+    log.info("Live data snapshot broadcaster started (/ws/live)")
     asyncio.create_task(_options_uoa_loop())
     log.info("Options unusual-activity scan loop started")
     asyncio.create_task(_news_monitor_loop())
@@ -8587,7 +9289,12 @@ def options_uoa_unusual(limit: int = 50):
     return {
         "last_scan": state.get("options_uoa_last_scan"),
         "universe_size": state.get("options_uoa_universe_size"),
-        "threshold": OPTIONS_UOA_RATIO_THRESHOLD,
+        "threshold_note": (
+            "Threshold is now per-ticker relative (each ticker's own real "
+            "historical p90 vol/OI ratio, fallback "
+            f"{OPTIONS_UOA_RATIO_THRESHOLD}x if <30 scans) since 2026-08-30 -- "
+            "see /options-flow/{ticker} for the specific value used for one name."
+        ),
         "flagged": [dict(r) for r in rows],
     }
 
@@ -8602,8 +9309,9 @@ def options_uoa_ticker(ticker: str, limit: int = 50):
         WHERE ticker = ? ORDER BY scan_time DESC LIMIT ?
     """, (ticker.upper(), limit)).fetchall()
     con.close()
+    current_threshold = _options_uoa_relative_threshold(ticker.upper())
     return {"ticker": ticker.upper(), "last_scan": state.get("options_uoa_last_scan"),
-            "threshold": OPTIONS_UOA_RATIO_THRESHOLD, "rows": [dict(r) for r in rows]}
+            "threshold": current_threshold, "rows": [dict(r) for r in rows]}
 
 
 @app.post("/options-flow/scan-now")
@@ -8833,6 +9541,17 @@ def risk_status():
     violations = rm.get("violations", [])
     critical   = [v for v in violations if v["severity"] == "CRITICAL"]
     warnings   = [v for v in violations if v["severity"] == "WARNING"]
+    # Real bug found 2026-08-26 (unattended CRO check alerted on this):
+    # cfg["account_value"] is a fallback-only default (currently 50000.0)
+    # -- _risk_monitor_coro already pulls LIVE net liq for the real Rule 5
+    # calculation and never uses this static number when IBKR is connected,
+    # but this endpoint was still echoing the raw, stale config value with
+    # nothing to show it wasn't what's actually used. Exposing the real,
+    # currently-effective value here so external checks (and anyone reading
+    # this endpoint) see reality instead of a number that looks miscalibrated
+    # but isn't actually load-bearing.
+    ib = state.get("ib")
+    live_acct_val = (_get_net_liq(ib) if ib and ib.isConnected() else None)
     return {
         "enabled":      rm["enabled"],
         "last_check":   rm.get("last_check"),
@@ -8840,6 +9559,8 @@ def risk_status():
         "market_hours": rm.get("market_hours"),
         "vix":        rm.get("vix_latest"),
         "config":     cfg,
+        "account_value_effective": live_acct_val or cfg.get("account_value", 50000.0),
+        "account_value_source": "live_net_liq" if live_acct_val else "config_fallback (IBKR not connected)",
         "summary": {
             "total_violations": len(violations),
             "critical":         len(critical),
@@ -9013,6 +9734,71 @@ def get_bars(ticker: str, limit: int = 80):
     if ticker not in state["bars"]:
         raise HTTPException(404, f"No bars for {ticker}")
     return state["bars"][ticker][-limit:]
+
+
+@app.get("/bars-1m/{ticker}")
+def get_bars_1m(ticker: str, limit: int = 1200):
+    """Independent 1-min charting bars -- see ONE_MIN_TICKERS. Not fed by
+    /add_ticker's 5-min pipe; use POST /add_ticker_1m to subscribe."""
+    ticker = ticker.upper()
+    if ticker not in state["bars_1m"]:
+        raise HTTPException(404, f"No 1m bars for {ticker} -- POST /add_ticker_1m first")
+    return state["bars_1m"][ticker][-limit:]
+
+
+@app.post("/add_ticker_1m")
+def add_ticker_1m(req: AddTickerRequest):
+    ticker = req.ticker.upper()
+    with _tickers_1m_lock:
+        if ticker not in ONE_MIN_TICKERS:
+            ONE_MIN_TICKERS.append(ticker)
+            log.info(f"Queued {ticker} for 1m streaming — streaming loop will subscribe within 10 s")
+    return {"ok": True, "ticker": ticker}
+
+
+class ChartAlertRequest(BaseModel):
+    ticker: str
+    price: float
+    direction: str   # "above" | "below"
+    note: Optional[str] = None
+
+
+@app.get("/chart-alerts")
+def list_chart_alerts(ticker: Optional[str] = None):
+    alerts = state["chart_alerts"]["alerts"]
+    if ticker:
+        alerts = [a for a in alerts if a["ticker"] == ticker.upper()]
+    return {"alerts": alerts}
+
+
+@app.post("/chart-alerts")
+def create_chart_alert(req: ChartAlertRequest):
+    if req.direction not in ("above", "below"):
+        raise HTTPException(400, "direction must be 'above' or 'below'")
+    alert = {
+        "id": uuid.uuid4().hex[:12],
+        "ticker": req.ticker.upper(),
+        "price": req.price,
+        "direction": req.direction,
+        "note": req.note,
+        "created_at": _utcnow().isoformat(),
+    }
+    with _chart_alerts_lock:
+        state["chart_alerts"]["alerts"].append(alert)
+    _chart_alerts_save()
+    return {"ok": True, "alert": alert}
+
+
+@app.delete("/chart-alerts/{alert_id}")
+def delete_chart_alert(alert_id: str):
+    with _chart_alerts_lock:
+        before = len(state["chart_alerts"]["alerts"])
+        state["chart_alerts"]["alerts"] = [a for a in state["chart_alerts"]["alerts"] if a["id"] != alert_id]
+        removed = before != len(state["chart_alerts"]["alerts"])
+    if not removed:
+        raise HTTPException(404, f"alert {alert_id} not found")
+    _chart_alerts_save()
+    return {"ok": True}
 
 
 @app.get("/technicals/{ticker}")
@@ -12382,6 +13168,36 @@ def pnl_dashboard():
     except Exception:
         pass
 
+    # ── Alpaca account snapshot -- found 2026-09-03 that this dashboard's
+    # "Net Liquidation" was IBKR-only (account_summary() never touches
+    # Alpaca), even though a real, growing share of this account's capital
+    # and trading (GOOG condor, 0DTE butterflies, Ashley signal-follow,
+    # Safe Income once it fires) lives at Alpaca, not IBKR. Same
+    # TradingClient pattern already used by GET /alpaca/positions. Never
+    # fatal to the dashboard if Alpaca is unreachable.
+    alpaca_acct: dict = {}
+    _apositions: list = []
+    try:
+        from alpaca.trading.client import TradingClient as _AlpTC
+        with open(os.path.join(os.path.dirname(__file__), "scanner_config.json")) as _f:
+            _acfg = json.load(_f)
+        if _acfg.get("alpaca_api_key") and _acfg.get("alpaca_secret_key"):
+            _aclient = _AlpTC(_acfg["alpaca_api_key"], _acfg["alpaca_secret_key"],
+                               paper=False, url_override=_acfg.get("alpaca_base_url"))
+            _aacct = _aclient.get_account()
+            _apositions = _aclient.get_all_positions()
+            alpaca_acct = {
+                "cash":   float(_aacct.cash),
+                "equity": float(_aacct.equity),
+                "options_buying_power": float(_aacct.options_buying_power) if _aacct.options_buying_power else None,
+                "unrealized_pnl": round(sum(float(p.unrealized_pl or 0) for p in _apositions), 2),
+                "open_position_count": len(_apositions),
+            }
+    except Exception as exc:
+        log.warning("pnl_dashboard: alpaca account fetch failed: %s", exc)
+
+    combined_net_liquidation = round((acct.get("net_liquidation") or 0) + (alpaca_acct.get("equity") or 0), 2)
+
     con      = sqlite3.connect(JOURNAL_DB_PATH, check_same_thread=False)
     all_rows = con.execute("SELECT * FROM trade_journal ORDER BY id").fetchall()
     desc     = con.execute("SELECT * FROM trade_journal LIMIT 0").description or []
@@ -12395,6 +13211,71 @@ def pnl_dashboard():
         key=lambda t: t["closed_at"], reverse=True,
     )
 
+    # ── Merge in Alpaca-executed strategies tracked via the separate registry
+    # (alpaca_0dte_positions.json, register_position/close_position in
+    # alpaca_0dte_common.py) instead of trade_journal.db -- found 2026-09-03
+    # that GOOG weekly condor and the 0DTE butterflies (SPY/QQQ/IWM) were
+    # completely invisible to this dashboard because they never write to
+    # trade_journal.db at all. Excludes iron_condor_earnings/_INCOMPLETE
+    # (pre-EVC-migration artifacts already tracked via EVC's own direct
+    # trade_journal writes under strategy_type='earnings_vol_crush' --
+    # merging them here too would double-count). Only rows with a real,
+    # non-null close_pnl are included -- some registry entries were
+    # reconciled 2026-09-03 with close_pnl deliberately left null because
+    # the real number wasn't confidently verifiable (MLEG auto-close combo
+    # pricing); showing a fabricated number would be worse than omitting it.
+    _ALPACA_STRATEGY_MAP = {"iron_condor_weekly": "GOOG_CONDOR", "long_butterfly_0dte": None,
+                             "ashley_signal": "ASHLEY_SIGNAL"}
+    try:
+        with open("alpaca_0dte_positions.json") as _f:
+            _alp_reg = json.load(_f)
+        for _p in _alp_reg.get("closed", []):
+            _strat = _p.get("strategy")
+            if _strat not in _ALPACA_STRATEGY_MAP or _p.get("close_pnl") is None:
+                continue
+            _stype = _ALPACA_STRATEGY_MAP[_strat] or f"BUTTERFLY_{_p.get('ticker', '')}"
+            closed_trades.append({
+                "id": None, "opened_at": _p.get("entry_time"), "closed_at": _p.get("closed_at"),
+                "ticker": _p.get("ticker"), "expiry": None, "strike": None, "right": None,
+                "action": {"iron_condor_weekly": "SELL_CONDOR", "ashley_signal": "BUY"}.get(_strat, "BUY_BUTTERFLY"),
+                "qty": _p.get("qty", 1), "entry_price": _p.get("net_entry_credit"), "exit_price": None,
+                "pnl": _p.get("close_pnl"), "pnl_pct": None,
+                "win": 1 if _p.get("close_pnl", 0) > 0 else 0,
+                "exit_reason": "alpaca_registry_close", "strategy_type": _stype,
+                "commission": 0.0, "is_paper": 0, "notes": _p.get("close_reason"),
+                "max_profit": None, "dte": None,
+            })
+        closed_trades.sort(key=lambda t: t["closed_at"], reverse=True)
+    except Exception as exc:
+        log.warning("pnl_dashboard: alpaca registry merge failed: %s", exc)
+
+    # ── Merge in Ashley-signal trades (ashley_signal_trades.json) -- same gap
+    # as above: ashleyklieu_trigger_executor.py computes a real pnl on every
+    # exit but only ever puts it in a Telegram message / oversight_log text
+    # line, never a structured store. Backfilled 2026-09-03 by reconstructing
+    # every real fill from Alpaca's own order history (not just the ones with
+    # a clean "exit FILLED" log line -- 4 of 9 real positions had no matching
+    # close logged in that format at all, including the 764P failed-ladder
+    # loss) rather than parsing log text, which would have missed exactly
+    # those 4. See ashley_signal_trades.json's close_reason per row for how
+    # each was verified.
+    try:
+        with open("ashley_signal_trades.json") as _f:
+            _ashley_reg = json.load(_f)
+        for _t in _ashley_reg.get("closed", []):
+            closed_trades.append({
+                "id": None, "opened_at": _t.get("opened_at"), "closed_at": _t.get("closed_at"),
+                "ticker": _t.get("ticker"), "expiry": None, "strike": _t.get("strike"), "right": _t.get("right"),
+                "action": "BUY", "qty": _t.get("qty", 1), "entry_price": _t.get("entry_price"),
+                "exit_price": _t.get("exit_price"), "pnl": _t.get("pnl"), "pnl_pct": None,
+                "win": _t.get("win"), "exit_reason": "alpaca_registry_close",
+                "strategy_type": "ASHLEY_SIGNAL", "commission": 0.0, "is_paper": 0,
+                "notes": _t.get("close_reason"), "max_profit": None, "dte": None,
+            })
+        closed_trades.sort(key=lambda t: t["closed_at"], reverse=True)
+    except Exception as exc:
+        log.warning("pnl_dashboard: ashley signal registry merge failed: %s", exc)
+
     daily: dict = defaultdict(float)
     for t in closed_trades:
         day = (t.get("closed_at") or "")[:10]
@@ -12406,15 +13287,24 @@ def pnl_dashboard():
         cum += pnl
         daily_pnl.append({"date": day, "pnl": round(pnl, 2), "cumulative": round(cum, 2)})
 
-    _REAL_EXIT_SET = {
-        "profit_target", "stop_loss", "roll_close",
-        "roll_max", "roll_no_credit", "21dte", "manual", "rotation",
-        "hard_stop", "dma23_trail", "max_hold",   # stock trader
-        "manual_close", "force_close",             # day trader
-        "max_loss_stop",                           # EVC
-        "trailing_stop",                           # auto-trader CSP/LEAP
-    }
-    real_closed   = [t for t in closed_trades if t.get("exit_reason") in _REAL_EXIT_SET]
+    # Found 2026-09-03: this used to be an INCLUDE whitelist of known-good exit
+    # reasons -- and EVC alone has accumulated 7+ bespoke, incident-descriptive
+    # exit reasons over time (e.g. "expired_ITM_call_spread_max_loss_real_..."
+    # "premature_stop_pre_earnings_gate_bug", "manual_close_3of4_legs_1_..."),
+    # none of which were ever added to the whitelist. Net effect: ALL 11 of
+    # EVC's real (is_paper=0) closed trades were silently excluded from every
+    # stat on this dashboard (total_realized_pnl, win_rate, EVC's own
+    # per-strategy card) -- real net -$1,653 completely invisible. A
+    # dynamically-worded reason from Manual Trader ("profit_target_hit
+    # ($+18.19 >= $18.0)") was excluded the same way. Checked the full real
+    # distribution: "orphaned" is the ONLY genuinely non-informative value in
+    # the entire table (274 rows) -- every other exit_reason, however
+    # bespoke-worded, represents a real completed close. An EXCLUDE list is
+    # inherently more robust here: a new incident can only ever produce a new
+    # DESCRIPTIVE reason (which should count), never accidentally resurrect
+    # "orphaned" as if it were a real exit.
+    _JUNK_EXIT_REASONS = {"orphaned", "unknown", None, ""}
+    real_closed   = [t for t in closed_trades if t.get("exit_reason") not in _JUNK_EXIT_REASONS]
     closed_pnls   = [t["pnl"] for t in real_closed if t.get("pnl") is not None]
     wins          = [t for t in real_closed if t.get("win") == 1]
     losses        = [t for t in real_closed if t.get("win") == 0]
@@ -12484,7 +13374,7 @@ def pnl_dashboard():
 
     total_commission = round(sum(t.get("commission") or 0 for t in real_closed), 2)
     total_realized   = round(sum(closed_pnls), 2) if closed_pnls else 0.0
-    total_unrealized = round(float(acct.get("unrealized_pnl") or 0), 2)
+    total_unrealized = round(float(acct.get("unrealized_pnl") or 0) + float(alpaca_acct.get("unrealized_pnl") or 0), 2)
 
     # ── Build open_positions: IBKR is the source of truth when connected ──────
     # Enrich each IBKR portfolio item with journal metadata (entry price, IV, etc.)
@@ -12593,8 +13483,50 @@ def pnl_dashboard():
             if (t.get("opened_at") or "") >= recent_cutoff
         ]
 
+    # ── Merge in currently-OPEN Alpaca-registry positions (added 2026-09-04) ──
+    # Real gap found live: visible_open only ever came from IBKR's own
+    # portfolio_items above -- a position actually held at Alpaca (the 0DTE
+    # butterflies, Ashley signal-follow, GOOG condor) was completely invisible
+    # here WHILE STILL OPEN, even though its P&L is already folled into
+    # alpaca_acct's aggregate unrealized_pnl a few lines up. Made concrete
+    # 2026-09-04: 3 real trades (QQQ butterfly, IWM butterfly, Ashley SPY
+    # 770C) sat open all morning with zero visibility on this dashboard --
+    # the user could see the TOTAL move but not which position caused it.
+    # Reuses _apositions (already fetched above for alpaca_acct -- no extra
+    # API call) for real, live qty/market_value/unrealized_pnl per leg.
+    try:
+        _apos_by_symbol = {p.symbol: p for p in _apositions}
+        with open("alpaca_0dte_positions.json") as _f:
+            _alp_reg_open = json.load(_f)
+        for _pid, _p in _alp_reg_open.get("positions", {}).items():
+            for _leg in _p.get("legs", []):
+                _sym = _leg.get("symbol", "")
+                _ap = _apos_by_symbol.get(_sym)
+                if _ap is None:
+                    continue   # already closed at Alpaca but registry hasn't caught up yet
+                _right = _sym[-9] if len(_sym) >= 9 else None
+                _expiry = ("20" + _sym[-15:-9]) if len(_sym) >= 15 else None
+                visible_open.append({
+                    "id": None, "ticker": _p.get("ticker"),
+                    "strategy_type": f"{_p.get('strategy', 'alpaca')}_{_leg.get('leg', '')}".upper(),
+                    "action": "BUY" if str(_ap.side).endswith("LONG") else "SELL",
+                    "strike": _leg.get("strike"), "right": _right, "expiry": _expiry,
+                    "qty": abs(float(_ap.qty)),
+                    "entry_price": _leg.get("fill"),
+                    "avg_cost": float(_ap.avg_entry_price) if _ap.avg_entry_price else None,
+                    "market_value": float(_ap.market_value) if _ap.market_value else None,
+                    "unrealized_pnl": round(float(_ap.unrealized_pl), 2) if _ap.unrealized_pl else 0.0,
+                    "live_iv_entry": None, "roll_count": 0,
+                    "opened_at": _p.get("entry_time"), "dte": None, "is_paper": 0,
+                    "pos_id": _pid,
+                })
+    except Exception as exc:
+        log.warning("pnl_dashboard: alpaca open-position merge failed: %s", exc)
+
     return {
         "account":  acct,
+        "alpaca_account": alpaca_acct,
+        "combined_net_liquidation": combined_net_liquidation,
         "is_live":  state.get("is_live", False),
         "stats": {
             "total_trades":         len(real_closed),
@@ -13651,1131 +14583,94 @@ def stock_trader_history(days: int = Query(30, ge=1, le=365)):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# DAY TRADER — intraday breakout positions, force-close by 15:45 ET
-# Same signals as Stock Trader; exits via profit target, hard stop, or EOD close.
+# DAY TRADER — extracted to a standalone process 2026-08-27 (day_trader_agent.py,
+# port 8010). Real incident that motivated this: main.py crashed/restarted 5x
+# between 8:48-9:37 AM that morning (a Windows asyncio ProactorEventLoop
+# AssertionError under heavy concurrent I/O), and daytrader_scanner.py's
+# top-ranked candidate that day (CRWD, score 95.5, real +10.08% earnings gap)
+# was submitted to /day-trader/signal at the exact moment main.py was mid-restart
+# and got a connection error -- the day's best signal silently lost to bad
+# timing. daytrader_scanner.py now posts candidates directly to the standalone
+# agent (bypasses main.py entirely for the time-critical entry path); these
+# endpoints are thin proxies/file-readers so the frontend needs no changes.
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _dt_log(action: str, ticker: str, detail: str) -> None:
-    from zoneinfo import ZoneInfo
-    entry = {
-        "time":   datetime.now(ZoneInfo("America/New_York")).strftime("%H:%M:%S ET"),
-        "action": action,
-        "ticker": ticker,
-        "detail": detail,
-    }
-    dt = state["day_trader"]
-    dt["decisions"].append(entry)
-    dt["decisions"] = dt["decisions"][-200:]
-    log.info("[DayTrader] %s %s: %s", action, ticker, detail)
+DAY_TRADER_AGENT_URL = "http://localhost:8010"
 
 
-def _dt_save_state() -> None:
-    dt = state["day_trader"]
-    try:
-        with open(DT_STATE_PATH, "w") as f:
-            json.dump({
-                "enabled":      dt["enabled"],
-                "config":       dt["config"],
-                "positions":    dt["positions"],
-                "closed_today": dt.get("closed_today", [])[-100:],
-                "decisions":    dt.get("decisions", [])[-200:],
-            }, f, indent=2, default=str)
-        # TEMPORARY diagnostic (2026-08-18): closed_today was found empty on
-        # disk only ~13 minutes after a real trade closed, with no restart in
-        # between and no other code path found that clears it -- every direct
-        # hypothesis (duplicate save/load site, mid-session reload, a second
-        # close-handling path, a shared daily-reset routine) was checked and
-        # ruled out via static code reading. Logging the caller + count on
-        # every save until the actual overwrite is caught live. Remove once
-        # task 2026-08-18-003 is closed.
-        import traceback as _tb
-        _caller = _tb.extract_stack()[-2]
-        log.info("[DT_SAVE_DIAG] closed_today=%d positions=%d caller=%s:%d(%s)",
-                  len(dt.get("closed_today", [])), len(dt.get("positions", {})),
-                  _caller.filename.split("\\")[-1], _caller.lineno, _caller.name)
-    except Exception as e:
-        log.warning("Day trader state save failed: %s", e)
-
-
-def _dt_load_state() -> None:
-    if not os.path.exists(DT_STATE_PATH):
-        return
-    try:
-        with open(DT_STATE_PATH, "r") as f:
-            saved = json.load(f)
-        dt = state["day_trader"]
-        if "config" in saved:
-            dt["config"].update(saved["config"])
-        if "enabled" in saved:
-            dt["enabled"] = saved["enabled"]
-        # Only restore same-day positions to avoid stale overnight entries
-        today = date.today().isoformat()
-        restored = {
-            tk: pos for tk, pos in saved.get("positions", {}).items()
-            if pos.get("entry_date") == today
-        }
-        # Clear stale live prices on load — monitor will repopulate them fresh
-        for pos in restored.values():
-            pos.pop("live_price", None)
-            pos.pop("live_pnl", None)
-        # KNOWN LIMITATION (documented 2026-08-07, not fixed): if a restored
-        # position is phase=0 (buy order placed but not yet confirmed filled
-        # before the restart), the monitor's phase-0 check relies on
-        # ib.trades()/ib.fills(), which only cover THIS connection's session
-        # -- a genuinely-still-pending order from before the restart won't
-        # appear there and will be misread as unfilled, marking it
-        # BUY_LAPSED even if it's actually still live at IBKR. Narrow window
-        # (a marketable LIMIT order should resolve within seconds per today's
-        # evidence), but real: avoid restarting with a phase=0 position on
-        # the books. A proper fix would reconcile via ib.reqAllOpenOrders()
-        # (asks IBKR directly, not client-cache-dependent) before trusting
-        # any phase=0 restored position, not yet implemented.
-        dt["positions"]    = restored
-        dt["closed_today"] = [r for r in saved.get("closed_today", [])
-                               if r.get("exit_date") == today]
-        dt["decisions"]    = saved.get("decisions", [])
-        log.info("Day trader state restored: %d open, %d closed today",
-                 len(restored), len(dt["closed_today"]))
-    except Exception as exc:
-        log.warning("Day trader state load failed: %s", exc)
-
-
-def _close_dt_position(ticker: str, pos: dict, exit_px: float,
-                        exit_type: str, pnl: float,
-                        commission: float = 0.0) -> None:
-    """Record a closed day trade to closed_today + trade journal."""
-    dt = state["day_trader"]
-    entry_px = pos.get("entry_price", exit_px)
-    pnl_pct  = round((exit_px - entry_px) / entry_px * 100, 3) if entry_px else 0.0
-    record = {
-        "ticker":      ticker,
-        "entry_date":  pos.get("entry_date"),
-        "exit_date":   date.today().isoformat(),
-        "entry_price": round(entry_px, 4),
-        "exit_price":  round(exit_px, 4),
-        "shares":      pos.get("shares", 0),
-        "pnl":         round(pnl, 2),
-        "pnl_pct":     pnl_pct,
-        "exit_type":   exit_type,
-        "win":         pnl > 0,
-    }
-    dt["closed_today"].append(record)
-    dt["closed_today"] = dt["closed_today"][-100:]
-    try:
-        con = sqlite3.connect(JOURNAL_DB_PATH, check_same_thread=False)
-        con.execute("""
-            INSERT INTO trade_journal
-                (opened_at, closed_at, ticker, action, qty,
-                 entry_price, exit_price, pnl, pnl_pct, win,
-                 exit_reason, strategy_type, score, vol_ratio, commission, is_paper)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """, (
-            pos.get("entry_date"), date.today().isoformat(),
-            ticker, "BUY", pos.get("shares", 0),
-            round(entry_px, 4), round(exit_px, 4),
-            round(pnl, 2), pnl_pct, 1 if pnl > 0 else 0,
-            exit_type, "DAY_BREAKOUT",
-            pos.get("composite_score"), pos.get("vol_ratio"),
-            round(commission, 4),
-            _is_paper(),
-        ))
-        con.commit()
-        con.close()
-    except Exception as exc:
-        log.warning("Day trade journal insert failed: %s", exc)
-    _dt_log(exit_type.upper(), ticker,
-            f"exit={exit_px:.2f} pnl={'+'if pnl>=0 else''}{pnl:.2f} ({pnl_pct:+.2f}%)")
-    _dt_save_state()
-
-
-def _dt_pretrade_review(ib, alp_client, ticker: str, shares: int, entry_price: float,
-                         cost: float, stop_price, profit_price, cfg: dict) -> dict:
-    """Real-time CRO/CFO pre-trade review for a Day Trader entry -- BLOCKING
-    gate, same pattern as EVC's (task 2026-08-20-003), extended here per
-    task 2026-08-20-006. CRO: what-if scenarios at stop/target/flat. CFO:
-    this trade's cost against the cross-strategy capital budget (both this
-    strategy's own per-trade cap and total portfolio headroom -- task
-    2026-08-20-006's cro_cfo_capital_budget). Also: options-flow/UOA
-    cross-check (informational) and an exit-plan verification (a stop or
-    trailing-stop must actually be configured for this entry).
-    Returns {"approved": bool, "findings": [...], "scenarios": [...]}."""
-    findings: list[str] = []
-    approved = True
-
-    # ── CRO: what-if scenarios ──────────────────────────────────────────
-    scenarios = []
-    if stop_price is not None and profit_price is not None:
-        stop_pnl = round((stop_price - entry_price) * shares, 2)
-        target_pnl = round((profit_price - entry_price) * shares, 2)
-        scenarios = [
-            {"case": "stop hit", "price": stop_price, "pnl": stop_pnl},
-            {"case": "flat", "price": entry_price, "pnl": 0.0},
-            {"case": "target hit", "price": profit_price, "pnl": target_pnl},
-        ]
-    else:
-        trail_pct = float(cfg.get("trailing_stop_pct", 0.3))
-        worst_pnl = round(-entry_price * (trail_pct / 100) * shares, 2)
-        scenarios = [{"case": f"trailing stop ({trail_pct}% worst-case from entry)",
-                      "price": round(entry_price * (1 - trail_pct / 100), 2), "pnl": worst_pnl}]
-        findings.append(f"trailing-stop mode: no fixed target, worst-case ~${worst_pnl:.0f} "
-                         f"if stopped immediately at {trail_pct}%")
-
-    # ── CFO: cost vs cross-strategy capital budget ──────────────────────
-    try:
-        budget = _cro_cfo_capital_budget(ib, alp_client)
-        findings.append(f"CFO: trade cost ${cost:,.0f} vs per-strategy cap ${budget['per_strategy_cap']:,.0f}, "
-                         f"portfolio headroom ${budget['headroom']:,.0f} of ${budget['total_budget']:,.0f} budget")
-        if cost > budget["per_strategy_cap"]:
-            findings.append(f"EXCEEDS per-strategy cap (${budget['per_strategy_cap']:,.0f})")
-            approved = False
-        if cost > budget["headroom"]:
-            findings.append(f"EXCEEDS remaining portfolio headroom (${budget['headroom']:,.0f})")
-            approved = False
-    except Exception as exc:
-        findings.append(f"could not compute capital budget: {exc}")
-        approved = False
-
-    # ── Options flow (UOA) cross-check -- informational, not a gate ─────
-    try:
-        con = sqlite3.connect(TAPE_DB_PATH, check_same_thread=False)
-        con.row_factory = sqlite3.Row
-        rows = con.execute("""
-            SELECT * FROM options_unusual_activity WHERE ticker = ?
-            ORDER BY scan_time DESC LIMIT 5
-        """, (ticker.upper(),)).fetchall()
-        con.close()
-        if rows:
-            flagged = [r for r in rows if r["is_unusual"]]
-            findings.append(f"options flow: {len(flagged)}/{len(rows)} recent scans flagged unusual for {ticker}")
-        else:
-            findings.append(f"options flow: no recent UOA scan data for {ticker}")
-    except Exception as exc:
-        findings.append(f"options flow check failed: {exc}")
-
-    # ── Exit-plan verification ──────────────────────────────────────────
-    if stop_price is None and not cfg.get("use_trailing_stop", True):
-        findings.append("NO EXIT PLAN: neither a fixed stop nor trailing stop configured")
-        approved = False
-    else:
-        findings.append(f"exit plan: {'trailing stop ' + str(cfg.get('trailing_stop_pct')) + '%' if stop_price is None else f'fixed stop @ {stop_price}'}")
-
-    return {"approved": approved, "findings": findings, "scenarios": scenarios}
-
-
-async def _day_trader_monitor_coro(ib) -> None:
-    """One monitor cycle: fill detection, profit target, stop, EOD force-close.
-
-    Migrated to Alpaca execution 2026-08-19 (CEO directive: all trading
-    moves off IBKR given the recurring PDT rejections) -- IBKR stays the
-    live-price data source (reqTickersAsync below, unchanged), but every
-    order now goes out via Alpaca. This is NOT a simple venue swap like
-    EVC's migration was: this exact coroutine is where the 2026-08-07
-    incident happened (9 real positions orphaned with no stop-loss, from a
-    timing bug in the old fill-detection/phase-transition logic) -- so the
-    redesign below deliberately favors robustness over cleverness:
-
-    - Fixed stop/target mode now submits ONE Alpaca BRACKET order at entry
-      (order_class=BRACKET, take_profit+stop_loss attached atomically) --
-      this is a real safety IMPROVEMENT over the old IBKR path, which had
-      a real gap between "fill detected" and "protective orders placed"
-      (exactly the gap 2026-08-07's bug lived in). Trailing-stop mode still
-      has that gap by necessity (the trail needs the real fill price as
-      its anchor, so it can only be placed AFTER the fill) -- same risk
-      shape as before for that mode specifically.
-    - Exit detection no longer tries to track/match individual Alpaca
-      bracket child-leg order ids (their exact shape wasn't verified live
-      before this shipped -- market was closed at build time). Instead it
-      polls whether the Alpaca POSITION still exists each cycle; once it's
-      gone, the protective order fired, and the real fill is recovered via
-      Alpaca's own closed-orders history. Simpler and more robust than
-      leg-id matching, at the cost of not knowing exactly which protective
-      order fired without an extra lookup (which the code below does).
-    - The old "fallback poll for positions that pre-date the OCA bracket"
-      branch is gone -- that existed only for IBKR positions from before
-      the bracket feature existed. Every Alpaca position here always has
-      real broker-side protection from the moment it fills, so there's no
-      legacy case to catch.
-
-    NOT yet live-fire-verified end-to-end (built with market closed) --
-    verify with a small real trade before trusting this at normal size.
-    """
-    from zoneinfo import ZoneInfo
-    dt  = state["day_trader"]
-    cfg = dt["config"]
-
-    if not dt["positions"] and not dt.get("watching"):
-        return
-
-    # alpaca-py's TradingClient is synchronous (requests-based HTTP) --
-    # this coroutine runs on the shared IBKR streaming event loop
-    # (_run_in_streaming_loop), so every Alpaca call below is offloaded to
-    # a thread via run_in_executor rather than blocking that loop (which
-    # also carries real-time IBKR data for every other strategy).
-    _loop = asyncio.get_event_loop()
-
-    async def _dt_alp_call(func, *args):
-        return await _loop.run_in_executor(None, func, *args)
-
-    _alp_cfg_cached = None
-    _alp_client_cached = None
-
-    def _dt_alp_client():
-        nonlocal _alp_cfg_cached, _alp_client_cached
-        if _alp_client_cached is None:
-            _alp_cfg_cached = _alp_load_config()
-            _alp_client_cached = _alp_client(_alp_cfg_cached)
-        return _alp_client_cached
-
-    now_et = datetime.now(ZoneInfo("America/New_York"))
-
-    # Parse force_close_time ("HH:MM") into today's datetime
-    try:
-        fc_h, fc_m = map(int, cfg["force_close_time"].split(":"))
-        force_close_dt = now_et.replace(hour=fc_h, minute=fc_m, second=0, microsecond=0)
-    except Exception:
-        force_close_dt = now_et.replace(hour=15, minute=45, second=0, microsecond=0)
-
-    # NOTE: trades_by_oid/fills_by_oid are built AFTER the watching-
-    # confirmation block below, not here -- see that block's trailing comment
-    # for why (confirmed 2026-08-07: a snapshot taken here went stale the
-    # moment a watching candidate confirmed and got a real order placed later
-    # in this same coroutine call, causing the position loop to immediately
-    # mark genuinely-filled buys as "BUY_LAPSED" and drop them from tracking
-    # with zero stop-loss protection -- 9 real fills were orphaned this way
-    # across two incidents before both root causes were found and fixed).
-
-    # Live prices via reqTickersAsync for all phase-1 positions AND watching
-    # candidates (need volume too for the latter -- confirmation gate). We
-    # intentionally avoid portfolio.marketPrice — it can bleed in other lots
-    # (e.g., auto-hedge SPY puts showing as SPY price) and is unreliable in paper.
-    ticker_snapshot: dict = {}
-    volume_snapshot: dict = {}
-    phase1_tickers = [t for t, p in dt["positions"].items() if p.get("phase", 0) == 1]
-    watching_tickers = list(dt.get("watching", {}).keys())
-    snapshot_tickers = list(dict.fromkeys(phase1_tickers + watching_tickers))
-    if snapshot_tickers:
-        try:
-            from ib_insync import Stock as IbStock
-            contracts = [IbStock(t, "SMART", "USD") for t in snapshot_tickers]
-            tickers = await ib.reqTickersAsync(*contracts)
-            for tk in tickers:
-                sym = tk.contract.symbol
-                mid = None
-                if tk.ask > 0 and tk.bid > 0:
-                    mid = (tk.bid + tk.ask) / 2
-                elif tk.close > 0:
-                    # prefer official EOD close over last (last can be option cross-contamination)
-                    mid = tk.close
-                elif tk.last > 1.0:
-                    # only use last if it's plausibly a stock price (> $1)
-                    mid = tk.last
-                if mid:
-                    ticker_snapshot[sym] = round(mid, 4)
-                if tk.volume and tk.volume > 0:
-                    volume_snapshot[sym] = float(tk.volume)   # cumulative day volume
-        except Exception as ex:
-            log.debug("Day trader reqTickers failed: %s", ex)
-
-    # ── Watching: price + volume confirmation gate ─────────────────────────
-    # Candidates the /day-trader/signal gates already approved, but not yet
-    # bought -- only buy once a real move shows up (price AND volume), not
-    # blind at the signal price. See trailing_stop_pct's config comment for
-    # the validated backtest behind this (real 1-min-bar sample, 2026-08-07).
-    if dt.get("watching"):
-        confirm_pct = float(cfg.get("confirm_pct", 0.35))
-        confirm_window = int(cfg.get("confirm_window_min", 60))
-
-        for ticker, watch in list(dt["watching"].items()):
-            live_price = ticker_snapshot.get(ticker)
-            cum_vol    = volume_snapshot.get(ticker)
-            watch["live_price"] = live_price
-
-            # Window is per-candidate, anchored to WHEN IT WAS REGISTERED, not a
-            # fixed 9:30 market-open clock. Fixed 2026-08-07: the old version
-            # anchored every candidate to today's literal 9:30 open, so any
-            # scan run later than confirm_window_min after the open (e.g. a
-            # manual re-trigger at 10:39) registered candidates whose window
-            # had ALREADY expired -- every one got dropped within seconds with
-            # zero chance to confirm, regardless of real price action. Safe
-            # (fails closed, no orders placed) but silently broke every re-run
-            # outside the 9:30-10:30 window.
-            try:
-                registered_at = _parse_utc(watch.get("registered_at", ""))
-                age_min = (_utcnow() - registered_at).total_seconds() / 60
-            except Exception:
-                age_min = 0.0
-            if age_min > confirm_window:
-                _dt_log("WATCH_EXPIRED", ticker,
-                        f"no confirmation within {confirm_window}min of registration — dropped")
-                dt["watching"].pop(ticker, None)
-                continue
-
-            if live_price is None or cum_vol is None:
-                continue   # no live snapshot yet this cycle -- try again next poll
-
-            last_cum = watch.get("last_cum_volume")
-            watch["last_cum_volume"] = cum_vol
-            if last_cum is None:
-                continue   # first observation -- need a second one to get an interval
-
-            interval_vol = max(0.0, cum_vol - last_cum)
-            watch.setdefault("interval_volumes", []).append(interval_vol)
-            vols = sorted(watch["interval_volumes"])
-            median_vol = vols[len(vols) // 2]
-
-            confirm_price = watch["day_open"] * (1 + confirm_pct / 100)
-            price_ok  = live_price >= confirm_price
-            volume_ok = interval_vol >= median_vol
-            if not (price_ok and volume_ok):
-                continue
-
-            if len(dt["positions"]) >= cfg["max_positions"]:
-                _dt_log("WATCH_DROPPED", ticker, "confirmed but at capacity — dropped")
-                dt["watching"].pop(ticker, None)
-                continue
-
-            # ── Confirmed: fire the actual entry now, at the confirmed price ──
-            pos_size_pct = float(cfg.get("position_size_pct", 0))
-            if pos_size_pct > 0:
-                net_liq = _get_net_liq(ib)
-                position_size = (net_liq * pos_size_pct / 100) if net_liq > 0 else cfg["position_size"]
-            else:
-                position_size = cfg["position_size"]
-
-            max_mult = float(cfg.get("max_price_multiple", 1.5))
-            if live_price > position_size * max_mult:
-                _dt_log("WATCH_DROPPED", ticker,
-                        f"confirmed but too expensive for target size: 1sh=${live_price:.2f} "
-                        f"> {max_mult}x target ${position_size:.0f} — dropped, not force-bought")
-                dt["watching"].pop(ticker, None)
-                continue
-
-            shares = max(1, int(position_size / live_price))
-            buf_pct = 0.50 if (now_et.hour == 9 and now_et.minute < 45) else cfg["limit_buffer_pct"]
-            lmt_px  = round(live_price * (1 + buf_pct / 100), 2)
-
-            use_trailing = cfg.get("use_trailing_stop", True)
-            stop_px_planned = profit_px_planned = None
-            if not use_trailing:
-                stop_px_planned   = round(lmt_px * (1 - cfg["hard_stop_pct"] / 100), 2)
-                profit_px_planned = round(lmt_px * (1 + cfg["profit_target_pct"] / 100), 2)
-
-            # ── Real-time CRO/CFO pre-trade review -- BLOCKING gate (task 2026-08-20-006) ──
-            alp_client = _dt_alp_client()
-            cost = round(shares * lmt_px, 2)
-            review = _dt_pretrade_review(ib, alp_client, ticker, shares, lmt_px, cost,
-                                          stop_px_planned, profit_px_planned, cfg)
-            review_summary = f"CRO/CFO pre-trade review for {ticker}: " + " | ".join(review["findings"])
-            _dt_log("PRETRADE_REVIEW", ticker,
-                    f"{'APPROVED' if review['approved'] else 'REJECTED'} — {review_summary}")
-            _oversight_log("risk_manager" if not review["approved"] else "trader",
-                            "pretrade_review", f"Day Trader {ticker}: {review_summary}",
-                            outcome="APPROVED" if review["approved"] else "REJECTED — no order placed")
-            if not review["approved"]:
-                _oversight_notify(f"Day Trader pre-trade review REJECTED {ticker}: {review_summary}", high_priority=False)
-                dt["watching"].pop(ticker, None)
-                continue
-
-            try:
-                if use_trailing:
-                    # Protective order can't be attached yet -- it needs the
-                    # real fill price as its trail anchor, placed once filled.
-                    alp_order = await _dt_alp_call(_alp_entry_buy, alp_client, ticker, shares, lmt_px)
-                else:
-                    # ONE order: entry + native OCO stop/target attached
-                    # atomically -- no gap between fill and protection.
-                    alp_order = await _dt_alp_call(_alp_bracket_buy, alp_client, ticker, shares, lmt_px, stop_px_planned, profit_px_planned)
-            except Exception as exc:
-                _dt_log("ERROR", ticker, f"confirmed entry order failed: {exc}")
-                dt["watching"].pop(ticker, None)
-                continue
-
-            dt["positions"][ticker] = {
-                "entry_date":        date.today().isoformat(),
-                "entry_price":       live_price,
-                "shares":            shares,
-                "cost":              round(shares * live_price, 2),
-                "buy_order_id":      str(alp_order.id),
-                "stop_order_id":     None,
-                "stop_price":        stop_px_planned,
-                "profit_price":      profit_px_planned,
-                "phase":             0,
-                "venue":             "alpaca",
-                "alert_fired_at":    _utcnow().isoformat(),
-                "composite_score":   watch.get("composite_score"),
-                "vol_ratio":         watch.get("vol_ratio"),
-                "live_price":        None,
-                "live_pnl":          None,
-                "atr14":             watch.get("atr14"),
-                "atr_pct":           watch.get("atr_pct"),
-            }
-            _dt_log("CONFIRMED", ticker,
-                    f"day_open={watch['day_open']:.2f} -> confirmed@{live_price:.2f} "
-                    f"({(live_price/watch['day_open']-1)*100:+.2f}%, vol={interval_vol:.0f} "
-                    f"vs median={median_vol:.0f}) — LIMIT BUY {shares}sh @ {lmt_px:.2f} via Alpaca "
-                    f"(ord#{alp_order.id}, {'trailing' if use_trailing else 'bracket'})")
-            dt["watching"].pop(ticker, None)
-        _dt_save_state()
-
-    to_remove: list[str] = []
-
-    for ticker, pos in list(dt["positions"].items()):
-        phase = pos.get("phase", 0)
-
-        # Refresh live price / pnl — portfolio first, then ticker snapshot
-        if ticker in ticker_snapshot:
-            pos["live_price"] = ticker_snapshot[ticker]
-
-        # Always compute P&L from our specific entry and shares — isolates this
-        # day-trade lot from any other lots (hedges, long-term holds) in the account
-        if pos.get("live_price") and pos.get("entry_price"):
-            pos["live_pnl"] = round(
-                (pos["live_price"] - pos["entry_price"]) * pos.get("shares", 0), 2
-            )
-
-        # Track running high + implied current trail level for display only --
-        # IBKR's native TRAIL order ratchets the actual stop server-side; this
-        # is purely so /day-trader/status can show where it currently sits.
-        if pos.get("is_trailing") and pos.get("live_price"):
-            pos["running_high"] = max(pos.get("running_high", pos["live_price"]), pos["live_price"])
-            trail_pct = float(cfg.get("trailing_stop_pct", 0.3))
-            pos["stop_price"] = round(pos["running_high"] * (1 - trail_pct / 100), 2)
-
-        ALP_STILL_WORKING = {"new", "partially_filled", "accepted", "pending_new",
-                             "pending_review", "held", "calculated", "accepted_for_bidding"}
-
-        # ── Phase 0: waiting for buy fill ─────────────────────────────────
-        if phase == 0:
-            buy_oid = pos.get("buy_order_id")
-            if not buy_oid:
-                continue
-            try:
-                order = await _dt_alp_call(_alp_get_order, _dt_alp_client(), buy_oid)
-            except Exception as exc:
-                log.debug("Day trader Alpaca order poll failed %s: %s", ticker, exc)
-                continue
-            status = str(getattr(order.status, "value", order.status))
-            if status in ALP_STILL_WORKING:
-                # Cancel stale pending buys (genuinely still working at Alpaca)
-                try:
-                    alert_ts = pos.get("alert_fired_at", "")
-                    at = _parse_utc(alert_ts) if alert_ts else None
-                    age_min = (_utcnow() - at).total_seconds() / 60 if at is not None else 0
-                except Exception:
-                    age_min = 0
-                if age_min > cfg.get("signal_freshness_min", 30):
-                    try:
-                        await _dt_alp_call(_dt_alp_client().cancel_order_by_id, buy_oid)
-                    except Exception:
-                        pass
-                    _dt_log("BUY_CANCELLED", ticker,
-                            f"stale after {age_min:.0f}min — cancelled, slot freed")
-                    to_remove.append(ticker)
-                continue
-            if status == "filled" and order.filled_qty and float(order.filled_qty) > 0:
-                fill_px = round(float(order.filled_avg_price), 4)
-                pos["entry_price"] = fill_px
-                pos["phase"]       = 1
-
-                if cfg.get("use_trailing_stop", True):
-                    # Trailing stop needs the real fill price as its anchor,
-                    # so it's placed now, AFTER the fill -- validated
-                    # 2026-08-07 on real 1-min bars: the old fixed 0.25%/1.0%
-                    # pair measured a real 67.3% win rate against an 80%
-                    # breakeven requirement (-0.16%/trade); trailing at the
-                    # empirically-best 0.3% width flipped this to
-                    # +0.14%/trade on the same sample. See trailing_stop_pct's
-                    # config comment for the full backtest.
-                    trail_pct = float(cfg.get("trailing_stop_pct", 0.3))
-                    init_stop_px = round(fill_px * (1 - trail_pct / 100), 2)
-                    pos["is_trailing"]  = True
-                    pos["running_high"] = fill_px
-                    pos["stop_price"]   = init_stop_px
-                    pos["profit_price"] = None
-                    try:
-                        trail_order = await _dt_alp_call(_alp_trailing_stop, _dt_alp_client(), ticker, pos["shares"], trail_pct)
-                        pos["stop_order_id"] = str(trail_order.id)
-                        _dt_log("FILLED", ticker,
-                                f"fill={fill_px:.2f} x{pos['shares']}sh via Alpaca "
-                                f"TRAILING STOP {trail_pct}% (init={init_stop_px:.2f}, ord#{trail_order.id})")
-                    except Exception as exc:
-                        _dt_log("ERROR", ticker,
-                                f"TRAILING STOP placement failed after real fill: {exc} — "
-                                f"POSITION IS UNPROTECTED, CHECK ALPACA NOW")
-                        _oversight_notify(
-                            f"Day Trader/Alpaca: {ticker} filled but trailing-stop placement FAILED "
-                            f"({exc}) — position unprotected, check Alpaca NOW.", high_priority=True)
-                        _oversight_log("trader", "execution_issue",
-                                        f"Day Trader/Alpaca {ticker} trailing-stop placement failed post-fill: {exc}",
-                                        outcome="needs immediate manual review — unprotected position")
-                    _dt_save_state()
-                    continue
-
-                # Fixed mode: stop/target were already attached atomically as
-                # part of the bracket order at entry -- nothing more to place.
-                _dt_log("FILLED", ticker,
-                        f"fill={fill_px:.2f} x{pos['shares']}sh via Alpaca BRACKET "
-                        f"stop@{pos.get('stop_price')} target@{pos.get('profit_price')} "
-                        f"(protected atomically at entry)")
-                _dt_save_state()
-            else:
-                _dt_log("BUY_LAPSED", ticker, f"buy not filled (status={status}) — removing")
-                to_remove.append(ticker)
-            continue
-
-        # ── Phase 3: MKT sell (EOD force-close) in flight ──────────────────
-        if phase == 3:
-            sell_oid = pos.get("stop_order_id")
-            if not sell_oid:
-                continue
-            try:
-                order = await _dt_alp_call(_alp_get_order, _dt_alp_client(), sell_oid)
-            except Exception as exc:
-                log.debug("Day trader Alpaca close-order poll failed %s: %s", ticker, exc)
-                continue
-            status = str(getattr(order.status, "value", order.status))
-            if status not in ALP_STILL_WORKING:
-                exit_px = round(float(order.filled_avg_price), 4) if order.filled_avg_price else pos.get("entry_price", 0)
-                pnl     = round((exit_px - pos["entry_price"]) * pos["shares"], 2)
-                exit_type = pos.get("pending_exit_type", "force_close")
-                _close_dt_position(ticker, pos, exit_px, exit_type, pnl, commission=0.0)
-                to_remove.append(ticker)
-            continue
-
-        # ── Phase 1: active intraday position ──────────────────────────────
-        # Protective order (bracket OCO pair or trailing stop) lives at
-        # Alpaca, not here -- poll whether the POSITION still exists rather
-        # than trying to track/match individual child-leg order ids (not
-        # verified live before this shipped; existence-based detection is
-        # simpler and doesn't depend on getting that shape exactly right).
-        alp_pos = await _dt_alp_call(_alp_has_position, _dt_alp_client(), ticker)
-        if alp_pos is None:
-            closing = await _dt_alp_call(_alp_last_closing_fill, _dt_alp_client(), ticker)
-            if closing:
-                exit_px      = round(float(closing.filled_avg_price), 4)
-                closed_qty   = float(closing.filled_qty or pos["shares"])
-                pnl          = round((exit_px - pos["entry_price"]) * closed_qty, 2)
-            else:
-                # Shouldn't happen, but fail safe with the best estimate on hand
-                exit_px = pos.get("stop_price") or pos.get("entry_price", 0)
-                pnl     = round((exit_px - pos["entry_price"]) * pos["shares"], 2)
-            exit_type = ("trailing_stop" if pos.get("is_trailing")
-                         else ("profit_target" if pnl >= 0 else "hard_stop"))
-            _close_dt_position(ticker, pos, exit_px, exit_type, pnl, commission=0.0)
-            to_remove.append(ticker)
-            continue
-
-        # Force-close time reached?
-        if now_et >= force_close_dt:
-            try:
-                closing_order = await _dt_alp_call(_alp_close_stock, _dt_alp_client(), ticker)
-            except Exception as exc:
-                _dt_log("ERROR", ticker, f"EOD force-close order failed: {exc} — CHECK ALPACA MANUALLY")
-                _oversight_notify(
-                    f"Day Trader/Alpaca: {ticker} EOD force-close FAILED ({exc}) — check Alpaca manually NOW.",
-                    high_priority=True)
-                continue
-            if closing_order is None:
-                # Already flat (protective order fired between the existence
-                # check above and now) -- next cycle's phase-1 branch won't
-                # run since alp_pos will be None; nothing more to do here.
-                continue
-            pos["phase"]             = 3
-            pos["stop_order_id"]     = str(closing_order.id)
-            pos["pending_exit_type"] = "force_close"
-            _dt_log("FORCE_CLOSE", ticker,
-                    f"EOD force-close @ {cfg['force_close_time']} ET via Alpaca (ord#{closing_order.id})")
-            _dt_save_state()
-
-    for ticker in to_remove:
-        dt["positions"].pop(ticker, None)
-    if to_remove:
-        _dt_save_state()
-
-
-async def _day_trader_monitor_loop() -> None:
-    """Background task: monitor day trader positions every 30 seconds."""
-    await asyncio.sleep(30)   # let server finish starting
-    while True:
-        await asyncio.sleep(30)
-        dt = state["day_trader"]
-        if not dt["enabled"] or (not dt["positions"] and not dt.get("watching")):
-            continue
-        if not state.get("connected") or not state.get("ib"):
-            continue
-        from zoneinfo import ZoneInfo
-        now_et = datetime.now(ZoneInfo("America/New_York"))
-        # Only run during market hours + 15 min buffer after close for fill detection
-        if now_et.weekday() >= 5:
-            continue
-        mkt_open  = now_et.replace(hour=9,  minute=25, second=0, microsecond=0)
-        mkt_close = now_et.replace(hour=16, minute=15, second=0, microsecond=0)
-        if not (mkt_open <= now_et <= mkt_close):
-            continue
-        ib = state["ib"]
-        try:
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(
-                None,
-                lambda: _run_in_streaming_loop(_day_trader_monitor_coro(ib), timeout=25),
-            )
-        except Exception as exc:
-            log.warning("Day trader monitor error: %s", exc)
-
-
-# ── Day Trader request models ──────────────────────────────────────────────────
-
-class DayConfigRequest(BaseModel):
-    position_size:        Optional[float] = None
-    position_size_pct:    Optional[float] = None   # % of net-liq per trade (0 = use fixed $)
-    max_positions:        Optional[int]   = None
-    hard_stop_pct:        Optional[float] = None
-    profit_target_pct:    Optional[float] = None
-    force_close_time:     Optional[str]   = None   # "HH:MM"
-    signal_freshness_min: Optional[int]   = None
-    limit_buffer_pct:     Optional[float] = None
-    daily_profit_target:  Optional[float] = None
-    expected_return_pct:  Optional[float] = None
-    win_rate_est:         Optional[float] = None
-    min_composite_score:  Optional[float] = None   # 0 = disabled, 75-85 recommended
-    use_entry_filters:    Optional[bool]  = None   # ATR+DMA23+σ gate (default True)
-    atr_period:           Optional[int]   = None
-    atr_multiplier:       Optional[float] = None
-    std_dev_period:       Optional[int]   = None
-    std_dev_threshold:    Optional[float] = None
-    use_vol_filter:       Optional[bool]  = None   # DT-VOL gate: own ATR% volatility character (default True)
-    min_atr_pct:          Optional[float] = None   # required ATR14 as % of price
-    use_confirmation_gate: Optional[bool]  = None   # False = revert to old blind-entry behavior
-    confirm_pct:           Optional[float] = None   # price move from today's open required to confirm
-    confirm_window_min:    Optional[int]   = None   # confirmation watch window, minutes from open
-    use_trailing_stop:     Optional[bool]  = None   # False = revert to fixed profit_target_pct/hard_stop_pct
-    trailing_stop_pct:     Optional[float] = None   # trailing stop distance from running high since entry
-    max_price_multiple:    Optional[float] = None   # skip candidates where 1 share costs > this x target size
-
-
-# ── Day Trader endpoints ───────────────────────────────────────────────────────
-
-@app.post("/day-trader/signal")
-async def day_trader_signal(req: StockSignalRequest):
-    """Called by breakout_scanner on BREAKOUT — same payload as /stock-trader/signal."""
-    from zoneinfo import ZoneInfo
-    dt  = state["day_trader"]
-    cfg = dt["config"]
-
-    if not dt["enabled"]:
-        return {"status": "skipped", "reason": "disabled"}
-
-    now_et = datetime.now(ZoneInfo("America/New_York"))
-    if now_et.weekday() >= 5:
-        return {"status": "skipped", "reason": "weekend"}
-    mkt_open  = now_et.replace(hour=9,  minute=30, second=0, microsecond=0)
-    # Stop new entries 30 min before force-close so position has time to work
-    try:
-        fc_h, fc_m = map(int, cfg["force_close_time"].split(":"))
-        entry_cutoff = now_et.replace(hour=fc_h, minute=max(0, fc_m - 30),
-                                      second=0, microsecond=0)
-    except Exception:
-        entry_cutoff = now_et.replace(hour=15, minute=15, second=0, microsecond=0)
-    if not (mkt_open <= now_et <= entry_cutoff):
-        return {"status": "skipped", "reason": "outside_hours"}
-
-    if req.alert_fired_at:
-        try:
-            fired_at = _parse_utc(req.alert_fired_at)
-            age_min = (_utcnow() - fired_at).total_seconds() / 60
-            if age_min > cfg["signal_freshness_min"]:
-                return {"status": "skipped", "reason": "stale_signal", "age_min": round(age_min, 1)}
-        except Exception:
-            pass
-
-    ticker = req.ticker.upper()
-    if ticker in dt["positions"]:
-        _dt_log("SKIPPED", ticker, "already have open position")
-        return {"status": "skipped", "reason": "already_open"}
-    if ticker in dt.get("watching", {}):
-        _dt_log("SKIPPED", ticker, "already watching for confirmation")
-        return {"status": "skipped", "reason": "already_watching"}
-    if len(dt["positions"]) >= cfg["max_positions"]:
-        _dt_log("SKIPPED", ticker,
-                f"at capacity ({len(dt['positions'])}/{cfg['max_positions']} positions)")
-        return {"status": "skipped", "reason": "at_capacity"}
-
-    min_score = float(cfg.get("min_composite_score", 0))
-    if min_score > 0:
-        score = req.composite_score
-        if score is None:
-            _dt_log("SKIPPED", ticker, f"no composite_score in signal — min={min_score:.0f} required")
-            return {"status": "skipped", "reason": "no_score"}
-        if score < min_score:
-            _dt_log("SKIPPED", ticker, f"score={score:.0f} < min={min_score:.0f}")
-            return {"status": "skipped", "reason": "score_below_threshold",
-                    "score": score, "min": min_score}
-
-    ib = state.get("ib")
-    if not ib or not ib.isConnected():
-        raise HTTPException(503, "IBKR not connected")
-
-    # ── ATR / 23-DMA / 3.7σ entry filters + DT-VOL gate ───────────────────
-    # Both gates share one _fetch_entry_metrics call (40 daily bars) but are
-    # independently toggleable: use_entry_filters confirms TODAY's move is
-    # already unusually large; use_vol_filter instead requires the ticker's
-    # own PERSISTENT volatility character (ATR14 as % of price, known before
-    # today's open) to clear a floor -- see min_atr_pct's config comment for
-    # why (500-ticker/5yr same-day-mover study, 2026-08-06).
-    need_metrics = cfg.get("use_entry_filters", True) or cfg.get("use_vol_filter", True)
-    dt_metrics: dict = {}
-    if need_metrics:
-        try:
-            _loop_pre = asyncio.get_event_loop()
-            dt_metrics = await _loop_pre.run_in_executor(
-                None,
-                lambda: _run_in_streaming_loop(
-                    _fetch_entry_metrics(ib, ticker), timeout=20
-                ),
-            )
-        except Exception:
-            dt_metrics = {}
-        if not dt_metrics:
-            _dt_log("SKIPPED", ticker, "entry-filter data unavailable — skipping")
-            return {"status": "skipped", "reason": "filter_data_unavailable"}
-
-    if cfg.get("use_entry_filters", True):
-        atr_req = float(cfg.get("atr_multiplier", 1.8))
-        sig_req = float(cfg.get("std_dev_threshold", 3.7))
-
-        if dt_metrics["atr_mult"] < atr_req:
-            _dt_log("SKIPPED", ticker,
-                    f"ATR filter: range={dt_metrics['atr_mult']:.2f}× < {atr_req}× ATR14")
-            return {"status": "skipped", "reason": "atr_filter",
-                    "atr_mult": dt_metrics["atr_mult"], "required": atr_req}
-
-        if dt_metrics["std_score"] < sig_req:
-            _dt_log("SKIPPED", ticker,
-                    f"σ filter: {dt_metrics['std_score']:.2f}σ < {sig_req}σ threshold")
-            return {"status": "skipped", "reason": "std_dev_filter",
-                    "std_score": dt_metrics["std_score"], "required": sig_req}
-
-    if cfg.get("use_vol_filter", True):
-        atr_pct_req = float(cfg.get("min_atr_pct", 2.5))
-        atr_pct_val = dt_metrics.get("atr_pct", 0.0)
-        if atr_pct_val < atr_pct_req:
-            _dt_log("SKIPPED", ticker,
-                    f"DT-VOL filter: ATR%={atr_pct_val:.2f}% < {atr_pct_req}% "
-                    f"(ticker too low-volatility for a reliable 0.5%+ intraday day)")
-            return {"status": "skipped", "reason": "vol_filter",
-                    "atr_pct": atr_pct_val, "required": atr_pct_req}
-
-    if dt_metrics:
-        _dt_log("FILTERS_PASS", ticker,
-                f"atr={dt_metrics.get('atr_mult', 0):.2f}×ATR14  σ={dt_metrics.get('std_score', 0):.2f}  "
-                f"ATR%={dt_metrics.get('atr_pct', 0):.2f}%  dma23={dt_metrics.get('dma23', 0):.2f} (exit floor)")
-
-    # ── Confirmation gate (added 2026-08-07) ──────────────────────────────
-    # Everything above still gates on the STATIC signal (ATR%/score/etc, same
-    # as before) -- this decides whether to WATCH a ticker at all. Once a
-    # candidate clears those gates, don't buy blind at the signal price;
-    # register it and let _day_trader_monitor_coro confirm a real price+volume
-    # move before any order fires. See trailing_stop_pct's config comment for
-    # the validated backtest (67.3% real win rate blind vs the confirmation+
-    # trailing-stop version's +0.14%/trade on the same 147-trade sample).
-    if cfg.get("use_confirmation_gate", True):
-        dt["watching"][ticker] = {
-            "day_open":          req.price,
-            "registered_at":     _utcnow().isoformat(),
-            "composite_score":   req.composite_score,
-            "vol_ratio":         req.vol_ratio,
-            "atr14":             dt_metrics.get("atr14"),
-            "atr_pct":           dt_metrics.get("atr_pct"),
-            "last_cum_volume":   None,
-            "interval_volumes":  [],
-            "live_price":        None,
-        }
-        _dt_log("WATCHING", ticker,
-                f"day_open={req.price:.2f} -- awaiting {cfg.get('confirm_pct', 0.35)}% move + "
-                f"volume confirmation (window {cfg.get('confirm_window_min', 60)}min from open)")
-        _dt_save_state()
-        return {"status": "watching", "ticker": ticker, "day_open": req.price}
-
-    price = req.price
-    # 10% of account net-liq when position_size_pct is set; else fixed dollar amount
-    pos_size_pct = float(cfg.get("position_size_pct", 0))
-    if pos_size_pct > 0:
-        net_liq = _get_net_liq(ib)
-        position_size = (net_liq * pos_size_pct / 100) if net_liq > 0 else cfg["position_size"]
-    else:
-        position_size = cfg["position_size"]
-
-    max_mult = float(cfg.get("max_price_multiple", 1.5))
-    if price > position_size * max_mult:
-        _dt_log("SKIPPED", ticker,
-                f"too expensive for target size: 1sh=${price:.2f} > {max_mult}x target "
-                f"${position_size:.0f} — skipped, not force-bought")
-        return {"status": "skipped", "reason": "too_expensive_for_size",
-                "price": price, "target_position_size": position_size, "max_multiple": max_mult}
-
-    shares = max(1, int(position_size / price))
-    # Widen limit buffer during 9:30-9:45 opening volatility window (spreads $0.20-0.80)
-    buf_pct = 0.50 if (now_et.hour == 9 and now_et.minute < 45) else cfg["limit_buffer_pct"]
-    lmt_px = round(price * (1 + buf_pct / 100), 2)
-    cost   = round(shares * price, 2)
-
-    async def _do_buy(ib):
-        contract = Stock(ticker, "SMART", "USD")
-        await ib.qualifyContractsAsync(contract)
-        if not contract.conId:
-            raise ValueError(f"Cannot qualify {ticker}")
-        buy_ord = LimitOrder("BUY", shares, lmt_px)
-        buy_ord.tif = "DAY"
-        trade = ib.placeOrder(contract, buy_ord)
-        await asyncio.sleep(0.5)
-        return trade.order.orderId
-
-    try:
-        loop   = asyncio.get_event_loop()
-        buy_id = await loop.run_in_executor(
-            None,
-            lambda: _run_in_streaming_loop(_do_buy(ib), timeout=15),
-        )
-    except (ValueError, TimeoutError, RuntimeError) as exc:
-        _dt_log("ERROR", ticker, f"order placement failed: {exc}")
-        raise HTTPException(500, str(exc))
-
-    profit_px = round(price * (1 + cfg["profit_target_pct"] / 100), 2)
-    stop_px   = round(price * (1 - cfg["hard_stop_pct"] / 100), 2)
-
-    dt["positions"][ticker] = {
-        "entry_date":        date.today().isoformat(),
-        "entry_price":       price,
-        "shares":            shares,
-        "cost":              cost,
-        "buy_order_id":      buy_id,
-        "stop_order_id":     None,
-        "stop_price":        stop_px,
-        "profit_price":      profit_px,
-        "phase":             0,
-        "alert_fired_at":    req.alert_fired_at or _utcnow().isoformat(),
-        "composite_score":   req.composite_score,
-        "vol_ratio":         req.vol_ratio,
-        "live_price":        None,
-        "live_pnl":          None,
-        "atr14":             dt_metrics.get("atr14"),
-        "atr_pct":           dt_metrics.get("atr_pct"),
-    }
-    score_str = f" score={req.composite_score:.0f}" if req.composite_score is not None else ""
-    _dt_log("ENTERED", ticker,
-            f"LIMIT BUY {shares}sh @ {lmt_px:.2f} "
-            f"(signal={price:.2f} cost=${cost:,.0f} ord#{buy_id}) "
-            f"target={profit_px:.2f} stop={stop_px:.2f}{score_str}")
-    _dt_save_state()
-    return {"status": "ordered", "ticker": ticker, "shares": shares,
-            "limit_price": lmt_px, "cost": cost, "order_id": buy_id}
+def _dt_agent_unreachable(exc) -> HTTPException:
+    return HTTPException(503, f"Day Trader agent (port 8010) unreachable: {exc}")
 
 
 @app.get("/day-trader/status")
 def day_trader_status():
-    dt  = state["day_trader"]
-    cfg = dt["config"]
-    open_positions = dt["positions"]
-    closed         = dt.get("closed_today", [])
-
-    capital_deployed = sum(
-        p.get("shares", 0) * p.get("entry_price", 0)
-        for p in open_positions.values()
-    )
-    closed_pnl = sum(r.get("pnl", 0) for r in closed)
-    open_pnl   = sum(
-        p.get("live_pnl", 0) or 0
-        for p in open_positions.values()
-        if p.get("phase", 0) == 1
-    )
-    today_pnl = closed_pnl + open_pnl
-
-    # EOD stats from closed trades
-    n          = len(closed)
-    wins       = [r for r in closed if r.get("win")]
-    losses     = [r for r in closed if not r.get("win")]
-    gross_profit = sum(r["pnl"] for r in wins)
-    gross_loss   = sum(r["pnl"] for r in losses)
-    avg_ret_pct  = (sum(r.get("pnl_pct", 0) for r in closed) / n) if n else 0
-    avg_win_pct  = (sum(r.get("pnl_pct", 0) for r in wins)   / len(wins))   if wins   else 0
-    avg_loss_pct = (sum(r.get("pnl_pct", 0) for r in losses) / len(losses)) if losses else 0
-    best  = max(closed, key=lambda r: r.get("pnl", 0), default=None)
-    worst = min(closed, key=lambda r: r.get("pnl", 0), default=None)
-    total_capital_traded = sum(
-        r.get("entry_price", 0) * r.get("shares", 0) for r in closed
-    ) + capital_deployed
-    exit_breakdown = {}
-    for r in closed:
-        et = r.get("exit_type", "unknown")
-        exit_breakdown[et] = exit_breakdown.get(et, 0) + 1
-
-    eod_summary = {
-        "total_trades":          n,
-        "wins":                  len(wins),
-        "losses":                len(losses),
-        "win_rate":              round(len(wins) / n * 100, 1) if n else 0,
-        "avg_return_pct":        round(avg_ret_pct, 3),
-        "avg_win_pct":           round(avg_win_pct, 3),
-        "avg_loss_pct":          round(avg_loss_pct, 3),
-        "gross_profit":          round(gross_profit, 2),
-        "gross_loss":            round(gross_loss, 2),
-        "profit_factor":         round(gross_profit / abs(gross_loss), 2) if gross_loss else None,
-        "best_trade":            {"ticker": best["ticker"],  "pnl": best["pnl"],  "pnl_pct": best["pnl_pct"]}  if best  else None,
-        "worst_trade":           {"ticker": worst["ticker"], "pnl": worst["pnl"], "pnl_pct": worst["pnl_pct"]} if worst else None,
-        "total_capital_traded":  round(total_capital_traded, 2),
-        "exit_breakdown":        exit_breakdown,
-        # profit_target_pct/hard_stop_pct only actually apply when use_trailing_stop
-        # is off -- shown here for reference either way, but when trailing is on
-        # (the default) trailing_stop_pct is the real, active exit mechanism.
-        "profit_target_pct":     cfg["profit_target_pct"],
-        "hard_stop_pct":         cfg["hard_stop_pct"],
-        "use_trailing_stop":     cfg.get("use_trailing_stop", True),
-        "trailing_stop_pct":     cfg.get("trailing_stop_pct"),
-        "daily_profit_target":   cfg["daily_profit_target"],
-        "goal_achieved":         today_pnl >= cfg["daily_profit_target"],
-    }
-
-    return {
-        "enabled":      dt["enabled"],
-        "config":       cfg,
-        "positions":    open_positions,
-        "watching":     dt.get("watching", {}),   # candidates awaiting price+volume confirmation, not yet bought
-        "closed_today": closed,
-        "decisions":    dt.get("decisions", [])[-50:],
-        "eod_summary":  eod_summary,
-        "summary": {
-            "open_positions":   len(open_positions),
-            "watching":         len(dt.get("watching", {})),
-            "capital_deployed": round(capital_deployed, 2),
-            "closed_pnl":       round(closed_pnl, 2),
-            "open_pnl":         round(open_pnl, 2),
-            "today_pnl":        round(today_pnl, 2),
-            "today_trades":     n,
-            "goal_pct":         round(today_pnl / cfg["daily_profit_target"] * 100, 1)
-                                if cfg["daily_profit_target"] > 0 else 0,
-        },
-    }
+    try:
+        r = requests.get(f"{DAY_TRADER_AGENT_URL}/day-trader/status", timeout=10)
+        r.raise_for_status()
+        return r.json()
+    except Exception as exc:
+        raise _dt_agent_unreachable(exc)
 
 
 @app.post("/day-trader/enable")
 def day_trader_enable(enabled: bool = True):
-    dt = state["day_trader"]
-    dt["enabled"] = enabled
-    _dt_log("CONFIG", "—", f"{'enabled' if enabled else 'disabled'} by user")
-    _dt_save_state()
-    return {"enabled": dt["enabled"]}
+    try:
+        r = requests.post(f"{DAY_TRADER_AGENT_URL}/day-trader/enable",
+                           params={"enabled": enabled}, timeout=10)
+        r.raise_for_status()
+        return r.json()
+    except Exception as exc:
+        raise _dt_agent_unreachable(exc)
 
 
 @app.post("/day-trader/config")
-def day_trader_config(req: DayConfigRequest):
-    dt  = state["day_trader"]
-    cfg = dt["config"]
-    updates: dict = req.model_dump(exclude_none=True)
-    cfg.update(updates)
-
-    # Retroactively reprice open positions when profit_target_pct changes
-    if "profit_target_pct" in updates:
-        new_pct = updates["profit_target_pct"]
-        repriced = []
-        for ticker, pos in dt["positions"].items():
-            if pos.get("phase", 0) in (0, 1) and pos.get("entry_price"):
-                old_target = pos.get("profit_price")
-                pos["profit_price"] = round(pos["entry_price"] * (1 + new_pct / 100), 2)
-                repriced.append(f"{ticker}: ${old_target}->${pos['profit_price']}")
-        if repriced:
-            _dt_log("REPRICE", "—", f"profit_target→{new_pct}%: {', '.join(repriced)}")
-
-    # Log max_positions change prominently so operator knows new capacity
-    if "max_positions" in updates:
-        open_n = len(dt["positions"])
-        _dt_log("CONFIG", "—",
-                f"max_positions→{updates['max_positions']} (currently {open_n} open)")
-
-    _dt_log("CONFIG", "—", f"updated: {updates}")
-    _dt_save_state()
-    return {"config": cfg}
+async def day_trader_config(req: Request):
+    try:
+        body = await req.json()
+        r = requests.post(f"{DAY_TRADER_AGENT_URL}/day-trader/config", json=body, timeout=10)
+        r.raise_for_status()
+        return r.json()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise _dt_agent_unreachable(exc)
 
 
 @app.post("/day-trader/close/{ticker}")
-async def day_trader_close(ticker: str):
-    """Manually close a day trader position immediately."""
-    ticker = ticker.upper()
-    dt  = state["day_trader"]
-    pos = dt["positions"].get(ticker)
-    if not pos:
-        raise HTTPException(404, f"{ticker} not in open day trader positions")
-    ib = state.get("ib")
-    if not ib or not ib.isConnected():
-        raise HTTPException(503, "IBKR not connected")
-
-    if pos.get("phase", 0) == 0:
-        buy_oid = pos.get("buy_order_id")
-        async def _cancel_buy(ib):
-            ot = {t.order.orderId: t for t in ib.openTrades()}
-            if buy_oid and buy_oid in ot:
-                ib.cancelOrder(ot[buy_oid].order)
-                await asyncio.sleep(0.5)
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, lambda: _run_in_streaming_loop(_cancel_buy(ib), timeout=15))
-        dt["positions"].pop(ticker, None)
-        _dt_log("MANUAL_CANCEL", ticker, f"pending buy ord#{buy_oid} cancelled")
-        _dt_save_state()
-        return {"status": "cancelled", "ticker": ticker}
-
-    stop_oid   = pos.get("stop_order_id")
-    target_oid = pos.get("target_order_id")
-    async def _do_close(ib):
-        ot = {t.order.orderId: t for t in ib.openTrades()}
-        for oid in (stop_oid, target_oid):
-            if oid and oid in ot:
-                ib.cancelOrder(ot[oid].order)
-        await asyncio.sleep(1)
-        contract = Stock(ticker, "SMART", "USD")
-        mkt_ord = Order()
-        mkt_ord.orderType     = "MKT"
-        mkt_ord.action        = "SELL"
-        mkt_ord.totalQuantity = pos["shares"]
-        mkt_ord.tif           = "DAY"
-        trade = ib.placeOrder(contract, mkt_ord)
-        await asyncio.sleep(0.5)
-        return trade.order.orderId
-
-    loop    = asyncio.get_event_loop()
-    sell_id = await loop.run_in_executor(None, lambda: _run_in_streaming_loop(_do_close(ib), timeout=15))
-    pos["phase"]             = 3
-    pos["stop_order_id"]     = sell_id
-    pos["pending_exit_type"] = "manual_close"
-    _dt_log("MANUAL_CLOSE", ticker, f"MKT SELL {pos['shares']}sh (ord#{sell_id})")
-    _dt_save_state()
-    return {"status": "closing", "ticker": ticker, "order_id": sell_id}
+def day_trader_close(ticker: str):
+    try:
+        r = requests.post(f"{DAY_TRADER_AGENT_URL}/day-trader/close/{ticker}", timeout=15)
+        if r.status_code == 404:
+            raise HTTPException(404, r.json().get("detail", "not found"))
+        r.raise_for_status()
+        return r.json()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise _dt_agent_unreachable(exc)
 
 
 @app.get("/day-trader/goal")
 def day_trader_goal():
-    """Calculate capital required to hit the daily profit target.
-
-    Fixed 2026-08-07: the old formula was pos_size * win_rate * exp_ret,
-    which only ever counted the WIN side -- it had no -(1-win_rate)*avg_loss
-    term, so it wasn't a real expected value at all (e.g. old defaults
-    win_rate_est=0.55, expected_return_pct=2.0 implied every trade either
-    wins +2% or is simply skipped, never loses). expected_return_pct now
-    means the AVERAGE NET return per trade (wins and losses already blended,
-    probability-weighted) -- exactly what a backtest's avg_ret_pct measures
-    -- so it's used directly, not multiplied by win_rate a second time.
-    win_rate_est is kept for informational display only (see win_rate_est's
-    own docs), not part of this calc anymore.
-    """
-    cfg      = state["day_trader"]["config"]
-    target   = cfg["daily_profit_target"]
-    win_rate = cfg["win_rate_est"]
-    exp_ret  = cfg["expected_return_pct"]
-    pos_size = cfg["position_size"]
+    """Capital required to hit the daily profit target. Reads config/closed_today
+    from the shared state file the standalone agent owns (day_trader_agent.py) --
+    a simple local calc, no need for a network round-trip for this one."""
+    try:
+        with open(DT_STATE_PATH) as f:
+            saved = json.load(f)
+    except Exception as exc:
+        raise HTTPException(503, f"Day Trader state unavailable: {exc}")
+    cfg      = saved.get("config", {})
+    target   = cfg.get("daily_profit_target", 0)
+    win_rate = cfg.get("win_rate_est")
+    exp_ret  = cfg.get("expected_return_pct", 0)
+    pos_size = cfg.get("position_size", 0)
     ev_per   = pos_size * (exp_ret / 100)
     if ev_per <= 0:
         return {"error": "Invalid expected_return_pct (must be a positive avg net return per trade)"}
     req_pos     = int(np.ceil(target / ev_per))
     req_capital = round(req_pos * pos_size, 2)
-    today_pnl   = sum(r.get("pnl", 0) for r in state["day_trader"].get("closed_today", []))
+    today_pnl   = sum(r.get("pnl", 0) for r in saved.get("closed_today", []))
     remaining   = max(0.0, target - today_pnl)
     req_pos_remaining = int(np.ceil(remaining / ev_per)) if remaining > 0 else 0
     return {
@@ -14789,8 +14684,8 @@ def day_trader_goal():
         "today_pnl":             round(today_pnl, 2),
         "remaining_target":      round(remaining, 2),
         "remaining_positions":   req_pos_remaining,
-        "current_max_positions": cfg["max_positions"],
-        "positions_gap":         max(0, req_pos - cfg["max_positions"]),
+        "current_max_positions": cfg.get("max_positions"),
+        "positions_gap":         max(0, req_pos - cfg.get("max_positions", 0)),
     }
 
 
@@ -14829,196 +14724,14 @@ def day_trader_history(days: int = Query(30, ge=1, le=365)):
 
 # ── SPX 0DTE Trader ──────────────────────────────────────────────────────────
 
-# FOMC announcement dates — hardcoded fallback (second day of each 2-day meeting).
-# Online fetch from federalreserve.gov runs daily and overrides these.
-# Update annually in January as a backup in case the Fed site is unreachable.
-# Source: https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm
-_FOMC_DATES_FALLBACK: dict[int, list[str]] = {
-    2025: [
-        "2025-01-29", "2025-03-19", "2025-05-07", "2025-06-18",
-        "2025-07-30", "2025-09-17", "2025-10-29", "2025-12-10",
-    ],
-    2026: [
-        "2026-01-28", "2026-03-18", "2026-04-29", "2026-06-17",
-        "2026-07-29", "2026-09-16", "2026-10-28", "2026-12-09",
-    ],
-}
-
-# Daily-refreshed cache: {date_iso: reason}
-_macro_cache: dict = {
-    "dates":          {},      # populated by _refresh_macro_calendar()
-    "last_refreshed": None,    # date object
-    "fomc_source":    None,    # "online (federalreserve.gov)" | "fallback (hardcoded)"
-    "nfp_source":     None,    # "online (bls.gov)" | "calculated (first Friday)"
-    "cpi_source":     None,    # "online (bls.gov)" | "none"
-    "ppi_source":     None,    # "online (bls.gov)" | "none"
-}
-
-
-def _nfp_dates(year: int) -> list[str]:
-    """First Friday of each month = NFP release day (calculated fallback).
-    Holiday shifts (e.g. Jan 1 on Friday) push NFP to the following Friday —
-    the online BLS fetch handles those edge cases correctly.
-    """
-    result = []
-    for month in range(1, 13):
-        for day in range(1, 8):
-            d = date(year, month, day)
-            if d.weekday() == 4:   # Friday
-                result.append(d.isoformat())
-                break
-    return result
-
-
-def _fetch_fomc_dates_online(year: int) -> list[str] | None:
-    """Scrape FOMC announcement dates from federalreserve.gov for the given year.
-    Returns list of ISO date strings, or None if fetch/parse fails.
-    """
-    import re
-    try:
-        import requests as _req
-        r = _req.get(
-            "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm",
-            timeout=10,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; IBKRTrader/1.0)"},
-        )
-        r.raise_for_status()
-        html = r.text
-
-        _MONTH_NUM = {
-            "January": 1, "February": 2, "March": 3, "April": 4,
-            "May": 5, "June": 6, "July": 7, "August": 8,
-            "September": 9, "October": 10, "November": 11, "December": 12,
-        }
-
-        # Isolate the section for the target year.
-        # The page uses <h4>YYYY</h4> or similar markers.
-        year_match = re.search(
-            rf'(?s)(?:{year})(.+?)(?:{year + 1}|$)', html
-        )
-        if not year_match:
-            log.warning("FOMC online: year %d section not found in page", year)
-            return None
-        section = year_match.group(1)
-
-        dates: list[str] = []
-        # Match patterns like "January 28-29" or "January 29" (single day)
-        # The page sometimes includes asterisks for unscheduled / tentative
-        for m in re.finditer(
-            r'(January|February|March|April|May|June|July|August'
-            r'|September|October|November|December)[^0-9]{0,10}(\d{1,2})(?:\s*[-–]\s*(\d{1,2}))?',
-            section,
-        ):
-            month_name = m.group(1)
-            start_day  = int(m.group(2))
-            end_day    = int(m.group(3)) if m.group(3) else start_day
-            try:
-                ann_date = date(year, _MONTH_NUM[month_name], end_day)
-                dates.append(ann_date.isoformat())
-            except ValueError:
-                pass   # bad day number — skip
-
-        if not dates:
-            log.warning("FOMC online: parsed 0 dates for %d — HTML structure may have changed", year)
-            return None
-
-        log.info("FOMC online: fetched %d announcement dates for %d from federalreserve.gov",
-                 len(dates), year)
-        return sorted(set(dates))
-
-    except Exception as exc:
-        log.warning("FOMC online fetch failed: %s", exc)
-        return None
-
-
-def _fetch_nfp_dates_online(year: int) -> list[str] | None:
-    """Scrape NFP release dates from BLS employment situation schedule page.
-    Returns list of ISO date strings, or None if fetch/parse fails.
-    Source: https://www.bls.gov/schedule/news_release/empsit.htm
-    """
-    import re
-    try:
-        import requests as _req
-        r = _req.get(
-            "https://www.bls.gov/schedule/news_release/empsit.htm",
-            timeout=10,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; IBKRTrader/1.0)"},
-        )
-        r.raise_for_status()
-        html = r.text
-
-        _MONTH_NUM = {
-            "January": 1, "February": 2, "March": 3, "April": 4,
-            "May": 5, "June": 6, "July": 7, "August": 8,
-            "September": 9, "October": 10, "November": 11, "December": 12,
-        }
-
-        dates: list[str] = []
-        # BLS page format: "Friday, August 01, 2025" or "Friday, August 1, 2025"
-        for m in re.finditer(
-            r'(?:Monday|Tuesday|Wednesday|Thursday|Friday),\s+'
-            r'(January|February|March|April|May|June|July|August'
-            r'|September|October|November|December)\s+(\d{1,2}),\s+(\d{4})',
-            html,
-        ):
-            month_name = m.group(1)
-            day        = int(m.group(2))
-            yr         = int(m.group(3))
-            if yr == year:
-                try:
-                    dates.append(date(yr, _MONTH_NUM[month_name], day).isoformat())
-                except ValueError:
-                    pass
-
-        if not dates:
-            log.warning("NFP online: parsed 0 dates for %d from BLS — page structure may have changed", year)
-            return None
-
-        log.info("NFP online: fetched %d release dates for %d from bls.gov", len(dates), year)
-        return sorted(set(dates))
-
-    except Exception as exc:
-        log.warning("NFP online fetch failed: %s", exc)
-        return None
-
-
-def _fetch_bls_dates_online(year: int, url: str, label: str) -> list[str] | None:
-    """Generic BLS schedule page scraper (CPI, PPI, etc.).
-    All BLS release schedule pages use the same date format:
-      "Wednesday, January 15, 2025" or "Thursday, January 16, 2025"
-    """
-    import re
-    _MONTH_NUM = {
-        "January": 1, "February": 2, "March": 3, "April": 4,
-        "May": 5, "June": 6, "July": 7, "August": 8,
-        "September": 9, "October": 10, "November": 11, "December": 12,
-    }
-    try:
-        import requests as _req
-        r = _req.get(url, timeout=10,
-                     headers={"User-Agent": "Mozilla/5.0 (compatible; IBKRTrader/1.0)"})
-        r.raise_for_status()
-        dates: list[str] = []
-        for m in re.finditer(
-            r'(?:Monday|Tuesday|Wednesday|Thursday|Friday),\s+'
-            r'(January|February|March|April|May|June|July|August'
-            r'|September|October|November|December)\s+(\d{1,2}),\s+(\d{4})',
-            r.text,
-        ):
-            mon, day, yr = m.group(1), int(m.group(2)), int(m.group(3))
-            if yr == year and mon in _MONTH_NUM:
-                try:
-                    dates.append(date(yr, _MONTH_NUM[mon], day).isoformat())
-                except ValueError:
-                    pass
-        if not dates:
-            log.warning("%s online: 0 dates for %d — BLS page structure may have changed", label, year)
-            return None
-        log.info("%s online: fetched %d dates for %d", label, len(dates), year)
-        return sorted(set(dates))
-    except Exception as exc:
-        log.warning("%s online fetch failed: %s", label, exc)
-        return None
+# Real, auto-refreshing FOMC/NFP/CPI/PPI calendar -- extracted 2026-09-04 into
+# macro_calendar.py so the same live calendar can gate/caution other live
+# strategies (butterflies, Day Trader, Ashley signal-follow), not just SPX.
+from macro_calendar import (
+    _FOMC_DATES_FALLBACK, _macro_cache, _nfp_dates,
+    _fetch_fomc_dates_online, _fetch_bls_dates_online,
+    _refresh_macro_calendar, _spx_macro_skip_dates,
+)
 
 
 def _spx_get_session_open() -> float:
@@ -15055,91 +14768,6 @@ def _get_10yr_rate_change() -> float:
     except Exception as exc:
         log.debug("10yr rate fetch failed: %s", exc)
         return 0.0
-
-
-def _refresh_macro_calendar() -> None:
-    """Fetch FOMC, NFP, CPI, and PPI dates online; merge with fallbacks.
-    Runs at most once per calendar day (cached). Safe to call frequently.
-    """
-    today = date.today()
-    if _macro_cache["last_refreshed"] == today:
-        return   # already fresh
-
-    year   = today.year
-    merged: dict[str, str] = {}
-
-    # ── FOMC ──────────────────────────────────────────────────────────────────
-    fomc_online = _fetch_fomc_dates_online(year)
-    if fomc_online:
-        fomc_dates                  = fomc_online
-        _macro_cache["fomc_source"] = "online (federalreserve.gov)"
-    else:
-        fomc_dates                  = _FOMC_DATES_FALLBACK.get(year, [])
-        _macro_cache["fomc_source"] = "fallback (hardcoded)"
-        if not fomc_dates:
-            log.warning("SPX macro: no FOMC fallback dates for %d — update _FOMC_DATES_FALLBACK", year)
-    for d in fomc_dates:
-        merged[d] = "FOMC rate decision"
-
-    # ── NFP ───────────────────────────────────────────────────────────────────
-    nfp_online = _fetch_bls_dates_online(
-        year, "https://www.bls.gov/schedule/news_release/empsit.htm", "NFP")
-    if nfp_online:
-        nfp_dates                  = nfp_online
-        _macro_cache["nfp_source"] = "online (bls.gov)"
-    else:
-        nfp_dates                  = _nfp_dates(year)
-        _macro_cache["nfp_source"] = "calculated (first Friday)"
-    for d in nfp_dates:
-        merged.setdefault(d, "NFP release")
-
-    # ── CPI ───────────────────────────────────────────────────────────────────
-    cpi_dates = _fetch_bls_dates_online(
-        year, "https://www.bls.gov/schedule/news_release/cpi.htm", "CPI")
-    if cpi_dates:
-        _macro_cache["cpi_source"] = "online (bls.gov)"
-        for d in cpi_dates:
-            merged.setdefault(d, "CPI inflation report")
-    else:
-        _macro_cache["cpi_source"] = "none (fetch failed — add manually to skip_dates)"
-
-    # ── PPI ───────────────────────────────────────────────────────────────────
-    ppi_dates = _fetch_bls_dates_online(
-        year, "https://www.bls.gov/schedule/news_release/ppi.htm", "PPI")
-    if ppi_dates:
-        _macro_cache["ppi_source"] = "online (bls.gov)"
-        for d in ppi_dates:
-            merged.setdefault(d, "PPI inflation report")
-    else:
-        _macro_cache["ppi_source"] = "none (fetch failed — add manually to skip_dates)"
-
-    _macro_cache["dates"]          = merged
-    _macro_cache["last_refreshed"] = today
-    log.info(
-        "SPX macro calendar refreshed: %d skip dates for %d  "
-        "(FOMC=%s, NFP=%s, CPI=%s, PPI=%s)",
-        len(merged), year,
-        _macro_cache["fomc_source"], _macro_cache["nfp_source"],
-        _macro_cache["cpi_source"],  _macro_cache["ppi_source"],
-    )
-
-
-def _spx_macro_skip_dates(year: int | None = None) -> dict[str, str]:
-    """Return {date_iso: reason} for all FOMC + NFP days.
-
-    Triggers a daily online refresh on first call of the day.
-    For years other than current, returns hardcoded + calculated data.
-    """
-    _refresh_macro_calendar()
-    if year is None or year == date.today().year:
-        return _macro_cache["dates"]
-    # Non-current year: use fallback + calculated
-    result: dict[str, str] = {}
-    for d in _FOMC_DATES_FALLBACK.get(year, []):
-        result[d] = "FOMC rate decision"
-    for d in _nfp_dates(year):
-        result.setdefault(d, "NFP release")
-    return result
 
 
 def _spx_log(action: str, detail: str, spread_id: str = "—") -> None:
@@ -15277,12 +14905,26 @@ def _evc_load_state() -> None:
             ev["config"].update(saved["config"])
         ev["enabled"]      = saved.get("enabled", False)
         ev["decisions"]    = saved.get("decisions", [])
-        # Restore positions only if from today and still open
+        # Real bug found 2026-08-26 (INTU): this used to require
+        # v["date"] == today to restore a position, but EVC positions are
+        # DESIGNED to span overnight (afternoon entry, next-morning
+        # IV-crush exit at exit_start/exit_cutoff) -- so ANY restart between
+        # entry evening and exit morning would silently drop a genuinely
+        # still-open position from tracking entirely, not just mislabel its
+        # phase. This was a latent bug present since EVC's positions dict
+        # was first added, only now triggered because tonight was the first
+        # time a real overnight position existed during a restart. Fixed to
+        # match signal_trader's own correct pattern for a similar overnight
+        # window (expiry_future check, main.py ~18591): keep any position
+        # that's still open and hasn't reached its own expiry yet, instead
+        # of requiring same-day entry.
+        today_ymd = today.replace("-", "")
         ev["positions"]    = {
             k: v for k, v in saved.get("positions", {}).items()
-            if v.get("date") == today and v.get("phase") == "open"
+            if v.get("phase") == "open" and v.get("expiry", "00000000") >= today_ymd
         }
-        ev["closed_today"] = [r for r in saved.get("closed_today", []) if r.get("date") == today]
+        ev["closed_today"] = [r for r in saved.get("closed_today", [])
+                               if r.get("exit_date", r.get("date")) == today]
         ev["scan_date"]        = saved.get("scan_date") if saved.get("date") == today else None
         ev["candidates_today"] = saved.get("candidates_today", []) if saved.get("date") == today else []
         ev["incomplete_attempts_today"] = (
@@ -16559,6 +16201,26 @@ async def _spx_monitor_loop() -> None:
 
 # ── Earnings Volatility Crush — core async functions ──────────────────────────
 
+def _evc_earnings_report_dt(ticker: str):
+    """Return the real earnings-release datetime (tz-aware, ET) from yfinance's
+    earningsTimestampStart, or None if unavailable. Same data source as
+    _evc_earnings_timing, exposed as an actual timestamp so a position can
+    record exactly when its own catalyst fires (see pos["earnings_report_time"]
+    and the stop-loss gate that reads it in _evc_monitor_loop) instead of just
+    a same-day/next-day category."""
+    from zoneinfo import ZoneInfo
+    from datetime import datetime as _dt
+    _ET = ZoneInfo("America/New_York")
+    try:
+        info = yf.Ticker(ticker).info
+        ts = info.get("earningsTimestampStart") or info.get("earningsTimestamp")
+        if not ts:
+            return None
+        return _dt.fromtimestamp(int(ts), _ET)
+    except Exception:
+        return None
+
+
 def _evc_earnings_timing(ticker: str) -> str:
     """
     Return one of: 'today_bmo', 'today_ah', 'tomorrow_bmo', 'tomorrow_ah',
@@ -16687,11 +16349,35 @@ async def _evc_get_stock_price(ib, ticker: str) -> float:
 
 async def _evc_get_chain_params(ib, ticker: str) -> tuple[str, list[float]]:
     """
-    Return (nearest_expiry_YYYYMMDD, sorted_strikes) using real option chain data.
-    Uses reqSecDefOptParamsAsync — same pattern as IV refresh — so the expiry and
-    strikes we compute are guaranteed to exist in IBKR's chain (no phantom probing).
+    Return (nearest_expiry_YYYYMMDD, sorted_strikes) using real, PER-EXPIRY
+    option chain data.
+
+    Two real bugs found 2026-08-26 (NVDA), both now fixed:
+
+    1. Some tickers list MORE THAN ONE SMART-exchange chain entry from
+       reqSecDefOptParamsAsync -- e.g. NVDA has a real "NVDA" tradingClass
+       AND a legacy/split-adjusted "2NVDA" class (2 strikes only: [200,
+       203]), both under exchange="SMART" with unstable list ordering.
+       Fixed by explicitly matching tradingClass == ticker when picking the
+       chain.
+
+    2. Even with the right chain, `chain.strikes` from
+       reqSecDefOptParamsAsync is a chain-WIDE UNION across every expiry
+       that chain lists (21 for NVDA) -- not the strikes actually valid for
+       THIS specific expiry. Strike spacing commonly differs by expiry
+       (NVDA's near-dated 20260828 uses $2.50 steps around 190-260: ...,
+       190.0, 192.5, 195.0, ...; the union also contains $1-step values
+       like 192.0/194.0 that only exist on OTHER expiries). _nearest()
+       picking one of those phantom values produced strikes that don't
+       exist for 20260828 at all -- "No security definition has been
+       found" on qualification ("cannot qualify condor legs"). This is the
+       exact same lesson already learned for SPY (_spy_quote_condor: "must
+       use tradingClass + reqContractDetails for PER-EXPIRY real strikes,
+       not the chain-wide union") -- applying that same proven fix here,
+       since every EVC earnings ticker goes through this shared function,
+       not just SPY.
     """
-    from ib_insync import Stock as IbStock
+    from ib_insync import Stock as IbStock, Option as IbOpt
     from datetime import timedelta
 
     stk = IbStock(ticker, "SMART", "USD")
@@ -16702,14 +16388,154 @@ async def _evc_get_chain_params(ib, ticker: str) -> tuple[str, list[float]]:
     chains = await ib.reqSecDefOptParamsAsync(ticker, "", "STK", stk.conId)
     if not chains:
         raise ValueError(f"no option chain params for {ticker}")
-    chain = next((c for c in chains if c.exchange == "SMART"), chains[0])
+    chain = next((c for c in chains if c.exchange == "SMART" and c.tradingClass == ticker), None)
+    if chain is None:
+        chain = next((c for c in chains if c.exchange == "SMART"), chains[0])
 
     tomorrow_str = (date.today() + timedelta(days=1)).strftime("%Y%m%d")
     future_expiries = sorted(e for e in chain.expirations if e >= tomorrow_str)
     if not future_expiries:
         raise ValueError(f"no future expiries in option chain for {ticker}")
+    expiry = future_expiries[0]
 
-    return future_expiries[0], sorted(chain.strikes)
+    # await reqContractDetailsAsync directly on this coroutine's own event
+    # loop -- NOT the sync reqContractDetails() wrapped in run_in_executor
+    # (that's what _spy_quote_condor does, but this function can be called
+    # from inside _run_in_streaming_loop's own background thread, e.g. via
+    # the read-only /earnings-vol-crush/preview/{ticker} endpoint -- a
+    # SECOND executor thread nested inside that one has no event loop of
+    # its own, and ib_insync's sync API needs one in the calling thread:
+    # real error found 2026-08-26, "There is no current event loop in
+    # thread 'asyncio_0'". The async call has no such requirement.
+    async def _real_strikes(right):
+        c = IbOpt(ticker, expiry, 0, right, "SMART", "100", "USD", tradingClass=ticker)
+        details = await ib.reqContractDetailsAsync(c)
+        return set(d.contract.strike for d in details)
+
+    put_strikes  = await _real_strikes("P")
+    call_strikes = await _real_strikes("C")
+    real_strikes = sorted(put_strikes | call_strikes)
+    if not real_strikes:
+        raise ValueError(f"no real per-expiry strikes listed for {ticker} {expiry}")
+
+    return expiry, real_strikes
+
+
+def _evc_iv_of(td) -> Optional[float]:
+    """Implied vol from a Ticker's modelGreeks -- already being requested via
+    generic tick 106 on every EVC leg, just never read before 2026-08-25."""
+    mg = getattr(td, "modelGreeks", None)
+    if mg and mg.impliedVol and mg.impliedVol > 0:
+        return float(mg.impliedVol)
+    return None
+
+
+def _evc_iv_curve_shape(spot: float, points: list[tuple[float, Optional[float]]]) -> dict:
+    """
+    Simplified proxy for the 'concave pre-earnings IV curve' pattern described
+    in the options-event-risk literature (e.g. Review of Finance 2026, concave
+    curves before earnings reflecting a bimodal risk-neutral distribution).
+    NOT a replication of that methodology -- that research fits a dense grid
+    of near-the-money strikes/deltas; this fits a quadratic in log-moneyness
+    across only the 5 strikes EVC's own condor construction already quotes
+    (long_put/short_put/ATM/short_call/long_call), spanning +/-1.5x the
+    expected move. Treat the sign as suggestive, not validated -- added
+    2026-08-25 specifically because DKS's actual pre-earnings curve turned
+    out to be unrecoverable after the fact (IBKR has no historical per-strike
+    IV for a mid-liquidity name like DKS), so this can only be checked live,
+    going forward, never retroactively.
+    """
+    pts = [(k, iv) for k, iv in points if iv is not None and spot > 0]
+    if len(pts) < 3:
+        return {"available": False, "reason": f"only {len(pts)}/5 legs returned a usable IV"}
+    x = np.array([np.log(k / spot) for k, _ in pts])
+    y = np.array([iv for _, iv in pts])
+    a, b, c = np.polyfit(x, y, 2)
+    shape = "concave (event-risk signature -- ATM richer than wings would predict)" if a < 0 \
+        else "convex (typical smile -- wings richer than ATM, no unusual event pricing)"
+    return {
+        "available": True,
+        "curvature": round(float(a), 4),
+        "shape": shape,
+        "iv_by_strike": {str(k): round(iv, 4) for k, iv in pts},
+        "n_points": len(pts),
+    }
+
+
+async def _evc_gex_wall_check(ib, ticker: str, expiry: str, real_strikes: list[float],
+                               spot: float, short_put: float, short_call: float) -> dict:
+    """
+    Real, TARGETED gamma-exposure + call/put OI check around only the
+    condor's own short strikes (short_put, short_call) and their immediate
+    real-strike neighbors -- NOT the full +/-15 strike scan
+    gex-vex-calculator's standalone batch job does (that takes ~1.5s x 2
+    legs x 31 strikes =~ 90s+ per ticker, too slow to add to every EVC
+    quote in a ~50min entry window with multiple candidates).
+
+    Same dollar_gamma formula and sign convention as
+    gex-vex-calculator/calc_gex_vex.py (Net GEX = call gamma*OI -
+    put gamma*OI, scaled to $-per-1%-move) -- see that skill's own honest
+    caveats: sign convention is an assumed dealer-positioning model, not
+    observed fact; this is a directional indicator, not a precise figure.
+
+    Built 2026-08-25 after finding INTU's default short put (327.5) sat
+    directly on the chain's largest negative-gamma wall (-1.75M net GEX at
+    325) the same night DKS-style tail risk was being discussed. Purely
+    informational -- see _evc_pretrade_review's call site for why this does
+    NOT affect `approved` yet (one real data point is not a validated rule).
+    """
+    from ib_insync import Option as IbOpt
+
+    def _neighbors(strike: float) -> list[float]:
+        if strike not in real_strikes:
+            return [strike]
+        idx = real_strikes.index(strike)
+        lo, hi = max(0, idx - 1), min(len(real_strikes) - 1, idx + 1)
+        return real_strikes[lo:hi + 1]
+
+    check_strikes = sorted(set(_neighbors(short_put)) | set(_neighbors(short_call)))
+    strike_gex: dict[float, float] = {}
+    total_call_oi = total_put_oi = 0
+
+    for k in check_strikes:
+        row_gex = 0.0
+        for right in ("C", "P"):
+            c = IbOpt(ticker, expiry, k, right, "SMART", "100", "USD", tradingClass=ticker)
+            await ib.qualifyContractsAsync(c)
+            if not c.conId:
+                continue
+            td = ib.reqMktData(c, "101,106", False, False)
+            await asyncio.sleep(1.5)
+            oi_raw = td.callOpenInterest if right == "C" else td.putOpenInterest
+            oi = float(oi_raw) if oi_raw and oi_raw > 0 else 0.0
+            mg = td.modelGreeks
+            ib.cancelMktData(c)
+            if oi <= 0 or not mg or not mg.gamma:
+                continue
+            dollar_gamma = mg.gamma * oi * 100 * (spot ** 2) * 0.01
+            if right == "C":
+                row_gex += dollar_gamma
+                total_call_oi += int(oi)
+            else:
+                row_gex -= dollar_gamma
+                total_put_oi += int(oi)
+        if row_gex:
+            strike_gex[k] = round(row_gex, 0)
+
+    if not strike_gex:
+        return {"available": False, "reason": "no OI/gamma data near short strikes"}
+
+    biggest_k = max(strike_gex, key=lambda k: abs(strike_gex[k]))
+    return {
+        "available": True,
+        "strike_gex": strike_gex,
+        "put_wall_gex":  strike_gex.get(short_put),
+        "call_wall_gex": strike_gex.get(short_call),
+        "pc_oi_ratio": round(total_put_oi / total_call_oi, 3) if total_call_oi else None,
+        "biggest_wall_strike": biggest_k,
+        "biggest_wall_gex": strike_gex[biggest_k],
+        "short_strike_on_biggest_wall": biggest_k in (short_put, short_call),
+    }
 
 
 async def _evc_quote_condor(ib, ticker: str) -> dict:
@@ -16738,8 +16564,8 @@ async def _evc_quote_condor(ib, ticker: str) -> dict:
     atm = _nearest(spot)
 
     # 4. Quote ATM call + put to get expected move
-    atm_call = IbOpt(ticker, expiry, atm, "C", "SMART", "100", "USD")
-    atm_put  = IbOpt(ticker, expiry, atm, "P", "SMART", "100", "USD")
+    atm_call = IbOpt(ticker, expiry, atm, "C", "SMART", "100", "USD", tradingClass=ticker)
+    atm_put  = IbOpt(ticker, expiry, atm, "P", "SMART", "100", "USD", tradingClass=ticker)
     await ib.qualifyContractsAsync(atm_call, atm_put)
     if not atm_call.conId or not atm_put.conId:
         raise ValueError(f"cannot qualify ATM options for {ticker} exp {expiry}")
@@ -16749,6 +16575,8 @@ async def _evc_quote_condor(ib, ticker: str) -> dict:
     await asyncio.sleep(5)
     call_mid = _spx_mid(td_c)
     put_mid  = _spx_mid(td_p)
+    iv_atm_call = _evc_iv_of(td_c)
+    iv_atm_put  = _evc_iv_of(td_p)
     ib.cancelMktData(atm_call)
     ib.cancelMktData(atm_put)
 
@@ -16765,20 +16593,139 @@ async def _evc_quote_condor(ib, ticker: str) -> dict:
     if im_pct > 0.25:
         raise ValueError(f"expected move implausibly large ({im_pct:.1%}) for {ticker}")
 
-    # 5. Condor strikes — nearest real strike to each target
-    short_put  = _nearest(spot - expected_move)
-    short_call = _nearest(spot + expected_move)
-    long_put   = _nearest(spot - cfg["wing_mult"] * expected_move)
-    long_call  = _nearest(spot + cfg["wing_mult"] * expected_move)
+    # 5. Condor strikes — nearest real strike to each target. Short strikes
+    # use put_cushion_mult/call_cushion_mult independently (both default 1.0
+    # = today's behavior, spot -/+ 1.0x EM) so either side can be pushed
+    # further OTM on its own -- e.g. widening put_cushion_mult without
+    # touching the call side, for a name whose put-side skew/GEX profile
+    # warrants it.
+    put_cushion_mult  = float(cfg.get("put_cushion_mult", 1.0))
+    call_cushion_mult = float(cfg.get("call_cushion_mult", 1.0))
+    short_put  = _nearest(spot - put_cushion_mult * expected_move)
+    short_call = _nearest(spot + call_cushion_mult * expected_move)
+
+    # Wing (long) strikes: minimize width -- and therefore max_risk -- per
+    # side, instead of a flat wing_mult distance. CEO instruction 2026-08-27,
+    # the same night a manual tight-wing MRVL/AFRM/ULTA entry cut max_risk
+    # 79-91% vs. the old flat-wing_mult default. NOT a blind "always use the
+    # nearest real strike" rule, though: that same night, ULTA's single
+    # nearest strike had a bid-ask spread so wide (short_call $5.40/$7.10)
+    # that the real fillable credit was negative -- entering there would
+    # have guaranteed a loss even if the stock never moved, using mid-price
+    # credit as the earlier check would have missed. So this walks every
+    # real strike between the short strike and the old wing_mult target,
+    # tightest first, using the CONSERVATIVE worst-fill price (short bid
+    # minus candidate-long ask -- same convention as the GOOG weekly
+    # condor's own conservative_credit), and takes the first candidate whose
+    # per-side credit is still positive. Falls back to the original
+    # wing_mult width if every tighter strike fails that check -- that
+    # width is today's already-live default, so this can never end up
+    # WIDER (or riskier) than before, only tighter when the market supports it.
+    wing_mult = float(cfg["wing_mult"])
+    put_wing_fallback  = _nearest(spot - wing_mult * expected_move)
+    call_wing_fallback = _nearest(spot + wing_mult * expected_move)
+
+    put_candidates  = sorted({s for s in real_strikes if put_wing_fallback <= s < short_put} | {put_wing_fallback},
+                              reverse=True)
+    call_candidates = sorted({s for s in real_strikes if short_call < s <= call_wing_fallback} | {call_wing_fallback})
+
+    short_put_c  = IbOpt(ticker, expiry, short_put,  "P", "SMART", "100", "USD", tradingClass=ticker)
+    short_call_c = IbOpt(ticker, expiry, short_call, "C", "SMART", "100", "USD", tradingClass=ticker)
+    put_wing_cs  = [IbOpt(ticker, expiry, k, "P", "SMART", "100", "USD", tradingClass=ticker) for k in put_candidates]
+    call_wing_cs = [IbOpt(ticker, expiry, k, "C", "SMART", "100", "USD", tradingClass=ticker) for k in call_candidates]
+    all_wing_probe = [short_put_c, short_call_c] + put_wing_cs + call_wing_cs
+    await ib.qualifyContractsAsync(*all_wing_probe)
+    probe_tds = {c.conId: ib.reqMktData(c, "", False, False) for c in all_wing_probe if c.conId}
+    await asyncio.sleep(4)
+
+    def _bid(c):
+        td = probe_tds.get(c.conId)
+        return _spx_safe_px(td.bid) if td else None
+
+    def _ask(c):
+        td = probe_tds.get(c.conId)
+        return _spx_safe_px(td.ask) if td else None
+
+    short_put_bid  = _bid(short_put_c)
+    short_call_bid = _bid(short_call_c)
+
+    def _mid(c):
+        b, a = _bid(c), _ask(c)
+        return (b + a) / 2 if b and a else None
+
+    short_put_mid  = _mid(short_put_c)
+    short_call_mid = _mid(short_call_c)
+
+    # Per-side wing info, tightest-first, real strike + ask + mid for every
+    # candidate (fallback included as the last/widest entry) -- all already
+    # fetched in the one probe request above, no extra IBKR calls needed below.
+    put_info  = [(k, _ask(c), _mid(c)) for c, k in zip(put_wing_cs, put_candidates)]
+    call_info = [(k, _ask(c), _mid(c)) for c, k in zip(call_wing_cs, call_candidates)]
+
+    def _first_viable(info, short_bid):
+        for i, (_k, ask, _m) in enumerate(info):
+            if short_bid and ask and (short_bid - ask) > 0:
+                return i
+        return len(info) - 1  # nothing cleared -- land on the widest/fallback
+
+    pi = _first_viable(put_info, short_put_bid)
+    ci = _first_viable(call_info, short_call_bid)
+
+    # Joint-liquidity retry: each side starts at its own tightest strike whose
+    # PER-SIDE conservative credit clears (existing check). But ULTA (2026-08-30)
+    # showed that isn't enough -- both call legs individually looked survivable,
+    # yet the COMBINED worst-fill credit across all 4 legs at once was still
+    # negative (a real -$0.39 fill against a quoted +$0.93 mid credit). So before
+    # locking in a choice, check the combined conservative credit against the
+    # SAME EVC_LIQUIDITY_MIN_FRACTION floor _evc_pretrade_review enforces --
+    # if it doesn't clear, widen whichever side has the thinner per-side margin
+    # one real strike at a time and retry, instead of handing the pretrade
+    # review a doomed quote and letting it reject the trade outright. Bounded to
+    # len(put)+len(call) retries; if nothing ever clears, both sides land on
+    # their widest/fallback strike -- never wider than today's pre-existing
+    # default, so this can only turn a rejection into an approval, never make an
+    # already-approvable trade riskier.
+    for _attempt in range(len(put_info) + len(call_info) + 1):
+        lp_k, lp_ask, lp_mid = put_info[pi]
+        lc_k, lc_ask, lc_mid = call_info[ci]
+        combined = (short_put_bid + short_call_bid - lp_ask - lc_ask
+                    if all(v and v > 0 for v in (short_put_bid, short_call_bid, lp_ask, lc_ask)) else None)
+        mid_est = (short_put_mid + short_call_mid - lp_mid - lc_mid
+                   if all(v and v > 0 for v in (short_put_mid, short_call_mid, lp_mid, lc_mid)) else None)
+        cleared = combined is not None and combined > 0 and (
+            mid_est is None or mid_est <= 0 or combined >= mid_est * EVC_LIQUIDITY_MIN_FRACTION)
+        both_maxed = pi >= len(put_info) - 1 and ci >= len(call_info) - 1
+        if cleared or both_maxed:
+            long_put, long_call = lp_k, lc_k
+            break
+        put_margin  = (short_put_bid - lp_ask) if (short_put_bid and lp_ask) else float("-inf")
+        call_margin = (short_call_bid - lc_ask) if (short_call_bid and lc_ask) else float("-inf")
+        if (put_margin <= call_margin and pi < len(put_info) - 1) or ci >= len(call_info) - 1:
+            pi = min(pi + 1, len(put_info) - 1)
+        else:
+            ci = min(ci + 1, len(call_info) - 1)
+    else:
+        long_put, long_call = put_info[pi][0], call_info[ci][0]
+
+    for c in all_wing_probe:
+        if c.conId:
+            ib.cancelMktData(c)
 
     if long_put >= short_put or short_call >= long_call:
         raise ValueError(f"invalid condor strikes: {long_put}/{short_put}/{short_call}/{long_call}")
 
     # 6. Quote the 4 OTM legs
-    c_lp = IbOpt(ticker, expiry, long_put,   "P", "SMART", "100", "USD")
-    c_sp = IbOpt(ticker, expiry, short_put,  "P", "SMART", "100", "USD")
-    c_sc = IbOpt(ticker, expiry, short_call, "C", "SMART", "100", "USD")
-    c_lc = IbOpt(ticker, expiry, long_call,  "C", "SMART", "100", "USD")
+    # tradingClass=ticker pins qualification to the underlying's real option
+    # class -- real bug found 2026-08-26 (NVDA): a leg strike that also
+    # exists under a legacy split-adjusted class (e.g. NVDA's "2NVDA", 2
+    # strikes only) qualifies AMBIGUOUSLY without this, and conId never
+    # resolves ("cannot qualify condor legs"). Same fix as the ATM-strike
+    # qualification a few lines above and _evc_get_chain_params's chain
+    # selection -- all three needed it, this was the last of the three.
+    c_lp = IbOpt(ticker, expiry, long_put,   "P", "SMART", "100", "USD", tradingClass=ticker)
+    c_sp = IbOpt(ticker, expiry, short_put,  "P", "SMART", "100", "USD", tradingClass=ticker)
+    c_sc = IbOpt(ticker, expiry, short_call, "C", "SMART", "100", "USD", tradingClass=ticker)
+    c_lc = IbOpt(ticker, expiry, long_call,  "C", "SMART", "100", "USD", tradingClass=ticker)
     await ib.qualifyContractsAsync(c_lp, c_sp, c_sc, c_lc)
     if not all([c_lp.conId, c_sp.conId, c_sc.conId, c_lc.conId]):
         raise ValueError(f"cannot qualify condor legs for {ticker}")
@@ -16793,6 +16740,10 @@ async def _evc_quote_condor(ib, ticker: str) -> dict:
     sp_mid = _spx_mid(td_sp)
     sc_mid = _spx_mid(td_sc)
     lc_mid = _spx_mid(td_lc)
+    iv_lp = _evc_iv_of(td_lp)
+    iv_sp = _evc_iv_of(td_sp)
+    iv_sc = _evc_iv_of(td_sc)
+    iv_lc = _evc_iv_of(td_lc)
 
     # Liquidity proxy for the entry repricing walk: relative bid-ask spread on the
     # two SHORT legs (the ones that set the credit). Wider spread = thinner market =
@@ -16805,6 +16756,22 @@ async def _evc_quote_condor(ib, ticker: str) -> dict:
         return 0.0
     short_spread_pct = round((_rel_spread(td_sp) + _rel_spread(td_sc)) / 2, 4)
 
+    # Conservative (worst-realistic-fill) credit across all 4 legs together --
+    # sell legs at bid, buy legs at ask, matching the same "short bid minus long
+    # ask" convention already used per-side in the wing-tightening walk above,
+    # now applied to the WHOLE structure before ever attempting entry. Built
+    # 2026-08-30 after ULTA's real entry: each side's spread looked survivable
+    # in isolation, but chasing the aggressive ladder step on BOTH call legs at
+    # once flipped a quoted +$0.93 mid-credit into an actual -$0.39 debit --
+    # net_credit (mid-based) alone never would have caught that combined effect.
+    lp_bid, lp_ask = _spx_safe_px(td_lp.bid), _spx_safe_px(td_lp.ask)
+    sp_bid, sp_ask = _spx_safe_px(td_sp.bid), _spx_safe_px(td_sp.ask)
+    sc_bid, sc_ask = _spx_safe_px(td_sc.bid), _spx_safe_px(td_sc.ask)
+    lc_bid, lc_ask = _spx_safe_px(td_lc.bid), _spx_safe_px(td_lc.ask)
+    conservative_credit = None
+    if all(v and v > 0 for v in (sp_bid, sc_bid, lp_ask, lc_ask)):
+        conservative_credit = round(sp_bid + sc_bid - lp_ask - lc_ask, 4)
+
     for c_ in [c_lp, c_sp, c_sc, c_lc]:
         ib.cancelMktData(c_)
 
@@ -16814,6 +16781,34 @@ async def _evc_quote_condor(ib, ticker: str) -> dict:
     net_credit = round(sp_mid + sc_mid - lp_mid - lc_mid, 2)
     if net_credit < cfg["min_credit"]:
         raise ValueError(f"net credit {net_credit:.2f} below minimum {cfg['min_credit']:.2f}")
+
+    iv_atm = None
+    if iv_atm_call is not None and iv_atm_put is not None:
+        iv_atm = (iv_atm_call + iv_atm_put) / 2
+    elif iv_atm_call is not None or iv_atm_put is not None:
+        iv_atm = iv_atm_call if iv_atm_call is not None else iv_atm_put
+    iv_curve = _evc_iv_curve_shape(spot, [
+        (long_put, iv_lp), (short_put, iv_sp), (atm, iv_atm),
+        (short_call, iv_sc), (long_call, iv_lc),
+    ])
+
+    try:
+        gex_wall = await _evc_gex_wall_check(ib, ticker, expiry, real_strikes, spot, short_put, short_call)
+    except Exception as exc:
+        gex_wall = {"available": False, "reason": f"gex check failed: {exc}"}
+
+    # Real backtest finding 2026-09-01 (evc_condor_backtest_current_mechanism.py,
+    # n=209 real historical events): condors where the wing-walk only needed
+    # to tighten ONE side from the flat fallback showed a real, diversified
+    # positive edge (n=71 across 30 tickers, 88.7% win vs 85.3% breakeven
+    # needed, +3.4pt margin); condors needing BOTH sides tightened showed a
+    # real loser (n=138, 68.8% win vs 75.4% needed, -6.6pt margin). pi/ci are
+    # the final chosen indices into put_info/call_info after the joint-
+    # liquidity retry above -- index == len-1 means it landed on the
+    # widest/fallback strike (not tightened); anything tighter is a real
+    # tightening. Exposed here so _evc_pretrade_review can gate on it.
+    put_tightened = pi < len(put_info) - 1
+    call_tightened = ci < len(call_info) - 1
 
     return {
         "ticker":         ticker,
@@ -16830,8 +16825,13 @@ async def _evc_quote_condor(ib, ticker: str) -> dict:
         "short_call_conid": c_sc.conId,
         "long_call_conid":  c_lc.conId,
         "net_credit":     net_credit,
+        "conservative_credit": conservative_credit,
         "im_pct":            round(im_pct, 4),
         "short_spread_pct":  short_spread_pct,
+        "iv_curve":          iv_curve,
+        "gex_wall":          gex_wall,
+        "put_tightened":     put_tightened,
+        "call_tightened":    call_tightened,
     }
 
 
@@ -16891,9 +16891,85 @@ def _evc_pretrade_review(ticker: str, quote: dict, ibkr_net_liq: float,
     short_call, long_call = quote["short_call"], quote["long_call"]
     put_width  = short_put - long_put
     call_width = long_call - short_call
-    max_risk = round(min(put_width, call_width) * 100 - credit * 100, 2)
+    # Real, serious bug found 2026-08-26: this used min(put_width,
+    # call_width), the NARROWER wing -- but an iron condor's actual max
+    # loss is bounded by whichever wing gets breached, and there's no way
+    # to know in advance which side that'll be. Using min() silently
+    # reports the BETTER-CASE wing's risk as if it were the worst case,
+    # understating real risk by 5-8x for this account's own standing
+    # asymmetric cushion config (put_cushion_mult=1.3, call_cushion_mult=
+    # 1.0 -- put_width and call_width are NEVER equal under that config,
+    # so this bug fired on every single EVC trade, not just an edge case).
+    # Confirmed against real open positions the same night this was found:
+    # CRM/CRWD/NVDA were each approved under the 5% max_position_pct
+    # ceiling using a reported max risk of $111/$53/$99 -- real max risk
+    # (call side, the wider wing on all three) was $611/$803/$599, 3-4x
+    # over the actual ceiling once corrected. Fixed to max(), the true
+    # worst-case wing.
+    max_risk = round(max(put_width, call_width) * 100 - credit * 100, 2)
     breakeven_low  = round(short_put - credit, 2)
     breakeven_high = round(short_call + credit, 2)
+
+    # ── Liquidity gate: is this market actually tradable, not just structurally
+    # sound? Built 2026-08-30 after ULTA's real entry -- the structure and
+    # sizing were both fine, but a wide bid-ask (short call $5.40/$7.10) forced
+    # the ladder to chase aggressive fills on both call legs, flipping a quoted
+    # +$0.93 mid-credit into an actual -$0.39 debit before the stock ever
+    # moved. net_credit (mid-price) alone can't see that risk -- it assumes a
+    # fill at the middle of the spread, exactly the assumption that failed.
+    # conservative_credit (sell at bid, buy at ask, across all 4 legs at once --
+    # see _evc_quote_condor) is the worst-realistic-fill estimate. Two
+    # independent checks, either one fails the trade outright:
+    #   1. conservative_credit <= 0: a guaranteed debit under worst-case
+    #      execution even if the stock never moves -- exactly ULTA's shape.
+    #   2. conservative_credit < 30% of the quoted mid credit: technically
+    #      still positive, but real execution friction would eat most of the
+    #      theoretical edge, not a fraction worth the risk.
+    # A missing conservative_credit (couldn't get a two-sided quote on some
+    # leg) fails closed -- treated as a liquidity failure, not skipped.
+    conservative_credit = quote.get("conservative_credit")
+    if conservative_credit is None:
+        findings.append("LIQUIDITY_GATE_FAILED: could not get a real two-sided quote on all 4 legs "
+                         "to estimate worst-case fill -- failing closed, not assuming it's fine")
+        approved = False
+    elif conservative_credit <= 0:
+        findings.append(f"LIQUIDITY_GATE_FAILED: conservative (worst-fill) credit ${conservative_credit:.2f} "
+                         f"is <= 0 -- real execution could produce a guaranteed debit even if the stock "
+                         f"never moves (mid-price credit ${credit:.2f} looked fine, but the spread is too "
+                         f"wide to trust it)")
+        approved = False
+    elif credit > 0 and conservative_credit < credit * EVC_LIQUIDITY_MIN_FRACTION:
+        findings.append(f"LIQUIDITY_GATE_FAILED: conservative (worst-fill) credit ${conservative_credit:.2f} "
+                         f"is only {conservative_credit/credit*100:.0f}% of the quoted mid credit ${credit:.2f} "
+                         f"-- spread too wide relative to the edge, real fills would likely erase most of it")
+        approved = False
+    else:
+        findings.append(f"liquidity: conservative (worst-fill) credit ${conservative_credit:.2f} "
+                         f"({conservative_credit/credit*100:.0f}% of mid credit ${credit:.2f}) -- OK")
+
+    # ── Wing-tightening gate: real backtest finding 2026-09-01 ──────────────
+    # (evc_condor_backtest_current_mechanism.py, n=209 real Polygon-priced
+    # historical events, replicating this account's live 1.3x-cushion +
+    # tight-wing-walk mechanism exactly). Condors where the wing-walk needed
+    # to tighten BOTH sides from the flat 1.5x-EM fallback were a real,
+    # diversified loser (n=138, 68.8% win vs 75.4% breakeven needed, -6.6pt
+    # margin); condors needing at most ONE side tightened showed a real
+    # positive edge (n=71 across 30 distinct tickers, 88.7% win vs 85.3%
+    # needed, +3.4pt margin). Blocking, not informational, per CEO direction
+    # 2026-09-01 ("make this finding part of all EVC scans going forward").
+    put_tightened = quote.get("put_tightened", False)
+    call_tightened = quote.get("call_tightened", False)
+    sides_tightened = int(bool(put_tightened)) + int(bool(call_tightened))
+    if sides_tightened >= 2:
+        findings.append("WING_GATE_FAILED: both wings needed tightening from the flat 1.5x-EM fallback "
+                         "-- real backtest (n=138) showed this specific case is a net loser (68.8% win vs "
+                         "75.4% breakeven needed, -6.6pt margin). Single-side-tightened trades cleared "
+                         "backtest (n=71 across 30 tickers, +3.4pt margin) -- this trade is not one of those.")
+        approved = False
+    else:
+        findings.append(f"wing check: {sides_tightened} side(s) tightened from the flat fallback "
+                         f"(backtest: 0-1 sides -> n=71/30 tickers, +3.4pt real margin; 2 sides -> n=138, "
+                         f"-6.6pt margin) -- OK")
 
     # ── CRO: what-if scenarios across a range of moves ──────────────────────
     scenarios = []
@@ -16952,18 +17028,87 @@ def _evc_pretrade_review(ticker: str, quote: dict, ibkr_net_liq: float,
         findings.append(f"EXCEEDS {max_pct:.0%} position-size ceiling (config.max_position_pct)")
         approved = False
 
+    # ── IV curve shape -- informational, not a gate ─────────────────────────
+    # Added 2026-08-25 after the DKS incident: DKS's own historical containment
+    # rate was a clean 11/11 and its credit-to-risk ratio was unremarkable next
+    # to a real win (INTC), yet it went on to crash ~29% on a guidance cut --
+    # neither signal available at entry time would have flagged it. Real
+    # research (concave pre-earnings IV curves signaling bimodal/event-risk
+    # pricing) suggests curve SHAPE across strikes carries information neither
+    # of those checks uses. This is a simplified proxy (quadratic fit across
+    # only the condor's own 5 strikes, not a dense near-the-money grid) --
+    # purely informational until it's been checked against real outcomes over
+    # enough trades to mean something. DKS's own curve could not be recovered
+    # retroactively (IBKR has no historical per-strike IV for a name this
+    # size) -- this can only start accumulating validation data going forward.
+    iv_curve = quote.get("iv_curve", {})
+    if iv_curve.get("available"):
+        findings.append(
+            f"IV curve shape: {iv_curve['shape']} (curvature={iv_curve['curvature']:+.4f}, "
+            f"{iv_curve['n_points']}/5 strikes) -- informational only, NOT validated as predictive"
+        )
+    else:
+        findings.append(f"IV curve shape: unavailable ({iv_curve.get('reason', 'no data')})")
+
+    # ── GEX wall + call/put OI ratio -- informational, not a gate ───────────
+    # Added 2026-08-25 (CEO request) after finding INTU's default short put
+    # sat directly on the chain's largest negative-gamma concentration.
+    # ONE real data point -- not evidence this predicts anything yet. Do NOT
+    # let this affect `approved` or strike selection until it's been checked
+    # against real outcomes over enough trades (same standard as IV curve
+    # shape and UOA skew above).
+    gex_wall = quote.get("gex_wall", {})
+    if gex_wall.get("available"):
+        wall_flag = (f" -- SHORT STRIKE (${gex_wall['biggest_wall_strike']:.0f}) SITS ON THE LARGEST "
+                     f"NEARBY GAMMA WALL ({gex_wall['biggest_wall_gex']:+,.0f})"
+                     if gex_wall.get("short_strike_on_biggest_wall") else "")
+        findings.append(
+            f"GEX/OI check: put-side wall={gex_wall.get('put_wall_gex')!r}  "
+            f"call-side wall={gex_wall.get('call_wall_gex')!r}  "
+            f"P/C OI ratio={gex_wall.get('pc_oi_ratio')}{wall_flag} "
+            f"-- informational only, NOT validated as predictive"
+        )
+    else:
+        findings.append(f"GEX/OI check: unavailable ({gex_wall.get('reason', 'no data')})")
+
     # ── Options tape/flow (UOA) cross-check -- informational, not a gate ────
+    # Call/put skew breakdown added 2026-08-25 (CEO request) -- the underlying
+    # options_unusual_activity rows always carried "right" (C/P) per contract,
+    # this just surfaces the split instead of collapsing it into one flagged
+    # count. Still purely informational: only 4 real trading days of data
+    # exist as of this writing (started 2026-08-19), nowhere near enough to
+    # have validated call/put skew as predictive of anything -- do NOT let
+    # this affect `approved` until it's been backtested the way the F11
+    # dark-pool hypothesis was (real accumulated history, checked against
+    # actual outcomes, see darkpool-levels-calculator's SKILL.md).
     try:
         con = sqlite3.connect(TAPE_DB_PATH, check_same_thread=False)
         con.row_factory = sqlite3.Row
+        latest_scan = con.execute(
+            "SELECT MAX(scan_time) FROM options_unusual_activity WHERE ticker = ?",
+            (ticker.upper(),)).fetchone()[0]
         rows = con.execute("""
-            SELECT * FROM options_unusual_activity WHERE ticker = ?
-            ORDER BY scan_time DESC LIMIT 5
-        """, (ticker.upper(),)).fetchall()
+            SELECT * FROM options_unusual_activity WHERE ticker = ? AND scan_time = ?
+        """, (ticker.upper(), latest_scan)).fetchall() if latest_scan else []
         con.close()
         if rows:
-            flagged = [r for r in rows if r["is_unusual"]]
-            findings.append(f"options flow: {len(flagged)}/{len(rows)} recent scans flagged unusual for {ticker}")
+            call_rows = [r for r in rows if r["right"] == "C"]
+            put_rows  = [r for r in rows if r["right"] == "P"]
+            call_vol  = sum(r["volume"] or 0 for r in call_rows)
+            put_vol   = sum(r["volume"] or 0 for r in put_rows)
+            call_flag = sum(1 for r in call_rows if r["is_unusual"])
+            put_flag  = sum(1 for r in put_rows if r["is_unusual"])
+            if call_vol > put_vol * 1.3:
+                skew = "call-skewed"
+            elif put_vol > call_vol * 1.3:
+                skew = "put-skewed"
+            else:
+                skew = "balanced"
+            findings.append(
+                f"options flow ({latest_scan[11:16]} UTC latest scan): calls vol={call_vol} "
+                f"({call_flag} flagged unusual) | puts vol={put_vol} ({put_flag} flagged unusual) "
+                f"-- {skew}, informational only, NOT validated as directional signal"
+            )
         else:
             findings.append(f"options flow: no recent UOA scan data for {ticker} (outside scan universe)")
     except Exception as exc:
@@ -17041,10 +17186,10 @@ async def _evc_place_condor(ib, quote: dict) -> bool:
         return False
 
     contracts = {
-        "long_put":   IbOpt(ticker, quote["expiry"], quote["long_put"],   "P", "SMART", "100", "USD"),
-        "long_call":  IbOpt(ticker, quote["expiry"], quote["long_call"],  "C", "SMART", "100", "USD"),
-        "short_put":  IbOpt(ticker, quote["expiry"], quote["short_put"],  "P", "SMART", "100", "USD"),
-        "short_call": IbOpt(ticker, quote["expiry"], quote["short_call"], "C", "SMART", "100", "USD"),
+        "long_put":   IbOpt(ticker, quote["expiry"], quote["long_put"],   "P", "SMART", "100", "USD", tradingClass=ticker),
+        "long_call":  IbOpt(ticker, quote["expiry"], quote["long_call"],  "C", "SMART", "100", "USD", tradingClass=ticker),
+        "short_put":  IbOpt(ticker, quote["expiry"], quote["short_put"],  "P", "SMART", "100", "USD", tradingClass=ticker),
+        "short_call": IbOpt(ticker, quote["expiry"], quote["short_call"], "C", "SMART", "100", "USD", tradingClass=ticker),
     }
     await ib.qualifyContractsAsync(*contracts.values())
     if not all(c.conId for c in contracts.values()):
@@ -17075,14 +17220,20 @@ async def _evc_place_condor(ib, quote: dict) -> bool:
                  f"{ev_cfg['min_credit']:.2f} — aborting before any orders placed")
         return False
 
-    # 40%-toward-market concession from mid, same convention as every other
-    # Alpaca condor script this account runs (alpaca_earnings_condor.py etc).
+    # (bid, ask, mid) tuples per leg so place_condor_sequential can walk its
+    # favorable->mid->aggressive ladder instead of firing one flat 40%-
+    # toward-market price with no retry. Real incident 2026-08-26 (DG): the
+    # flat short_put limit missed its 20s fill window, and since entries
+    # stop at the first leg failure, the two already-filled long legs were
+    # left uncovered -- a real, unintended position needing manual
+    # completion. (_evc_reprice_schedule looked like it should have covered
+    # this but was dead code, never actually called from here.)
     lp_mid, lc_mid, sp_mid, sc_mid = (lp_a+lp_b)/2, (lc_a+lc_b)/2, (sp_a+sp_b)/2, (sc_a+sc_b)/2
     entry_limits = {
-        "long_put":   round(lp_a - (lp_a - lp_mid) * 0.40, 2),
-        "long_call":  round(lc_a - (lc_a - lc_mid) * 0.40, 2),
-        "short_put":  round(sp_b + (sp_mid - sp_b) * 0.40, 2),
-        "short_call": round(sc_b + (sc_mid - sc_b) * 0.40, 2),
+        "long_put":   (lp_b, lp_a, lp_mid),
+        "long_call":  (lc_b, lc_a, lc_mid),
+        "short_put":  (sp_b, sp_a, sp_mid),
+        "short_call": (sc_b, sc_a, sc_mid),
     }
 
     expiry_alp = f"{quote['expiry'][:4]}-{quote['expiry'][4:6]}-{quote['expiry'][6:]}"
@@ -17124,7 +17275,7 @@ async def _evc_place_condor(ib, quote: dict) -> bool:
         _evc_log("NO_FILL", ticker, f"could not fetch live Alpaca buying power: {exc} — aborting, no orders placed")
         return False
 
-    long_leg_cost = (entry_limits["long_put"] + entry_limits["long_call"]) * 100
+    long_leg_cost = (lp_a + lc_a) * 100  # worst-case: paying the full ask on both longs
     put_width  = quote["short_put"]  - quote["long_put"]
     call_width = quote["long_call"] - quote["short_call"]
     est_required = long_leg_cost + (put_width + call_width) * 100  # conservative: full width both sides
@@ -17170,6 +17321,17 @@ async def _evc_place_condor(ib, quote: dict) -> bool:
 
     filled_credit = round((fills["short_put"] + fills["short_call"]) - (fills["long_put"] + fills["long_call"]), 2)
     pos_id = f"{ticker}_{date.today().strftime('%Y%m%d')}"
+    # Real earnings-release timestamp, captured once at entry so the stop-loss
+    # gate below (main.py's monitor loop) knows exactly when this position's
+    # own catalyst fires -- fixes a real incident 2026-08-26 (DG, DLTR): the
+    # intraday stop-loss was firing on ordinary PRE-earnings price/vol drift,
+    # hours before either name had actually reported, realizing real losses
+    # (-$75, -$60) on noise the strategy is designed to collect premium
+    # against, not react defensively to. CEO correction: "these are EVCs
+    # built to hold" -- the stop should only ever be able to fire AFTER the
+    # actual print, never before.
+    report_dt = await asyncio.get_event_loop().run_in_executor(
+        None, _evc_earnings_report_dt, ticker)
     pos = {
         "pos_id":        pos_id,
         "ticker":        ticker,
@@ -17196,6 +17358,7 @@ async def _evc_place_condor(ib, quote: dict) -> bool:
         "phase":      "open",
         "live_pnl":   0.0,
         "entry_time": datetime.now(timezone.utc).isoformat(),
+        "earnings_report_time": report_dt.isoformat() if report_dt else None,
     }
     ev["positions"][pos_id] = pos
     _evc_log("ENTERED", ticker,
@@ -17229,21 +17392,50 @@ async def _evc_close_position(ib, pos_id: str, reason: str) -> None:
     IBKR is still used for live close-pricing quotes only (data stays on
     IBKR)."""
     from ib_insync import Option as IbOpt
+    from zoneinfo import ZoneInfo
     ev  = state["evc"]
     pos = ev["positions"].get(pos_id)
     if not pos or pos["phase"] != "open":
         return
+    # Defense-in-depth for the same 2026-08-26 bug fixed at the stop-loss
+    # call site: closing goes through Alpaca OPTIONS orders, which only fill
+    # 9:30-16:00 ET regardless of caller (automated stop or the manual
+    # /earnings-vol-crush/close/{pos_id} endpoint) -- block here too so no
+    # future call site can reintroduce the guaranteed-zero-fill/stuck-
+    # phase="closing" failure mode.
+    # Real bug found 2026-08-26 (same day, a few hours after adding this
+    # gate): ZoneInfo was used here without a local import -- this function
+    # is a separate scope from _evc_monitor_loop, which imports it at the
+    # top of its own while-loop, so that import never covered this
+    # function. Result: EVERY real close attempt (manual endpoint AND the
+    # automatic stop-loss path once it reaches this call) raised a raw
+    # NameError, caught nowhere, returned as a bare 500 to callers. Caught
+    # immediately when a real manual close was attempted -- the position
+    # itself was never at risk (it stayed open, phase never left "open"),
+    # but the fix from a few hours ago was silently non-functional the
+    # whole time. Lesson: a market-hours gate that's never been exercised
+    # against a real close attempt is not verified, no matter how obviously
+    # correct the logic looks on read-through.
+    now_et_close = datetime.now(ZoneInfo("America/New_York"))
+    opt_open  = now_et_close.replace(hour=9,  minute=30, second=0, microsecond=0)
+    opt_close = now_et_close.replace(hour=16, minute=0,  second=0, microsecond=0)
+    if not ((opt_open <= now_et_close <= opt_close) and now_et_close.weekday() < 5):
+        _evc_log("CLOSE_DEFERRED", pos["ticker"],
+                 f"close requested (reason={reason}) outside options trading hours (9:30-16:00 ET) -- "
+                 f"refusing to attempt a guaranteed zero-fill order; retry once market reopens")
+        return
     pos["phase"] = "closing"
+    pos["close_reason_pending"] = reason  # so a retry that completes this later (_evc_retry_incomplete_closes) records the real original reason, not a generic fallback
     ticker = pos["ticker"]
     expiry = pos["expiry"]
     qty    = pos["qty"]
     syms   = pos["alpaca_symbols"]
 
     contracts = {
-        "long_put":   IbOpt(ticker, expiry, pos["long_put"],   "P", "SMART", "100", "USD"),
-        "long_call":  IbOpt(ticker, expiry, pos["long_call"],  "C", "SMART", "100", "USD"),
-        "short_put":  IbOpt(ticker, expiry, pos["short_put"],  "P", "SMART", "100", "USD"),
-        "short_call": IbOpt(ticker, expiry, pos["short_call"], "C", "SMART", "100", "USD"),
+        "long_put":   IbOpt(ticker, expiry, pos["long_put"],   "P", "SMART", "100", "USD", tradingClass=ticker),
+        "long_call":  IbOpt(ticker, expiry, pos["long_call"],  "C", "SMART", "100", "USD", tradingClass=ticker),
+        "short_put":  IbOpt(ticker, expiry, pos["short_put"],  "P", "SMART", "100", "USD", tradingClass=ticker),
+        "short_call": IbOpt(ticker, expiry, pos["short_call"], "C", "SMART", "100", "USD", tradingClass=ticker),
     }
     await ib.qualifyContractsAsync(*contracts.values())
 
@@ -17254,16 +17446,23 @@ async def _evc_close_position(ib, pos_id: str, reason: str) -> None:
         ib.cancelMktData(contract)
         return b, a
 
+    # (bid, ask, mid) tuples per leg, not a single precomputed price -- lets
+    # close_condor_sequential walk its favorable->mid->aggressive ladder
+    # (place_leg_with_ladder) instead of firing one flat limit with no
+    # retry. Real incident 2026-08-26 (INTU): the old code anchored a
+    # missing/zero live quote on the ORIGINAL ENTRY FILL PRICE, which is
+    # almost never fillable for a leg being closed (the whole point of
+    # closing is that the price moved) -- that stranded the long_call leg
+    # at a $3.20 limit when it had decayed to pennies, leaving the position
+    # stuck at phase="closing" until a human closed it manually. mid=None
+    # (missing/zero quote) is handled inside price_ladder itself, which
+    # falls back to whatever single side exists, or $0.01 as a last
+    # resort -- always closer to fillable than the stale entry price.
     quotes = {name: await _live_bid_ask(c) for name, c in contracts.items()}
     close_limits = {}
     for name, (b, a) in quotes.items():
-        if b > 0 and a > 0:
-            mid = (a + b) / 2
-            # closing a long = SELL (cross toward bid); closing a short = BUY (cross toward ask)
-            close_limits[name] = round(b + (mid - b) * 0.40, 2) if name.startswith("long") \
-                else round(a - (a - mid) * 0.40, 2)
-        else:
-            close_limits[name] = pos["leg_fills"][name]  # stale/missing quote -- anchor on entry fill
+        mid = (a + b) / 2 if (b > 0 and a > 0) else None
+        close_limits[name] = (b, a, mid)
 
     try:
         alp_cfg = _alp_load_config()
@@ -17278,13 +17477,32 @@ async def _evc_close_position(ib, pos_id: str, reason: str) -> None:
         None, _alp_close_condor, client, syms, close_limits, qty)
 
     if not ok:
-        msg = f"EVC/Alpaca: {ticker} close INCOMPLETE (fills={fills}) — check Alpaca positions manually NOW."
+        msg = f"EVC/Alpaca: {ticker} close INCOMPLETE (fills={fills}) — retrying automatically in the background."
         _evc_log("CLOSE_INCOMPLETE", ticker, msg)
         _oversight_notify(msg, high_priority=True)
         _oversight_log("trader", "execution_issue", f"EVC/Alpaca {ticker} close incomplete: fills={fills}",
-                        outcome="needs manual review — position left phase=closing, will not auto-retry")
-        return  # leave phase="closing" -- needs a human look, not an auto-retry
+                        outcome="left phase=closing -- _evc_retry_incomplete_closes will pick it up next cycle")
+        # Record whatever DID fill so a retry never re-submits a leg that's
+        # already closed (the exact race the old "never auto-retry" rule
+        # existed to avoid -- see _evc_retry_incomplete_closes's own
+        # docstring). Real Alpaca position state is still re-verified before
+        # every retry attempt regardless; this is just a head start.
+        pos["close_fills"] = {k: v for k, v in fills.items() if v}
+        pos.setdefault("close_retry_count", 0)
+        pos["last_retry_attempt"] = None  # force an immediate first retry, not a cooldown wait
+        return  # leave phase="closing" -- _evc_retry_incomplete_closes takes it from here
 
+    _evc_finalize_close(pos_id, pos, fills, reason)
+
+
+def _evc_finalize_close(pos_id: str, pos: dict, fills: dict, reason: str) -> None:
+    """Shared completion logic for a fully-closed EVC condor (all 4 legs
+    accounted for) -- computes real pnl, records closed_today, and updates
+    trade_journal.db. Factored out 2026-08-28 so _evc_retry_incomplete_closes
+    can call the exact same finalization _evc_close_position's own success
+    path already used, instead of a second, easy-to-drift-out-of-sync copy."""
+    ev = state["evc"]
+    ticker, qty = pos["ticker"], pos["qty"]
     close_cost = 0.0
     for name, sign in (("long_put", -1), ("short_put", 1), ("short_call", 1), ("long_call", -1)):
         fill_px = fills.get(name) or 0.0
@@ -17300,7 +17518,17 @@ async def _evc_close_position(ib, pos_id: str, reason: str) -> None:
         "pos_id":        pos_id,
         "ticker":        ticker,
         "date":          pos["date"],
-        "expiry":        expiry,
+        # Entry date, kept for continuity with older records. The actual
+        # close-day boundary for restore-on-restart uses exit_date below --
+        # real bug found 2026-08-26 (INTU): _evc_load_state's closed_today
+        # filter checked this "date" field against today, but for any
+        # overnight-spanning position (this account's normal EVC pattern:
+        # afternoon entry, next-morning exit) that field is the ENTRY date,
+        # not today, so a same-day-as-close restart silently dropped the
+        # closed-trade record -- the same class of bug already fixed for
+        # the open-positions restore filter, just on the closed side.
+        "exit_date":     date.today().isoformat(),
+        "expiry":        pos["expiry"],
         "expected_move": pos["expected_move"],
         "short_put":     pos["short_put"],
         "short_call":    pos["short_call"],
@@ -17337,6 +17565,142 @@ async def _evc_close_position(ib, pos_id: str, reason: str) -> None:
 
     _evc_log("CLOSED", ticker, f"exit={reason}  P&L=${pnl:.2f} ({pnl_pct:.1f}%) via Alpaca")
     _evc_save_state()
+
+
+async def _evc_retry_incomplete_closes(ib) -> None:
+    """Automatically retries any EVC position stuck at phase="closing" after
+    an incomplete close -- built 2026-08-28 after ULTA sat fully exposed on
+    all 4 legs for ~40 minutes because the original "never auto-retry an
+    incomplete close" rule (DE 2026-08-19: a blind retry could resubmit an
+    order for a leg that actually already filled, doubling up a position)
+    meant NOTHING retried it until a human happened to check.
+
+    Safe by construction, not by removing the old caution: every leg is
+    re-verified against the REAL Alpaca position before any new order is
+    ever submitted for it. A leg with no open Alpaca position is treated as
+    already closed (whether from the original attempt or a prior retry) and
+    is never touched again -- this is the same existence-check pattern
+    already used for Day Trader/SPX 0DTE exit-fill detection, just applied
+    per-leg instead of per-position. Only genuinely still-open legs get a
+    fresh closing order.
+
+    Retries on a cooldown (not every monitor tick) and escalates to a HIGH
+    priority alert (without giving up) if a position has needed an unusual
+    number of attempts, so a leg that's persistently unclosable (the same
+    "account not eligible to trade uncovered option contracts" quirk seen
+    repeatedly on worthless long options this week) surfaces loudly instead
+    of retrying silently forever.
+    """
+    from ib_insync import Option as IbOpt
+    ev = state["evc"]
+    RETRY_COOLDOWN_S = 90
+    ESCALATE_EVERY_N_ATTEMPTS = 6   # re-alert periodically, not just once, if it's still stuck
+    MAX_ATTEMPTS = 20               # ~30min at the 90s cooldown -- stop auto-retrying, needs a human by then
+
+    for pos_id, pos in list(ev["positions"].items()):
+        if pos.get("phase") != "closing":
+            continue
+        if pos.get("close_retry_count") == -1:
+            continue  # automated retries exhausted (see MAX_ATTEMPTS below) -- needs a human, won't self-resolve
+
+        last_attempt = pos.get("last_retry_attempt")
+        if last_attempt:
+            try:
+                if (_utcnow() - _parse_utc(last_attempt)).total_seconds() < RETRY_COOLDOWN_S:
+                    continue
+            except Exception:
+                pass
+
+        ticker, expiry, syms = pos["ticker"], pos["expiry"], pos["alpaca_symbols"]
+        try:
+            alp_cfg = _alp_load_config()
+            client  = _alp_client(alp_cfg)
+        except Exception as exc:
+            log.warning("EVC retry-close %s: Alpaca client init failed: %s", ticker, exc)
+            continue
+
+        pos["last_retry_attempt"] = _utcnow().isoformat()
+        pos["close_retry_count"] = pos.get("close_retry_count", 0) + 1
+        fills = dict(pos.get("close_fills") or {})
+
+        leg_side = {
+            "short_put": _AlpOrderSide.BUY, "short_call": _AlpOrderSide.BUY,
+            "long_put": _AlpOrderSide.SELL, "long_call": _AlpOrderSide.SELL,
+        }
+        loop = asyncio.get_event_loop()
+        still_open = []
+        for leg in ("short_put", "short_call", "long_put", "long_call"):
+            if fills.get(leg):
+                continue  # already have a real fill for this leg, from this attempt or an earlier one
+            sym = syms[leg]
+            real_pos = await loop.run_in_executor(None, _alp_has_position, client, sym)
+            if real_pos is None:
+                # No open Alpaca position -- already closed (by the original
+                # attempt or a previous retry). Recover the real fill price
+                # from Alpaca's own order history rather than leaving it
+                # blank, so the eventual pnl calc is accurate, not just complete.
+                try:
+                    orders = client.get_orders(GetOrdersRequest(
+                        status=QueryOrderStatus.CLOSED, symbols=[sym], limit=10, direction="desc"))
+                    want_side = "buy" if leg_side[leg] == _AlpOrderSide.BUY else "sell"
+                    match = next((o for o in orders if str(o.side).lower().endswith(want_side)
+                                  and o.filled_avg_price and float(o.filled_qty or 0) > 0), None)
+                    if match:
+                        fills[leg] = float(match.filled_avg_price)
+                except Exception as exc:
+                    log.warning("EVC retry-close %s %s: could not recover historical fill: %s", ticker, leg, exc)
+                continue
+            still_open.append(leg)
+
+        for leg in still_open:
+            strike = pos[leg]
+            right = "P" if "put" in leg else "C"
+            contract = IbOpt(ticker, expiry, strike, right, "SMART", "100", "USD", tradingClass=ticker)
+            try:
+                await ib.qualifyContractsAsync(contract)
+                td = ib.reqMktData(contract, "", False, False)
+                await asyncio.sleep(3)
+                b, a = _spx_safe_px(td.bid), _spx_safe_px(td.ask)
+                ib.cancelMktData(contract)
+                mid = (a + b) / 2 if (b and a) else None
+                ok, fill_px = await loop.run_in_executor(
+                    None, _alp_leg_ladder, client, syms[leg], leg_side[leg],
+                    f"EVC retry-close {ticker} {leg}", pos["qty"], b, a, mid)
+                if ok:
+                    fills[leg] = fill_px
+                    _evc_log("RETRY_LEG_CLOSED", ticker, f"{leg} closed @ {fill_px} (attempt #{pos['close_retry_count']})")
+            except Exception as exc:
+                log.warning("EVC retry-close %s %s: %s", ticker, leg, exc)
+
+        pos["close_fills"] = fills
+        remaining = [leg for leg in ("short_put", "short_call", "long_put", "long_call") if not fills.get(leg)]
+
+        if not remaining:
+            _evc_log("RETRY_CLOSE_COMPLETE", ticker,
+                     f"all 4 legs accounted for after {pos['close_retry_count']} retry attempt(s)")
+            _evc_finalize_close(pos_id, pos, fills, pos.get("close_reason_pending", "manual_close_retried"))
+            continue
+
+        attempts = pos["close_retry_count"]
+        if attempts >= MAX_ATTEMPTS:
+            _oversight_notify(
+                f"EVC/Alpaca: {ticker} still has {len(remaining)} leg(s) stuck after {attempts} automated "
+                f"retry attempts (~{attempts * RETRY_COOLDOWN_S // 60}min) -- remaining legs: {remaining}. "
+                f"Giving up automated retry now (likely a genuinely unclosable leg, e.g. the recurring "
+                f"'account not eligible to trade uncovered option contracts' quirk on a worthless long "
+                f"option) -- needs a human look. Not retrying again automatically.",
+                high_priority=True)
+            pos["close_retry_count"] = -1  # sentinel: retries exhausted, stop picking this up again
+        elif attempts % ESCALATE_EVERY_N_ATTEMPTS == 0:
+            _oversight_notify(
+                f"EVC/Alpaca: {ticker} still stuck closing after {attempts} automated retry attempts -- "
+                f"remaining legs: {remaining}. Likely a genuinely unclosable leg (e.g. the recurring "
+                f"'account not eligible to trade uncovered option contracts' quirk on a worthless long "
+                f"option) rather than a transient failure. Still retrying automatically, but take a look.",
+                high_priority=True)
+        _evc_save_state()
+
+
 
 
 async def _evc_entry_coro(ib) -> None:
@@ -17477,10 +17841,18 @@ async def _evc_preflight_loop() -> None:
 
 
 async def _evc_exit_coro(ib) -> None:
-    """Close all open EVC positions (IV crush exit at morning open)."""
+    """Close all open EVC positions (IV crush exit at morning open) --
+    except any with hold_override set (CEO decision 2026-08-27: hold a
+    specific position past the normal exit window on an asymmetric-risk
+    thesis, not a blanket policy change)."""
     ev = state["evc"]
     for pos_id in list(ev["positions"].keys()):
         pos = ev["positions"].get(pos_id)
+        if pos and pos["phase"] == "open" and pos.get("hold_override"):
+            _evc_log("EXIT_SKIPPED_HOLD_OVERRIDE", pos["ticker"],
+                     f"hold_override is set -- CEO chose to hold {pos_id} past the "
+                     f"9:31-9:35 ET exit window, not closing")
+            continue
         if pos and pos["phase"] == "open":
             await _evc_close_position(ib, pos_id, "iv_crush_exit")
 
@@ -17534,9 +17906,21 @@ async def _evc_monitor_loop() -> None:
             # EXIT: morning IV crush close (highest priority)
             if _t(cfg["exit_start"]) <= now <= _t(cfg["exit_cutoff"]):
                 if ev["positions"]:
+                    # timeout raised 120->1200s (matches the entry path's own
+                    # timeout just above): real, time-critical bug found
+                    # 2026-08-27, caught BEFORE it could fire for real.
+                    # _evc_exit_coro closes every open position SEQUENTIALLY
+                    # via the same ladder-based _evc_close_position fixed
+                    # 2026-08-26 (up to ~240s worst case per position, 4 legs
+                    # x 3 ladder retries x 20s). With 3 real positions open
+                    # this morning (CRM/CRWD/NVDA), worst case is ~720s --
+                    # the old 120s timeout would have cancelled the outer
+                    # task and orphaned the close threads in the background,
+                    # exactly the DG/DLTR incident from yesterday, at the
+                    # worst possible moment (the actual planned exit).
                     await loop.run_in_executor(
                         None,
-                        lambda: _run_in_streaming_loop(_evc_exit_coro(ib), timeout=120))
+                        lambda: _run_in_streaming_loop(_evc_exit_coro(ib), timeout=1200))
 
             # ENTRY: afternoon pre-earnings window
             elif _t(cfg["entry_start"]) <= now <= _t(cfg["entry_cutoff"]):
@@ -17544,6 +17928,15 @@ async def _evc_monitor_loop() -> None:
                     await loop.run_in_executor(
                         None,
                         lambda: _run_in_streaming_loop(_evc_entry_coro(ib), timeout=1200))
+
+            # Retry any position stuck at phase="closing" from an earlier
+            # incomplete close -- runs every tick, own 90s-per-position
+            # cooldown keeps it from hammering retries (see the function's
+            # own docstring for why this is now safe to auto-retry).
+            if any(p.get("phase") == "closing" for p in ev["positions"].values()):
+                await loop.run_in_executor(
+                    None,
+                    lambda: _run_in_streaming_loop(_evc_retry_incomplete_closes(ib), timeout=300))
 
             # LIVE P&L + intraday stop check (any time positions are open)
             if ev["positions"]:
@@ -17582,13 +17975,101 @@ async def _evc_monitor_loop() -> None:
                             entry_dt  = _parse_utc(entry_ts)
                             entry_age = (now - entry_dt).total_seconds()
                             grace_ok  = entry_age > 300
-                        if live_pnl < -max_loss and grace_ok:
-                            _evc_log("STOP", ticker,
-                                     f"live_pnl=${live_pnl:.2f} < max_loss=${-max_loss:.2f}")
-                            await loop.run_in_executor(
-                                None,
-                                lambda pid=pos_id: _run_in_streaming_loop(
-                                    _evc_close_position(ib, pid, "max_loss_stop"), timeout=60))
+                        # Real incident 2026-08-26 (DG, DLTR): the stop-loss
+                        # used to fire on ordinary PRE-earnings price/vol
+                        # drift -- both names were BMO reporters that hadn't
+                        # even printed yet when they got stopped out for real
+                        # losses (-$75, -$60). "These are EVCs built to
+                        # hold": the position should never be defensively
+                        # closed before its own catalyst has actually fired,
+                        # only after (a real post-earnings move stopping out
+                        # is still legitimate -- see the INTU 18:05 ET real
+                        # stop from the same night, a genuine post-move).
+                        # 30-min buffer past the reported release time covers
+                        # AH/BMO print-processing lag. Missing timestamp data
+                        # (older positions, or a yfinance lookup miss at
+                        # entry) defaults to "reported" -- fail toward the
+                        # existing protective behavior, not toward silently
+                        # disabling it.
+                        report_ts = pos.get("earnings_report_time")
+                        earnings_reported = True
+                        if report_ts:
+                            try:
+                                report_dt = datetime.fromisoformat(report_ts)
+                                earnings_reported = now >= report_dt + timedelta(minutes=30)
+                            except Exception:
+                                earnings_reported = True
+                        if live_pnl < -max_loss and grace_ok and not earnings_reported:
+                            _evc_log("STOP_SUPPRESSED_PRE_EARNINGS", ticker,
+                                     f"live_pnl=${live_pnl:.2f} < max_loss=${-max_loss:.2f} but "
+                                     f"earnings hasn't reported yet (report_time={report_ts}) -- "
+                                     f"holding per standing EVC policy, not closing on pre-event noise")
+                        # CEO decision 2026-08-27: hold this specific position
+                        # past the normal exit window on an asymmetric-risk
+                        # thesis (already near its own max loss/profit, real
+                        # room to improve, limited room to get materially
+                        # worse) -- honors "sounds like a good plan" without
+                        # the always-on stop-loss immediately overriding it
+                        # the moment real quotes come in. Also excluded from
+                        # _evc_exit_coro's 9:31-9:35 morning sweep below.
+                        hold_override = bool(pos.get("hold_override"))
+                        if live_pnl < -max_loss and grace_ok and hold_override:
+                            _evc_log("STOP_SUPPRESSED_HOLD_OVERRIDE", ticker,
+                                     f"live_pnl=${live_pnl:.2f} < max_loss=${-max_loss:.2f} but "
+                                     f"hold_override is set -- CEO chose to hold this position past "
+                                     f"the normal exit/stop, not closing")
+                        if live_pnl < -max_loss and grace_ok and earnings_reported and not hold_override:
+                            # Real bug found 2026-08-26 (INTU): this check runs
+                            # any time positions are open, including after
+                            # options regular trading hours (the underlying
+                            # stock keeps moving in extended hours, so live_pnl
+                            # here can be real and accurate well past 4pm ET --
+                            # confirmed live_pnl=-$381 was a genuine post-
+                            # earnings move, not a stale number). But the close
+                            # itself goes through Alpaca OPTIONS orders, which
+                            # can only fill 9:30-16:00 ET -- attempting it after
+                            # hours guarantees a zero-fill CLOSE_INCOMPLETE, and
+                            # _evc_close_position deliberately does NOT auto-
+                            # retry an incomplete close (same rule as the entry
+                            # side, DE 2026-08-19), so the position was stuck in
+                            # phase="closing" limbo for ~8 hours until found.
+                            # Now: log the real stop condition either way (so
+                            # it's visible), but only ATTEMPT the close inside
+                            # real options trading hours -- outside that window,
+                            # leave phase="open" so it's re-evaluated next tick
+                            # and closes for real once the market reopens.
+                            now_et_stop = datetime.now(ZoneInfo("America/New_York"))
+                            opt_mkt_open  = now_et_stop.replace(hour=9,  minute=30, second=0, microsecond=0)
+                            opt_mkt_close = now_et_stop.replace(hour=16, minute=0,  second=0, microsecond=0)
+                            in_opt_hours = (opt_mkt_open <= now_et_stop <= opt_mkt_close) and now_et_stop.weekday() < 5
+                            if in_opt_hours:
+                                _evc_log("STOP", ticker,
+                                         f"live_pnl=${live_pnl:.2f} < max_loss=${-max_loss:.2f}")
+                                # timeout raised 60->300s: real incident 2026-08-26 (DG).
+                                # _run_in_streaming_loop's future.cancel() on timeout does
+                                # NOT stop the underlying work -- close_condor_sequential
+                                # runs inside run_in_executor as SYNCHRONOUS, time.sleep()-
+                                # based code, which a raw OS thread keeps executing to
+                                # completion regardless of asyncio cancellation. At 60s,
+                                # a 4-leg ladder-based close (up to 3 retries x 20s per
+                                # leg, ~240s worst case since the 2026-08-26 ladder fix)
+                                # routinely exceeded the timeout: the HTTP-equivalent call
+                                # here gave up, but the real closes kept executing
+                                # orphaned in the background, eventually completing all 4
+                                # legs for real money with no one left to record it into
+                                # ev["positions"]/closed_today -- exactly why DG stayed
+                                # stuck at phase="closing" after already being fully,
+                                # correctly closed at Alpaca. 300s comfortably covers the
+                                # new worst case with margin.
+                                await loop.run_in_executor(
+                                    None,
+                                    lambda pid=pos_id: _run_in_streaming_loop(
+                                        _evc_close_position(ib, pid, "max_loss_stop"), timeout=300))
+                            else:
+                                _evc_log("STOP_DEFERRED", ticker,
+                                         f"live_pnl=${live_pnl:.2f} < max_loss=${-max_loss:.2f} but outside "
+                                         f"options trading hours (9:30-16:00 ET) -- deferring close attempt "
+                                         f"to avoid a guaranteed zero-fill CLOSE_INCOMPLETE; will retry once market reopens")
                     except Exception as exc:
                         log.debug("EVC P&L update %s: %s", pos_id, exc)
                 _evc_save_state()
@@ -17871,6 +18352,8 @@ class EVCConfigRequest(BaseModel):
     reprice_wait_s:         Optional[int]   = None
     max_reprice_concession: Optional[float] = None
     max_move_pct:           Optional[float] = None
+    put_cushion_mult:       Optional[float] = None
+    call_cushion_mult:      Optional[float] = None
 
 
 @app.get("/earnings-vol-crush/status")
@@ -17960,6 +18443,84 @@ def evc_enable(enabled: bool = True):
     return {"enabled": ev["enabled"]}
 
 
+# SPY Weekly Condor extracted to its own standalone process 2026-09-07
+# (spy_weekly_condor_agent.py, port 8011) -- these routes are now thin
+# proxies, exactly matching the established /day-trader/* pattern. This
+# strategy had never gone live (disabled, zero positions) at extraction
+# time -- same real motivation as Day Trader's own 2026-08-27 extraction:
+# isolate its Monday-entry/Friday-exit cycle from any main.py crash/restart.
+
+def _spy_agent_unreachable(exc) -> HTTPException:
+    return HTTPException(503, f"SPY Weekly Condor agent (port 8011) unreachable: {exc}")
+
+
+@app.get("/spy-condor/status")
+def spy_condor_status():
+    try:
+        r = requests.get(f"{SPY_CONDOR_AGENT_URL}/spy-condor/status", timeout=10)
+        r.raise_for_status()
+        return r.json()
+    except Exception as exc:
+        raise _spy_agent_unreachable(exc)
+
+
+@app.post("/spy-condor/enable")
+def spy_condor_enable(enabled: bool = True):
+    try:
+        r = requests.post(f"{SPY_CONDOR_AGENT_URL}/spy-condor/enable",
+                           params={"enabled": enabled}, timeout=10)
+        r.raise_for_status()
+        return r.json()
+    except Exception as exc:
+        raise _spy_agent_unreachable(exc)
+
+
+@app.post("/spy-condor/config")
+async def spy_condor_config(req: Request):
+    try:
+        body = await req.json()
+        r = requests.post(f"{SPY_CONDOR_AGENT_URL}/spy-condor/config", json=body, timeout=10)
+        r.raise_for_status()
+        return r.json()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise _spy_agent_unreachable(exc)
+
+
+@app.post("/spy-condor/close/{pos_id}")
+def spy_condor_close(pos_id: str):
+    try:
+        # 300s -- the agent's own close can take up to ~240s worst case
+        # across 4 legs (sequential ladder), same real timing as before.
+        r = requests.post(f"{SPY_CONDOR_AGENT_URL}/spy-condor/close/{pos_id}", timeout=300)
+        if r.status_code == 404:
+            raise HTTPException(404, r.json().get("detail", "not found"))
+        r.raise_for_status()
+        return r.json()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise _spy_agent_unreachable(exc)
+
+
+@app.post("/spy-condor/enter-now")
+def spy_condor_enter_now():
+    """Manual override: quote and (if it passes review) enter a SPY weekly
+    condor right now, bypassing the Monday-only window -- for controlled
+    testing, not for routine use. Real orders if approved."""
+    try:
+        r = requests.post(f"{SPY_CONDOR_AGENT_URL}/spy-condor/enter-now", timeout=300)
+        if r.status_code in (400, 409):
+            raise HTTPException(r.status_code, r.json().get("detail", "rejected"))
+        r.raise_for_status()
+        return r.json()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise _spy_agent_unreachable(exc)
+
+
 @app.post("/earnings-vol-crush/config")
 def evc_config(req: EVCConfigRequest):
     ev  = state["evc"]
@@ -17981,10 +18542,57 @@ async def evc_close(pos_id: str):
         raise HTTPException(503, "IBKR not connected")
     _evc_log("MANUAL_CLOSE", ev["positions"][pos_id]["ticker"], f"manual close requested for {pos_id}")
     loop = asyncio.get_event_loop()
+    # timeout raised 60->300s -- see the stop-loss close call site's comment
+    # above (real incident 2026-08-26, DG): a too-short timeout here orphans
+    # the real, synchronous close work in the background once it fires.
     await loop.run_in_executor(
         None,
-        lambda: _run_in_streaming_loop(_evc_close_position(ib, pos_id, "manual_close"), timeout=60))
+        lambda: _run_in_streaming_loop(_evc_close_position(ib, pos_id, "manual_close"), timeout=300))
     return {"status": "closing", "pos_id": pos_id}
+
+
+@app.get("/earnings-vol-crush/preview/{ticker}")
+async def evc_preview_ticker(ticker: str):
+    """Read-only: build the real condor quote and run the same CRO/CFO
+    pre-trade review /enter/{ticker} uses, WITHOUT calling
+    _evc_place_condor -- lets a candidate be evaluated (strikes, credit,
+    approval, scenarios) without risking an actual order."""
+    ib = state.get("ib")
+    if not ib or not ib.isConnected():
+        raise HTTPException(503, "IBKR not connected — ensure TWS/IB Gateway is running")
+    ticker = ticker.upper()
+    ev_cfg = state["evc"]["config"]
+
+    async def _do_preview(ib):
+        quote = await _evc_quote_condor(ib, ticker)
+        try:
+            alp_cfg = _alp_load_config()
+            client  = _alp_client(alp_cfg)
+            alpaca_equity = float(client.get_account().equity)
+        except Exception:
+            alpaca_equity = 0.0
+        ibkr_net_liq = _get_net_liq(ib) if ib and ib.isConnected() else 0.0
+        review = _evc_pretrade_review(ticker, quote, ibkr_net_liq, alpaca_equity, ev_cfg)
+        return {
+            "ticker":         ticker,
+            "spot":           quote["spot"],
+            "expected_move":  quote["expected_move"],
+            "strikes":        f"{quote['long_put']}/{quote['short_put']}P | {quote['short_call']}/{quote['long_call']}C",
+            "net_credit":     quote["net_credit"],
+            "im_pct":         quote.get("im_pct"),
+            "approved":       review["approved"],
+            "findings":       review["findings"],
+            "scenarios":      review["scenarios"],
+        }
+
+    loop = asyncio.get_event_loop()
+    try:
+        result = await loop.run_in_executor(
+            None,
+            lambda: _run_in_streaming_loop(_do_preview(ib), timeout=120))
+    except (ValueError, RuntimeError) as e:
+        raise HTTPException(400, str(e))
+    return result
 
 
 @app.post("/earnings-vol-crush/enter/{ticker}")
@@ -18004,16 +18612,26 @@ async def evc_enter_ticker(ticker: str):
         return {
             "success": success,
             "ticker":  ticker,
-            "strikes": f"{quote['long_put_strike']}/{quote['short_put_strike']}P | {quote['short_call_strike']}/{quote['long_call_strike']}C",
-            "credit":  quote["credit_start"],
+            "strikes": f"{quote['long_put']}/{quote['short_put']}P | {quote['short_call']}/{quote['long_call']}C",
+            "credit":  quote["net_credit"],
             "em_pct":  f"{quote['im_pct']:.1%}",
         }
 
     loop = asyncio.get_event_loop()
     try:
+        # timeout raised 180->300s: real incident 2026-08-26 (DLTR). At
+        # 180s this timed out while place_condor_sequential's ladder
+        # retries were still legitimately in progress (up to ~240s worst
+        # case across 4 legs since the 2026-08-26 ladder fix) --
+        # _run_in_streaming_loop's future.cancel() doesn't stop the
+        # underlying synchronous, time.sleep()-based executor thread, so
+        # the real order placement kept running orphaned in the
+        # background after this endpoint had already returned an error,
+        # with no path left to record the eventual result into
+        # ev["positions"]. 300s comfortably covers the new worst case.
         result = await loop.run_in_executor(
             None,
-            lambda: _run_in_streaming_loop(_do_enter(ib), timeout=180))
+            lambda: _run_in_streaming_loop(_do_enter(ib), timeout=300))
     except (ValueError, RuntimeError) as e:
         raise HTTPException(400, str(e))
     return result
@@ -18066,8 +18684,15 @@ async def _ibkr_reconcile(ib, *, on_startup: bool = False) -> None:
     # Auto-trader: matched by contract key (symbol_right_strike_expiry), no conid stored
     at_keys = set(state["autotrader"].get("positions", {}).keys())
 
-    # Day Trader + Auto-trader + Stock-trader stocks: matched by symbol
-    dt_symbols  = set(state["day_trader"]["positions"].keys())
+    # Day Trader + Auto-trader + Stock-trader stocks: matched by symbol.
+    # Day Trader runs as its own standalone process since 2026-08-27
+    # (day_trader_agent.py) -- read its positions from the shared state
+    # file it owns rather than in-process state that no longer exists here.
+    try:
+        with open("day_trader_state.json") as _dtf:
+            dt_symbols = set(json.load(_dtf).get("positions", {}).keys())
+    except Exception:
+        dt_symbols = set()
     at_symbols  = {k.split("_")[0] for k in at_keys}
     st_symbols  = set(state.get("stock_trader", {}).get("positions", {}).keys())
     claimed_stk = dt_symbols | at_symbols | st_symbols
@@ -18110,13 +18735,40 @@ async def _ibkr_reconcile(ib, *, on_startup: bool = False) -> None:
                 continue
             untracked_stk.append(item)
 
-    # ── 3. Ghost opens: state says open, IBKR holds none of those conids ──
+    # ── 3. Ghost opens: state says open, but the REAL venue holds none of it ──
+    # Real bug found 2026-08-25 (INTU): every EVC position since 2026-08-19 is
+    # placed via Alpaca (2026-08-11 architecture decision), so its "conids"
+    # are only ever used for IBKR pricing/qualification -- they were never
+    # expected to appear in IBKR's own portfolio. This check used to compare
+    # them against ibkr_conid_set regardless, so a perfectly real, freshly-
+    # filled Alpaca condor got immediately misclassified as a ghost and
+    # stamped externally_closed, silently turning off its own exit monitoring
+    # the same day it was entered. Fixed to check Alpaca-venue positions
+    # against Alpaca's real holdings instead of IBKR's.
     ghost_evc: list = []
+    alpaca_symbols_held: Optional[set] = None  # lazy-loaded, only if needed
     for pos_id, pos in list(state["evc"]["positions"].items()):
-        pos_conids = {int(c) for c in pos.get("conids", {}).values() if c}
-        if pos_conids and not pos_conids & ibkr_conid_set:
-            ghost_evc.append((pos_id, pos))
-            pos["phase"] = "externally_closed"   # stop monitor from trying to exit
+        if pos.get("phase") not in ("open", None):
+            continue  # already closing/closed -- not a ghost-open candidate
+        if pos.get("venue") == "alpaca":
+            if alpaca_symbols_held is None:
+                alpaca_symbols_held = set()
+                try:
+                    alp_cfg = _alp_load_config()
+                    alp_client = _alp_client(alp_cfg)
+                    alpaca_symbols_held = {p.symbol for p in alp_client.get_all_positions()}
+                except Exception as exc:
+                    log.warning("RECON [%s]: could not fetch Alpaca positions for ghost-check: %s", label, exc)
+                    continue  # can't verify -- don't misclassify on a fetch failure
+            pos_symbols = set(pos.get("alpaca_symbols", {}).values())
+            if pos_symbols and not pos_symbols & alpaca_symbols_held:
+                ghost_evc.append((pos_id, pos))
+                pos["phase"] = "externally_closed"   # stop monitor from trying to exit
+        else:
+            pos_conids = {int(c) for c in pos.get("conids", {}).values() if c}
+            if pos_conids and not pos_conids & ibkr_conid_set:
+                ghost_evc.append((pos_id, pos))
+                pos["phase"] = "externally_closed"   # stop monitor from trying to exit
     if ghost_evc:
         _evc_save_state()
 
@@ -20518,9 +21170,338 @@ def fx_history(limit: int = 50):
         return {"trades": [], "error": str(e)}
 
 
+# ── Live Data WebSocket -- account/strategy snapshot push (2026-09-07) ──────
+# Structurally independent from /ws/tape below: that endpoint needs the
+# special streaming-thread treatment because it owns a live ib_insync.IB()
+# connection (one dedicated IBKR client id per ticker watched). This one
+# never touches ib_insync directly -- it only reads state's plain dicts
+# (already-computed, in-memory) and proxies 2 lightweight HTTP calls to the
+# standalone agents that have their own server (Day Trader :8010, SPY
+# Weekly Condor :8011) -- runs fine on uvicorn's own loop.
+_live_ws_clients: set = set()
+
+# Per-strategy adapter -- NOT a generic walker. Confirmed live 2026-09-07:
+# state["spx_0dte"] keys open items as "spreads", not "positions" like
+# every other in-process strategy; state["manual_trader"] uses "closed",
+# not "closed_today" like everyone else, and its "closed" list is the last
+# 100 closes (not day-scoped), so a naive sum would silently misreport
+# "today's" P&L -- left null there rather than fabricate a wrong number,
+# same convention pnl_dashboard's own Alpaca-merge already uses (see its
+# comment: "showing a fabricated number would be worse than omitting it").
+def _live_snapshot_inprocess_strategies() -> dict:
+    out = {}
+
+    def _today_pnl(closed_list):
+        try:
+            return round(sum(float(r.get("pnl", 0) or 0) for r in closed_list), 2)
+        except Exception:
+            return None
+
+    at = state.get("autotrader", {})
+    out["autotrader"] = {"enabled": at.get("enabled", False),
+                          "open_position_count": len(at.get("positions", {})),
+                          "today_pnl": None}  # only cumulative counters kept, no daily-reset list
+
+    st = state.get("stock_trader", {})
+    out["stock_trader"] = {"enabled": st.get("enabled", False),
+                            "open_position_count": len(st.get("positions", {})),
+                            "today_pnl": _today_pnl(st.get("closed_today", []))}
+
+    sx = state.get("spx_0dte", {})
+    out["spx_0dte"] = {"enabled": sx.get("enabled", False),
+                        "open_position_count": len(sx.get("spreads", {})),
+                        "today_pnl": _today_pnl(sx.get("closed_today", []))}
+
+    ev = state.get("evc", {})
+    out["evc"] = {"enabled": ev.get("enabled", False),
+                  "open_position_count": len(ev.get("positions", {})),
+                  "today_pnl": _today_pnl(ev.get("closed_today", []))}
+
+    sig = state.get("sig_trader", {})
+    out["sig_trader"] = {"enabled": sig.get("enabled", False),
+                          "open_position_count": len(sig.get("positions", {})),
+                          "today_pnl": _today_pnl(sig.get("closed_today", []))}
+
+    fx = state.get("fx_trader", {})
+    out["fx_trader"] = {"enabled": fx.get("enabled", False),
+                         "open_position_count": len(fx.get("positions", {})),
+                         "today_pnl": _today_pnl(fx.get("closed_today", []))}
+
+    mt = state.get("manual_trader", {})
+    out["manual_trader"] = {"enabled": mt.get("enabled", False),
+                             "open_position_count": len(mt.get("positions", {})),
+                             "today_pnl": None}  # "closed" isn't day-scoped, see docstring above
+
+    return out
+
+
+def _live_snapshot_standalone_agent(url: str) -> dict | None:
+    """Sync helper -- always called via run_in_executor, never directly in
+    an async context (would block the event loop otherwise)."""
+    try:
+        r = requests.get(url, timeout=3)
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        return None
+
+
+def _plain_bar(b: dict | None) -> dict | None:
+    """Cast a bars-dataframe row to plain JSON-safe types before it goes
+    over the WebSocket. state["bars"] rows come from a pandas DataFrame
+    (_bars_to_df / df.tail(80).to_dict), so "volume" in particular is
+    typically numpy.int64 -- unlike numpy.float64 (which subclasses
+    Python's float and serializes fine), numpy.int64 does NOT subclass
+    int and raises TypeError under the plain json.dumps() that
+    WebSocket.send_json() uses (no FastAPI/pydantic encoder in the path
+    the way the existing /bars/{ticker} REST endpoint gets for free)."""
+    if not b:
+        return None
+    return {
+        "time": b.get("time"),
+        "open": float(b["open"]), "high": float(b["high"]),
+        "low": float(b["low"]), "close": float(b["close"]),
+        "volume": float(b["volume"]) if b.get("volume") is not None else None,
+    }
+
+
+async def _build_live_snapshot() -> dict:
+    loop = asyncio.get_event_loop()
+    dt_status, spy_status = await asyncio.gather(
+        loop.run_in_executor(None, _live_snapshot_standalone_agent, f"{DAY_TRADER_AGENT_URL}/day-trader/status"),
+        loop.run_in_executor(None, _live_snapshot_standalone_agent, f"{SPY_CONDOR_AGENT_URL}/spy-condor/status"),
+    )
+    ib = state.get("ib")
+    return {
+        "type": "snapshot",
+        "time": datetime.now(timezone.utc).isoformat(),
+        "account": {"net_liquidation": _get_net_liq(ib) if ib and ib.isConnected() else None},
+        "strategies": {
+            **_live_snapshot_inprocess_strategies(),
+            "day_trader": ({"enabled": dt_status.get("enabled", False),
+                             "open_position_count": len(dt_status.get("positions", {})),
+                             "today_pnl": None, "reachable": True}
+                            if dt_status is not None else {"reachable": False}),
+            "spy_weekly_condor": ({"enabled": spy_status.get("enabled", False),
+                                    "open_position_count": len(spy_status.get("positions", {})),
+                                    "today_pnl": spy_status.get("summary", {}).get("today_pnl"),
+                                    "reachable": True}
+                                   if spy_status is not None else {"reachable": False}),
+        },
+        # Signals (research/Signals tab): state["signals"][ticker] is
+        # already recomputed on every live IBKR tick by on_bar_update()
+        # (reqHistoricalDataAsync(..., keepUpToDate=True) streams into the
+        # currently-forming bar) -- this was already real-time on the
+        # backend, the frontend just polled it every 15s. Pushing it here
+        # closes that gap to this broadcaster's existing ~3s cadence.
+        # predict()'s own return already casts every field to plain
+        # float/str, so no extra casting needed here (unlike bars, below).
+        "signals": dict(state.get("signals", {})),
+        "latest_bar": {
+            ticker: _plain_bar(bars[-1] if bars else None)
+            for ticker, bars in state.get("bars", {}).items()
+        },
+        "latest_bar_1m": {
+            ticker: _plain_bar(bars[-1] if bars else None)
+            for ticker, bars in state.get("bars_1m", {}).items()
+        },
+    }
+
+
+async def _live_snapshot_broadcaster() -> None:
+    while True:
+        try:
+            snapshot = await _build_live_snapshot()
+            for ws in list(_live_ws_clients):
+                try:
+                    await ws.send_json(snapshot)
+                except Exception:
+                    _live_ws_clients.discard(ws)
+        except Exception as exc:
+            log.warning("Live snapshot broadcaster error: %s", exc)
+        await asyncio.sleep(3)
+
+
+# ── Independent Traders: run/schedule status ─────────────────────────────
+# The 8 strategies now running outside this process (2026-08-27 Day Trader
+# extraction, 2026-09-07 SPY Weekly Condor extraction, plus Ashley/
+# Butterflies x3/GOOG Condor/Safe Income Trader which were always standalone
+# scripts). Two of these (Day Trader, SPY Weekly Condor) have their own
+# HTTP server and a /health endpoint; the rest fire on a Windows Task
+# Scheduler cadence with no live server to ask, so "is this still scheduled
+# and when did/will it run" has to come from Task Scheduler itself.
+INDEPENDENT_TRADER_TASK_NAMES = {
+    "ashley":        "IBKR-AshleyExecutorWatchdog",
+    "butterfly_spy": "IBKR-SPYButterflyFixed",
+    "butterfly_qqq": "IBKR-QQQButterflyWindow",
+    "butterfly_iwm": "IBKR-IWMButterflyWindow",
+    "goog_condor":   "IBKR-GOOGCondorMonday",
+    "safe_income":   "IBKR-SafeIncomeTrader",
+}
+
+
+_TASK_SCHEDULER_SCRIPT = os.path.join(os.path.dirname(__file__), "query_scheduled_tasks.ps1")
+
+
+def _query_task_scheduler_sync() -> dict:
+    """Sync -- always called via run_in_executor, never directly in an
+    async context. Returns {task_name: {State, LastRunTime, NextRunTime,
+    LastTaskResult}}. Real subprocess call (~1-2s) -- this is why this
+    lives behind its own slow-poll REST endpoint, not folded into the 3s
+    /ws/live broadcast. Runs a real .ps1 file (query_scheduled_tasks.ps1)
+    rather than an inline -Command string -- an inline string with nested
+    quotes (ToString("o") inside a PSCustomObject inside a ForEach-Object)
+    hit real PowerShell argument-parsing quote-stripping and silently
+    failed every call (confirmed live 2026-09-07); a real file with
+    -File sidesteps that whole class of bug."""
+    names = list(INDEPENDENT_TRADER_TASK_NAMES.values())
+    try:
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-File", _TASK_SCHEDULER_SCRIPT,
+             "-TaskNames", ",".join(names)],
+            capture_output=True, text=True, timeout=15)
+        if proc.returncode != 0 or not proc.stdout.strip():
+            log.warning("Task Scheduler query returned nothing (code=%s): %s", proc.returncode, proc.stderr[-500:])
+            return {}
+        data = json.loads(proc.stdout)
+        if isinstance(data, dict):
+            data = [data]
+        return {d["Name"]: d for d in data}
+    except Exception as exc:
+        log.warning("Task Scheduler query failed: %s", exc)
+        return {}
+
+
+def _state_file_field(path: str, key: str):
+    try:
+        with open(path) as f:
+            return json.load(f).get(key)
+    except Exception:
+        return None
+
+
+# Real open-position visibility for the scheduled-task independent traders
+# (Butterflies/GOOG Condor/Ashley/Safe Income) -- added 2026-09-08 after a
+# real incident where IWM/QQQ butterflies were open for ~6 real hours with
+# zero visibility anywhere in the UI (the tab only ever showed Task
+# Scheduler last/next-run times for these rows, never live position state
+# -- a genuine v1 scope gap, not a bug, but one that contributed to a real
+# stuck-position bug going unnoticed until manually investigated). Reads
+# the same registry files each strategy's own pretrade/close code already
+# treats as the source of truth -- no new tracking mechanism invented.
+_ALPACA_0DTE_ROW_FILTER = {
+    "butterfly_spy": ("SPY", "long_butterfly_0dte"),
+    "butterfly_qqq": ("QQQ", "long_butterfly_0dte"),
+    "butterfly_iwm": ("IWM", "long_butterfly_0dte"),
+    "goog_condor":   ("GOOG", "iron_condor_weekly"),
+    "ashley":        (None, "ashley_signal"),  # ticker varies (usually SPY), don't filter on it
+}
+
+
+def _open_positions_for_row(row_id: str) -> list:
+    if row_id == "safe_income":
+        try:
+            with open("safe_income_auto_state.json") as f:
+                positions = json.load(f).get("positions", {})
+        except Exception:
+            return []
+        return [
+            {
+                "pos_id": pid,
+                "ticker": p.get("ticker"),
+                "entry_time": p.get("entered_at"),
+                "summary": f"{p.get('ticker')} {p.get('short_k')}/{p.get('long_k')} {p.get('right')} "
+                           f"exp {p.get('expiry')} -- credit ${p.get('entry_credit')} ({p.get('exit_rule')})",
+            }
+            for pid, p in positions.items()
+        ]
+
+    filt = _ALPACA_0DTE_ROW_FILTER.get(row_id)
+    if not filt:
+        return []
+    want_ticker, want_strategy = filt
+    try:
+        with open("alpaca_0dte_positions.json") as f:
+            positions = json.load(f).get("positions", {})
+    except Exception:
+        return []
+    out = []
+    for pid, p in positions.items():
+        if p.get("strategy") != want_strategy:
+            continue
+        if want_ticker is not None and p.get("ticker") != want_ticker:
+            continue
+        legs = p.get("legs", [])
+        leg_summary = ", ".join(f"{l.get('leg')} {l.get('strike')}" for l in legs) if legs else "?"
+        out.append({
+            "pos_id": pid,
+            "ticker": p.get("ticker"),
+            "entry_time": p.get("entry_time"),
+            "summary": f"{p.get('ticker')} {leg_summary} -- net {'credit' if (p.get('net_entry_credit') or 0) > 0 else 'debit'} "
+                       f"${abs(p.get('net_entry_credit') or 0):.2f}, max risk ${p.get('max_risk')}"
+                       + (f", closes by {p.get('hard_close_time')} ET" if p.get("hard_close_time") else ""),
+        })
+    return out
+
+
+@app.get("/independent-traders/status")
+async def independent_traders_status():
+    loop = asyncio.get_event_loop()
+    tasks_info, dt_health, spy_health = await asyncio.gather(
+        loop.run_in_executor(None, _query_task_scheduler_sync),
+        loop.run_in_executor(None, _live_snapshot_standalone_agent, f"{DAY_TRADER_AGENT_URL}/health"),
+        loop.run_in_executor(None, _live_snapshot_standalone_agent, f"{SPY_CONDOR_AGENT_URL}/health"),
+    )
+
+    rows = [
+        {"id": "day_trader", "label": "Day Trader", "kind": "always_on",
+         "reachable": dt_health is not None, "health": dt_health},
+        {"id": "spy_weekly_condor", "label": "SPY Weekly Condor", "kind": "always_on",
+         "reachable": spy_health is not None, "health": spy_health},
+    ]
+    for row_id, label, task_key, state_file, activity_key in [
+        ("ashley", "Ashley", "ashley", "ashleyklieu_trigger_executor_state.json", "last_processed_date"),
+        ("butterfly_spy", "Butterflies (SPY)", "butterfly_spy", None, None),
+        ("butterfly_qqq", "Butterflies (QQQ)", "butterfly_qqq", None, None),
+        ("butterfly_iwm", "Butterflies (IWM)", "butterfly_iwm", None, None),
+        ("goog_condor", "GOOG Condor", "goog_condor", None, None),
+        ("safe_income", "Safe Income Trader", "safe_income", None, None),
+    ]:
+        task_name = INDEPENDENT_TRADER_TASK_NAMES[task_key]
+        info = tasks_info.get(task_name, {})
+        rows.append({
+            "id": row_id, "label": label, "kind": "scheduled",
+            "task_state": info.get("State"),
+            "last_run": info.get("LastRunTime"),
+            "next_run": info.get("NextRunTime"),
+            "last_result": info.get("LastTaskResult"),
+            "last_activity": _state_file_field(state_file, activity_key) if state_file else None,
+            "open_positions": _open_positions_for_row(row_id),
+        })
+    return {"traders": rows}
+
+
+@app.websocket("/ws/live")
+async def ws_live(websocket: WebSocket):
+    await websocket.accept()
+    _live_ws_clients.add(websocket)
+    try:
+        while True:
+            await websocket.receive_text()  # only used to detect disconnect promptly
+    except Exception:
+        pass
+    finally:
+        _live_ws_clients.discard(websocket)
+
+
 # ── Live Tape WebSocket ─────────────────────────────────────────────────────
 @app.websocket("/ws/tape/{ticker}")
-async def ws_tape(websocket: WebSocket, ticker: str, block: int = Query(default=5000)):
+async def ws_tape(websocket: WebSocket, ticker: str, block: Optional[int] = Query(
+        default=None,
+        description="Manual block-size override, in shares. Omit for automatic ADV-relative "
+                    "sizing (same 0.5%-of-ADV / $1M-floor rule validated for dark-pool sizing "
+                    "2026-08-30 -- lands at a consistent real p94.7-p99.8 across small and mega "
+                    "caps, unlike a flat share count).")):
     """
     Stream real-time tick-by-tick trade data (Time & Sales) for a stock.
     Each message is a JSON object with the raw tick plus plain-English explanations.
@@ -20534,6 +21515,14 @@ async def ws_tape(websocket: WebSocket, ticker: str, block: int = Query(default=
     loop via call_soon_threadsafe since asyncio.Queue isn't safe to touch cross-loop.
     """
     await websocket.accept()
+
+    ticker_adv = None
+    if block is None:
+        try:
+            with open("darkpool_adv_cache.json") as f:
+                ticker_adv = json.load(f).get("adv", {}).get(ticker.upper())
+        except Exception:
+            ticker_adv = None
 
     cid = _acquire_tape_cid()
     if cid is None:
@@ -20622,6 +21611,19 @@ async def ws_tape(websocket: WebSocket, ticker: str, block: int = Query(default=
             if size == 0 or price <= 0:
                 continue
 
+            if block is None:
+                # Real threshold study, 2026-08-30: a flat share count is
+                # miscalibrated across tickers -- comparable mega-caps' real
+                # p95 print size ranged ~100 shares (META) to ~29,000 (AAPL),
+                # a ~300x spread, at the SAME nominal "5000 shares" default.
+                # Auto-size once, on this session's first real tick, to the
+                # SAME 0.5%-of-ADV / $1M-floor rule already validated for
+                # dark-pool sizing (lands at a consistent real p94.7-p99.8
+                # across small and mega caps there) -- converted to an
+                # equivalent share count at this ticker's current price.
+                block_dollars = max(1_000_000, 0.005 * ticker_adv) if ticker_adv else 1_000_000
+                block = max(1, round(block_dollars / price))
+
             d = _direction(price)
             if open_price is None:
                 open_price = price
@@ -20706,6 +21708,7 @@ async def ws_tape(websocket: WebSocket, ticker: str, block: int = Query(default=
                 "delta":          net_delta,
                 "exchange":       tk.exchange or "—",
                 "is_block":       is_block,
+                "block_threshold": block,
                 "is_after_hours": tk.tickAttribLast.pastLimit,
                 "block_count":    block_count,
                 "open_price":     open_price,

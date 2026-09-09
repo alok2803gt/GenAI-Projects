@@ -86,6 +86,58 @@ ibkr_trader/backend/spx_0dte_bars.json
 ibkr_trader/backend/*_baseline.json
 ibkr_trader/backend/*_candidates.json
 ibkr_trader/backend/schedules/session_schedules.json
+ibkr_trader/backend/chart_alerts.json
+ibkr_trader/backend/harami_scanner_state.json
+ibkr_trader/backend/sector_catalyst_scanner_state.json
+ibkr_trader/backend/ashley_signal_trades.json
+ibkr_trader/backend/ashleyklieu_contracts_override.json
+ibkr_trader/backend/ashleyklieu_fired_today.json
+ibkr_trader/backend/total_risk_budget_override.json
+ibkr_trader/backend/daytrader_premarket_shortlist.json
+ibkr_trader/backend/spy_0dte_gex_raw.json
+ibkr_trader/backend/darkpool_weekly_review.json
+ibkr_trader/backend/evc_current_mechanism_log.txt
+ibkr_trader/backend/evc_long_straddle_log.txt
+ibkr_trader/backend/news_august_backfill_qualifying.json
+ibkr_trader/backend/**/*cache*/
+.pytest_cache/
+# Large, regeneratable market-data pickle caches -- real market data
+# re-fetched fresh from yfinance/Alpaca/IBKR by each research script's own
+# fetch step, not authored work; committing these would bloat the repo
+# with 100+MB of binary data that provides no value once the fetch script
+# exists (found 2026-09-09 before a large commit/push).
+*.pkl
+
+# Logs, crash dumps, and raw data-cache files INSIDE research subdirectories
+# (signals_research/, scalp_research/, daytrader_research/, etc.) -- the
+# top-level ibkr_trader/backend/*.log-style patterns above only match files
+# directly in backend/, not nested subdirectories, so this same class of
+# file was slipping through in every *_research/ subfolder. Found 2026-09-09
+# before a large commit: ~700MB of these (a 237MB tape_data.db, 60-145MB
+# raw option-chain/bar JSON dumps, dozens of multi-MB crash logs) were about
+# to get swept into git history permanently. Real research value is in the
+# scripts + RESEARCH_LOG.md + summary CSVs, not these regeneratable dumps.
+ibkr_trader/backend/**/*.log
+ibkr_trader/backend/**/*.log.*
+ibkr_trader/backend/**/*_stdout.txt
+ibkr_trader/backend/**/*_stderr.txt
+ibkr_trader/backend/**/*stdout*.log
+ibkr_trader/backend/**/*stderr*.log
+ibkr_trader/backend/**/crash_logs/
+ibkr_trader/backend/**/*.db
+ibkr_trader/backend/**/results.json
+ibkr_trader/backend/**/*_results.json
+ibkr_trader/backend/**/*_bars.json
+ibkr_trader/backend/**/minute_bars*.json
+ibkr_trader/backend/**/*_rows.csv
+ibkr_trader/backend/**/forward_returns_*.csv
+ibkr_trader/backend/**/quality_score_*.csv
+ibkr_trader/backend/**/*_sample.json
+ibkr_trader/backend/**/spy_cboe_chains*.json
+ibkr_trader/backend/uvicorn_stderr.txt
+ibkr_trader/backend/uvicorn_stdout.txt
+ibkr_trader/backend/scanner_err.txt
+ibkr_trader/backend/close_evc_stderr.txt
 
 # Secrets / local config
 .env

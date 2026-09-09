@@ -1,0 +1,522 @@
+<title>Same-Day Indicator Combinations</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
+
+  :root {
+    --bg: #f6f4ee;
+    --surface: #ffffff;
+    --surface-2: #efece3;
+    --border: #ddd8c9;
+    --text: #1c1b17;
+    --muted: #6b6656;
+    --accent: #a8721f;
+    --accent-soft: #f0e2c8;
+    --accent-2: #34505a;
+    --pos: #1f7a4c;
+    --pos-soft: #e2f2e8;
+    --neg: #ad3f34;
+    --neg-soft: #fbe8e5;
+    --row-hover: #faf7ee;
+    --shadow: 0 1px 2px rgba(28,27,23,0.06), 0 8px 24px rgba(28,27,23,0.05);
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #15161a;
+      --surface: #1d1f24;
+      --surface-2: #24262c;
+      --border: #33353c;
+      --text: #ece9e1;
+      --muted: #9a978d;
+      --accent: #d9a54a;
+      --accent-soft: #3a2f1a;
+      --accent-2: #7fa6b1;
+      --pos: #55b083;
+      --pos-soft: #16261f;
+      --neg: #e08074;
+      --neg-soft: #2c1917;
+      --row-hover: #24262c;
+      --shadow: 0 1px 2px rgba(0,0,0,0.3), 0 8px 24px rgba(0,0,0,0.35);
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #15161a;
+    --surface: #1d1f24;
+    --surface-2: #24262c;
+    --border: #33353c;
+    --text: #ece9e1;
+    --muted: #9a978d;
+    --accent: #d9a54a;
+    --accent-soft: #3a2f1a;
+    --accent-2: #7fa6b1;
+    --pos: #55b083;
+    --pos-soft: #16261f;
+    --neg: #e08074;
+    --neg-soft: #2c1917;
+    --row-hover: #24262c;
+    --shadow: 0 1px 2px rgba(0,0,0,0.3), 0 8px 24px rgba(0,0,0,0.35);
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: "IBM Plex Sans", system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap {
+    max-width: 1180px;
+    margin: 0 auto;
+    padding: 2rem 1.5rem 4rem;
+  }
+
+  header.mast {
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+    margin-bottom: 1.5rem;
+  }
+  .eyebrow {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 0.72rem;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--accent);
+    font-weight: 600;
+  }
+  h1 {
+    font-size: clamp(1.5rem, 2.6vw, 2.1rem);
+    margin: 0;
+    font-weight: 700;
+    text-wrap: balance;
+    letter-spacing: -0.01em;
+  }
+  .sub {
+    color: var(--muted);
+    font-size: 0.95rem;
+    max-width: 68ch;
+    line-height: 1.5;
+  }
+
+  .stat-row {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 0.75rem;
+    margin: 1.5rem 0;
+  }
+  .stat {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 0.85rem 1rem;
+    box-shadow: var(--shadow);
+  }
+  .stat .k {
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--muted);
+    margin-bottom: 0.3rem;
+  }
+  .stat .v {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 1.25rem;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+  }
+  .stat .v.pos { color: var(--pos); }
+
+  details.methodology {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    margin-bottom: 1.25rem;
+    box-shadow: var(--shadow);
+  }
+  details.methodology summary {
+    cursor: pointer;
+    padding: 0.95rem 1.2rem;
+    font-weight: 600;
+    font-size: 0.92rem;
+    list-style: none;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  details.methodology summary::-webkit-details-marker { display: none; }
+  details.methodology summary::after {
+    content: "+";
+    font-family: "IBM Plex Mono", monospace;
+    color: var(--muted);
+    font-size: 1.1rem;
+  }
+  details.methodology[open] summary::after { content: "\2212"; }
+  .method-body {
+    padding: 0 1.2rem 1.2rem;
+    color: var(--muted);
+    font-size: 0.87rem;
+    line-height: 1.6;
+  }
+  .method-body h3 {
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.07em;
+    color: var(--text);
+    margin: 1rem 0 0.5rem;
+  }
+  .method-body h3:first-child { margin-top: 0; }
+  .legend {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+    gap: 0.4rem 1rem;
+    margin-top: 0.4rem;
+  }
+  .legend code {
+    color: var(--accent-2);
+    font-family: "IBM Plex Mono", monospace;
+    font-weight: 600;
+  }
+  .callout {
+    border-left: 3px solid var(--neg);
+    background: var(--neg-soft);
+    color: var(--text);
+    padding: 0.7rem 0.9rem;
+    border-radius: 0 8px 8px 0;
+    font-size: 0.85rem;
+    line-height: 1.55;
+    margin-top: 0.75rem;
+  }
+  .callout strong { color: var(--neg); }
+
+  .controls {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.9rem;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 0.85rem 1.1rem;
+    margin-bottom: 0.9rem;
+    box-shadow: var(--shadow);
+    position: sticky;
+    top: 0.75rem;
+    z-index: 5;
+  }
+  .field {
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+    font-size: 0.82rem;
+    color: var(--muted);
+  }
+  .field label { font-weight: 500; }
+  .field input[type="number"] {
+    width: 5.5rem;
+    padding: 0.35rem 0.5rem;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: var(--bg);
+    color: var(--text);
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 0.85rem;
+  }
+  .field select {
+    padding: 0.35rem 0.5rem;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: var(--bg);
+    color: var(--text);
+    font-family: "IBM Plex Sans", sans-serif;
+    font-size: 0.82rem;
+  }
+  .result-count {
+    margin-left: auto;
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 0.8rem;
+    color: var(--muted);
+  }
+  .reset-btn {
+    border: 1px solid var(--border);
+    background: var(--surface-2);
+    color: var(--text);
+    padding: 0.35rem 0.7rem;
+    border-radius: 6px;
+    font-size: 0.78rem;
+    cursor: pointer;
+    font-family: "IBM Plex Sans", sans-serif;
+  }
+  .reset-btn:hover { background: var(--accent-soft); }
+
+  .table-scroll {
+    overflow-x: auto;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    box-shadow: var(--shadow);
+    background: var(--surface);
+  }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    min-width: 980px;
+    font-size: 0.86rem;
+  }
+  thead th {
+    position: sticky;
+    top: 0;
+    background: var(--surface-2);
+    text-align: left;
+    padding: 0.65rem 0.8rem;
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--muted);
+    cursor: pointer;
+    user-select: none;
+    white-space: nowrap;
+    border-bottom: 1px solid var(--border);
+  }
+  thead th.num { text-align: right; }
+  thead th:hover { color: var(--text); }
+  thead th .arrow { font-size: 0.7rem; margin-left: 0.25rem; color: var(--accent); }
+  tbody td {
+    padding: 0.5rem 0.8rem;
+    border-bottom: 1px solid var(--border);
+    font-family: "IBM Plex Mono", monospace;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+  tbody td.rank { color: var(--muted); }
+  tbody td.combo {
+    font-family: "IBM Plex Sans", sans-serif;
+    white-space: normal;
+    min-width: 260px;
+  }
+  .chip {
+    display: inline-block;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    color: var(--accent-2);
+    border-radius: 5px;
+    padding: 0.1rem 0.4rem;
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 0.72rem;
+    font-weight: 600;
+    margin: 0.08rem 0.15rem 0.08rem 0;
+  }
+  tbody tr:hover { background: var(--row-hover); }
+  tbody tr.thin-sample { opacity: 0.55; }
+  td.pos { color: var(--pos); font-weight: 600; }
+  td.neg { color: var(--neg); font-weight: 600; }
+  .n-flag {
+    font-size: 0.68rem;
+    color: var(--neg);
+    font-family: "IBM Plex Sans", sans-serif;
+    margin-left: 0.35rem;
+  }
+
+  footer {
+    margin-top: 1.5rem;
+    color: var(--muted);
+    font-size: 0.78rem;
+    line-height: 1.6;
+  }
+  footer code {
+    font-family: "IBM Plex Mono", monospace;
+    background: var(--surface-2);
+    padding: 0.1rem 0.35rem;
+    border-radius: 4px;
+  }
+
+  @media (max-width: 640px) {
+    .controls { position: static; }
+  }
+</style>
+
+<div class="wrap">
+  <header class="mast">
+    <div class="eyebrow">Day-Trader Research &middot; Indicator Screen</div>
+    <h1>1,023 Same-Day Indicator Combinations, Blind Close vs. Trailing Stop</h1>
+    <p class="sub">Every non-empty AND-combination of 10 standard technical indicators, backtested two ways on the same real trades: blind buy-open/sell-close, and with the account's own live Day Trader exit mechanic (0.3% trailing stop, real intraday path). Sortable and filterable below.</p>
+  </header>
+
+  <div class="stat-row">
+    <div class="stat"><div class="k">Ticker-days evaluated</div><div class="v">28,224</div></div>
+    <div class="stat"><div class="k">Universe</div><div class="v">112 names</div></div>
+    <div class="stat"><div class="k">Unconditional: blind close</div><div class="v">50.49% win &middot; <span class="pos">+0.033%</span></div></div>
+    <div class="stat"><div class="k">Unconditional: 0.3% trailing stop</div><div class="v">48.12% win &middot; <span class="pos">+0.075%</span></div></div>
+  </div>
+
+  <details class="methodology">
+    <summary>Methodology, indicator definitions &amp; a real bug found along the way &ndash; read before trusting the top rows</summary>
+    <div class="method-body">
+      <h3>Universe &amp; window</h3>
+      <p>112-ticker curated universe (same reference list as this account's breakout-alert research), real daily OHLCV via yfinance for indicators, real Alpaca 1-minute bars for the intraday exit path. Evaluation window is each ticker's most recent ~252 trading days (~1 year, through 2026-08-24); fuller history is used only as warmup so rolling indicators aren't zero-padded at the start.</p>
+      <h3>The two simulated exits, same entries</h3>
+      <p><strong>Blind close:</strong> buy the real open, sell the real close, no stop or target. <strong>0.3% trailing stop:</strong> same entry, but walked bar-by-bar through the real 1-minute path &mdash; peak trails the running high since entry, exit fires the instant price pulls back 0.3% off that peak, falling through to the real close if never triggered. 0.3% is the account's own live Day Trader trailing-stop setting, not a swept parameter. Every indicator is computed strictly as of the <em>prior</em> day's close (no lookahead).</p>
+      <h3>The 10 indicators (not user-specified &mdash; a standard, stated list)</h3>
+      <div class="legend">
+        <div><code>RSI</code> RSI(14) in 50&ndash;70</div>
+        <div><code>MACD</code> MACD(12,26) line &gt; signal(9)</div>
+        <div><code>BB%B</code> Bollinger %B(20,2) in 0.8&ndash;1.0</div>
+        <div><code>ADX</code> ADX(14) &gt; 25</div>
+        <div><code>Stoch</code> Stoch %K(14,3) &gt; %D, %K &lt; 80</div>
+        <div><code>VolR</code> Volume &gt; 1.2&times; 20-day avg</div>
+        <div><code>CCI</code> CCI(20) &gt; 100</div>
+        <div><code>W%R</code> Williams %R(14) &gt; -50</div>
+        <div><code>EMA</code> EMA(9) &gt; EMA(21)</div>
+        <div><code>ROC</code> ROC(10) &gt; 0</div>
+      </div>
+      <div class="callout">
+        <strong>A real data bug lives in the first attempt at this comparison, since fixed.</strong> yfinance's daily bars for a handful of tickers (BKNG, CRWD, KLAC, NOW, XLE, XLK, NFLX) carry a per-ticker back-adjustment that's internally consistent with yfinance's own same-day % returns, but doesn't match Alpaca's real intraday price levels &mdash; mixing the two sources briefly produced trades with 2,000%+ "returns." Fixed by sourcing both entry and exit from Alpaca alone. The blind-close numbers here are recomputed from Alpaca and match the original yfinance-only version almost exactly (50.49% vs 50.46% win rate), confirming that first report's own findings held up.
+      </div>
+      <div class="callout">
+        <strong>Read the sample size before trusting a row.</strong> Small-n combinations can still swing on 1-2 outlier trades. Rows below the sample-size filter are dimmed rather than hidden, and every row shows its real n. The more trustworthy region is n &ge; 400&ndash;500, where several combinations land at 56&ndash;58% win rate / +0.20% avg return under the trailing stop &mdash; both meaningfully above the account's own live Day Trader benchmark (50.5% win / +0.137&ndash;0.154%/trade), and on a bigger sample than that strategy's own original validation.
+      </div>
+    </div>
+  </details>
+
+  <div class="controls">
+    <div class="field">
+      <label for="minN">Min trades (n &ge;)</label>
+      <input type="number" id="minN" value="400" min="0" step="10">
+    </div>
+    <div class="field">
+      <label for="minInd"># indicators</label>
+      <select id="minInd">
+        <option value="0">any</option>
+        <option value="1">1</option>
+        <option value="2">2</option>
+        <option value="3">3</option>
+        <option value="4">4</option>
+        <option value="5">5</option>
+        <option value="6">6</option>
+        <option value="7">7</option>
+        <option value="8">8</option>
+        <option value="9">9</option>
+        <option value="10">10</option>
+      </select>
+    </div>
+    <button class="reset-btn" id="resetBtn">Reset filters</button>
+    <div class="result-count" id="resultCount"></div>
+  </div>
+
+  <div class="table-scroll">
+    <table id="comboTable">
+      <thead>
+        <tr>
+          <th data-key="rank" class="num">#<span class="arrow"></span></th>
+          <th data-key="c">Indicator combination<span class="arrow"></span></th>
+          <th data-key="i" class="num">Count<span class="arrow"></span></th>
+          <th data-key="n" class="num">N trades<span class="arrow"></span></th>
+          <th data-key="wb" class="num">Win % (blind)<span class="arrow"></span></th>
+          <th data-key="ab" class="num">Avg % (blind)<span class="arrow"></span></th>
+          <th data-key="wt" class="num">Win % (trail)<span class="arrow"></span></th>
+          <th data-key="at" class="num">Avg % (trail)<span class="arrow"></span></th>
+          <th data-key="mt" class="num">Median % (trail)<span class="arrow"></span></th>
+          <th data-key="st" class="num">Std (trail)<span class="arrow"></span></th>
+        </tr>
+      </thead>
+      <tbody id="tbody"></tbody>
+    </table>
+  </div>
+
+  <footer>
+    Full data also saved to <code>indicator_combo_trailstop_results.csv</code>, <code>indicator_combo_backtest.py</code> and <code>indicator_combo_backtest_trailstop.py</code> in <code>ibkr_trader/backend/daytrader_research/</code>. Rows are dimmed (not hidden) when n falls below the min-trades filter &mdash; raise or lower it to see the tradeoff between sample confidence and how narrow a combination is. "Trail" columns are the 0.3% trailing-stop exit; "blind" columns are the original buy-open/sell-close exit, for comparison.
+  </footer>
+</div>
+
+<script>
+  const DATA = __DATA_JSON__;
+  DATA.forEach((d, idx) => { d.rank = idx + 1; });
+
+  let sortKey = "at";
+  let sortDir = -1;
+  let minN = 400;
+  let minInd = 0;
+
+  const tbody = document.getElementById("tbody");
+  const resultCount = document.getElementById("resultCount");
+  const minNInput = document.getElementById("minN");
+  const minIndSelect = document.getElementById("minInd");
+
+  function fmtPct(v) {
+    const s = v.toFixed(3) + "%";
+    return v > 0 ? "+" + s : s;
+  }
+
+  function render() {
+    const sorted = [...DATA].sort((a, b) => {
+      if (sortKey === "c") {
+        return a.c.join(",").localeCompare(b.c.join(",")) * sortDir;
+      }
+      return (a[sortKey] - b[sortKey]) * sortDir;
+    });
+    sorted.forEach((d, idx) => { d._displayRank = idx + 1; });
+    let visible = sorted.filter(d => d.i >= minInd);
+
+    resultCount.textContent = visible.length + " / " + DATA.length + " combinations · " +
+      visible.filter(d => d.n >= minN).length + " above n≥" + minN;
+
+    const frag = document.createDocumentFragment();
+    visible.forEach(d => {
+      const tr = document.createElement("tr");
+      if (d.n < minN) tr.className = "thin-sample";
+      const chips = d.c.map(x => `<span class="chip">${x}</span>`).join("");
+      const abCls = d.ab > 0 ? "pos" : (d.ab < 0 ? "neg" : "");
+      const atCls = d.at > 0 ? "pos" : (d.at < 0 ? "neg" : "");
+      const mtCls = d.mt > 0 ? "pos" : (d.mt < 0 ? "neg" : "");
+      tr.innerHTML = `
+        <td class="rank">${d._displayRank}</td>
+        <td class="combo">${chips}</td>
+        <td class="num">${d.i}</td>
+        <td class="num">${d.n.toLocaleString()}${d.n < 30 ? '<span class="n-flag">thin</span>' : ''}</td>
+        <td class="num">${d.wb.toFixed(2)}%</td>
+        <td class="num ${abCls}">${fmtPct(d.ab)}</td>
+        <td class="num">${d.wt.toFixed(2)}%</td>
+        <td class="num ${atCls}">${fmtPct(d.at)}</td>
+        <td class="num ${mtCls}">${fmtPct(d.mt)}</td>
+        <td class="num">${d.st.toFixed(3)}</td>
+      `;
+      frag.appendChild(tr);
+    });
+    tbody.innerHTML = "";
+    tbody.appendChild(frag);
+  }
+
+  document.querySelectorAll("thead th").forEach(th => {
+    th.addEventListener("click", () => {
+      const key = th.dataset.key;
+      if (sortKey === key) {
+        sortDir *= -1;
+      } else {
+        sortKey = key;
+        sortDir = key === "c" ? 1 : -1;
+      }
+      document.querySelectorAll("thead .arrow").forEach(a => a.textContent = "");
+      th.querySelector(".arrow").textContent = sortDir === 1 ? "↑" : "↓";
+      render();
+    });
+  });
+
+  minNInput.addEventListener("input", () => {
+    minN = parseInt(minNInput.value, 10) || 0;
+    render();
+  });
+  minIndSelect.addEventListener("change", () => {
+    minInd = parseInt(minIndSelect.value, 10) || 0;
+    render();
+  });
+  document.getElementById("resetBtn").addEventListener("click", () => {
+    minNInput.value = 400; minN = 400;
+    minIndSelect.value = "0"; minInd = 0;
+    sortKey = "at"; sortDir = -1;
+    document.querySelectorAll("thead .arrow").forEach(a => a.textContent = "");
+    document.querySelector('th[data-key="at"] .arrow').textContent = "↓";
+    render();
+  });
+
+  document.querySelector('th[data-key="at"] .arrow').textContent = "↓";
+  render();
+</script>

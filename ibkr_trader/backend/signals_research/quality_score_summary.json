@@ -1,0 +1,214 @@
+{
+  "AAPL": {
+    "n_bars": 115669,
+    "score_distribution": {
+      "count": 115669.0,
+      "mean": 0.6029221312538362,
+      "std": 0.22005522794931467,
+      "min": 0.0,
+      "25%": 0.45,
+      "50%": 0.65,
+      "75%": 0.85,
+      "max": 1.0
+    },
+    "CSP_5d": {
+      "LOW": {
+        "n": 43734,
+        "mean_pct": 0.2453,
+        "median_pct": 0.3015,
+        "pct_positive": 56.78
+      },
+      "MID": {
+        "n": 35616,
+        "mean_pct": 0.2385,
+        "median_pct": 0.2793,
+        "pct_positive": 56.21
+      },
+      "HIGH": {
+        "n": 35929,
+        "mean_pct": 0.2725,
+        "median_pct": 0.3253,
+        "pct_positive": 57.18
+      }
+    },
+    "LEAP_63d": {
+      "LOW": {
+        "n": 42059,
+        "mean_pct": 3.1007,
+        "median_pct": 2.8402,
+        "pct_positive": 64.69
+      },
+      "MID": {
+        "n": 34153,
+        "mean_pct": 2.9842,
+        "median_pct": 2.8279,
+        "pct_positive": 63.54
+      },
+      "HIGH": {
+        "n": 34543,
+        "mean_pct": 3.0232,
+        "median_pct": 2.8057,
+        "pct_positive": 64.25
+      }
+    }
+  },
+  "MSFT": {
+    "n_bars": 107865,
+    "score_distribution": {
+      "count": 107865.0,
+      "mean": 0.6033648542159181,
+      "std": 0.2224656027219584,
+      "min": 0.0,
+      "25%": 0.45,
+      "50%": 0.65,
+      "75%": 0.85,
+      "max": 1.0
+    },
+    "CSP_5d": {
+      "LOW": {
+        "n": 40794,
+        "mean_pct": 0.1095,
+        "median_pct": 0.1097,
+        "pct_positive": 52.27
+      },
+      "MID": {
+        "n": 32713,
+        "mean_pct": 0.119,
+        "median_pct": 0.1278,
+        "pct_positive": 52.7
+      },
+      "HIGH": {
+        "n": 33968,
+        "mean_pct": 0.121,
+        "median_pct": 0.13,
+        "pct_positive": 52.76
+      }
+    },
+    "LEAP_63d": {
+      "LOW": {
+        "n": 39147,
+        "mean_pct": 1.2879,
+        "median_pct": -0.363,
+        "pct_positive": 48.07
+      },
+      "MID": {
+        "n": 31345,
+        "mean_pct": 1.3047,
+        "median_pct": -0.2058,
+        "pct_positive": 48.85
+      },
+      "HIGH": {
+        "n": 32459,
+        "mean_pct": 1.4496,
+        "median_pct": -0.2189,
+        "pct_positive": 48.98
+      }
+    }
+  },
+  "NVDA": {
+    "n_bars": 119528,
+    "score_distribution": {
+      "count": 119528.0,
+      "mean": 0.6006057158155412,
+      "std": 0.22977022720503693,
+      "min": 0.0,
+      "25%": 0.45,
+      "50%": 0.65,
+      "75%": 0.85,
+      "max": 1.0
+    },
+    "CSP_5d": {
+      "LOW": {
+        "n": 44448,
+        "mean_pct": 0.4518,
+        "median_pct": 0.4666,
+        "pct_positive": 54.96
+      },
+      "MID": {
+        "n": 37921,
+        "mean_pct": 0.339,
+        "median_pct": 0.3593,
+        "pct_positive": 54.04
+      },
+      "HIGH": {
+        "n": 36769,
+        "mean_pct": 0.3795,
+        "median_pct": 0.3934,
+        "pct_positive": 54.18
+      }
+    },
+    "LEAP_63d": {
+      "LOW": {
+        "n": 42787,
+        "mean_pct": 5.0055,
+        "median_pct": 2.7858,
+        "pct_positive": 60.22
+      },
+      "MID": {
+        "n": 36496,
+        "mean_pct": 4.561,
+        "median_pct": 2.4203,
+        "pct_positive": 58.58
+      },
+      "HIGH": {
+        "n": 35331,
+        "mean_pct": 4.6633,
+        "median_pct": 2.4135,
+        "pct_positive": 58.29
+      }
+    }
+  },
+  "SPY": {
+    "n_bars": 118333,
+    "score_distribution": {
+      "count": 118333.0,
+      "mean": 0.5870564424125138,
+      "std": 0.21416194978663272,
+      "min": 0.0,
+      "25%": 0.45,
+      "50%": 0.65,
+      "75%": 0.85,
+      "max": 1.0
+    },
+    "CSP_5d": {
+      "LOW": {
+        "n": 49860,
+        "mean_pct": 0.152,
+        "median_pct": 0.225,
+        "pct_positive": 58.38
+      },
+      "MID": {
+        "n": 34620,
+        "mean_pct": 0.1474,
+        "median_pct": 0.2207,
+        "pct_positive": 58.92
+      },
+      "HIGH": {
+        "n": 33463,
+        "mean_pct": 0.1604,
+        "median_pct": 0.2312,
+        "pct_positive": 59.28
+      }
+    },
+    "LEAP_63d": {
+      "LOW": {
+        "n": 47985,
+        "mean_pct": 1.9453,
+        "median_pct": 2.1013,
+        "pct_positive": 71.71
+      },
+      "MID": {
+        "n": 33228,
+        "mean_pct": 1.9756,
+        "median_pct": 2.1675,
+        "pct_positive": 71.35
+      },
+      "HIGH": {
+        "n": 32206,
+        "mean_pct": 1.9044,
+        "median_pct": 2.1006,
+        "pct_positive": 70.69
+      }
+    }
+  }
+}

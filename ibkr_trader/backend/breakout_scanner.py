@@ -2278,8 +2278,16 @@ def _main_loop():
                     send_telegram(token, chat_id, msg)
                     time.sleep(0.3)   # Telegram rate limit: ~30 msg/s
 
-                # Direct stock-trader + day-trader triggers (fast path — bypasses 5-min AT poll)
+                # Direct stock-trader trigger (fast path — bypasses 5-min AT poll)
                 # Only fires on first alert per ticker per day, same gate as Telegram.
+                # NOTE: does NOT post to /day-trader/signal (removed 2026-08-25) --
+                # daytrader_scanner.py (its own watchdog-run process, see
+                # run_daytrader_scanner.ps1) is now the sole candidate source for
+                # Day Trader, since that's the scanner all of daytrader_research/'s
+                # backtests were actually validated against. This scanner's own
+                # composite_score uses a different formula (vol_ratio/prior_5d_ret/
+                # close_pos/vol_trend/bb_bwidth percentile-ranks) that was never
+                # backtested for Day Trader's min_composite_score gate.
                 if sig_type == "BREAKOUT" and backend_url:
                     _signal_payload = {
                         "ticker":          tk,
@@ -2288,7 +2296,7 @@ def _main_loop():
                         "composite_score": ind.get("composite_score"),
                         "vol_ratio":       ind.get("vol_ratio"),
                     }
-                    for _ep in ("/stock-trader/signal", "/day-trader/signal"):
+                    for _ep in ("/stock-trader/signal",):
                         try:
                             requests.post(
                                 f"{backend_url.rstrip('/')}{_ep}",

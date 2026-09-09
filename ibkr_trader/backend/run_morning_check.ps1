@@ -107,6 +107,54 @@ if ($wdCount -eq 0) {
     [void]$issues.Add("Killed $($killedPids.Count) duplicate watchdog(s) -- would have caused scanner chaos at open")
 }
 
+# 4b. DayTrader Scanner running -- added 2026-08-26. This is the real
+# candidate source for Day Trader (daytrader_scanner.py's own compute_dt_scores,
+# distinct from breakout_scanner.py's composite_score) -- it went unnoticed
+# for 18 days (last ran 2026-08-07) before being found and fixed, because
+# nothing was checking it. Same process-existence pattern as check #3 above.
+$dtScannerProc = Get-WmiObject Win32_Process -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -eq "python.exe" -and $_.CommandLine -match "daytrader_scanner\.py" }
+if ($dtScannerProc) {
+    $dtScannerPid = ($dtScannerProc | Select-Object -First 1).ProcessId
+    [void]$checks.Add("[OK] DayTrader Scanner: running (PID $dtScannerPid)")
+} else {
+    $dtScannerPid = $null
+    [void]$checks.Add("[FAIL] DayTrader Scanner: NOT running")
+    [void]$issues.Add("DayTrader Scanner is not running -- Day Trader has no validated candidate source (falls back to breakout_scanner's different, unvalidated-for-DT scoring)")
+}
+
+# 4c. DayTrader Scanner watchdog duplicate check -- mirrors check #4's logic
+$allDtWds = @(Get-WmiObject Win32_Process -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -like "powershell*" -and $_.CommandLine -match "run_daytrader_scanner" })
+$dtWdCount = $allDtWds.Count
+
+if ($dtWdCount -eq 0) {
+    [void]$checks.Add("[WARN] DayTrader Scanner watchdog: not running (no restart guard)")
+    [void]$issues.Add("DayTrader Scanner watchdog not running -- scanner will not restart if it crashes")
+} elseif ($dtWdCount -eq 1) {
+    [void]$checks.Add("[OK] DayTrader Scanner watchdog: 1 instance")
+} else {
+    $ownerDtWd    = $null
+    $killedDtPids = @()
+    if ($dtScannerPid) {
+        foreach ($wd in $allDtWds) {
+            $kids = @(Get-WmiObject Win32_Process -Filter "ParentProcessId = $($wd.ProcessId)" -ErrorAction SilentlyContinue)
+            if ($kids | Where-Object { $_.ProcessId -eq [int]$dtScannerPid }) {
+                $ownerDtWd = $wd.ProcessId
+                break
+            }
+        }
+    }
+    foreach ($wd in $allDtWds) {
+        if ($wd.ProcessId -ne $ownerDtWd) {
+            Stop-Process -Id $wd.ProcessId -Force -Confirm:$false -ErrorAction SilentlyContinue
+            $killedDtPids += $wd.ProcessId
+        }
+    }
+    [void]$checks.Add("[WARN] DayTrader Scanner watchdog: $dtWdCount found -- killed duplicates ($($killedDtPids -join ', ')), kept $ownerDtWd")
+    [void]$issues.Add("Killed $($killedDtPids.Count) duplicate DayTrader Scanner watchdog(s)")
+}
+
 # 5. Day trader enabled
 try {
     $dt = Invoke-RestMethod -Uri "$BackendUrl/day-trader/status" -Method Get -TimeoutSec 5

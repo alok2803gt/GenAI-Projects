@@ -1,0 +1,69 @@
+signal,kind,iv_mult,year,n,win_rate,avg_pnl_dollars,total_pnl_dollars,worst_loss_dollars,avg_credit,avg_breakeven_win_rate_needed
+A_rsi_reset_baseline,"mean-reversion (existing, baseline)",1.0,ALL,35,0.8286,-3.07,-107.44,-196.71,0.2188,0.8906
+A_rsi_reset_baseline,"mean-reversion (existing, baseline)",1.0,2021,8,0.875,-15.45,-123.6,-196.71,0.0955,0.9523
+A_rsi_reset_baseline,"mean-reversion (existing, baseline)",1.0,2022,7,0.8571,14.34,100.39,-168.85,0.4291,0.7854
+A_rsi_reset_baseline,"mean-reversion (existing, baseline)",1.0,2023,5,0.8,16.15,80.75,-18.5,0.2589,0.8706
+A_rsi_reset_baseline,"mean-reversion (existing, baseline)",1.0,2024,6,1.0,8.26,49.57,2.67,0.0826,0.9587
+A_rsi_reset_baseline,"mean-reversion (existing, baseline)",1.0,2025,5,0.6,-34.67,-173.37,-185.85,0.2061,0.897
+A_rsi_reset_baseline,"mean-reversion (existing, baseline)",1.0,2026,4,0.75,-10.29,-41.18,-135.89,0.267,0.8665
+A_rsi_reset_baseline,"mean-reversion (existing, baseline)",1.3,ALL,35,0.8286,8.58,300.37,-189.68,0.3353,0.8324
+A_rsi_reset_baseline,"mean-reversion (existing, baseline)",1.3,2021,8,0.875,-6.2,-49.63,-189.68,0.188,0.906
+A_rsi_reset_baseline,"mean-reversion (existing, baseline)",1.3,2022,7,0.8571,28.5,199.5,-154.28,0.5707,0.7146
+A_rsi_reset_baseline,"mean-reversion (existing, baseline)",1.3,2023,5,0.8,29.32,146.58,-4.1,0.3906,0.8047
+A_rsi_reset_baseline,"mean-reversion (existing, baseline)",1.3,2024,6,1.0,18.14,108.85,9.04,0.1814,0.9093
+A_rsi_reset_baseline,"mean-reversion (existing, baseline)",1.3,2025,5,0.6,-22.71,-113.53,-176.9,0.3257,0.8371
+A_rsi_reset_baseline,"mean-reversion (existing, baseline)",1.3,2026,4,0.75,2.15,8.6,-123.99,0.3915,0.8042
+B_sma200_breakout_baseline,"mean-reversion (existing, baseline)",1.0,ALL,7,0.7143,-31.31,-219.2,-188.49,0.2583,0.8708
+B_sma200_breakout_baseline,"mean-reversion (existing, baseline)",1.0,2021,3,1.0,7.22,21.67,1.46,0.0722,0.9639
+B_sma200_breakout_baseline,"mean-reversion (existing, baseline)",1.0,2022,1,1.0,62.39,62.39,62.39,0.6239,0.6881
+B_sma200_breakout_baseline,"mean-reversion (existing, baseline)",1.0,2023,1,1.0,50.92,50.92,50.92,0.5092,0.7454
+B_sma200_breakout_baseline,"mean-reversion (existing, baseline)",1.0,2025,1,0.0,-165.69,-165.69,-165.69,0.3431,0.8284
+B_sma200_breakout_baseline,"mean-reversion (existing, baseline)",1.0,2026,1,0.0,-188.49,-188.49,-188.49,0.1151,0.9424
+B_sma200_breakout_baseline,"mean-reversion (existing, baseline)",1.3,ALL,7,0.7143,-20.46,-143.19,-176.65,0.3669,0.8166
+B_sma200_breakout_baseline,"mean-reversion (existing, baseline)",1.3,2021,3,1.0,14.9,44.71,5.97,0.149,0.9255
+B_sma200_breakout_baseline,"mean-reversion (existing, baseline)",1.3,2022,1,1.0,75.38,75.38,75.38,0.7538,0.6231
+B_sma200_breakout_baseline,"mean-reversion (existing, baseline)",1.3,2023,1,1.0,64.57,64.57,64.57,0.6457,0.6771
+B_sma200_breakout_baseline,"mean-reversion (existing, baseline)",1.3,2025,1,0.0,-151.2,-151.2,-151.2,0.488,0.756
+B_sma200_breakout_baseline,"mean-reversion (existing, baseline)",1.3,2026,1,0.0,-176.65,-176.65,-176.65,0.2335,0.8832
+TF1_sma20_basing_breakout,trend-following (candidate),1.0,ALL,24,0.875,9.78,234.78,-184.02,0.2906,0.8547
+TF1_sma20_basing_breakout,trend-following (candidate),1.0,2021,6,0.6667,-22.17,-132.99,-184.02,0.216,0.892
+TF1_sma20_basing_breakout,trend-following (candidate),1.0,2022,4,0.75,-6.25,-25.02,-160.78,0.4374,0.7813
+TF1_sma20_basing_breakout,trend-following (candidate),1.0,2023,6,1.0,29.66,177.98,7.59,0.2966,0.8517
+TF1_sma20_basing_breakout,trend-following (candidate),1.0,2024,2,1.0,22.32,44.63,10.26,0.2232,0.8884
+TF1_sma20_basing_breakout,trend-following (candidate),1.0,2025,4,1.0,26.51,106.05,9.09,0.2651,0.8674
+TF1_sma20_basing_breakout,trend-following (candidate),1.0,2026,2,1.0,32.06,64.13,25.74,0.3206,0.8396
+TF1_sma20_basing_breakout,trend-following (candidate),1.3,ALL,24,0.875,22.68,544.39,-171.16,0.4196,0.7902
+TF1_sma20_basing_breakout,trend-following (candidate),1.3,2021,6,0.6667,-10.59,-63.53,-171.16,0.3318,0.8341
+TF1_sma20_basing_breakout,trend-following (candidate),1.3,2022,4,0.75,7.8,31.21,-146.33,0.578,0.711
+TF1_sma20_basing_breakout,trend-following (candidate),1.3,2023,6,1.0,42.44,254.65,17.52,0.4244,0.7878
+TF1_sma20_basing_breakout,trend-following (candidate),1.3,2024,2,1.0,35.18,70.36,21.39,0.3518,0.8241
+TF1_sma20_basing_breakout,trend-following (candidate),1.3,2025,4,1.0,39.79,159.17,19.98,0.3979,0.801
+TF1_sma20_basing_breakout,trend-following (candidate),1.3,2026,2,1.0,46.26,92.53,40.1,0.4626,0.7687
+TF2_donchian20_high,trend-following (candidate),1.0,ALL,33,0.8788,6.9,227.57,-180.74,0.2488,0.8756
+TF2_donchian20_high,trend-following (candidate),1.0,2021,6,0.8333,0.32,1.9,-94.53,0.2012,0.8994
+TF2_donchian20_high,trend-following (candidate),1.0,2022,5,0.8,-1.76,-8.79,-163.97,0.4356,0.7822
+TF2_donchian20_high,trend-following (candidate),1.0,2023,7,0.8571,-3.22,-22.56,-180.74,0.2535,0.8733
+TF2_donchian20_high,trend-following (candidate),1.0,2024,7,1.0,16.62,116.37,3.8,0.1662,0.9169
+TF2_donchian20_high,trend-following (candidate),1.0,2025,6,1.0,21.1,126.63,5.21,0.2111,0.8945
+TF2_donchian20_high,trend-following (candidate),1.0,2026,2,0.5,7.01,14.02,-38.26,0.3101,0.845
+TF2_donchian20_high,trend-following (candidate),1.3,ALL,33,0.8788,19.07,629.2,-167.26,0.3705,0.8148
+TF2_donchian20_high,trend-following (candidate),1.3,2021,6,0.8333,10.39,62.36,-80.63,0.3019,0.8491
+TF2_donchian20_high,trend-following (candidate),1.3,2022,5,0.8,12.43,62.17,-149.57,0.5775,0.7112
+TF2_donchian20_high,trend-following (candidate),1.3,2023,7,0.8571,9.94,69.58,-167.26,0.3851,0.8074
+TF2_donchian20_high,trend-following (candidate),1.3,2024,7,1.0,28.32,198.25,11.18,0.2832,0.8584
+TF2_donchian20_high,trend-following (candidate),1.3,2025,6,1.0,33.01,198.06,13.86,0.3301,0.8349
+TF2_donchian20_high,trend-following (candidate),1.3,2026,2,0.5,19.39,38.78,-27.06,0.4339,0.783
+TF3_sma10_30_crossover,trend-following (candidate),1.0,ALL,20,0.85,-2.08,-41.58,-193.03,0.2925,0.8538
+TF3_sma10_30_crossover,trend-following (candidate),1.0,2021,4,1.0,20.51,82.05,1.57,0.2051,0.8974
+TF3_sma10_30_crossover,trend-following (candidate),1.0,2022,4,0.75,-17.5,-69.99,-163.97,0.3915,0.8042
+TF3_sma10_30_crossover,trend-following (candidate),1.0,2023,5,0.8,-12.6,-63.01,-180.74,0.274,0.863
+TF3_sma10_30_crossover,trend-following (candidate),1.0,2024,2,1.0,26.26,52.51,12.74,0.2626,0.8688
+TF3_sma10_30_crossover,trend-following (candidate),1.0,2025,4,0.75,-25.02,-100.08,-193.03,0.2498,0.8751
+TF3_sma10_30_crossover,trend-following (candidate),1.0,2026,1,1.0,56.94,56.94,56.94,0.5694,0.7153
+TF3_sma10_30_crossover,trend-following (candidate),1.3,ALL,20,0.85,10.36,207.1,-183.2,0.4168,0.7916
+TF3_sma10_30_crossover,trend-following (candidate),1.3,2021,4,1.0,30.86,123.43,6.32,0.3086,0.8457
+TF3_sma10_30_crossover,trend-following (candidate),1.3,2022,4,0.75,-3.11,-12.45,-149.57,0.5354,0.7323
+TF3_sma10_30_crossover,trend-following (candidate),1.3,2023,5,0.8,-0.03,-0.15,-167.26,0.3997,0.8001
+TF3_sma10_30_crossover,trend-following (candidate),1.3,2024,2,1.0,39.3,78.6,24.7,0.393,0.8035
+TF3_sma10_30_crossover,trend-following (candidate),1.3,2025,4,0.75,-13.02,-52.1,-183.2,0.3697,0.8151
+TF3_sma10_30_crossover,trend-following (candidate),1.3,2026,1,1.0,69.77,69.77,69.77,0.6977,0.6512

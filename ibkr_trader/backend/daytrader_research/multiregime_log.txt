@@ -1,0 +1,35 @@
+Loaded 112 tickers of daily data
+Tickers with at least one signal day: 112
+Total real signal-days across full history: 7737
+Signal date range: 2021-09-23 to 2026-08-24
+NOTE: Alpaca minute-bar history has a real floor at 2021-09-02 on this account's plan -- 2020 COVID crash is NOT reachable with the real intraday trailing-stop path and is not included here.
+Pulling real 1-min bars for 112 tickers, 2021-09-02 to 2026-08-26...
+  20/112 minute pulls done
+  40/112 minute pulls done
+  60/112 minute pulls done
+  80/112 minute pulls done
+  100/112 minute pulls done
+Minute bar pulls complete.
+Skipped 2 signal-days with no real Alpaca minute data available (these are the pre-2021-09-02 days this account's data plan can't reach)
+
+Total real signal-days with a real intraday exit simulated: 7735
+Years covered: [2021, 2022, 2023, 2024, 2025, 2026]
+
+=== BY YEAR (real regime breakdown) ===
+  2021: n= 453  trail: win= 43.3% avg=+0.041%  |  blind: win= 51.0% avg=+0.114%
+  2022: n=1060  trail: win= 53.7% avg=+0.099%  |  blind: win= 52.3% avg=+0.085%
+  2023: n=1813  trail: win= 47.7% avg=+0.076%  |  blind: win= 54.4% avg=+0.238%
+  2024: n=1764  trail: win= 45.7% avg=+0.067%  |  blind: win= 48.5% avg=-0.152%
+  2025: n=1550  trail: win= 47.8% avg=+0.088%  |  blind: win= 51.7% avg=+0.111%
+  2026: n=1095  trail: win= 62.3% avg=+0.261%  |  blind: win= 52.5% avg=+0.192%
+
+=== FULL PERIOD ===
+  trail:  n=7735  win=49.89%  avg=+0.1035%  median=-0.0008%  std=0.4243%
+  blind:  n=7735  win=51.76%  avg=+0.0887%  median=+0.0657%  std=2.2814%
+
+=== REAL-DOLLAR VIEW at $150/trade (Day Trader's real live size), one signal-day trade per ticker per day (no position-limit/overlap modeled) ===
+  Total P&L if every signal-day were traded: $+1200.57 over 7735 trades
+  Max drawdown (peak-to-trough, pooled sequence): $-12.80 (around 2024-10-29, TSLA)
+  Longest losing streak: 15 consecutive losing trades
+  Worst single trade: SLB 2021-10-12 -0.30% ($-0.45)
+  Best single trade: MPC 2023-01-24 +6.89% ($+10.34)

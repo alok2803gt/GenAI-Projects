@@ -1,0 +1,22 @@
+2026-08-25 09:28:23 [INFO] Universe cache is 18 days old (>7) -- refreshing from Wikipedia.
+2026-08-25 09:28:23 [INFO] Fetched + cached 503 S&P 500 tickers from Wikipedia.
+Universe: 503 tickers
+  batch 1/13 done (40 tickers so far)
+  batch 2/13 done (80 tickers so far)
+  batch 3/13 done (120 tickers so far)
+  batch 4/13 done (160 tickers so far)
+  batch 5/13 done (199 tickers so far)
+  batch 6/13 done (238 tickers so far)
+  batch 7/13 done (278 tickers so far)
+  batch 8/13 done (318 tickers so far)
+  batch 9/13 done (358 tickers so far)
+  batch 10/13 done (397 tickers so far)
+  batch 11/13 done (437 tickers so far)
+  batch 12/13 done (477 tickers so far)
+  batch 13/13 done (500 tickers so far)
+Downloaded 500/503 tickers
+Panel: 615,796 ticker-days
+After 120-day recent-window cutoff: 40,999 ticker-days
+After ATR floor (2.5%): 28,532 ticker-days
+
+Saved 820 candidate (date, ticker) selections to candidates.csv, 82 trading days, 100 unique tickers

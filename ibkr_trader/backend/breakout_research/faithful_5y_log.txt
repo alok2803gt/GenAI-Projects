@@ -1,0 +1,30 @@
+Universe: 86 tickers, 5.0y minute / 5.4y daily window
+Pulling 5.0y minute bars for 86 tickers...
+  10/86 minute pulls done
+  20/86 minute pulls done
+  30/86 minute pulls done
+  40/86 minute pulls done
+  50/86 minute pulls done
+  60/86 minute pulls done
+  70/86 minute pulls done
+  80/86 minute pulls done
+Pulling 5.4y daily bars...
+Pulling VIX + SPY for F1 regime gate...
+  simulated 10/86 tickers, 272 real gated alerts so far
+  simulated 20/86 tickers, 485 real gated alerts so far
+  simulated 30/86 tickers, 867 real gated alerts so far
+  simulated 40/86 tickers, 1104 real gated alerts so far
+  simulated 50/86 tickers, 1372 real gated alerts so far
+  simulated 60/86 tickers, 1863 real gated alerts so far
+  simulated 70/86 tickers, 2171 real gated alerts so far
+  simulated 80/86 tickers, 2524 real gated alerts so far
+
+Total simulated REAL gated alerts (production settings, 5.0y window): 2794
+Saved to faithful_5y_rows.csv
+
+=== date range achieved ===
+2022-08-16 to 2026-08-31
+signal
+PRE-BREAKOUT    2487
+BREAKOUT         307
+Name: count, dtype: int64

@@ -1,0 +1,11 @@
+Loaded 112 tickers of daily data
+Tickers with a valid evaluation window: 112
+Evaluation date range: 2025-08-22 to 2026-08-24
+Pulling real 1-min bars for 112 tickers, 2025-08-17 to 2026-08-26...
+  20/112 minute pulls done
+  40/112 minute pulls done
+  60/112 minute pulls done
+  80/112 minute pulls done
+  100/112 minute pulls done
+Minute bar pulls complete.
+  processed ~5040 ticker-days so far...

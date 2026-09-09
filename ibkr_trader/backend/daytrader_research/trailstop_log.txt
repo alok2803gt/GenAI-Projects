@@ -1,0 +1,62 @@
+Loaded 112 tickers of daily data
+Tickers with a valid evaluation window: 112
+Evaluation date range: 2025-08-22 to 2026-08-24
+Pulling real 1-min bars for 112 tickers, 2025-08-17 to 2026-08-26...
+  20/112 minute pulls done
+  40/112 minute pulls done
+  60/112 minute pulls done
+  80/112 minute pulls done
+  100/112 minute pulls done
+Minute bar pulls complete.
+  processed ~5040 ticker-days so far...
+  processed ~10080 ticker-days so far...
+  processed ~15120 ticker-days so far...
+  processed ~20160 ticker-days so far...
+  processed ~25200 ticker-days so far...
+
+Total ticker-days simulated with real intraday trailing-stop exit: 28224
+Saved raw rows to trailstop_rows.csv
+
+Stopped out intraday: 28105 / 28224 (99.6%)
+
+UNCONDITIONAL comparison (n=28224):
+  ret_blind: win_rate=50.46% avg=+0.0331% median=+0.0205%
+  ret_trail: win_rate=49.95% avg=+25.6908% median=-0.0004%
+
+Saved 1023 combo rows to C:\Projects\GenAI-Projects\ibkr_trader\backend\daytrader_research\indicator_combo_trailstop_results.csv
+
+=== TOP 20 by TRAIL-STOP avg return (n>=30) ===
+ rank                                                                                        indicators  n_trades  win_rate_trail  avg_return_trail  win_rate_blind  avg_return_blind
+    1                              MACD_bull & ADX_gt25 & Stoch_bull & VolRatio_gt1.2 & WilliamsR_gt-50        86       55.813953         63.644152       41.860465          0.014156
+    2                                                MACD_bull & ADX_gt25 & Stoch_bull & VolRatio_gt1.2       124       58.870968         46.737261       39.516129          0.072067
+    3                                                                       Stoch_bull & VolRatio_gt1.2      1542       55.642023         45.315280       48.249027         -0.005742
+    4                                          ADX_gt25 & Stoch_bull & VolRatio_gt1.2 & WilliamsR_gt-50       156       55.769231         42.943153       43.589744          0.095853
+    5                                                            ADX_gt25 & Stoch_bull & VolRatio_gt1.2       550       56.181818         42.527014       47.818182          0.082429
+    6                  MACD_bull & ADX_gt25 & Stoch_bull & VolRatio_gt1.2 & WilliamsR_gt-50 & ROC10_pos        63       53.968254         38.774702       42.857143          0.067754
+    7                                         MACD_bull & Stoch_bull & VolRatio_gt1.2 & WilliamsR_gt-50       306       61.764706         35.503259       43.790850         -0.080449
+    8                                                                                    VolRatio_gt1.2      5729       54.756502         35.248907       51.806598          0.100412
+    9                                    MACD_bull & ADX_gt25 & Stoch_bull & VolRatio_gt1.2 & ROC10_pos        70       57.142857         34.919691       41.428571          0.082393
+   10 RSI_50_70 & MACD_bull & Stoch_bull & VolRatio_gt1.2 & WilliamsR_gt-50 & EMA9_gt_EMA21 & ROC10_pos       138       62.318841         33.575137       42.753623         -0.072362
+   11             MACD_bull & Stoch_bull & VolRatio_gt1.2 & WilliamsR_gt-50 & EMA9_gt_EMA21 & ROC10_pos       140       61.428571         33.095339       42.142857         -0.097053
+   12                                                     Stoch_bull & VolRatio_gt1.2 & WilliamsR_gt-50       578       58.996540         32.904091       47.923875          0.054037
+   13                   RSI_50_70 & MACD_bull & Stoch_bull & VolRatio_gt1.2 & EMA9_gt_EMA21 & ROC10_pos       141       62.411348         32.860672       42.553191         -0.102328
+   14                               MACD_bull & Stoch_bull & VolRatio_gt1.2 & EMA9_gt_EMA21 & ROC10_pos       144       61.805556         32.179361       42.361111         -0.121630
+   15                                         Stoch_bull & VolRatio_gt1.2 & WilliamsR_gt-50 & ROC10_pos       396       60.101010         32.163100       48.737374         -0.040628
+   16             RSI_50_70 & MACD_bull & Stoch_bull & VolRatio_gt1.2 & WilliamsR_gt-50 & EMA9_gt_EMA21       150       63.333333         31.622354       43.333333         -0.017053
+   17                             MACD_bull & Stoch_bull & VolRatio_gt1.2 & WilliamsR_gt-50 & ROC10_pos       246       60.975610         31.380777       43.495935         -0.177636
+   18                                                       Stoch_bull & VolRatio_gt1.2 & EMA9_gt_EMA21       409       58.924205         31.378145       47.677262          0.053050
+   19                                           RSI_50_70 & Stoch_bull & VolRatio_gt1.2 & EMA9_gt_EMA21       380       60.000000         31.375792       47.368421          0.059316
+   20                         MACD_bull & Stoch_bull & VolRatio_gt1.2 & WilliamsR_gt-50 & EMA9_gt_EMA21       152       62.500000         31.206129       42.763158         -0.040522
+
+=== single-indicator results, blind vs trail-stop ===
+     indicators  n_trades  win_rate_blind  avg_return_blind  win_rate_trail  avg_return_trail
+ VolRatio_gt1.2      5729       51.806598          0.100412       54.756502         35.248907
+     Stoch_bull      8793       49.880587          0.028170       51.290799         27.932949
+      MACD_bull     14591       49.366048          0.012730       50.380371         24.438747
+WilliamsR_gt-50     15251       49.944266          0.030589       50.796669         23.275474
+      RSI_50_70     13601       49.871333          0.017044       49.841923         22.820965
+      ROC10_pos     15370       50.026025          0.028638       50.260247         22.418698
+BB_pctB_0.8-1.0      5281       49.138421         -0.019368       50.785836         22.417113
+      CCI_gt100      6950       49.611511          0.014296       51.956835         22.194099
+  EMA9_gt_EMA21     15851       50.438458          0.033020       49.870671         20.326866
+       ADX_gt25     10116       51.047845          0.074370       51.136813         11.707998

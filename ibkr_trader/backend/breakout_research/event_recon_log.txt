@@ -1,0 +1,9 @@
+Loaded 112 tickers
+
+7711 real historical BREAKOUT/PRE-BREAKOUT transition events, 112 tickers, 2021-09-22 00:00:00-04:00 to 2026-08-24 00:00:00-04:00
+by state: {'PRE-BREAKOUT': 7193, 'BREAKOUT': 518}
+
+=== BASELINE (all events) ===
+  ret_1d: n=7706 win_rate=52.9% avg=+0.129% median=+0.091%
+  ret_3d: n=7698 win_rate=53.0% avg=+0.114% median=+0.203%
+  ret_5d: n=7672 win_rate=53.1% avg=+0.183% median=+0.269%

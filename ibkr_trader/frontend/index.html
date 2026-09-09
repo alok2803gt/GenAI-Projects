@@ -7,6 +7,7 @@
   <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
   <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
   <script src="https://unpkg.com/@babel/standalone@7.23.5/babel.min.js"></script>
+  <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;700;800&display=swap" rel="stylesheet" />
   <style>
@@ -31,6 +32,14 @@
 <script type="text/babel" data-presets="react">
 const { useState, useEffect, useRef, useCallback } = React;
 const API = "http://localhost:8000";
+// Day Trader runs as its own standalone process (day_trader_agent.py, port
+// 8010) with its own entry/exit decisions -- fully decoupled from main.py
+// as of 2026-09-02 (scanning, trading, monitoring all independent; main.py
+// no longer auto-disables it on reconnect or on a VIX spike). Calling it
+// directly here (rather than through main.py's /day-trader/* proxy) means
+// the enable toggle and config actually reflect that independence instead
+// of silently depending on main.py being reachable to take effect.
+const DAY_TRADER_API = "http://localhost:8010";
 
 const C = {
   bg:      "#0d1117",
@@ -53,6 +62,12 @@ const sans = { fontFamily:"'Inter', sans-serif" };
 // ── helpers ───────────────────────────────────────────────────────────────
 async function apiFetch(path, opts) {
   const r = await fetch(API + path, opts);
+  if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+  return r.json();
+}
+
+async function dayTraderFetch(path, opts) {
+  const r = await fetch(DAY_TRADER_API + path, opts);
   if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
   return r.json();
 }
@@ -84,6 +99,147 @@ const RISK_COLOR = {
   "MEDIUM":     C.orange,
 };
 const SIG_COLOR = { BUY: C.bull, SELL: C.bear, HOLD: C.neutral };
+
+// ── Toasts (2026-09-07) ──────────────────────────────────────────────────
+// Replaces window.alert() at specific call sites (PnLTab, Signals tab) --
+// the rest of this file's ~28 other alert() calls are a deliberate later
+// follow-up, not touched here.
+const ToastContext = React.createContext(null);
+
+function ToastProvider({ children }) {
+  const [toasts, setToasts] = useState([]);
+  const idRef = useRef(0);
+
+  const dismissToast = useCallback((id) => {
+    setToasts(prev => prev.filter(t => t.id !== id));
+  }, []);
+
+  const showToast = useCallback((message, opts = {}) => {
+    const id = ++idRef.current;
+    const duration = opts.duration ?? 5000;
+    setToasts(prev => [...prev, { id, message, kind: opts.kind || "info" }]);
+    if (duration > 0) setTimeout(() => dismissToast(id), duration);
+    return id;
+  }, [dismissToast]);
+
+  const KIND_COLOR = { info: C.accent, success: C.bull, error: C.bear };
+
+  return (
+    <ToastContext.Provider value={{ showToast, dismissToast }}>
+      {children}
+      <div style={{ position:"fixed", bottom:16, right:16, zIndex:9999, display:"flex",
+                     flexDirection:"column", gap:8, maxWidth:360 }}>
+        {toasts.map(t => (
+          <div key={t.id} onClick={() => dismissToast(t.id)} style={{
+            ...sans, fontSize:13, padding:"10px 14px", borderRadius:8, cursor:"pointer",
+            background: C.card, borderLeft:`3px solid ${KIND_COLOR[t.kind] || C.border}`,
+            color: C.text, boxShadow:"0 4px 16px rgba(0,0,0,0.45)", animation:"fadeIn 0.2s ease",
+          }}>
+            {t.message}
+          </div>
+        ))}
+      </div>
+    </ToastContext.Provider>
+  );
+}
+
+function useToast() {
+  const ctx = React.useContext(ToastContext);
+  if (!ctx) throw new Error("useToast must be used within a ToastProvider");
+  return ctx;
+}
+
+// ── Reconnecting WebSocket + live data push (2026-09-07) ────────────────
+// TapeTab's own WebSocket (the only precedent before this) has zero
+// reconnect logic -- a drop requires the user to manually click "start"
+// again. This is deliberately NOT retrofitted into TapeTab in this pass:
+// that socket owns a scarce, pooled IBKR client id and a live tick
+// subscription, and aggressive reconnects there carry a real, distinct
+// risk (the pool not releasing an id before a new attempt claims another)
+// that needs its own dedicated test, not a drive-by share.
+function createReconnectingSocket(url, { onMessage, onOpen, onClose } = {}) {
+  let ws = null, attempt = 0, stopped = false, lastMessageAt = Date.now();
+  let reconnectTimer = null;
+
+  function scheduleReconnect() {
+    if (stopped) return;
+    const delay = Math.min(30000, 1000 * Math.pow(2, attempt)) * (0.8 + Math.random() * 0.4);
+    attempt += 1;
+    reconnectTimer = setTimeout(connect, delay);
+  }
+
+  function connect() {
+    if (stopped) return;
+    ws = new WebSocket(url);
+    ws.onopen = () => { attempt = 0; lastMessageAt = Date.now(); if (onOpen) onOpen(); };
+    ws.onmessage = (e) => {
+      lastMessageAt = Date.now();
+      if (onMessage) { try { onMessage(JSON.parse(e.data)); } catch(_) {} }
+    };
+    ws.onclose = () => { if (onClose) onClose(); scheduleReconnect(); };
+    ws.onerror = () => { try { ws.close(); } catch(_) {} };
+  }
+  connect();
+
+  // The 3s broadcast cadence doubles as a heartbeat -- nothing arriving for
+  // ~10s (3x cadence) means a dead-but-still-open socket, force-close so
+  // the reconnect loop above takes over. A real gap TapeTab has no defense
+  // against today.
+  const staleCheck = setInterval(() => {
+    if (!stopped && ws && ws.readyState === WebSocket.OPEN && Date.now() - lastMessageAt > 10000) {
+      ws.close();
+    }
+  }, 3000);
+
+  return {
+    close: () => {
+      stopped = true;
+      clearInterval(staleCheck);
+      clearTimeout(reconnectTimer);
+      if (ws) ws.close();
+    },
+  };
+}
+
+const LiveDataContext = React.createContext(null);
+
+function LiveDataProvider({ children }) {
+  const [snapshot, setSnapshot] = useState(null);
+  const prevRef = useRef(null);
+  const { showToast } = useToast();  // must be nested inside ToastProvider
+
+  useEffect(() => {
+    const socket = createReconnectingSocket("ws://localhost:8000/ws/live", {
+      onMessage: (data) => {
+        if (data.type !== "snapshot") return;
+        const prev = prevRef.current;
+        if (prev && prev.strategies && data.strategies) {
+          Object.entries(data.strategies).forEach(([key, cur]) => {
+            const before = prev.strategies[key];
+            if (!before || cur.reachable === false) return;
+            const beforeCount = before.open_position_count || 0;
+            const curCount = cur.open_position_count || 0;
+            if (beforeCount !== curCount) {
+              const label = key.replace(/_/g, " ");
+              showToast(curCount > beforeCount ? `${label}: new position opened`
+                                                : `${label}: position closed`,
+                         { kind: curCount > beforeCount ? "info" : "success" });
+            }
+          });
+        }
+        prevRef.current = data;
+        setSnapshot(data);
+      },
+    });
+    return () => socket.close();
+  }, [showToast]);
+
+  return <LiveDataContext.Provider value={snapshot}>{children}</LiveDataContext.Provider>;
+}
+
+function useLiveData() {
+  return React.useContext(LiveDataContext);
+}
 
 // ── reusable UI pieces ────────────────────────────────────────────────────
 function Pill({ children, color }) {
@@ -260,73 +416,361 @@ function OPRAPill({ opraActive, onRecheck }) {
   );
 }
 
+// TradingView Lightweight Charts always renders its time axis in UTC,
+// regardless of browser timezone -- there is no "display in ET" option, it's
+// a hard library default. Every bar timestamp in this app (main.py's own
+// t.isoformat()) already carries the correct real ET offset (e.g.
+// "2026-09-08T19:59:00-04:00"), so new Date(...).getTime() gives the true
+// UTC instant -- but feeding that straight to the chart makes it display
+// 23:59 UTC for a bar that was really 19:59 ET, a confusing 4-5h (DST-
+// dependent) mismatch against every other ET time shown elsewhere in this
+// app (found 2026-09-09: chart showed "23:50" at 12:03am real ET time).
+// Fix: strip the embedded offset and parse the wall-clock digits AS IF they
+// were UTC, so the library's UTC rendering echoes back the correct ET
+// digits. Works across DST since the offset in the source string is already
+// correct for that specific bar.
+function etIsoToChartSeconds(isoString) {
+  const naive = isoString.replace(/([+-]\d{2}:\d{2}|Z)$/, "");
+  return Math.floor(new Date(naive + "Z").getTime() / 1000);
+}
+
+// ── Technical indicators (client-side, computed on bars already in the browser) ──
+// RSI mirrors build_features()'s own formula in main.py exactly (plain rolling
+// mean of gains/losses over `period`, NOT textbook Wilder smoothing) so a
+// ticker's RSI reads the same here as it does on the ML Signals tab -- two
+// different RSI conventions on the same number would be confusing, not a
+// feature. SMA/EMA/MACD have no existing precedent in this codebase to match,
+// so they use the standard, textbook formulas.
+function computeSMA(bars, period) {
+  const out = new Array(bars.length).fill(null);
+  let sum = 0;
+  for (let i = 0; i < bars.length; i++) {
+    sum += +bars[i].close;
+    if (i >= period) sum -= +bars[i - period].close;
+    if (i >= period - 1) out[i] = sum / period;
+  }
+  return out;
+}
+
+function computeEMA(bars, period) {
+  const out = new Array(bars.length).fill(null);
+  const k = 2 / (period + 1);
+  let ema = null;
+  let seedSum = 0;
+  for (let i = 0; i < bars.length; i++) {
+    const close = +bars[i].close;
+    if (ema === null) {
+      seedSum += close;
+      if (i === period - 1) {
+        ema = seedSum / period;
+        out[i] = ema;
+      }
+    } else {
+      ema = close * k + ema * (1 - k);
+      out[i] = ema;
+    }
+  }
+  return out;
+}
+
+function computeRSI(bars, period = 14) {
+  const out = new Array(bars.length).fill(null);
+  const gains = new Array(bars.length).fill(0);
+  const losses = new Array(bars.length).fill(0);
+  for (let i = 1; i < bars.length; i++) {
+    const delta = +bars[i].close - +bars[i - 1].close;
+    gains[i] = Math.max(delta, 0);
+    losses[i] = Math.max(-delta, 0);
+  }
+  let gainSum = 0, lossSum = 0;
+  for (let i = 0; i < bars.length; i++) {
+    gainSum += gains[i];
+    lossSum += losses[i];
+    if (i >= period) {
+      gainSum -= gains[i - period];
+      lossSum -= losses[i - period];
+    }
+    if (i >= period) {
+      const avgGain = gainSum / period, avgLoss = lossSum / period;
+      out[i] = 100 - 100 / (1 + avgGain / (avgLoss + 1e-9));
+    }
+  }
+  return out;
+}
+
+function computeMACD(bars, fast = 12, slow = 26, signalPeriod = 9) {
+  const emaFast = computeEMA(bars, fast);
+  const emaSlow = computeEMA(bars, slow);
+  const macdLine = bars.map((_, i) => (emaFast[i] != null && emaSlow[i] != null) ? emaFast[i] - emaSlow[i] : null);
+  const macdBars = macdLine.map(v => ({ close: v ?? 0 }));
+  const firstValid = macdLine.findIndex(v => v != null);
+  const signalRaw = computeEMA(macdBars.slice(firstValid), signalPeriod);
+  const signalLine = new Array(bars.length).fill(null);
+  for (let i = 0; i < signalRaw.length; i++) signalLine[firstValid + i] = signalRaw[i];
+  const histogram = bars.map((_, i) => (macdLine[i] != null && signalLine[i] != null) ? macdLine[i] - signalLine[i] : null);
+  return { macdLine, signalLine, histogram };
+}
+
+// Bare bullish-harami shape check on whatever bars are passed in (1-min for
+// this chart) -- purely visual reference. IMPORTANT: the validated research
+// (candlestick_pattern_research/, p=0.00007) tested this pattern on DAILY
+// bars with a downtrend-context filter and a 5-trading-day hold. This is
+// the same shape check on a completely different, untested timeframe with
+// no downtrend filter -- matches the backend's _check_harami_1m() exactly
+// so the markers shown here are the same occurrences that trigger the
+// Telegram alert, but neither claims the daily version's proven edge.
+function computeHaramiMarkers(bars) {
+  if (!bars || bars.length < 3) return [];
+  const markers = [];
+  for (let i = 1; i < bars.length; i++) {
+    const prior = bars[i - 1], current = bars[i];
+    const priorBearish = +prior.close < +prior.open;
+    const currentBullish = +current.close > +current.open;
+    const contained = (+current.open > +prior.close) && (+current.close < +prior.open);
+    if (priorBearish && currentBullish && contained) {
+      markers.push({
+        time: current.time, position: "belowBar", color: "#c084fc", shape: "circle", text: "H",
+      });
+    }
+  }
+  return markers;
+}
+
 // ── Signals Tab components ─────────────────────────────────────────────────
-function CandleChart({ bars, signal }) {
-  if (!bars || bars.length < 5) return (
-    <div style={{ height:180, display:"flex", alignItems:"center", justifyContent:"center", color:C.muted, fontSize:12 }}>
-      Waiting for bars…
-    </div>
-  );
-  const W=580, H=180, padL=10, padR=50, padT=10, padB=22;
-  const visible = bars.slice(-60);
-  const prices = visible.flatMap(c => [+c.high, +c.low]);
-  const minP = Math.min(...prices), maxP = Math.max(...prices);
-  const rng = maxP - minP || 1;
-  const sy = p => padT + ((maxP - p) / rng) * (H - padT - padB);
-  const cw = (W - padL - padR) / visible.length;
-  const bw = Math.max(2, cw * 0.65);
-  const priceLabels = [minP, (minP+maxP)/2, maxP].map(p => ({ y:sy(p), val:p.toFixed(2) }));
-  const timeLabels = visible
-    .filter((_,i) => i % Math.ceil(visible.length/6) === 0)
-    .map(b => {
-      const idx = visible.indexOf(b);
-      const t = new Date(b.time);
-      return { x: padL + idx*cw + cw/2, label:`${t.getMonth()+1}/${t.getDate()} ${t.getHours()}:${String(t.getMinutes()).padStart(2,'0')}` };
+// Standard swing-high/low pivot detection for a support/resistance overlay --
+// a bar is a pivot high if its high is the max within +/-lookback bars either
+// side (pivot low: symmetric on the low). Deliberately NOT classical chart
+// patterns (head & shoulders, flags, triangles, etc.) -- those have weak,
+// inconsistent real backtested edge industry-wide and in this account's own
+// prior findings (breakout_scanner's trend/momentum quality filters showed
+// near-zero-to-negative lift), so shipping an automated detector for them
+// would be decoration, not a validated signal. Pivots are a plain, honest
+// description of where price has actually reversed before -- not a claim
+// about what will happen next.
+function computePivotLevels(bars, lookback = 15, maxLevels = 4) {
+  if (!bars || bars.length < lookback * 2 + 1) return [];
+  const highs = [], lows = [];
+  for (let i = lookback; i < bars.length - lookback; i++) {
+    const windowSlice = bars.slice(i - lookback, i + lookback + 1);
+    const hi = +bars[i].high, lo = +bars[i].low;
+    if (hi === Math.max(...windowSlice.map(b => +b.high))) highs.push(hi);
+    if (lo === Math.min(...windowSlice.map(b => +b.low)))  lows.push(lo);
+  }
+  const dedupe = (arr) => {
+    const sorted = [...new Set(arr.map(v => Math.round(v * 100) / 100))].sort((a, b) => b - a);
+    return sorted.slice(0, maxLevels);
+  };
+  return [
+    ...dedupe(highs).map(price => ({ price, color: "#f59e0b", title: "R" })),
+    ...dedupe(lows).map(price => ({ price, color: "#38bdf8", title: "S" })),
+  ];
+}
+
+// Stacks price + optional sub-panes (volume/RSI/MACD) top-to-bottom in one
+// chart instance via Lightweight Charts' per-priceScaleId scaleMargins --
+// same technique the original volume-only version used, generalized so
+// panes stack in a fixed order with a small gap between each rather than
+// hand-picked margins per combination.
+// clamp01: floating-point fractions (0.1/0.2-style values) don't always sum
+// exactly to 1.0 in IEEE 754 (e.g. 0.80 + 0.20 can land on
+// 1.0000000000000002) -- Lightweight Charts throws and crashes the whole
+// React tree on a scaleMargins value even a hair outside [0,1] (found
+// 2026-09-09: enabling RSI alone produced -2.22e-16 and blanked the page).
+const clamp01 = (v) => Math.max(0, Math.min(1, v));
+
+function computePaneLayout({ showVolume, showRSI, showMACD }) {
+  const subPanes = [];
+  if (showVolume) subPanes.push({ id: "vol", frac: 0.16 });
+  if (showRSI)    subPanes.push({ id: "rsi", frac: 0.20 });
+  if (showMACD)   subPanes.push({ id: "macd", frac: 0.20 });
+  const gap = 0.03;
+  const subTotal = subPanes.reduce((s, p) => s + p.frac, 0) + subPanes.length * gap;
+  const priceBottomMargin = clamp01(subPanes.length > 0 ? subTotal : 0.05);
+  let cursor = 1 - subTotal;
+  const slots = {};
+  for (const p of subPanes) {
+    const top = cursor + gap;
+    const bottom = top + p.frac;
+    slots[p.id] = { top: clamp01(top), bottom: clamp01(1 - bottom) };
+    cursor = bottom;
+  }
+  const baseHeight = 180;
+  const height = baseHeight + subPanes.length * 90;
+  return { priceMargins: { top: 0.05, bottom: priceBottomMargin }, slots, height };
+}
+
+function CandleChart({ bars, signal, priceLines, extraMarkers, showVolume, windowSize, indicators }) {
+  const containerRef = useRef(null);
+  const chartRef = useRef(null);
+  const seriesRef = useRef(null);
+  const volumeSeriesRef = useRef(null);
+  const smaSeriesRef = useRef({});
+  const rsiSeriesRef = useRef(null);
+  const macdSeriesRef = useRef({});
+  const priceLineRefs = useRef([]);
+  const ind = indicators || {};
+  const layout = computePaneLayout({ showVolume, showRSI: !!ind.rsi, showMACD: !!ind.macd });
+
+  // Real pan/zoom/crosshair via TradingView Lightweight Charts (2026-09-07,
+  // replacing the old static hand-rolled SVG) -- same {bars, signal} props,
+  // same 60-bar window, imperative DOM lifecycle instead of declarative SVG
+  // so chart creation/teardown happens in useEffect, not render.
+  useEffect(() => {
+    if (!containerRef.current) return;
+    const chart = LightweightCharts.createChart(containerRef.current, {
+      height: layout.height,
+      layout: { background: { color: C.card }, textColor: C.muted, fontFamily: "'JetBrains Mono', monospace" },
+      grid: { vertLines: { color: C.border }, horzLines: { color: C.border } },
+      rightPriceScale: { borderColor: C.border },
+      timeScale: { borderColor: C.border, timeVisible: true, secondsVisible: false },
+      crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
     });
+    const series = chart.addCandlestickSeries({
+      upColor: C.bull, downColor: C.bear, borderVisible: false,
+      wickUpColor: C.bull, wickDownColor: C.bear,
+      priceScaleId: "right",
+    });
+    series.priceScale().applyOptions({ scaleMargins: layout.priceMargins });
+
+    if (showVolume) {
+      const volSeries = chart.addHistogramSeries({ priceFormat: { type: "volume" }, priceScaleId: "vol", color: C.muted });
+      volSeries.priceScale().applyOptions({ scaleMargins: layout.slots.vol });
+      volumeSeriesRef.current = volSeries;
+    }
+    if (ind.sma20) smaSeriesRef.current.sma20 = chart.addLineSeries({ color: "#facc15", lineWidth: 1, priceScaleId: "right", priceLineVisible: false, lastValueVisible: false });
+    if (ind.sma50) smaSeriesRef.current.sma50 = chart.addLineSeries({ color: "#fb923c", lineWidth: 1, priceScaleId: "right", priceLineVisible: false, lastValueVisible: false });
+    if (ind.ema9)  smaSeriesRef.current.ema9  = chart.addLineSeries({ color: "#a78bfa", lineWidth: 1, priceScaleId: "right", priceLineVisible: false, lastValueVisible: false });
+    if (ind.rsi) {
+      const rsiSeries = chart.addLineSeries({ color: "#38bdf8", lineWidth: 1, priceScaleId: "rsi", priceLineVisible: false, lastValueVisible: true });
+      rsiSeries.priceScale().applyOptions({ scaleMargins: layout.slots.rsi });
+      // Static 30/70 reference lines -- created once here (not the data-update
+      // effect below) since they never change value; creating them on every
+      // bar update with no cleanup would stack duplicate lines indefinitely.
+      rsiSeries.createPriceLine({ price: 70, color: C.bear, lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dotted, axisLabelVisible: false });
+      rsiSeries.createPriceLine({ price: 30, color: C.bull, lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dotted, axisLabelVisible: false });
+      rsiSeriesRef.current = rsiSeries;
+    }
+    if (ind.macd) {
+      const macdLine   = chart.addLineSeries({ color: "#38bdf8", lineWidth: 1, priceScaleId: "macd", priceLineVisible: false, lastValueVisible: false });
+      const signalLine = chart.addLineSeries({ color: "#fb923c", lineWidth: 1, priceScaleId: "macd", priceLineVisible: false, lastValueVisible: false });
+      const histogram  = chart.addHistogramSeries({ priceScaleId: "macd", color: C.muted, priceLineVisible: false, lastValueVisible: false });
+      macdLine.priceScale().applyOptions({ scaleMargins: layout.slots.macd });
+      macdSeriesRef.current = { macdLine, signalLine, histogram };
+    }
+    chartRef.current = chart;
+    seriesRef.current = series;
+
+    const ro = new ResizeObserver(entries => {
+      if (entries[0]) chart.applyOptions({ width: entries[0].contentRect.width });
+    });
+    ro.observe(containerRef.current);
+
+    return () => {
+      ro.disconnect(); chart.remove();
+      chartRef.current = null; seriesRef.current = null; volumeSeriesRef.current = null;
+      smaSeriesRef.current = {}; rsiSeriesRef.current = null; macdSeriesRef.current = {};
+    };
+  }, [showVolume, ind.sma20, ind.sma50, ind.ema9, ind.rsi, ind.macd]);
+
+  useEffect(() => {
+    const series = seriesRef.current;
+    if (!series || !bars || bars.length < 5) return;
+    const visible = bars.slice(-(windowSize || 60));
+    // See etIsoToChartSeconds -- Lightweight Charts always renders its time
+    // axis in UTC, so bar times are re-labeled as UTC to display the
+    // correct real ET digits regardless of the viewer's own browser
+    // timezone (found 2026-09-09: was showing a raw UTC conversion,
+    // 4-5h ahead of real ET wall-clock time).
+    const candles = visible.map(b => ({
+      time: etIsoToChartSeconds(b.time),
+      open: +b.open, high: +b.high, low: +b.low, close: +b.close,
+    }));
+    series.setData(candles);
+
+    if (volumeSeriesRef.current) {
+      const volData = visible.map((b, i) => ({
+        time: candles[i].time, value: +b.volume || 0,
+        color: (+b.close >= +b.open ? C.bull : C.bear) + "88",
+      }));
+      volumeSeriesRef.current.setData(volData);
+    }
+
+    const lineData = (values) => values
+      .map((v, i) => (v == null ? null : { time: candles[i].time, value: v }))
+      .filter(Boolean);
+
+    if (smaSeriesRef.current.sma20) smaSeriesRef.current.sma20.setData(lineData(computeSMA(visible, 20)));
+    if (smaSeriesRef.current.sma50) smaSeriesRef.current.sma50.setData(lineData(computeSMA(visible, 50)));
+    if (smaSeriesRef.current.ema9)  smaSeriesRef.current.ema9.setData(lineData(computeEMA(visible, 9)));
+    if (rsiSeriesRef.current) {
+      rsiSeriesRef.current.setData(lineData(computeRSI(visible, 14)));
+    }
+    if (macdSeriesRef.current.macdLine) {
+      const { macdLine, signalLine, histogram } = computeMACD(visible);
+      macdSeriesRef.current.macdLine.setData(lineData(macdLine));
+      macdSeriesRef.current.signalLine.setData(lineData(signalLine));
+      macdSeriesRef.current.histogram.setData(
+        histogram.map((v, i) => (v == null ? null : {
+          time: candles[i].time, value: v, color: (v >= 0 ? C.bull : C.bear) + "88",
+        })).filter(Boolean)
+      );
+    }
+
+    const markers = [];
+    if (signal && signal.label !== "HOLD" && candles.length > 0) {
+      const last = candles[candles.length - 1];
+      const isBuy = signal.label === "BUY";
+      markers.push({
+        time: last.time, position: isBuy ? "belowBar" : "aboveBar",
+        color: isBuy ? C.bull : C.bear, shape: isBuy ? "arrowUp" : "arrowDown",
+        text: signal.label,
+      });
+    }
+    if (extraMarkers && extraMarkers.length > 0) {
+      for (const m of extraMarkers) {
+        const t = etIsoToChartSeconds(m.time);
+        markers.push({ time: t, position: m.position, color: m.color, shape: m.shape, text: m.text });
+      }
+    }
+    markers.sort((a, b) => a.time - b.time);
+    series.setMarkers(markers);
+
+    // Price lines (target/stop levels) -- torn down and rebuilt each update
+    // since createPriceLine has no update-in-place API; cheap for the
+    // small (<=3) line counts this is used for.
+    priceLineRefs.current.forEach(line => { try { series.removePriceLine(line); } catch(_) {} });
+    priceLineRefs.current = (priceLines || []).map(pl =>
+      series.createPriceLine({
+        price: pl.price, color: pl.color, lineWidth: 1,
+        lineStyle: LightweightCharts.LineStyle.Dashed, axisLabelVisible: true, title: pl.title,
+      })
+    );
+
+    chartRef.current.timeScale().fitContent();
+  }, [bars, signal, priceLines, extraMarkers, windowSize, ind.sma20, ind.sma50, ind.ema9, ind.rsi, ind.macd]);
+
+  const waiting = !bars || bars.length < 5;
   return (
-    <svg viewBox={`0 0 ${W} ${H}`} style={{ width:"100%", height:H }}>
-      <rect width={W} height={H} fill={C.card} rx={6} />
-      {priceLabels.map((pl,i) => (
-        <g key={i}>
-          <line x1={padL} y1={pl.y} x2={W-padR+4} y2={pl.y} stroke={C.border} strokeDasharray="3 3" />
-          <text x={W-padR+8} y={pl.y+4} fill={C.muted} fontSize={9} style={mono}>{pl.val}</text>
-        </g>
-      ))}
-      {visible.map((c,i) => {
-        const x = padL + i * cw;
-        const isUp = +c.close >= +c.open;
-        const col = isUp ? C.bull : C.bear;
-        const bodyTop = sy(Math.max(+c.open, +c.close));
-        const bodyBot = sy(Math.min(+c.open, +c.close));
-        const bh = Math.max(1.5, bodyBot - bodyTop);
-        const cx = x + cw/2;
-        return (
-          <g key={i} opacity={i===visible.length-1 ? 1 : 0.8}>
-            <line x1={cx} y1={sy(+c.high)} x2={cx} y2={sy(+c.low)} stroke={col} strokeWidth={1} />
-            <rect x={x+(cw-bw)/2} y={bodyTop} width={bw} height={bh} fill={col} rx={0.5}
-              style={i===visible.length-1 ? {filter:`drop-shadow(0 0 3px ${col})`} : {}} />
-          </g>
-        );
-      })}
-      {signal && signal.label !== "HOLD" && visible.length > 0 && (() => {
-        const last = visible[visible.length-1];
-        const cx = padL + (visible.length-1)*cw + cw/2;
-        const isBuy = signal.label === "BUY";
-        const cy = isBuy ? sy(+last.low)+10 : sy(+last.high)-10;
-        const col = isBuy ? C.bull : C.bear;
-        return (
-          <g>
-            <circle cx={cx} cy={cy} r={5} fill={col} style={{filter:`drop-shadow(0 0 5px ${col})`}} />
-            <text x={cx} y={isBuy ? cy+16 : cy-8} fill={col} fontSize={8} textAnchor="middle" style={mono} fontWeight={700}>
-              {signal.label}
-            </text>
-          </g>
-        );
-      })()}
-      {timeLabels.map((tl,i) => (
-        <text key={i} x={tl.x} y={H-4} fill={C.muted} fontSize={8} textAnchor="middle" style={sans}>{tl.label}</text>
-      ))}
-    </svg>
+    <div style={{ position:"relative", width:"100%", height:layout.height }}>
+      {/* Container is ALWAYS mounted, even while waiting -- the chart-
+          creation effect above runs once on mount against this ref; if it
+          were conditionally rendered based on bar count, an initial empty
+          state would mount with a null ref, the effect would no-op, and
+          bars arriving later would never get a real chart created against
+          them (the effect's [] deps mean it never re-fires). Wrapper height
+          was hardcoded to 180 regardless of the chart's real height (bug
+          found 2026-09-09 while adding indicator sub-panes -- with volume
+          shown the chart was already rendering at 260px inside a 180px
+          parent, just not visibly clipped since nothing constrained
+          overflow). Now tracks the same layout.height the chart itself uses. */}
+      <div ref={containerRef} style={{ width:"100%", height:layout.height, visibility: waiting ? "hidden" : "visible" }} />
+      {waiting && (
+        <div style={{ position:"absolute", inset:0, display:"flex", alignItems:"center",
+                       justifyContent:"center", color:C.muted, fontSize:12 }}>
+          Waiting for bars…
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -1344,29 +1788,67 @@ function SignalsTab({ connected }) {
   const [customTickers, setCustom] = useState([]);
   const prevSigRef                 = useRef({});
   const allTickers                 = [...tickers, ...customTickers];
+  const { showToast } = useToast();
+  const liveData = useLiveData();
 
+  // Shared between the live-push path and the fallback poll below, so
+  // "a new decision was made" (history row) is detected identically no
+  // matter which source noticed it first.
+  const applySignals = useCallback((sigs) => {
+    setSignals(sigs);
+    Object.entries(sigs).forEach(([ticker, sig]) => {
+      const prev = prevSigRef.current[ticker];
+      if (!prev || prev.timestamp !== sig.timestamp) {
+        setHistory(h => [{ ts:new Date(sig.timestamp).toLocaleTimeString(), ticker, ...sig }, ...h].slice(0,50));
+      }
+    });
+    prevSigRef.current = sigs;
+  }, []);
+
+  // Full reload: status + all signals + the active ticker's full 80-bar
+  // history. Needed on mount and on ticker switch (the live push below
+  // only ever carries the single latest bar, not backfill) -- kept as a
+  // slow fallback poll otherwise, same pattern as PnLTab's useLiveData
+  // adoption (2026-09-07): push does the real-time work, polling is just
+  // the safety net if the socket is down.
   const refresh = useCallback(async () => {
     try {
       const [st, sigs] = await Promise.all([apiFetch("/status"), apiFetch("/signals")]);
       setStatus(st);
-      setSignals(sigs);
+      applySignals(sigs);
       try {
         const b = await apiFetch(`/bars/${activeTicker}?limit=80`);
         setBars(prev => ({ ...prev, [activeTicker]: b }));
       } catch(_) {}
-      Object.entries(sigs).forEach(([ticker, sig]) => {
-        const prev = prevSigRef.current[ticker];
-        if (!prev || prev.timestamp !== sig.timestamp) {
-          setHistory(h => [{ ts:new Date(sig.timestamp).toLocaleTimeString(), ticker, ...sig }, ...h].slice(0,50));
-        }
-      });
-      prevSigRef.current = sigs;
     } catch(e) {
       setStatus(s => ({ ...s, connected:false, error:e.message }));
     }
-  }, [activeTicker]);
+  }, [activeTicker, applySignals]);
 
-  useEffect(() => { refresh(); const iv = setInterval(refresh,15000); return ()=>clearInterval(iv); }, [refresh]);
+  useEffect(() => { refresh(); }, [refresh]);
+  useEffect(() => { const iv = setInterval(refresh, 60000); return () => clearInterval(iv); }, [refresh]);
+
+  // Live push (2026-09-07): state["signals"] is already recomputed on
+  // every IBKR tick on the backend (keepUpToDate historical bars) -- this
+  // closes the display-side gap from the old 15s poll down to /ws/live's
+  // ~3s broadcast cadence. Only the active ticker's chart is patched
+  // in-place (append a new bar, or replace the still-forming last one)
+  // since latest_bar only ever carries one bar per ticker, not backfill.
+  useEffect(() => {
+    if (!liveData || !liveData.signals) return;
+    applySignals(liveData.signals);
+    const latest = liveData.latest_bar?.[activeTicker];
+    if (!latest) return;
+    setBars(prev => {
+      const existing = prev[activeTicker];
+      if (!existing || existing.length === 0) return prev;
+      const last = existing[existing.length - 1];
+      const merged = last && last.time === latest.time
+        ? [...existing.slice(0, -1), latest]
+        : [...existing, latest].slice(-80);
+      return { ...prev, [activeTicker]: merged };
+    });
+  }, [liveData, activeTicker, applySignals]);
 
   const addTicker = async () => {
     const t = newTicker.trim().toUpperCase();
@@ -1376,15 +1858,15 @@ function SignalsTab({ connected }) {
       setCustom(c => [...c, t]);
       setNewTicker("");
       setActive(t);
-    } catch(e) { alert("Error: " + e.message); }
+    } catch(e) { showToast("Error: " + e.message, { kind:"error" }); }
   };
 
   const retrain = async () => {
     try {
       const d = await apiFetch(`/retrain/${activeTicker}`, { method:"POST" });
-      alert(`Retrained on ${activeTicker}  accuracy=${(d.accuracy*100).toFixed(1)}%`);
+      showToast(`Retrained on ${activeTicker}  accuracy=${(d.accuracy*100).toFixed(1)}%`, { kind:"success" });
       setStatus(s => ({ ...s, model_accuracy:d.accuracy }));
-    } catch(e) { alert("Retrain failed: " + e.message); }
+    } catch(e) { showToast("Retrain failed: " + e.message, { kind:"error" }); }
   };
 
   const activeSig  = signals[activeTicker];
@@ -3512,10 +3994,16 @@ const STRAT_META = {
   "CSP":                { label:"Auto-Trader (CSP)",    color:"#3b82f6" },
   "LEAP":               { label:"Auto-Trader (LEAP)",   color:"#8b5cf6" },
   "signal_trader":      { label:"Signal Trader",        color:"#06b6d4" },
+  "GOOG_CONDOR":        { label:"GOOG Weekly Condor",   color:"#eab308" },
+  "BUTTERFLY_SPY":      { label:"SPY 0DTE Butterfly",   color:"#f43f5e" },
+  "BUTTERFLY_QQQ":      { label:"QQQ 0DTE Butterfly",   color:"#fb7185" },
+  "BUTTERFLY_IWM":      { label:"IWM 0DTE Butterfly",   color:"#fda4af" },
+  "SAFE_INCOME":        { label:"Safe Income Trader",   color:"#14b8a6" },
+  "ASHLEY_SIGNAL":      { label:"Ashley Signal-Follow", color:"#d946ef" },
   "OTHER":              { label:"Other / Unknown",      color:"#64748b" },
   "UNTRACKED":          { label:"Untracked (IBKR only)",color:"#ef4444" },
 };
-const STRAT_ORDER = ["SPX_0DTE","earnings_vol_crush","DAY_BREAKOUT","STOCK_BREAKOUT","CSP","LEAP","signal_trader","OTHER","UNTRACKED"];
+const STRAT_ORDER = ["SPX_0DTE","earnings_vol_crush","DAY_BREAKOUT","STOCK_BREAKOUT","CSP","LEAP","signal_trader","GOOG_CONDOR","BUTTERFLY_SPY","BUTTERFLY_QQQ","BUTTERFLY_IWM","SAFE_INCOME","ASHLEY_SIGNAL","OTHER","UNTRACKED"];
 
 function StratSection({ stratKey, closed, openPos, todaySummary, fmtDol, pnlCol, fmtDT, fmtDTE }) {
   const m = STRAT_META[stratKey] || { label: stratKey, color: C.muted };
@@ -3643,7 +4131,7 @@ function StratSection({ stratKey, closed, openPos, todaySummary, fmtDol, pnlCol,
                     ))}
                   </tr></thead>
                   <tbody>
-                    {closed.slice(0, 50).map(t => {
+                    {closed.slice(0, 50).map((t, i) => {
                       const days = t.closed_at && t.opened_at
                         ? Math.max(0, Math.round((new Date(t.closed_at) - new Date(t.opened_at)) / 86400000))
                         : null;
@@ -3652,7 +4140,7 @@ function StratSection({ stratKey, closed, openPos, todaySummary, fmtDol, pnlCol,
                         ? C.bear : C.neutral;
                       const isOrphan = (t.exit_reason||"") === "orphaned";
                       return (
-                        <tr key={t.id} style={{ borderTop:`1px solid ${C.border}33`, opacity: isOrphan ? 0.45 : 1 }}>
+                        <tr key={t.id || i} style={{ borderTop:`1px solid ${C.border}33`, opacity: isOrphan ? 0.45 : 1 }}>
                           <td style={{ ...mono, fontWeight:700, color:C.accent, padding:"5px 12px 5px 0" }}>{t.ticker}</td>
                           <td style={{ ...mono, padding:"5px 12px 5px 0" }}>{t.strike ? `$${t.strike}` : "—"}</td>
                           <td style={{ ...mono, fontSize:10, color:C.muted, padding:"5px 12px 5px 0" }}>{fmtDT(t.opened_at)}</td>
@@ -3713,6 +4201,7 @@ function PnLTab() {
   const [deltaOpen,   setDeltaOpen]   = useState(false);
   const [deltaLoading,setDeltaLoading]= useState(false);
   const [modeFilter,  setModeFilter]  = useState("live");
+  const { showToast } = useToast();
   const INTERVAL = 15;
 
   const loadDelta = async () => {
@@ -3731,15 +4220,15 @@ function PnLTab() {
     try {
       await apiFetch(`/orders/${id}`, {method:"DELETE"});
       await loadDelta();
-    } catch(e) { alert("Cancel failed: " + e.message); }
+    } catch(e) { showToast("Cancel failed: " + e.message, { kind:"error" }); }
   };
 
   const cancelInactiveOrders = async () => {
     try {
       const r = await apiFetch("/orders/cancel-inactive", {method:"POST"});
-      alert(`Cancelled ${r.count} Inactive order(s): [${r.cancelled.join(", ")}]`);
+      showToast(`Cancelled ${r.count} Inactive order(s): [${r.cancelled.join(", ")}]`, { kind:"success" });
       await loadDelta();
-    } catch(e) { alert("Cancel inactive failed: " + e.message); }
+    } catch(e) { showToast("Cancel inactive failed: " + e.message, { kind:"error" }); }
   };
 
   const load = useCallback(async () => {
@@ -3752,14 +4241,34 @@ function PnLTab() {
     finally    { setLoading(false); }
   }, []);
 
-  useEffect(() => { load(); const iv = setInterval(load, INTERVAL * 1000); return () => clearInterval(iv); }, [load]);
+  // /pnl/dashboard is a heavy, DB-querying endpoint (full trade history +
+  // live Alpaca call) -- NOT something to hit every 3s the way /ws/live
+  // pushes its lightweight summary. Instead: /ws/live's snapshot triggers
+  // an immediate refetch the moment it detects a real change (any
+  // strategy's open-position count moved), so P&L reflects a real close/
+  // open within ~3s instead of waiting up to 15s for the next blind poll.
+  // The slower interval below stays as a fallback safety net, not the
+  // primary refresh path anymore.
+  const liveData = useLiveData();
+  const prevOpenTotalRef = useRef(null);
+  useEffect(() => {
+    if (!liveData || !liveData.strategies) return;
+    const total = Object.values(liveData.strategies)
+      .reduce((sum, s) => sum + (s.open_position_count || 0), 0);
+    if (prevOpenTotalRef.current !== null && prevOpenTotalRef.current !== total) {
+      load();
+    }
+    prevOpenTotalRef.current = total;
+  }, [liveData, load]);
+
+  useEffect(() => { load(); const iv = setInterval(load, 60 * 1000); return () => clearInterval(iv); }, [load]);
   useEffect(() => { const iv = setInterval(() => setCountdown(c => c <= 1 ? INTERVAL : c - 1), 1000); return () => clearInterval(iv); }, []);
 
   if (loading && !data) return <div style={{...sans, padding:40, textAlign:"center", color:C.muted}}>Loading P&amp;L data…</div>;
   if (err) return <div style={{...sans, padding:40, textAlign:"center", color:C.bear}}>Error: {err}</div>;
   if (!data) return null;
 
-  const { account, stats, open_positions, closed_trades, daily_pnl, portfolio, exit_breakdown, strategy_today, is_live, mt_open, mt_closed } = data;
+  const { account, alpaca_account, combined_net_liquidation, stats, open_positions, closed_trades, daily_pnl, portfolio, exit_breakdown, strategy_today, is_live, mt_open, mt_closed } = data;
 
   const pnlCol  = v => v == null ? C.muted : v > 0 ? C.bull : v < 0 ? C.bear : C.muted;
   const fmtDol  = (v, sign=false) => {
@@ -3782,51 +4291,63 @@ function PnLTab() {
 
   // ── SVG cumulative P&L chart ──────────────────────────────────────────────
   function PnLChart({ pts: pts }) {
-    if (pts.length === 0) return (
-      <div style={{height:160, display:"flex", alignItems:"center", justifyContent:"center", color:C.muted, ...sans, fontSize:13}}>
-        No closed trades yet — chart will appear after the first close
-      </div>
-    );
-    const VW=760, VH=160, PAD={l:65,r:20,t:20,b:32};
-    const pW = VW-PAD.l-PAD.r, pH = VH-PAD.t-PAD.b;
-    const vals = pts.map(p => p.cumulative);
-    const yMin = Math.min(0, ...vals), yMax = Math.max(0, ...vals);
-    const yR   = yMax - yMin || 10;
-    const xS   = i  => PAD.l + (pts.length > 1 ? (i/(pts.length-1))*pW : pW/2);
-    const yS   = v  => PAD.t + pH - ((v - yMin)/yR)*pH;
-    const zY   = yS(0);
-    const lc   = vals[vals.length-1] >= 0 ? "#16a34a" : "#dc2626";
-    const linePts = pts.map((p,i) => `${xS(i).toFixed(1)},${yS(p.cumulative).toFixed(1)}`).join(" ");
-    const fillD   = `M ${xS(0)} ${zY} L ${pts.map((p,i)=>`${xS(i)} ${yS(p.cumulative)}`).join(" L ")} L ${xS(pts.length-1)} ${zY} Z`;
-    const yTicks  = [yMin, yMin+yR*0.25, yMin+yR*0.5, yMin+yR*0.75, yMax];
-    const xIdxs   = pts.length <= 6 ? pts.map((_,i)=>i) :
-      [0,1,2,3,4,5].map(i => Math.round(i*(pts.length-1)/5));
+    const containerRef = useRef(null);
+    const chartRef = useRef(null);
+
+    // Real pan/zoom/crosshair via Lightweight Charts (2026-09-07, replacing
+    // the old static hand-rolled SVG). pts[i].date is already "YYYY-MM-DD"
+    // -- natively compatible with Lightweight Charts' BusinessDay format,
+    // no timestamp conversion needed (unlike CandleChart's intraday bars).
+    useEffect(() => {
+      if (!containerRef.current) return;
+      const chart = LightweightCharts.createChart(containerRef.current, {
+        height: 160,
+        layout: { background: { color: C.card }, textColor: C.muted, fontFamily: "'JetBrains Mono', monospace" },
+        grid: { vertLines: { color: C.border }, horzLines: { color: C.border } },
+        rightPriceScale: { borderColor: C.border },
+        timeScale: { borderColor: C.border },
+        crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+      });
+      chartRef.current = chart;
+      const ro = new ResizeObserver(entries => {
+        if (entries[0]) chart.applyOptions({ width: entries[0].contentRect.width });
+      });
+      ro.observe(containerRef.current);
+      return () => { ro.disconnect(); chart.remove(); chartRef.current = null; };
+    }, []);
+
+    useEffect(() => {
+      const chart = chartRef.current;
+      if (!chart || !pts || pts.length === 0) return;
+      const lastVal = pts[pts.length - 1].cumulative;
+      const lc = lastVal >= 0 ? "#16a34a" : "#dc2626";
+      // Color depends on the LATEST cumulative value's sign, which can flip
+      // between updates -- addAreaSeries's colors are fixed at creation, so
+      // the series is recreated (not just re-fed data) whenever pts changes.
+      // Infrequent (only fires on a new closed trade), not a perf concern.
+      if (chart._pnlSeries) chart.removeSeries(chart._pnlSeries);
+      const series = chart.addAreaSeries({
+        lineColor: lc, topColor: `${lc}38`, bottomColor: `${lc}05`, lineWidth: 2,
+      });
+      chart._pnlSeries = series;
+      series.setData(pts.map(p => ({ time: p.date, value: p.cumulative })));
+      chart.timeScale().fitContent();
+    }, [pts]);
+
+    const empty = !pts || pts.length === 0;
     return (
-      <svg viewBox={`0 0 ${VW} ${VH}`} style={{width:"100%",height:"auto",overflow:"visible"}}>
-        <defs>
-          <linearGradient id="pg" x1="0" y1="0" x2="0" y2="1">
-            <stop offset="0%" stopColor={lc} stopOpacity="0.22"/>
-            <stop offset="100%" stopColor={lc} stopOpacity="0.02"/>
-          </linearGradient>
-        </defs>
-        {yTicks.map((v,i) => (
-          <g key={i}>
-            <line x1={PAD.l} y1={yS(v)} x2={VW-PAD.r} y2={yS(v)} stroke={C.border} strokeWidth="0.5" strokeDasharray="3,3"/>
-            <text x={PAD.l-6} y={yS(v)} textAnchor="end" dominantBaseline="middle" style={{...mono,fontSize:9,fill:C.muted}}>
-              {v<0?"-":""}${Math.abs(v).toFixed(0)}
-            </text>
-          </g>
-        ))}
-        <line x1={PAD.l} y1={zY} x2={VW-PAD.r} y2={zY} stroke={C.muted} strokeWidth="1" strokeOpacity="0.4"/>
-        <path d={fillD} fill="url(#pg)"/>
-        <polyline points={linePts} fill="none" stroke={lc} strokeWidth="2" strokeLinejoin="round"/>
-        <circle cx={xS(pts.length-1)} cy={yS(vals[vals.length-1])} r="4" fill={lc} stroke="white" strokeWidth="1.5"/>
-        {xIdxs.map(i => (
-          <text key={i} x={xS(i)} y={VH-4} textAnchor="middle" style={{...mono,fontSize:9,fill:C.muted}}>
-            {pts[i].date.slice(5)}
-          </text>
-        ))}
-      </svg>
+      // Container is ALWAYS mounted (same reasoning as CandleChart above) --
+      // a conditional container would leave chartRef null forever once
+      // pts arrives later, since the creation effect only ever runs once.
+      <div style={{ position:"relative", width:"100%", height:160 }}>
+        <div ref={containerRef} style={{ width:"100%", height:160, visibility: empty ? "hidden" : "visible" }} />
+        {empty && (
+          <div style={{ position:"absolute", inset:0, display:"flex", alignItems:"center",
+                         justifyContent:"center", color:C.muted, ...sans, fontSize:13 }}>
+            No closed trades yet — chart will appear after the first close
+          </div>
+        )}
+      </div>
     );
   }
 
@@ -3888,9 +4409,11 @@ function PnLTab() {
     { label:"Win Rate",       value:fWinRate!=null?`${fWinRate}%`:"—",       color:fWinRate>50?C.bull:fWinRate<50?C.bear:C.muted,
       sub:`avg W ${fmtDol(fAvgW)} / L ${fmtDol(fAvgL)}` },
     { label: commTracked ? "Net (after fees)" : "Net Liquidation",
-      value: commTracked ? fmtDol(Math.round((fTotalR-(stats.total_commission||0))*100)/100,true) : fmtDol(account.net_liquidation),
+      value: commTracked ? fmtDol(Math.round((fTotalR-(stats.total_commission||0))*100)/100,true) : fmtDol(combined_net_liquidation ?? account.net_liquidation),
       color: commTracked ? pnlCol(fTotalR-(stats.total_commission||0)) : C.accent,
-      sub: commTracked ? `fees: ${fmtDol(stats.total_commission)} · liq: ${fmtDol(account.net_liquidation)}` : (account.account||"—") },
+      sub: commTracked
+        ? `fees: ${fmtDol(stats.total_commission)} · liq: ${fmtDol(combined_net_liquidation ?? account.net_liquidation)}`
+        : `IBKR ${fmtDol(account.net_liquidation)} + Alpaca ${fmtDol(alpaca_account?.equity)}` },
   ];
 
   // ── Group closed trades + open positions by strategy ──────────────────────
@@ -4704,24 +5227,74 @@ function TechnicalsTab() {
 
 
 // ── Decisions Tab ─────────────────────────────────────────────────────────
+// Real gap fixed 2026-09-07: this tab used to show ONLY AutoTrader's own
+// decisions (/autotrader/decisions). AutoTrader's real last decision was
+// 2026-07-07 -- because AutoTrader itself has been disabled with zero
+// positions since then, not because anything crashed -- but the tab's
+// generic "Decisions" label made a quiet strategy read as "the whole
+// system stopped logging," when 8+ other strategies have been deciding
+// and trading every single day, invisibly to this tab. Now merges
+// decisions from every strategy that exposes them, each tagged with its
+// source. Deliberately does NOT attempt true cross-source chronological
+// interleaving -- each strategy formats its own `time` field differently
+// (some "HH:MM:SS ET" with no date, AutoTrader's own "Jul 07 15:54 ET",
+// GOOG Condor's full "YYYY-MM-DD HH:MM:SS ET") and naively string-sorting
+// across those formats would silently misorder entries. Each source's own
+// list is already correctly ordered by its own API; grouping by source
+// avoids the fragile-sort problem entirely while still solving the real
+// issue (a quiet strategy no longer looks like a dead system).
+const DECISION_SOURCES = [
+  { id: "autotrader",     label: "AutoTrader (CSP-Leap)", endpoint: "/autotrader/decisions?limit=200", key: "decisions" },
+  { id: "evc",            label: "Earnings Vol Crush",    endpoint: "/earnings-vol-crush/status",       key: "decisions" },
+  { id: "spx_0dte",       label: "SPX 0DTE",              endpoint: "/spx-0dte/status",                 key: "decisions" },
+  { id: "sig_trader",     label: "Signal Trader",         endpoint: "/signal-trader/status",            key: "decisions" },
+  { id: "fx_trader",      label: "FX Trader",             endpoint: "/fx-trader/status",                key: "decisions" },
+  { id: "stock_trader",   label: "Stock Trader",          endpoint: "/stock-trader/status",             key: "decisions" },
+  { id: "manual_trader",  label: "Manual Trader",         endpoint: "/manual-trader/status",            key: "decisions" },
+  { id: "spy_condor",     label: "SPY Weekly Condor",     endpoint: "/spy-condor/status",                key: "decisions" },
+  { id: "goog_condor",    label: "GOOG Condor",           endpoint: "/goog-condor/status",               key: "decisions" },
+];
+
 function DecisionsTab() {
-  const [decisions, setDecisions] = useState([]);
+  const [bySource, setBySource] = useState({});
   const [loading,   setLoading]   = useState(true);
   const [filter,    setFilter]    = useState("ALL");
+  const [sourceFilter, setSourceFilter] = useState("ALL");
 
   const load = async () => {
-    try {
-      const r = await apiFetch("/autotrader/decisions?limit=200");
-      setDecisions(r.decisions || []);
-    } catch(_) {}
-    finally { setLoading(false); }
+    const results = await Promise.all(DECISION_SOURCES.map(async src => {
+      try {
+        const r = await apiFetch(src.endpoint);
+        const raw = r[src.key] || [];
+        return [src.id, raw.map(d => ({
+          source: src.id, sourceLabel: src.label,
+          time: d.time, action: d.action || "ACTIVITY",
+          ticker: d.ticker || d.pair || d.spread_id || null,
+          headline: d.headline || null,
+          body: d.body || d.detail || "",
+        }))];
+      } catch(_) {
+        return [src.id, null];  // null = unreachable, distinct from "reachable, zero decisions"
+      }
+    }));
+    setBySource(Object.fromEntries(results));
+    setLoading(false);
   };
 
   useEffect(() => {
     load();
-    const id = setInterval(load, 10000);
+    const id = setInterval(load, 15000);
     return () => clearInterval(id);
   }, []);
+
+  // Capped per-source (not globally sliced after flattening) -- a global
+  // slice would let one verbose source (AutoTrader alone can return up to
+  // 200) crowd out every other source's entries entirely. Each source's
+  // own list is already newest-first, so the first N per source is its
+  // most recent N.
+  const decisions = Object.entries(bySource)
+    .filter(([id]) => sourceFilter === "ALL" || sourceFilter === id)
+    .flatMap(([, list]) => (list || []).slice(0, 40));
 
   const ACTION_META = {
     ENTER:        { label:"Entry",         color:"#27ae60", bg:"#0d3321" },
@@ -4748,63 +5321,93 @@ function DecisionsTab() {
     });
   };
 
+  const reachableCount = Object.values(bySource).filter(v => v !== null).length;
+
   return (
     <div>
-      <div style={{ display:"flex", alignItems:"center", gap:12, marginBottom:16, flexWrap:"wrap" }}>
+      <div style={{ display:"flex", alignItems:"center", gap:12, marginBottom:10, flexWrap:"wrap" }}>
         <div style={{ ...sans, fontSize:14, fontWeight:700, color:"#f1f5f9" }}>
           Trade Decision Log
         </div>
         <div style={{ ...mono, fontSize:11, color:"#64748b" }}>
-          {filtered.length} decision{filtered.length !== 1 ? "s" : ""}
+          {filtered.length} decision{filtered.length !== 1 ? "s" : ""} across {reachableCount} of {DECISION_SOURCES.length} strategies
           {filter !== "ALL" ? ` · ${filter}` : ""}
         </div>
-        <div style={{ display:"flex", gap:6, marginLeft:"auto", flexWrap:"wrap" }}>
-          {ALL_FILTERS.map(f => {
-            const m = ACTION_META[f] || {};
-            return (
-              <button key={f} onClick={() => setFilter(f)} style={{
-                ...sans, fontSize:11, padding:"3px 10px", borderRadius:12,
-                cursor:"pointer", fontWeight: filter===f ? 700 : 400,
-                border: `1px solid ${filter===f ? (m.color||"#3b82f6") : "#334155"}`,
-                background: filter===f ? (m.bg||"#1e293b") : "transparent",
-                color: filter===f ? (m.color||"#93c5fd") : "#64748b",
-              }}>{f==="ALL" ? "All" : (m.label||f)}</button>
-            );
-          })}
-        </div>
         <button onClick={load} style={{
-          ...sans, fontSize:11, padding:"3px 10px", borderRadius:6,
+          ...sans, fontSize:11, padding:"3px 10px", borderRadius:6, marginLeft:"auto",
           background:"#1e293b", color:"#94a3b8", border:"1px solid #334155", cursor:"pointer",
         }}>Refresh</button>
+      </div>
+
+      <div style={{ display:"flex", gap:6, marginBottom:10, flexWrap:"wrap" }}>
+        <span style={{ ...mono, fontSize:10, color:"#64748b", alignSelf:"center", marginRight:2 }}>SOURCE:</span>
+        {[{ id:"ALL", label:"All" }, ...DECISION_SOURCES].map(s => (
+          <button key={s.id} onClick={() => setSourceFilter(s.id)} style={{
+            ...sans, fontSize:11, padding:"3px 10px", borderRadius:12,
+            cursor:"pointer", fontWeight: sourceFilter===s.id ? 700 : 400,
+            border: `1px solid ${sourceFilter===s.id ? C.accent : "#334155"}`,
+            background: sourceFilter===s.id ? "#0c1a3a" : "transparent",
+            color: sourceFilter===s.id ? "#93c5fd" : (bySource[s.id]===null ? "#4b5563" : "#64748b"),
+          }}>{s.label}{bySource[s.id]===null ? " (unreachable)" : ""}</button>
+        ))}
+      </div>
+
+      <div style={{ display:"flex", gap:6, marginBottom:16, flexWrap:"wrap" }}>
+        <span style={{ ...mono, fontSize:10, color:"#64748b", alignSelf:"center", marginRight:2 }}>ACTION:</span>
+        {ALL_FILTERS.map(f => {
+          const m = ACTION_META[f] || {};
+          return (
+            <button key={f} onClick={() => setFilter(f)} style={{
+              ...sans, fontSize:11, padding:"3px 10px", borderRadius:12,
+              cursor:"pointer", fontWeight: filter===f ? 700 : 400,
+              border: `1px solid ${filter===f ? (m.color||"#3b82f6") : "#334155"}`,
+              background: filter===f ? (m.bg||"#1e293b") : "transparent",
+              color: filter===f ? (m.color||"#93c5fd") : "#64748b",
+            }}>{f==="ALL" ? "All" : (m.label||f)}</button>
+          );
+        })}
       </div>
 
       {loading && <div style={{ color:"#64748b", ...mono }}>Loading decisions…</div>}
       {!loading && filtered.length === 0 && (
         <Card>
           <div style={{ color:"#64748b", ...sans, fontSize:13 }}>
-            No decisions recorded yet. The CSP-Leap Trader logs a plain-English explanation
-            every time it enters, rolls, or exits a trade.
+            No decisions match this filter right now. A quiet strategy here just means it hasn't
+            done anything recently -- check the source filter above to confirm it's still reachable.
           </div>
         </Card>
       )}
 
-      <div style={{ display:"flex", flexDirection:"column", gap:12 }}>
-        {filtered.map((d, i) => {
+      {filtered.length > 0 && (
+        <div style={{ ...mono, fontSize:10, color:"#64748b", marginBottom:8 }}>
+          Showing latest {Math.min(filtered.length, 150)} of {filtered.length}
+        </div>
+      )}
+      <div style={{ display:"flex", flexDirection:"column", gap:12, maxHeight:"70vh", overflowY:"auto", paddingRight:4 }}>
+        {filtered.slice(0, 150).map((d, i) => {
           const m = ACTION_META[d.action] || { label:d.action, color:"#94a3b8", bg:"#1e293b" };
           return (
             <Card key={i} style={{ borderLeft:`3px solid ${m.color}`, padding:"14px 18px" }}>
-              <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom:8 }}>
+              <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom:8, flexWrap:"wrap" }}>
+                <span style={{
+                  ...mono, fontSize:10, fontWeight:700, padding:"2px 8px", borderRadius:8,
+                  background:"#1e293b", color:C.accent, border:`1px solid ${C.accent}55`,
+                }}>{d.sourceLabel}</span>
                 <span style={{
                   ...mono, fontSize:11, fontWeight:700, padding:"2px 8px", borderRadius:8,
                   background: m.bg, color: m.color, border:`1px solid ${m.color}55`,
                 }}>{m.label}</span>
-                <span style={{ ...mono, fontSize:13, fontWeight:700, color:"#f1f5f9" }}>
-                  {d.ticker}
-                </span>
-                <span style={{ flex:1, ...sans, fontSize:13, color:"#cbd5e1" }}>
-                  {d.headline}
-                </span>
-                <span style={{ ...mono, fontSize:11, color:C.muted, whiteSpace:"nowrap" }}>
+                {d.ticker && (
+                  <span style={{ ...mono, fontSize:13, fontWeight:700, color:"#f1f5f9" }}>
+                    {d.ticker}
+                  </span>
+                )}
+                {d.headline && (
+                  <span style={{ flex:1, ...sans, fontSize:13, color:"#cbd5e1" }}>
+                    {d.headline}
+                  </span>
+                )}
+                <span style={{ ...mono, fontSize:11, color:C.muted, whiteSpace:"nowrap", marginLeft:d.headline?0:"auto" }}>
                   {d.time}
                 </span>
               </div>
@@ -6000,6 +6603,299 @@ function EVCTab() {
 }
 
 
+// ── Signal Trader live chart ─────────────────────────────────────────────────
+// 1-min real-time bars (2026-09-08 upgrade from the initial 5-min version):
+// uses the independent ONE_MIN_TICKERS pipe (POST /add_ticker_1m, GET
+// /bars-1m/{ticker}, liveData.latest_bar_1m) -- deliberately NOT the same
+// pipe the ML Signals tab uses, since that one's BAR_SIZE="5 mins" is baked
+// into the model's feature windows (RSI-14 etc.); this stays fully separate
+// so nothing about the model changes. Supports charting ANY ticker, not
+// just Signal Trader's own roster (same "+ ticker" pattern as the Signals
+// tab), plus a volume subplot and a plain swing-high/low support/resistance
+// overlay (see computePivotLevels -- explicitly NOT classical chart-pattern
+// detection, which has no validated edge to build on).
+// A full extended session (4am pre-market -> 8pm after-hours close) is
+// ~16h = 960 one-min bars; sized a bit above that so pre-market stays
+// visible into the evening instead of getting pushed out by a single
+// day's regular+after-hours volume (found 2026-09-09). fitContent() zooms
+// to show all of it on load; the chart's own pan/zoom (built into
+// Lightweight Charts) is how you look at a narrower slice, rather than a
+// fixed recent-only window.
+const CHART_WINDOW_SIZE = 1200;
+// S/R deliberately uses a SEPARATE, much smaller window than the chart's
+// display range -- these two got tied together briefly (both reading
+// CHART_WINDOW_SIZE) and widening the chart to a full session silently
+// re-widened the S/R scan too, undoing the earlier declutter fix (found
+// 2026-09-09: went back to 4+ levels after that bump). ~2h of 1-min bars
+// keeps S/R meaningful/recent regardless of how much history the chart itself shows.
+const SR_SCAN_WINDOW = 120;
+
+function SigTraderChart({ setups, positions }) {
+  const rosterTickers = React.useMemo(() => Object.keys(setups || {}).sort(), [setups]);
+  const posTickerSet  = React.useMemo(() => new Set(Object.values(positions || {}).map(p => p.ticker)), [positions]);
+  const [customTickers, setCustomTickers] = useState([]);
+  const allTickers = React.useMemo(() => [...rosterTickers, ...customTickers], [rosterTickers, customTickers]);
+  const [selected, setSelected]     = useState(null);
+  const [newTicker, setNewTicker]   = useState("");
+  const [bars, setBars]             = useState([]);
+  const [loadingBars, setLoadingBars] = useState(false);
+  const subscribedRef = useRef(new Set());
+  const liveData = useLiveData();
+
+  // Indicator selection is a per-viewer display preference, not account
+  // state -- localStorage, not a backend endpoint (unlike everything else
+  // this chart persists, which is real account/strategy data).
+  const [indicators, setIndicators] = useState(() => {
+    try {
+      return JSON.parse(localStorage.getItem("sigTraderIndicators")) || {};
+    } catch (_) { return {}; }
+  });
+  const toggleIndicator = (key) => {
+    setIndicators(prev => {
+      const next = { ...prev, [key]: !prev[key] };
+      try { localStorage.setItem("sigTraderIndicators", JSON.stringify(next)); } catch (_) {}
+      return next;
+    });
+  };
+
+  // Price alerts ARE real account state (backend-owned, /chart-alerts),
+  // unlike indicator selection above -- a fired alert sends a real Telegram
+  // message and writes to oversight_log.jsonl, so it belongs server-side,
+  // not in localStorage.
+  const [alerts, setAlerts] = useState([]);
+  const [alertPrice, setAlertPrice] = useState("");
+  const [alertDir, setAlertDir] = useState("above");
+  const loadAlerts = useCallback(async (ticker) => {
+    if (!ticker) return;
+    try {
+      const r = await apiFetch(`/chart-alerts?ticker=${ticker}`);
+      setAlerts(r.alerts || []);
+    } catch (_) { setAlerts([]); }
+  }, []);
+  const createAlert = async () => {
+    const price = parseFloat(alertPrice);
+    if (!selected || !price || price <= 0) return;
+    try {
+      await apiFetch("/chart-alerts", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ticker: selected, price, direction: alertDir }),
+      });
+      setAlertPrice("");
+      loadAlerts(selected);
+    } catch (_) {}
+  };
+  const cancelAlert = async (id) => {
+    try { await apiFetch(`/chart-alerts/${id}`, { method: "DELETE" }); } catch (_) {}
+    loadAlerts(selected);
+  };
+
+  useEffect(() => {
+    if (selected && allTickers.includes(selected)) return;
+    const withPos = rosterTickers.find(t => posTickerSet.has(t));
+    setSelected(withPos || rosterTickers[0] || null);
+  }, [rosterTickers, posTickerSet, selected, allTickers]);
+
+  const ensureSubscribed = useCallback(async (ticker) => {
+    if (!ticker || subscribedRef.current.has(ticker)) return;
+    subscribedRef.current.add(ticker);
+    try {
+      await apiFetch("/add_ticker_1m", { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({ticker}) });
+    } catch(_) {}
+  }, []);
+
+  const loadBars = useCallback(async (ticker) => {
+    if (!ticker) return;
+    setLoadingBars(true);
+    try {
+      const b = await apiFetch(`/bars-1m/${ticker}?limit=${CHART_WINDOW_SIZE}`);
+      setBars(b || []);
+    } catch(_) { setBars([]); }
+    finally { setLoadingBars(false); }
+  }, []);
+
+  useEffect(() => {
+    if (!selected) return;
+    setBars([]);
+    ensureSubscribed(selected);
+    loadBars(selected);
+    loadAlerts(selected);
+    // A never-before-viewed ticker needs ~10s for the streaming loop to pick
+    // up /add_ticker_1m's queue entry and seed real bars -- the first
+    // backfill fetch right after selecting will usually 404/empty for a
+    // brand new ticker, so retry once after that window rather than leaving
+    // the chart stuck on "waiting" until the next unrelated re-render.
+    const retry = setTimeout(() => loadBars(selected), 12000);
+    // Poll alerts (not push-based) -- a fired alert disappears server-side
+    // on its own schedule (whenever a real price crosses it), not on any
+    // user action here, so the list needs to notice that on its own.
+    const poll = setInterval(() => loadAlerts(selected), 15000);
+    return () => { clearTimeout(retry); clearInterval(poll); };
+  }, [selected, ensureSubscribed, loadBars, loadAlerts]);
+
+  useEffect(() => {
+    if (!liveData || !liveData.latest_bar_1m || !selected) return;
+    const latest = liveData.latest_bar_1m[selected];
+    if (!latest) return;
+    setBars(prev => {
+      if (!prev || prev.length === 0) return prev;
+      const last = prev[prev.length - 1];
+      const merged = last && last.time === latest.time
+        ? [...prev.slice(0, -1), latest]
+        : [...prev, latest].slice(-CHART_WINDOW_SIZE);
+      return merged;
+    });
+  }, [liveData, selected]);
+
+  const addCustomTicker = () => {
+    const t = newTicker.trim().toUpperCase();
+    if (!t || allTickers.includes(t)) return;
+    setCustomTickers(c => [...c, t]);
+    setNewTicker("");
+    setSelected(t);
+  };
+
+  if (allTickers.length === 0) return null;
+
+  const openPos = Object.values(positions || {}).find(p => p.ticker === selected);
+  const setup   = setups[selected];
+  // Scan the SAME window the chart actually renders (CHART_WINDOW_SIZE
+  // below) -- scanning the full ~200-bar fetch while only displaying the
+  // most recent 120 produced S/R lines with no visible pivot candle behind
+  // them (found 2026-09-09).
+  const priceLines = computePivotLevels(bars.slice(-SR_SCAN_WINDOW));
+  if (openPos) {
+    if (openPos.target_spot)    priceLines.push({ price: openPos.target_spot,    color: "#4ade80", title: "target" });
+    if (openPos.stop_spot)      priceLines.push({ price: openPos.stop_spot,      color: "#f87171", title: "stop" });
+    if (openPos.spot_at_entry)  priceLines.push({ price: openPos.spot_at_entry,  color: "#94a3b8", title: "entry" });
+  }
+  for (const a of alerts) {
+    priceLines.push({ price: a.price, color: "#c084fc", title: a.direction === "above" ? "alert ▲" : "alert ▼" });
+  }
+  const extraMarkers = (openPos && openPos.entry_time) ? [{
+    time: openPos.entry_time, position: "belowBar", color: "#93c5fd", shape: "arrowUp", text: "ENTRY",
+  }] : [];
+  if (indicators.harami) {
+    extraMarkers.push(...computeHaramiMarkers(bars.slice(-CHART_WINDOW_SIZE)));
+  }
+
+  return (
+    <div style={{marginBottom:20}}>
+      <div style={{display:"flex", justifyContent:"space-between", alignItems:"baseline", marginBottom:8, flexWrap:"wrap", gap:6}}>
+        <div style={{...sans, fontSize:13, fontWeight:700, color:C.white}}>
+          Live Chart <span style={{...mono, fontSize:10, color:"#3b82f6", fontWeight:400}}>· {selected} · 1-min bars</span>
+        </div>
+        {setup && (
+          <div style={{...mono, fontSize:10, color:C.muted}}>
+            prime window {setup.win_start}–{setup.win_end} ET · target +{setup.target_pct}% · stop -{setup.stop_pct}%
+          </div>
+        )}
+      </div>
+      <div style={{display:"flex", flexWrap:"wrap", gap:6, marginBottom:10, alignItems:"center"}}>
+        {allTickers.map(tk => (
+          <button key={tk} onClick={() => setSelected(tk)} style={{
+            ...mono, fontSize:11, fontWeight:700, padding:"4px 10px", borderRadius:6, cursor:"pointer",
+            background: tk === selected ? "#1e3a5f" : "#0f172a",
+            border: `1px solid ${tk === selected ? "#3b82f6" : (posTickerSet.has(tk) ? "#a78bfa66" : C.border)}`,
+            color: tk === selected ? "#93c5fd" : (posTickerSet.has(tk) ? "#a78bfa" : C.muted),
+          }}>
+            {tk}{posTickerSet.has(tk) ? " ●" : ""}
+          </button>
+        ))}
+        <input value={newTicker} onChange={e => setNewTicker(e.target.value)}
+          onKeyDown={e => { if (e.key === "Enter") addCustomTicker(); }}
+          placeholder="+ ticker" style={{
+            ...mono, fontSize:11, width:70, padding:"4px 8px", borderRadius:6,
+            background:"#0f172a", border:`1px solid ${C.border}`, color:C.white, outline:"none",
+          }} />
+        <button onClick={addCustomTicker} style={{
+          ...sans, fontSize:11, fontWeight:700, padding:"4px 10px", borderRadius:6, cursor:"pointer",
+          background:"#0f172a", border:`1px solid ${C.border}`, color:C.muted,
+        }}>Add</button>
+      </div>
+      <div style={{display:"flex", flexWrap:"wrap", gap:10, marginBottom:10, alignItems:"center"}}>
+        {[
+          { key:"sma20", label:"SMA 20", color:"#facc15" },
+          { key:"sma50", label:"SMA 50", color:"#fb923c" },
+          { key:"ema9",  label:"EMA 9",  color:"#a78bfa" },
+          { key:"rsi",   label:"RSI 14", color:"#38bdf8" },
+          { key:"macd",  label:"MACD",   color:"#38bdf8" },
+          { key:"harami", label:"Harami", color:"#c084fc" },
+        ].map(({key, label, color}) => (
+          <label key={key} style={{...mono, fontSize:11, display:"flex", alignItems:"center", gap:4, cursor:"pointer",
+            color: indicators[key] ? color : C.muted}}>
+            <input type="checkbox" checked={!!indicators[key]} onChange={() => toggleIndicator(key)}
+              style={{accentColor:color, cursor:"pointer"}} />
+            {label}
+          </label>
+        ))}
+      </div>
+      <div style={{background:C.card, border:`1px solid ${C.border}`, borderRadius:8, padding:10}}>
+        {loadingBars && bars.length === 0 ? (
+          <div style={{height:260, display:"flex", alignItems:"center", justifyContent:"center", color:C.muted, fontSize:12}}>
+            Subscribing to {selected} live 1-min bars… (first load can take ~10s)
+          </div>
+        ) : (
+          <CandleChart bars={bars} priceLines={priceLines} extraMarkers={extraMarkers} showVolume
+            windowSize={CHART_WINDOW_SIZE} indicators={indicators} />
+        )}
+      </div>
+      <div style={{...sans, fontSize:10, color:C.muted, marginTop:6, marginBottom:6}}>
+        Orange/blue dashed lines are plain swing-high/low support-resistance levels from recent price action --
+        not a predictive signal, just where price has actually reversed before.
+      </div>
+      {indicators.harami && (
+        <div style={{...sans, fontSize:10, color:"#c084fc", marginBottom:14}}>
+          Purple "H" markers = bare bullish-harami candle shape on this chart's 1-min bars. The validated research
+          (candlestick_pattern_research/, real 5y backtest, p=0.00007) tested this pattern on DAILY bars with a
+          downtrend filter and a 5-day hold -- this 1-min version is a different, untested timeframe, shown for
+          reference only. Each occurrence also sends a Telegram alert, labeled the same way.
+        </div>
+      )}
+
+      <div style={{...sans, fontSize:12, fontWeight:700, color:C.white, marginBottom:8}}>
+        Price Alerts <span style={{...sans, fontSize:10, fontWeight:400, color:C.muted}}>· {selected} · sends a real Telegram message when crossed</span>
+      </div>
+      <div style={{display:"flex", gap:6, alignItems:"center", marginBottom:10, flexWrap:"wrap"}}>
+        <select value={alertDir} onChange={e => setAlertDir(e.target.value)} style={{
+          ...mono, fontSize:11, padding:"5px 8px", borderRadius:6,
+          background:"#0f172a", border:`1px solid ${C.border}`, color:C.white,
+        }}>
+          <option value="above">crosses above</option>
+          <option value="below">crosses below</option>
+        </select>
+        <input value={alertPrice} onChange={e => setAlertPrice(e.target.value)}
+          onKeyDown={e => { if (e.key === "Enter") createAlert(); }}
+          type="number" step="0.01" placeholder="price" style={{
+            ...mono, fontSize:11, width:90, padding:"5px 8px", borderRadius:6,
+            background:"#0f172a", border:`1px solid ${C.border}`, color:C.white, outline:"none",
+          }} />
+        <button onClick={createAlert} style={{
+          ...sans, fontSize:11, fontWeight:700, padding:"5px 12px", borderRadius:6, cursor:"pointer",
+          background:"#3b0764", border:"1px solid #a78bfa66", color:"#c084fc",
+        }}>Set Alert</button>
+      </div>
+      {alerts.length > 0 && (
+        <div style={{display:"flex", flexDirection:"column", gap:6, marginBottom:20}}>
+          {alerts.map(a => (
+            <div key={a.id} style={{
+              ...mono, fontSize:12, display:"flex", justifyContent:"space-between", alignItems:"center",
+              padding:"7px 10px", background:"#3b076422", border:"1px solid #a78bfa33", borderRadius:6,
+            }}>
+              <span style={{color:"#c084fc"}}>
+                {a.ticker} crosses {a.direction} ${a.price.toFixed(2)}
+                {a.note && <span style={{color:C.muted, marginLeft:8}}>{a.note}</span>}
+              </span>
+              <button onClick={() => cancelAlert(a.id)} style={{
+                ...sans, fontSize:10, padding:"3px 8px", borderRadius:4, cursor:"pointer",
+                background:"#450a0a", border:"1px solid #7f1d1d", color:"#fca5a5"}}>Cancel</button>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ── Signal Trader Tab ─────────────────────────────────────────────────────────
 function SigTraderTab() {
   const [status,  setStatus]  = useState(null);
@@ -6067,6 +6963,8 @@ function SigTraderTab() {
           color: status.enabled ? "#4ade80" : C.muted,
         }}>{status.enabled ? "LIVE" : "Disabled"}</button>
       </div>
+
+      <SigTraderChart setups={setups} positions={positions} />
 
       {/* Summary cards */}
       <div style={{background:"#0f172a", border:`1px solid ${C.border}`, borderRadius:8, padding:16, marginBottom:16}}>
@@ -7719,705 +8617,197 @@ function SPY0DTETab() {
 }
 
 
-// ── GOOG Weekly Condor Tab ───────────────────────────────────────────────────
-function GOOGCondorTab() {
-  const [data,    setData]    = useState(null);
-  const [error,   setError]   = useState(null);
-  const [loading, setLoading] = useState(true);
+// ── Independent Traders Tab (2026-09-07) ─────────────────────────────────
+// Consolidated read-only view for the 8 strategies now running outside this
+// dashboard's live per-tab control surfaces: Day Trader and SPY Weekly
+// Condor (their own standalone HTTP servers, extracted 2026-08-27 and
+// 2026-09-07 respectively), plus Ashley/Butterflies x3/GOOG Condor/Safe
+// Income (fire-on-schedule scripts with no server of their own -- status
+// comes from Task Scheduler via /independent-traders/status). Every row is
+// display-only, including Day Trader -- per CEO decision (2026-09-07) its
+// enable/config/close controls are dropped from the UI entirely rather than
+// just hidden; control stays available via direct API call only. This tab
+// replaces the old standalone DayTraderTab and GOOGCondorTab tabs, which
+// never had first-class UI for the other 6 strategies at all.
+const INDEPENDENT_TRADERS = [
+  { id:"day_trader",        label:"Day Trader",           strategyTypes:["DAY_BREAKOUT"] },
+  { id:"spy_weekly_condor", label:"SPY Weekly Condor",    strategyTypes:["spy_weekly_condor"] },
+  { id:"ashley",            label:"Ashley (Signal Copy)", strategyTypes:["ASHLEY_SIGNAL"] },
+  { id:"butterfly_spy",     label:"Butterfly — SPY", strategyTypes:["BUTTERFLY_SPY"] },
+  { id:"butterfly_qqq",     label:"Butterfly — QQQ", strategyTypes:["BUTTERFLY_QQQ"] },
+  { id:"butterfly_iwm",     label:"Butterfly — IWM", strategyTypes:["BUTTERFLY_IWM"] },
+  { id:"goog_condor",       label:"GOOG Condor",          strategyTypes:["GOOG_CONDOR"] },
+  { id:"safe_income",       label:"Safe Income",          strategyTypes:["SAFE_INCOME"] },
+];
+
+function IndependentTradersTab() {
+  const [statusRows, setStatusRows] = useState(null);
+  const [trades,     setTrades]     = useState(null);
+  const [error,      setError]      = useState(null);
+  const [expanded,   setExpanded]   = useState(null);
+  const liveData = useLiveData();
 
   const load = async () => {
-    try { setData(await apiFetch("/goog-condor/status")); setError(null); }
-    catch (e) { setError(e.message); }
-    finally { setLoading(false); }
+    try {
+      const [statusResp, pnlResp] = await Promise.all([
+        apiFetch("/independent-traders/status"),
+        apiFetch("/pnl/dashboard"),
+      ]);
+      setStatusRows(statusResp.traders || []);
+      setTrades(pnlResp.closed_trades || []);
+      setError(null);
+    } catch (e) { setError(e.message); }
   };
-  useEffect(() => { load(); const id = setInterval(load, 15000); return () => clearInterval(id); }, []);
+  useEffect(() => { load(); const id = setInterval(load, 30000); return () => clearInterval(id); }, []);
 
-  const actionColor = (action) => {
-    if (["ENTERED", "DRY_RUN_CLEAR"].includes(action)) return "#4ade80";
-    if (["ENTRY_INCOMPLETE", "PRICING_ABORT", "STRIKES_MISSING"].includes(action)) return "#f87171";
-    return C.muted; // NO_FIRE and anything else -- routine, not a problem
+  if (error && !statusRows) return <div style={{color:"#ef4444",...sans,fontSize:13}}>Independent Traders unavailable: {error}</div>;
+  if (!statusRows || !trades) return <div style={{color:C.muted,...sans,fontSize:13}}>Loading...</div>;
+
+  const byId = {}; statusRows.forEach(r => { byId[r.id] = r; });
+  const live = liveData?.strategies || {};
+
+  const fmtWhen = (s) => {
+    if (!s) return "—";
+    try { return new Date(s).toLocaleString("en-US", {month:"short", day:"numeric", hour:"numeric", minute:"2-digit"}); }
+    catch (_) { return s; }
   };
 
-  if (loading) return <div style={{color:C.muted,...sans,fontSize:13}}>Loading...</div>;
-  if (error)   return <div style={{color:"#ef4444",...sans,fontSize:13}}>GOOG Condor unavailable: {error}</div>;
-  if (!data)   return <div style={{color:C.muted,...sans,fontSize:13}}>No data</div>;
-
-  const { positions, closed, decisions, summary } = data;
-  const openList = Object.values(positions || {});
+  const taskStateColor = (taskState) => {
+    if (taskState === "Ready") return C.bull;
+    if (taskState === "Running") return C.accent;
+    if (taskState === "Disabled") return C.muted;
+    return C.orange;
+  };
 
   return (
     <div>
       <div style={{marginBottom:16}}>
-        <div style={{...sans, fontSize:17, fontWeight:700, color:C.white}}>GOOG Weekly Condor</div>
+        <div style={{...sans, fontSize:17, fontWeight:700, color:C.white}}>Independent Traders</div>
         <div style={{...sans, fontSize:12, color:C.muted, marginTop:2}}>
-          Weekly premium collection, explicitly-invoked (not auto-fired). 5% OTM / ~1.5% width, snapped to real
-          listed strikes. Backtest (2026-08-18, earnings-excluded, 3yr): 85.8% win rate, +5.3% avg return/week.
-          Holds to expiry -- no early profit-take automated.
+          Strategies running as their own processes or scheduled scripts, outside this dashboard's live
+          control surfaces. Read-only: status, trade history, and P&L only -- no enable/config/close
+          controls here. Click a row to see its trade history.
         </div>
       </div>
 
-      {/* Summary */}
-      <div style={{display:"flex", gap:24, flexWrap:"wrap", background:"#0f172a", border:"1px solid #1e3a5f", borderRadius:8, padding:14, marginBottom:20}}>
-        {[
-          ["Open Positions", String(summary.open_positions)],
-          ["Closed Trades", String(summary.closed_trades)],
-          ["Last Action", summary.last_action ? `${summary.last_action.action} @ ${summary.last_action.time}` : "—"],
-        ].map(([label, value]) => (
-          <div key={label}>
-            <div style={{...sans, fontSize:11, color:C.muted, textTransform:"uppercase", letterSpacing:0.5}}>{label}</div>
-            <div style={{...sans, fontSize:16, fontWeight:700, color:C.white, marginTop:2}}>{value}</div>
-          </div>
-        ))}
-      </div>
+      <div style={{display:"flex", flexDirection:"column", gap:10}}>
+        {INDEPENDENT_TRADERS.map(def => {
+          const row = byId[def.id] || {};
+          const liveRow = live[def.id];
+          const rowTrades = trades.filter(t => def.strategyTypes.includes(t.strategy_type));
+          const totalPnl = rowTrades.reduce((s,t) => s + (t.pnl || 0), 0);
+          const wins = rowTrades.filter(t => (t.pnl||0) > 0).length;
+          const isOpen = expanded === def.id;
 
-      {/* Open positions */}
-      <div style={{...sans, fontSize:13, fontWeight:600, color:C.muted, marginBottom:8, textTransform:"uppercase", letterSpacing:1}}>
-        Open Positions ({openList.length})
-      </div>
-      {openList.length === 0 ? (
-        <div style={{...sans, fontSize:13, color:C.muted, marginBottom:20}}>None open right now.</div>
-      ) : (
-        <div style={{overflowX:"auto", marginBottom:20}}>
-          <table style={{width:"100%", borderCollapse:"collapse", fontSize:12, ...sans}}>
-            <thead>
-              <tr style={{color:C.muted, borderBottom:"1px solid #1e293b"}}>
-                {["Pos ID","Entry Credit","Max Risk","Entry Time"].map(h=>(
-                  <th key={h} style={{textAlign:"left", padding:"5px 10px", whiteSpace:"nowrap"}}>{h}</th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {openList.map((p,i) => (
-                <tr key={i} style={{borderBottom:"1px solid #0f172a"}}>
-                  <td style={{padding:"5px 10px", color:C.white, fontFamily:mono.fontFamily}}>{p.pos_id}</td>
-                  <td style={{padding:"5px 10px", color:"#4ade80", fontVariantNumeric:"tabular-nums"}}>{fmt$(p.net_entry_credit)}</td>
-                  <td style={{padding:"5px 10px", color:C.muted, fontVariantNumeric:"tabular-nums"}}>{fmt$(p.max_risk)}</td>
-                  <td style={{padding:"5px 10px", color:C.muted}}>{p.entry_time}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      )}
+          let statusEl;
+          if (row.kind === "always_on") {
+            const reachable = row.reachable;
+            const enabled = row.health?.enabled;
+            const ibkrOk = row.health?.ibkr_connected;
+            statusEl = !reachable
+              ? <Pill color={C.bear}>UNREACHABLE</Pill>
+              : <Pill color={enabled ? C.bull : C.muted}>{enabled ? "● LIVE" : "○ DISABLED"}</Pill>;
+            if (reachable && !ibkrOk) {
+              statusEl = <span style={{display:"flex", gap:6}}>{statusEl}<Pill color={C.bear}>IBKR DOWN</Pill></span>;
+            }
+          } else {
+            statusEl = <Pill color={taskStateColor(row.task_state)}>{row.task_state || "UNKNOWN"}</Pill>;
+          }
 
-      {/* Decision log */}
-      <div style={{...sans, fontSize:13, fontWeight:600, color:C.muted, marginBottom:8, textTransform:"uppercase", letterSpacing:1}}>
-        Decision Log ({decisions.length})
-      </div>
-      {decisions.length === 0 ? (
-        <div style={{...sans, fontSize:13, color:C.muted}}>No decisions logged yet.</div>
-      ) : (
-        <div style={{overflowX:"auto", maxHeight:400, overflowY:"auto"}}>
-          <table style={{width:"100%", borderCollapse:"collapse", fontSize:12, ...sans}}>
-            <thead>
-              <tr style={{color:C.muted, borderBottom:"1px solid #1e293b"}}>
-                {["Time","Action","Detail"].map(h=>(
-                  <th key={h} style={{textAlign:"left", padding:"5px 10px", whiteSpace:"nowrap"}}>{h}</th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {[...decisions].reverse().map((d,i) => (
-                <tr key={i} style={{borderBottom:"1px solid #0f172a"}}>
-                  <td style={{padding:"5px 10px", color:C.muted, whiteSpace:"nowrap", fontVariantNumeric:"tabular-nums"}}>{d.time}</td>
-                  <td style={{padding:"5px 10px", color:actionColor(d.action), fontWeight:700, whiteSpace:"nowrap"}}>{d.action}</td>
-                  <td style={{padding:"5px 10px", color:C.text}}>{d.detail}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      )}
-    </div>
-  );
-}
+          // Real open-position count -- always_on rows get it live via /ws/live
+          // (open_position_count), scheduled rows via /independent-traders/status's
+          // own registry read (added 2026-09-08 after a real incident where
+          // scheduled-strategy positions were open for hours with zero visibility
+          // anywhere in this tab -- see open_positions below for the detail view).
+          const openPositions = row.kind === "scheduled" ? (row.open_positions || []) : null;
+          const openCount = row.kind === "always_on"
+            ? (liveRow?.reachable ? (liveRow.open_position_count ?? 0) : null)
+            : openPositions.length;
 
-
-// ── Day Trader Tab ────────────────────────────────────────────────────────────
-function DayTraderTab() {
-  const [status,   setStatus]   = useState(null);
-  const [goal,     setGoal]     = useState(null);
-  const [history,  setHistory]  = useState(null);
-  const [loading,  setLoading]  = useState(true);
-  const [targetIn, setTargetIn] = useState("");
-  const [saving,   setSaving]   = useState(false);
-  const [histDays, setHistDays] = useState(30);
-
-  const load = async () => {
-    try {
-      const [s, g] = await Promise.all([
-        apiFetch("/day-trader/status"),
-        apiFetch("/day-trader/goal"),
-      ]);
-      setStatus(s);
-      setGoal(g);
-      if (targetIn === "") setTargetIn(String(s.config.daily_profit_target || ""));
-    } catch(_) {}
-    finally { setLoading(false); }
-  };
-
-  const loadHistory = async (d) => {
-    try {
-      const h = await apiFetch(`/day-trader/history?days=${d}`);
-      setHistory(h);
-    } catch(_) {}
-  };
-
-  useEffect(() => {
-    load();
-    loadHistory(30);
-    const id = setInterval(load, 15000);
-    return () => clearInterval(id);
-  }, []);
-
-  const toggle = async () => {
-    await apiFetch(`/day-trader/enable?enabled=${!status.enabled}`, { method:"POST" });
-    load();
-  };
-
-  const updateTarget = async () => {
-    const v = parseFloat(targetIn);
-    if (isNaN(v) || v <= 0) return;
-    setSaving(true);
-    try {
-      await apiFetch("/day-trader/config", { method:"POST",
-        headers:{"Content-Type":"application/json"},
-        body: JSON.stringify({ daily_profit_target: v }) });
-      load();
-    } finally { setSaving(false); }
-  };
-
-  const updateCfg = async (key, val) => {
-    await apiFetch("/day-trader/config", { method:"POST",
-      headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({ [key]: val }) });
-    load();
-  };
-
-  const closePos = async (ticker) => {
-    await apiFetch(`/day-trader/close/${ticker}`, { method:"POST" });
-    load();
-  };
-
-  const pnlColor = v => v == null ? C.muted : v >= 0 ? "#22c55e" : "#ef4444";
-  const phaseLabel = p => p === 0 ? "Pending" : p === 1 ? "Active" : "Closing";
-  const phaseColor = p => p === 0 ? C.muted : p === 1 ? "#22c55e" : "#f59e0b";
-
-  if (loading) return <div style={{ color:C.muted, ...sans, fontSize:13 }}>Loading…</div>;
-  if (!status) return <div style={{ color:C.muted, ...sans, fontSize:13 }}>Backend unavailable</div>;
-
-  const { config: cfg, summary, positions, watching, closed_today, decisions, eod_summary: eod } = status;
-  const goalPct = Math.min(100, summary.goal_pct || 0);
-
-  return (
-    <div>
-      {/* Header */}
-      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:16 }}>
-        <div>
-          <div style={{ ...sans, fontSize:17, fontWeight:700, color:C.white }}>Day Trader ⚡</div>
-          <div style={{ ...sans, fontSize:12, color:C.muted, marginTop:2 }}>
-            Same breakout signals as Stock Trader · all positions force-closed by {cfg.force_close_time} ET
-          </div>
-        </div>
-        <button onClick={toggle} style={{
-          ...sans, fontSize:13, padding:"8px 18px", borderRadius:6, cursor:"pointer", fontWeight:700,
-          background: status.enabled ? "#14532d" : "#1e293b",
-          border: `1px solid ${status.enabled ? "#16a34a" : C.border}`,
-          color: status.enabled ? "#4ade80" : C.muted,
-        }}>
-          {status.enabled ? "● LIVE" : "○ Disabled"}
-        </button>
-      </div>
-
-      {/* Daily Goal Card */}
-      {goal && (
-        <div style={{ background:"#0f172a", border:`1px solid ${C.border}`, borderRadius:8, padding:16, marginBottom:16 }}>
-          <div style={{ ...sans, fontSize:13, fontWeight:700, color:C.white, marginBottom:12 }}>
-            Daily Profit Goal
-          </div>
-          <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr 1fr", gap:12, marginBottom:14 }}>
-            {[
-              { label:"Target", value:`$${cfg.daily_profit_target.toLocaleString()}`, color:C.white },
-              { label:"Today P&L", value:`${summary.today_pnl >= 0?"+":""}$${summary.today_pnl.toFixed(2)}`, color:pnlColor(summary.today_pnl) },
-              { label:"Remaining", value:`$${goal.remaining_target.toFixed(2)}`, color: goal.remaining_target > 0 ? "#f59e0b" : "#22c55e" },
-              { label:"Capital Needed", value:`$${goal.required_capital.toLocaleString()}`, color:C.muted },
-            ].map(({ label, value, color }) => (
-              <div key={label} style={{ textAlign:"center" }}>
-                <div style={{ ...sans, fontSize:11, color:C.muted, marginBottom:4 }}>{label}</div>
-                <div style={{ ...mono, fontSize:16, fontWeight:700, color }}>{value}</div>
-              </div>
-            ))}
-          </div>
-
-          {/* Progress bar */}
-          <div style={{ background:"#1e293b", borderRadius:4, height:8, marginBottom:10, overflow:"hidden" }}>
-            <div style={{ height:"100%", borderRadius:4, width:`${goalPct}%`,
-              background: goalPct >= 100 ? "#22c55e" : goalPct >= 50 ? "#f59e0b" : "#3b82f6",
-              transition:"width 0.5s" }} />
-          </div>
-          <div style={{ display:"flex", justifyContent:"space-between", ...sans, fontSize:11, color:C.muted, marginBottom:12 }}>
-            <span>{goalPct.toFixed(1)}% of daily goal</span>
-            <span>EV/position: ${goal.ev_per_position} · Need {goal.required_positions} trades</span>
-          </div>
-
-          {/* Goal input */}
-          <div style={{ display:"flex", gap:8, alignItems:"center" }}>
-            <span style={{ ...sans, fontSize:12, color:C.muted }}>Set daily target: $</span>
-            <input value={targetIn} onChange={e => setTargetIn(e.target.value)}
-              style={{ ...mono, fontSize:13, width:90, padding:"4px 8px", borderRadius:4,
-                background:"#1e293b", border:`1px solid ${C.border}`, color:C.white, outline:"none" }} />
-            <button onClick={updateTarget} disabled={saving} style={{
-              ...sans, fontSize:12, padding:"5px 14px", borderRadius:4, cursor:"pointer",
-              background:"#1e3a5f", border:"1px solid #2563eb", color:"#93c5fd" }}>
-              {saving ? "Saving…" : "Update"}
-            </button>
-            {goal.positions_gap > 0 && (
-              <span style={{ ...sans, fontSize:11, color:"#f59e0b", marginLeft:8 }}>
-                ⚠ max_positions ({cfg.max_positions}) is {goal.positions_gap} below what's needed
-              </span>
-            )}
-          </div>
-        </div>
-      )}
-
-      {/* Config Row */}
-      <div style={{ display:"grid", gridTemplateColumns:"repeat(5,1fr)", gap:10, marginBottom:16 }}>
-        {[
-          { label:"Position $", key:"position_size", type:"number", step:100 },
-          { label:"Max Positions", key:"max_positions", type:"number", step:1 },
-          // Trailing stop replaced the fixed target/stop pair (2026-08-07) --
-          // show whichever pair is actually active so this never displays a
-          // dead number. use_trailing_stop:false reverts to the old fields
-          // for instant rollback, so both variants stay wired up.
-          ...(cfg.use_trailing_stop
-            ? [
-                { label:"Trailing Stop %", key:"trailing_stop_pct", type:"number", step:0.1 },
-                { label:"Confirm Move %",  key:"confirm_pct",       type:"number", step:0.05 },
-              ]
-            : [
-                { label:"Hard Stop %",     key:"hard_stop_pct",     type:"number", step:0.5 },
-                { label:"Profit Target %", key:"profit_target_pct", type:"number", step:0.25 },
-              ]),
-          { label:"Force Close", key:"force_close_time", type:"text" },
-        ].map(({ label, key, type, step }) => (
-          <div key={key} style={{ background:"#0f172a", border:`1px solid ${C.border}`, borderRadius:6, padding:"8px 10px" }}>
-            <div style={{ ...sans, fontSize:10, color:C.muted, marginBottom:4 }}>{label}</div>
-            <input defaultValue={cfg[key]} type={type} step={step}
-              style={{ ...mono, fontSize:13, width:"100%", background:"none", border:"none",
-                color:C.white, outline:"none" }}
-              onBlur={e => {
-                const v = type === "number" ? parseFloat(e.target.value) : e.target.value;
-                if (v !== cfg[key]) updateCfg(key, v);
-              }} />
-          </div>
-        ))}
-      </div>
-
-      {/* Summary Row */}
-      <div style={{ display:"flex", gap:10, marginBottom:16 }}>
-        {[
-          { label:"Open", value:summary.open_positions },
-          { label:"Watching", value:summary.watching || 0, color: (summary.watching||0) > 0 ? "#f59e0b" : undefined },
-          { label:"Capital Deployed", value:`$${summary.capital_deployed.toLocaleString()}` },
-          { label:"Open P&L", value:`${(summary.open_pnl||0)>=0?"+":""}$${(summary.open_pnl||0).toFixed(2)}`, color:pnlColor(summary.open_pnl||0) },
-          { label:"Closed P&L", value:`${(summary.closed_pnl||0)>=0?"+":""}$${(summary.closed_pnl||0).toFixed(2)}`, color:pnlColor(summary.closed_pnl||0) },
-          { label:"Today P&L", value:`${summary.today_pnl>=0?"+":""}$${summary.today_pnl.toFixed(2)}`, color:pnlColor(summary.today_pnl) },
-          { label:"Closed Today", value:summary.today_trades },
-        ].map(({ label, value, color }) => (
-          <div key={label} style={{ flex:1, background:"#0f172a", border:`1px solid ${C.border}`,
-            borderRadius:6, padding:"10px 14px", textAlign:"center" }}>
-            <div style={{ ...sans, fontSize:10, color:C.muted, marginBottom:4 }}>{label}</div>
-            <div style={{ ...mono, fontSize:18, fontWeight:700, color: color || C.white }}>{value}</div>
-          </div>
-        ))}
-      </div>
-
-      {/* Open Positions */}
-      <div style={{ ...sans, fontSize:13, fontWeight:700, color:C.white, marginBottom:8 }}>Open Positions</div>
-      {Object.keys(positions).length === 0 ? (
-        <div style={{ color:C.muted, ...sans, fontSize:13, padding:"20px 0" }}>No open day trader positions</div>
-      ) : (
-        <div style={{ overflowX:"auto", marginBottom:20 }}>
-          <table style={{ width:"100%", borderCollapse:"collapse", ...sans, fontSize:13 }}>
-            <thead>
-              <tr style={{ background:"#0f172a" }}>
-                {["Ticker","Phase","Entry $","Target / Trail","Stop $","Current $","P&L","P&L %","Shares",""].map(h => (
-                  <th key={h} style={{ padding:"7px 10px", textAlign:"left", color:C.muted,
-                    fontSize:11, fontWeight:600, textTransform:"uppercase", letterSpacing:0.5,
-                    borderBottom:`1px solid ${C.border}` }}>{h}</th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {Object.entries(positions).map(([tk, p]) => (
-                <tr key={tk} style={{ borderBottom:`1px solid ${C.border}` }}>
-                  <td style={{ padding:"8px 10px", fontWeight:700, color:C.white, fontFamily:"monospace" }}>{tk}</td>
-                  <td style={{ padding:"8px 10px" }}>
-                    <span style={{ fontSize:11, fontWeight:700, color:phaseColor(p.phase),
-                      background:`${phaseColor(p.phase)}22`, borderRadius:4, padding:"2px 7px" }}>
-                      {phaseLabel(p.phase)}
-                    </span>
-                  </td>
-                  <td style={{ padding:"8px 10px", ...mono }}>${(p.entry_price||0).toFixed(2)}</td>
-                  {/* Trailing positions have no fixed profit_price -- show the running
-                      high they're trailing from instead of a misleading $0.00 */}
-                  <td style={{ padding:"8px 10px", ...mono, color:"#22c55e" }}>
-                    {p.is_trailing
-                      ? `↑$${(p.running_high||p.entry_price||0).toFixed(2)}`
-                      : `$${(p.profit_price||0).toFixed(2)}`}
-                  </td>
-                  <td style={{ padding:"8px 10px", ...mono, color:"#ef4444" }}>${(p.stop_price||0).toFixed(2)}</td>
-                  <td style={{ padding:"8px 10px", ...mono, fontWeight:600,
-                    color: p.live_price ? C.white : C.muted }}>
-                    {p.live_price ? `$${p.live_price.toFixed(2)}` : "—"}
-                  </td>
-                  <td style={{ padding:"8px 10px", ...mono, fontWeight:700, color:pnlColor(p.live_pnl) }}>
-                    {p.live_pnl != null ? `${p.live_pnl>=0?"+":""}$${p.live_pnl.toFixed(2)}` : "—"}
-                  </td>
-                  <td style={{ padding:"8px 10px", ...mono, fontWeight:700,
-                    color: p.live_price && p.entry_price ? pnlColor(p.live_price - p.entry_price) : C.muted }}>
-                    {p.live_price && p.entry_price
-                      ? (() => { const pct = (p.live_price - p.entry_price) / p.entry_price * 100;
-                                 return `${pct>=0?"+":""}${pct.toFixed(2)}%`; })()
-                      : "—"}
-                  </td>
-                  <td style={{ padding:"8px 10px", color:C.muted }}>{p.shares}</td>
-                  <td style={{ padding:"8px 10px" }}>
-                    <button onClick={() => closePos(tk)} style={{
-                      ...sans, fontSize:11, padding:"3px 8px", borderRadius:4, cursor:"pointer",
-                      background:"#450a0a", border:"1px solid #7f1d1d", color:"#fca5a5" }}>
-                      Close
-                    </button>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      )}
-
-      {/* Watching — candidates that cleared the entry-quality gates but haven't
-          bought yet; only fires once price + volume actually confirm the move
-          (added 2026-08-07, see trailing_stop_pct's config comment). */}
-      <div style={{ ...sans, fontSize:13, fontWeight:700, color:C.white, marginBottom:8 }}>
-        Watching <span style={{ color:C.muted, fontWeight:400, fontSize:12 }}>
-          — needs ≥{cfg.confirm_pct}% move from open + volume confirmation within {cfg.confirm_window_min}min
-        </span>
-      </div>
-      {!watching || Object.keys(watching).length === 0 ? (
-        <div style={{ color:C.muted, ...sans, fontSize:13, padding:"20px 0" }}>No candidates awaiting confirmation</div>
-      ) : (
-        <div style={{ overflowX:"auto", marginBottom:20 }}>
-          <table style={{ width:"100%", borderCollapse:"collapse", ...sans, fontSize:13 }}>
-            <thead>
-              <tr style={{ background:"#0f172a" }}>
-                {["Ticker","Day Open","Live $","Move %","Score","Registered"].map(h => (
-                  <th key={h} style={{ padding:"7px 10px", textAlign:"left", color:C.muted,
-                    fontSize:11, fontWeight:600, textTransform:"uppercase", letterSpacing:0.5,
-                    borderBottom:`1px solid ${C.border}` }}>{h}</th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {Object.entries(watching).map(([tk, w]) => {
-                const movePct = w.live_price ? (w.live_price / w.day_open - 1) * 100 : null;
-                return (
-                  <tr key={tk} style={{ borderBottom:`1px solid ${C.border}` }}>
-                    <td style={{ padding:"8px 10px", fontWeight:700, color:C.white, fontFamily:"monospace" }}>{tk}</td>
-                    <td style={{ padding:"8px 10px", ...mono }}>${(w.day_open||0).toFixed(2)}</td>
-                    <td style={{ padding:"8px 10px", ...mono, fontWeight:600, color: w.live_price ? C.white : C.muted }}>
-                      {w.live_price ? `$${w.live_price.toFixed(2)}` : "—"}
-                    </td>
-                    <td style={{ padding:"8px 10px", ...mono, fontWeight:700,
-                      color: movePct == null ? C.muted : movePct >= cfg.confirm_pct ? "#22c55e" : C.white }}>
-                      {movePct == null ? "—" : `${movePct>=0?"+":""}${movePct.toFixed(2)}%`}
-                    </td>
-                    <td style={{ padding:"8px 10px", color:C.muted }}>
-                      {w.composite_score != null ? w.composite_score.toFixed(0) : "—"}
-                    </td>
-                    <td style={{ padding:"8px 10px", color:C.muted, fontSize:12 }}>
-                      {w.registered_at ? new Date(w.registered_at).toLocaleTimeString() : "—"}
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        </div>
-      )}
-
-      {/* Closed Today */}
-      {closed_today.length > 0 && (
-        <>
-          <div style={{ ...sans, fontSize:13, fontWeight:700, color:C.white, marginBottom:8 }}>Closed Today</div>
-          <div style={{ overflowX:"auto", marginBottom:20 }}>
-            <table style={{ width:"100%", borderCollapse:"collapse", ...sans, fontSize:12 }}>
-              <thead>
-                <tr style={{ background:"#0f172a" }}>
-                  {["Ticker","Entry $","Exit $","Shares","P&L","P&L %","Exit Type"].map(h => (
-                    <th key={h} style={{ padding:"7px 10px", textAlign:"left", color:C.muted,
-                      fontSize:11, fontWeight:600, textTransform:"uppercase",
-                      borderBottom:`1px solid ${C.border}` }}>{h}</th>
-                  ))}
-                </tr>
-              </thead>
-              <tbody>
-                {[...closed_today].reverse().map((r, i) => (
-                  <tr key={i} style={{ borderBottom:`1px solid ${C.border}` }}>
-                    <td style={{ padding:"8px 10px", fontWeight:700, fontFamily:"monospace", color:C.white }}>{r.ticker}</td>
-                    <td style={{ padding:"8px 10px", ...mono }}>${(r.entry_price||0).toFixed(2)}</td>
-                    <td style={{ padding:"8px 10px", ...mono }}>${(r.exit_price||0).toFixed(2)}</td>
-                    <td style={{ padding:"8px 10px", color:C.muted }}>{r.shares}</td>
-                    <td style={{ padding:"8px 10px", ...mono, fontWeight:700, color:pnlColor(r.pnl) }}>
-                      {r.pnl>=0?"+":""}${r.pnl.toFixed(2)}
-                    </td>
-                    <td style={{ padding:"8px 10px", ...mono, color:pnlColor(r.pnl_pct) }}>
-                      {r.pnl_pct>=0?"+":""}{r.pnl_pct.toFixed(2)}%
-                    </td>
-                    <td style={{ padding:"8px 10px" }}>
-                      <span style={{ fontSize:11, padding:"2px 7px", borderRadius:4, fontWeight:700,
-                        color: r.exit_type==="profit_target" ? "#4ade80"
-                             : r.exit_type==="hard_stop"     ? "#f87171"
-                             : r.exit_type==="force_close"   ? "#f59e0b" : C.muted,
-                        background: r.exit_type==="profit_target" ? "#14532d44"
-                                  : r.exit_type==="hard_stop"     ? "#450a0a44"
-                                  : r.exit_type==="force_close"   ? "#78350f44" : "#1e293b" }}>
-                        {r.exit_type?.replace(/_/g," ")}
-                      </span>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </>
-      )}
-
-      {/* EOD Performance Summary */}
-      {eod && eod.total_trades > 0 && (() => {
-        const exitColors = { profit_target:"#4ade80", hard_stop:"#f87171", force_close:"#f59e0b", manual_close:"#94a3b8" };
-        const goalBar = Math.min(100, (summary.today_pnl / eod.daily_profit_target) * 100);
-        const goalColor = goalBar >= 100 ? "#4ade80" : goalBar >= 60 ? "#f59e0b" : "#ef4444";
-        return (
-          <div style={{ marginBottom:20 }}>
-            <div style={{ ...sans, fontSize:13, fontWeight:700, color:C.white, marginBottom:10,
-              display:"flex", alignItems:"center", gap:8 }}>
-              📊 Day Summary
-              {eod.goal_achieved && <span style={{ fontSize:11, padding:"2px 8px", borderRadius:4,
-                background:"#14532d", color:"#4ade80", fontWeight:700 }}>🎯 Goal Achieved</span>}
-            </div>
-
-            {/* Goal progress bar */}
-            <div style={{ marginBottom:14 }}>
-              <div style={{ display:"flex", justifyContent:"space-between", ...sans, fontSize:11,
-                color:C.muted, marginBottom:4 }}>
-                <span>Daily Goal: ${eod.daily_profit_target}</span>
-                <span style={{ color:goalColor }}>{goalBar.toFixed(1)}% complete</span>
-              </div>
-              <div style={{ height:6, background:"#1e293b", borderRadius:3 }}>
-                <div style={{ height:"100%", width:`${goalBar}%`, background:goalColor,
-                  borderRadius:3, transition:"width 0.4s" }} />
-              </div>
-            </div>
-
-            {/* Key stats grid */}
-            <div style={{ display:"grid", gridTemplateColumns:"repeat(4, 1fr)", gap:8, marginBottom:10 }}>
-              {[
-                { label:"Trades", value: eod.total_trades },
-                { label:"Win Rate", value:`${eod.win_rate}%`,
-                  color: eod.win_rate >= 60 ? "#4ade80" : eod.win_rate >= 40 ? "#f59e0b" : "#ef4444" },
-                { label:"Avg Return", value:`${eod.avg_return_pct >= 0?"+":""}${eod.avg_return_pct.toFixed(2)}%`,
-                  color: pnlColor(eod.avg_return_pct) },
-                { label:"Profit Factor",
-                  value: eod.profit_factor != null ? eod.profit_factor.toFixed(2) : "—",
-                  color: eod.profit_factor == null ? C.muted : eod.profit_factor >= 1.5 ? "#4ade80"
-                       : eod.profit_factor >= 1.0 ? "#f59e0b" : "#ef4444" },
-                { label:"Gross Profit", value:`+$${eod.gross_profit.toFixed(2)}`, color:"#4ade80" },
-                { label:"Gross Loss",   value:`-$${Math.abs(eod.gross_loss).toFixed(2)}`, color:"#ef4444" },
-                { label:"Net P&L", value:`${summary.today_pnl>=0?"+":""}$${summary.today_pnl.toFixed(2)}`,
-                  color: pnlColor(summary.today_pnl) },
-                { label:"Capital Used", value:`$${eod.total_capital_traded.toLocaleString(undefined,{maximumFractionDigits:0})}` },
-              ].map(({ label, value, color }) => (
-                <div key={label} style={{ background:"#0f172a", border:`1px solid ${C.border}`,
-                  borderRadius:6, padding:"8px 12px", textAlign:"center" }}>
-                  <div style={{ ...sans, fontSize:10, color:C.muted, marginBottom:3 }}>{label}</div>
-                  <div style={{ ...mono, fontSize:15, fontWeight:700, color: color || C.white }}>{value}</div>
+          return (
+            <Card key={def.id} style={{padding:0, overflow:"hidden"}}>
+              <div onClick={() => setExpanded(isOpen ? null : def.id)} style={{
+                display:"flex", alignItems:"center", gap:16, padding:"14px 18px", cursor:"pointer", flexWrap:"wrap",
+              }}>
+                <div style={{width:14, ...sans, color:C.muted, fontSize:12}}>{isOpen ? "▾" : "▸"}</div>
+                <div style={{flex:"0 0 190px", ...sans, fontSize:14, fontWeight:700, color:C.white}}>{def.label}</div>
+                <div style={{flex:"0 0 150px", display:"flex", gap:6, alignItems:"center"}}>
+                  {statusEl}
+                  {openCount != null && openCount > 0 && (
+                    <Pill color={C.orange}>{openCount} open</Pill>
+                  )}
                 </div>
-              ))}
-            </div>
-
-            {/* Avg win/loss + best/worst row */}
-            <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr 1fr", gap:8, marginBottom:10 }}>
-              <div style={{ background:"#0f172a", border:`1px solid ${C.border}`, borderRadius:6, padding:"8px 12px" }}>
-                <div style={{ ...sans, fontSize:10, color:C.muted, marginBottom:2 }}>Avg Win</div>
-                <div style={{ ...mono, fontSize:13, fontWeight:700, color:"#4ade80" }}>
-                  +{eod.avg_win_pct.toFixed(2)}% ({eod.wins}W)
+                <div style={{flex:"0 0 150px", ...sans, fontSize:11, color:C.muted}}>
+                  {row.kind === "scheduled" ? `Last run: ${fmtWhen(row.last_run)}` : ""}
                 </div>
-              </div>
-              <div style={{ background:"#0f172a", border:`1px solid ${C.border}`, borderRadius:6, padding:"8px 12px" }}>
-                <div style={{ ...sans, fontSize:10, color:C.muted, marginBottom:2 }}>Avg Loss</div>
-                <div style={{ ...mono, fontSize:13, fontWeight:700, color:"#ef4444" }}>
-                  {eod.avg_loss_pct.toFixed(2)}% ({eod.losses}L)
+                <div style={{flex:"0 0 150px", ...sans, fontSize:11, color:C.muted}}>
+                  {row.kind === "scheduled" ? `Next: ${fmtWhen(row.next_run)}` : ""}
                 </div>
-              </div>
-              {eod.best_trade && (
-                <div style={{ background:"#0f172a", border:`1px solid #14532d`, borderRadius:6, padding:"8px 12px" }}>
-                  <div style={{ ...sans, fontSize:10, color:C.muted, marginBottom:2 }}>Best Trade</div>
-                  <div style={{ ...mono, fontSize:13, fontWeight:700, color:"#4ade80" }}>
-                    {eod.best_trade.ticker} +${eod.best_trade.pnl.toFixed(2)} ({eod.best_trade.pnl_pct >= 0?"+":""}{eod.best_trade.pnl_pct.toFixed(2)}%)
+                <div style={{flex:1}} />
+                <div style={{textAlign:"right"}}>
+                  <div style={{...mono, fontSize:14, fontWeight:700, color: rowTrades.length ? (totalPnl >= 0 ? C.bull : C.bear) : C.muted}}>
+                    {rowTrades.length ? fmt$(totalPnl) : "—"}
                   </div>
+                  <div style={{...sans, fontSize:10, color:C.muted}}>
+                    {rowTrades.length} trade{rowTrades.length===1?"":"s"}{rowTrades.length ? ` · ${wins}W/${rowTrades.length-wins}L` : ""}
+                  </div>
+                </div>
+              </div>
+
+              {isOpen && (
+                <div style={{borderTop:`1px solid ${C.border}`, padding:"12px 18px 16px"}}>
+                  {openPositions && openPositions.length > 0 && (
+                    <div style={{marginBottom:14}}>
+                      <div style={{...sans, fontSize:10, textTransform:"uppercase", letterSpacing:1, color:C.orange, fontWeight:600, marginBottom:8}}>
+                        Open Right Now ({openPositions.length})
+                      </div>
+                      <div style={{display:"flex", flexDirection:"column", gap:6}}>
+                        {openPositions.map(p => (
+                          <div key={p.pos_id} style={{
+                            ...sans, fontSize:12, color:C.text, padding:"8px 10px",
+                            background:`${C.orange}11`, border:`1px solid ${C.orange}33`, borderRadius:6,
+                          }}>
+                            <span style={{...mono, fontWeight:700, color:C.orange}}>{p.ticker}</span>
+                            {" — "}{p.summary}
+                            <span style={{...mono, fontSize:10, color:C.muted, marginLeft:8}}>
+                              opened {fmtWhen(p.entry_time)}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                  {rowTrades.length === 0 ? (
+                    <div style={{...sans, fontSize:12, color:C.muted}}>No closed trades recorded yet.</div>
+                  ) : (
+                    <div style={{overflowX:"auto"}}>
+                      <table style={{width:"100%", borderCollapse:"collapse", fontSize:12, ...sans}}>
+                        <thead>
+                          <tr style={{color:C.muted, borderBottom:`1px solid ${C.border}`}}>
+                            {["Ticker","Opened","Closed","P&L","Exit"].map(h=>(
+                              <th key={h} style={{textAlign:"left", padding:"5px 10px", whiteSpace:"nowrap"}}>{h}</th>
+                            ))}
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {[...rowTrades].reverse().slice(0,50).map((t,i) => (
+                            <tr key={t.id ?? i} style={{borderBottom:`1px solid ${C.border}33`}}>
+                              <td style={{padding:"5px 10px", ...mono, fontWeight:700, color:C.accent}}>{t.ticker || "—"}</td>
+                              <td style={{padding:"5px 10px", ...mono, fontSize:10, color:C.muted}}>{fmtWhen(t.opened_at)}</td>
+                              <td style={{padding:"5px 10px", ...mono, fontSize:10, color:C.muted}}>{fmtWhen(t.closed_at)}</td>
+                              <td style={{padding:"5px 10px", ...mono, fontWeight:700, color: (t.pnl||0)>=0?C.bull:C.bear}}>{fmt$(t.pnl)}</td>
+                              <td style={{padding:"5px 10px", ...sans, fontSize:11, color:C.muted}}>{t.exit_reason || "—"}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
                 </div>
               )}
-              {eod.worst_trade && (
-                <div style={{ background:"#0f172a", border:`1px solid #450a0a`, borderRadius:6, padding:"8px 12px" }}>
-                  <div style={{ ...sans, fontSize:10, color:C.muted, marginBottom:2 }}>Worst Trade</div>
-                  <div style={{ ...mono, fontSize:13, fontWeight:700, color:"#ef4444" }}>
-                    {eod.worst_trade.ticker} ${eod.worst_trade.pnl.toFixed(2)} ({eod.worst_trade.pnl_pct >= 0?"+":""}{eod.worst_trade.pnl_pct.toFixed(2)}%)
-                  </div>
-                </div>
-              )}
-            </div>
-
-            {/* Strategy settings + exit breakdown */}
-            <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:8 }}>
-              <div style={{ background:"#0f172a", border:`1px solid ${C.border}`, borderRadius:6, padding:"10px 14px" }}>
-                <div style={{ ...sans, fontSize:11, fontWeight:700, color:C.muted, marginBottom:6 }}>STRATEGY SETTINGS</div>
-                {[
-                  ["Profit Target / trade", `+${eod.profit_target_pct}%`],
-                  ["Hard Stop / trade",     `-${eod.hard_stop_pct}%`],
-                  ["Daily Goal",            `$${eod.daily_profit_target}`],
-                  ["Risk/Reward",           `1 : ${(eod.profit_target_pct / eod.hard_stop_pct).toFixed(2)}`],
-                ].map(([k, v]) => (
-                  <div key={k} style={{ display:"flex", justifyContent:"space-between",
-                    ...sans, fontSize:12, padding:"2px 0", borderBottom:`1px solid ${C.border}` }}>
-                    <span style={{ color:C.muted }}>{k}</span>
-                    <span style={{ ...mono, color:C.white }}>{v}</span>
-                  </div>
-                ))}
-              </div>
-              <div style={{ background:"#0f172a", border:`1px solid ${C.border}`, borderRadius:6, padding:"10px 14px" }}>
-                <div style={{ ...sans, fontSize:11, fontWeight:700, color:C.muted, marginBottom:6 }}>EXIT BREAKDOWN</div>
-                {Object.entries(eod.exit_breakdown).map(([type, count]) => (
-                  <div key={type} style={{ display:"flex", justifyContent:"space-between", alignItems:"center",
-                    ...sans, fontSize:12, padding:"2px 0", borderBottom:`1px solid ${C.border}` }}>
-                    <span style={{ color: exitColors[type] || C.muted }}>{type.replace(/_/g," ")}</span>
-                    <span style={{ ...mono, fontWeight:700, color: exitColors[type] || C.white }}>
-                      {count} ({(count/eod.total_trades*100).toFixed(0)}%)
-                    </span>
-                  </div>
-                ))}
-              </div>
-            </div>
-          </div>
-        );
-      })()}
-
-      {/* Recent Decisions */}
-      {decisions.length > 0 && (
-        <>
-          <div style={{ ...sans, fontSize:13, fontWeight:700, color:C.white, marginBottom:8 }}>Decisions</div>
-          <div style={{ background:"#0f172a", border:`1px solid ${C.border}`, borderRadius:6,
-            padding:10, maxHeight:200, overflowY:"auto" }}>
-            {[...decisions].reverse().map((d, i) => (
-              <div key={i} style={{ ...mono, fontSize:11, color:C.muted, padding:"2px 0",
-                borderBottom: i < decisions.length-1 ? `1px solid ${C.border}` : "none" }}>
-                <span style={{ color:C.muted }}>{d.time}</span>
-                {" "}<span style={{ color: d.action==="FILLED"||d.action==="PROFIT_TARGET" ? "#4ade80"
-                  : d.action==="HARD_STOP" ? "#f87171"
-                  : d.action==="SKIPPED"   ? C.muted : C.text, fontWeight:700 }}>{d.action}</span>
-                {" "}<span style={{ color:C.white }}>{d.ticker}</span>
-                {" "}<span style={{ color:C.muted }}>{d.detail}</span>
-              </div>
-            ))}
-          </div>
-        </>
-      )}
-
-      {/* Trade History */}
-      <div style={{ marginTop:24 }}>
-        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:10 }}>
-          <div style={{ ...sans, fontSize:13, fontWeight:700, color:C.white }}>Trade History</div>
-          <div style={{ display:"flex", gap:6, alignItems:"center" }}>
-            {[7, 30, 90].map(d => (
-              <button key={d} onClick={() => { setHistDays(d); loadHistory(d); }} style={{
-                ...sans, fontSize:11, padding:"3px 10px", borderRadius:4, cursor:"pointer",
-                background: histDays === d ? "#1e3a5f" : "#1e293b",
-                border: `1px solid ${histDays === d ? "#2563eb" : C.border}`,
-                color: histDays === d ? "#93c5fd" : C.muted,
-              }}>{d}d</button>
-            ))}
-          </div>
-        </div>
-
-        {history && history.total > 0 ? (
-          <>
-            {/* Summary stats */}
-            <div style={{ display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:8, marginBottom:12 }}>
-              {[
-                { label:"Trades", value: history.total, color: C.white },
-                { label:"Win Rate", value:`${history.win_rate}%`,
-                  color: history.win_rate >= 60 ? "#4ade80" : history.win_rate >= 40 ? "#f59e0b" : "#ef4444" },
-                { label:"Total P&L", value:`${history.total_pnl >= 0 ? "+" : ""}$${history.total_pnl.toFixed(2)}`,
-                  color: pnlColor(history.total_pnl) },
-                { label:"Wins / Losses", value:`${history.wins}W / ${history.total - history.wins}L`, color: C.muted },
-              ].map(({ label, value, color }) => (
-                <div key={label} style={{ background:"#0f172a", border:`1px solid ${C.border}`,
-                  borderRadius:6, padding:"8px 12px", textAlign:"center" }}>
-                  <div style={{ ...sans, fontSize:10, color:C.muted, marginBottom:3 }}>{label}</div>
-                  <div style={{ ...mono, fontSize:14, fontWeight:700, color }}>{value}</div>
-                </div>
-              ))}
-            </div>
-
-            {/* Trades table */}
-            <div style={{ overflowX:"auto" }}>
-              <table style={{ width:"100%", borderCollapse:"collapse", ...sans, fontSize:12 }}>
-                <thead>
-                  <tr style={{ background:"#0f172a" }}>
-                    {["Date","Ticker","Entry $","Exit $","Shares","P&L","P&L %","Exit Type"].map(h => (
-                      <th key={h} style={{ padding:"6px 10px", textAlign:"left", color:C.muted,
-                        fontSize:11, fontWeight:600, textTransform:"uppercase", letterSpacing:0.5,
-                        borderBottom:`1px solid ${C.border}` }}>{h}</th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody>
-                  {history.trades.map((t, i) => {
-                    const exitColor = t.exit_reason === "profit_target" ? "#4ade80"
-                                    : t.exit_reason === "hard_stop"     ? "#f87171"
-                                    : t.exit_reason === "force_close"   ? "#f59e0b" : C.muted;
-                    return (
-                      <tr key={i} style={{ borderBottom:`1px solid ${C.border}`,
-                        background: i % 2 === 0 ? "transparent" : "#0f172a22" }}>
-                        <td style={{ padding:"7px 10px", color:C.muted }}>{t.closed_at}</td>
-                        <td style={{ padding:"7px 10px", fontWeight:700, fontFamily:"monospace", color:C.white }}>{t.ticker}</td>
-                        <td style={{ padding:"7px 10px", ...mono }}>${(t.entry_price||0).toFixed(2)}</td>
-                        <td style={{ padding:"7px 10px", ...mono }}>${(t.exit_price||0).toFixed(2)}</td>
-                        <td style={{ padding:"7px 10px", color:C.muted }}>{t.qty}</td>
-                        <td style={{ padding:"7px 10px", ...mono, fontWeight:700, color:pnlColor(t.pnl) }}>
-                          {t.pnl >= 0 ? "+" : ""}${(t.pnl||0).toFixed(2)}
-                        </td>
-                        <td style={{ padding:"7px 10px", ...mono, color:pnlColor(t.pnl_pct) }}>
-                          {t.pnl_pct >= 0 ? "+" : ""}{(t.pnl_pct||0).toFixed(2)}%
-                        </td>
-                        <td style={{ padding:"7px 10px" }}>
-                          <span style={{ fontSize:11, padding:"2px 7px", borderRadius:4, fontWeight:700,
-                            color: exitColor, background: `${exitColor}22` }}>
-                            {(t.exit_reason||"").replace(/_/g," ")}
-                          </span>
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
-          </>
-        ) : (
-          <div style={{ color:C.muted, ...sans, fontSize:13, padding:"16px 0" }}>
-            {history ? `No day trades in the last ${histDays} days` : "Loading history…"}
-          </div>
-        )}
+            </Card>
+          );
+        })}
       </div>
     </div>
   );
@@ -8648,7 +9038,7 @@ function WatchlistTab() {
 // ── Live Tape Tab ─────────────────────────────────────────────────────────
 function TapeTab() {
   const [ticker,    setTicker]  = useState("MSFT");
-  const [blockSize, setBlock]   = useState(5000);
+  const [blockSize, setBlock]   = useState(null);  // null = automatic ADV-relative sizing
   const [running,   setRunning] = useState(false);
   const [status,    setStatus]  = useState("idle");   // idle|connecting|live|error
   const [errMsg,    setErrMsg]  = useState("");
@@ -8671,7 +9061,7 @@ function TapeTab() {
     setStats(null);
     setErrMsg("");
 
-    const ws = new WebSocket(`ws://localhost:8000/ws/tape/${sym}?block=${blockSize}`);
+    const ws = new WebSocket(`ws://localhost:8000/ws/tape/${sym}${blockSize ? `?block=${blockSize}` : ""}`);
     wsRef.current = ws;
 
     ws.onmessage = (e) => {
@@ -8692,6 +9082,7 @@ function TapeTab() {
           sell_vol:      msg.sell_vol,
           delta:         msg.delta,
           block_count:   msg.block_count,
+          block_threshold: msg.block_threshold,
           open_price:    msg.open_price,
           pct_from_open: msg.pct_from_open,
           vwap_story:    msg.vwap_story,
@@ -8775,12 +9166,13 @@ function TapeTab() {
           </div>
           <div>
             <div style={{ ...sans, fontSize:11, color:C.muted, marginBottom:4 }}>
-              Block alert ≥ (shares)
+              Block alert ≥ (shares, blank = auto)
             </div>
             <input
               type="number"
-              value={blockSize}
-              onChange={e => setBlock(Number(e.target.value))}
+              value={blockSize ?? ""}
+              onChange={e => setBlock(e.target.value === "" ? null : Number(e.target.value))}
+              placeholder="auto"
               disabled={running}
               style={{ ...mono, fontSize:13, width:100, padding:"6px 10px",
                 border:`1px solid ${C.border}`, borderRadius:6, background:C.dim,
@@ -8817,9 +9209,13 @@ function TapeTab() {
         <div style={{ marginTop:12, padding:"10px 12px", background:C.dim, borderRadius:6,
           ...sans, fontSize:11, color:C.muted, lineHeight:1.7 }}>
           <b>What is the tape?</b> The tape shows every single trade that executes for this stock —
-          the exact price, number of shares, and which direction the price moved. Small trades (under {blockSize.toLocaleString()} shares)
+          the exact price, number of shares, and which direction the price moved. Small trades (under{" "}
+          {(stats?.block_threshold ?? blockSize) ? (stats?.block_threshold ?? blockSize).toLocaleString() : "the auto-sized threshold"} shares)
           are usually individual investors. Large "block" trades come from institutions like funds and banks
-          moving serious money. Watching the tape tells you who is in control of the price right now.
+          moving serious money — the threshold auto-sizes to 0.5% of this ticker's own 20-day dollar volume
+          (floor $1M) unless you set a manual value above, so "large" means roughly the same real rarity for
+          every ticker instead of a flat share count. Watching the tape tells you who is in control of the
+          price right now.
         </div>
       </Card>
 
@@ -8859,7 +9255,7 @@ function TapeTab() {
             <MetricBox
               label="Block Trades"
               value={stats.block_count}
-              sub={`Large prints ≥ ${blockSize.toLocaleString()}`}
+              sub={`Large prints ≥ ${(stats.block_threshold ?? blockSize ?? 0).toLocaleString()}${blockSize ? "" : " (auto)"}`}
               color="#8b5cf6"
             />
           </div>
@@ -10866,11 +11262,6 @@ function RiskMonitorTab() {
                 onChange={e => setCfg(p => ({...p, auto_close_csp: e.target.checked}))} />
               Auto-close CSP on 2x stop
             </label>
-            <label style={{...sans, fontSize:12, color:C.muted, display:"flex", gap:6, alignItems:"center"}}>
-              <input type="checkbox" checked={!!cfg.auto_disable_dt}
-                onChange={e => setCfg(p => ({...p, auto_disable_dt: e.target.checked}))} />
-              Auto-disable day trader on VIX spike
-            </label>
           </div>
           <button onClick={saveConfig}
             style={{background:"#22c55e", color:"#000", border:"none", borderRadius:4,
@@ -11069,6 +11460,109 @@ function LiveNewsPanel() {
 }
 
 // ── Root App ──────────────────────────────────────────────────────────────
+// ── Command Palette (2026-09-07) ─────────────────────────────────────────
+// Ctrl/Cmd+K global overlay, sourced from the same tabGroups array App()
+// already builds its nav from -- fuzzy-filtering that instead of keeping a
+// second hardcoded tab list means this can't silently drift out of sync
+// with the real nav as tabs get added/removed. Navigation only, no actions.
+function CommandPalette({ tabGroups, onNavigate }) {
+  const [open, setOpen]         = useState(false);
+  const [query, setQuery]       = useState("");
+  const [activeIdx, setActiveIdx] = useState(0);
+  const inputRef = useRef(null);
+
+  const allTabs = React.useMemo(() => {
+    const out = [];
+    tabGroups.forEach(g => g.tabs.forEach(t => out.push({ ...t, group: g.label })));
+    return out;
+  }, [tabGroups]);
+
+  const filtered = React.useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return allTabs;
+    return allTabs.filter(t => t.label.toLowerCase().includes(q) || t.group.toLowerCase().includes(q));
+  }, [allTabs, query]);
+
+  useEffect(() => {
+    const onKeyDown = (e) => {
+      const isMeta = e.metaKey || e.ctrlKey;
+      if (isMeta && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        setOpen(o => !o);
+      } else if (e.key === "Escape") {
+        setOpen(false);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
+
+  useEffect(() => {
+    if (open) {
+      setQuery("");
+      setActiveIdx(0);
+      setTimeout(() => inputRef.current?.focus(), 0);
+    }
+  }, [open]);
+
+  useEffect(() => { setActiveIdx(0); }, [query]);
+
+  if (!open) return null;
+
+  const select = (t) => {
+    if (t) onNavigate(t.id);
+    setOpen(false);
+  };
+
+  const onInputKeyDown = (e) => {
+    if (e.key === "ArrowDown") { e.preventDefault(); setActiveIdx(i => Math.min(i + 1, filtered.length - 1)); }
+    else if (e.key === "ArrowUp") { e.preventDefault(); setActiveIdx(i => Math.max(i - 1, 0)); }
+    else if (e.key === "Enter") { e.preventDefault(); select(filtered[activeIdx]); }
+  };
+
+  return (
+    <div onClick={() => setOpen(false)} style={{
+      position:"fixed", inset:0, zIndex:10000, background:"rgba(0,0,0,0.55)",
+      display:"flex", alignItems:"flex-start", justifyContent:"center", paddingTop:"12vh",
+    }}>
+      <div onClick={e => e.stopPropagation()} style={{
+        width:520, maxWidth:"90vw", background:C.surface, border:`1px solid ${C.border}`,
+        borderRadius:10, boxShadow:"0 12px 40px rgba(0,0,0,0.5)", overflow:"hidden",
+      }}>
+        <input
+          ref={inputRef}
+          value={query}
+          onChange={e => setQuery(e.target.value)}
+          onKeyDown={onInputKeyDown}
+          placeholder="Jump to a tab..."
+          style={{
+            width:"100%", boxSizing:"border-box", padding:"14px 18px", fontSize:15,
+            background:"transparent", border:"none", borderBottom:`1px solid ${C.border}`,
+            color:C.white, outline:"none", ...sans,
+          }}
+        />
+        <div style={{maxHeight:"50vh", overflowY:"auto"}}>
+          {filtered.length === 0 ? (
+            <div style={{...sans, fontSize:13, color:C.muted, padding:"16px 18px"}}>No matching tab.</div>
+          ) : filtered.map((t, i) => (
+            <div key={t.id} onClick={() => select(t)} onMouseEnter={() => setActiveIdx(i)} style={{
+              display:"flex", justifyContent:"space-between", alignItems:"center",
+              padding:"10px 18px", cursor:"pointer",
+              background: i === activeIdx ? `${C.accent}22` : "transparent",
+            }}>
+              <span style={{...sans, fontSize:13, color: i === activeIdx ? C.white : C.text}}>{t.label}</span>
+              <span style={{...sans, fontSize:10, color:C.muted, textTransform:"uppercase", letterSpacing:0.5}}>{t.group}</span>
+            </div>
+          ))}
+        </div>
+        <div style={{...sans, fontSize:10, color:C.muted, padding:"8px 18px", borderTop:`1px solid ${C.border}`}}>
+          &uarr;&darr; navigate &middot; Enter select &middot; Esc close
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function App() {
   const [tab, setTab]         = useState("pnl");
   const [connected, setConn]  = useState(false);
@@ -11112,10 +11606,9 @@ function App() {
       { id:"pnl",         label:"P&L"          },
       { id:"autotrader",  label:"CSP-Leap"      },
       { id:"stocktrader", label:"Stock Trader"  },
-      { id:"daytrader",   label:"Day Trader"    },
+      { id:"indeptraders",label:"Independent Traders" },
       { id:"spx0dte",     label:"SPX 0DTE"      },
       { id:"spy0dte",     label:"SPY 0DTE"      },
-      { id:"googcondor",  label:"GOOG Condor"   },
       { id:"evc",         label:"Earnings"      },
       { id:"sigtrader",   label:"Sig Trader"    },
       { id:"fxtrader",      label:"FX Trader"     },
@@ -11158,6 +11651,7 @@ function App() {
   return (
     <div style={{ minHeight:"100vh", background:C.bg }}>
       <IndexBanner />
+      <CommandPalette tabGroups={tabGroups} onNavigate={setTab} />
 
       {/* ── Fixed top navbar (sits below the 40px IndexBanner ticker) ── */}
       <div style={{
@@ -11236,10 +11730,9 @@ function App() {
         <div style={{display: tab==="leaps"        ? "" : "none"}}><LEAPTab       connected={connected} /></div>
         <div style={{display: tab==="autotrader"   ? "" : "none"}}><AutoTraderTab /></div>
         <div style={{display: tab==="stocktrader"  ? "" : "none"}}><StockTraderTab /></div>
-        <div style={{display: tab==="daytrader"    ? "" : "none"}}><DayTraderTab /></div>
+        <div style={{display: tab==="indeptraders" ? "" : "none"}}><IndependentTradersTab /></div>
         <div style={{display: tab==="spx0dte"      ? "" : "none"}}><SPX0DTETab /></div>
         <div style={{display: tab==="spy0dte"      ? "" : "none"}}><SPY0DTETab /></div>
-        <div style={{display: tab==="googcondor"   ? "" : "none"}}><GOOGCondorTab /></div>
         <div style={{display: tab==="evc"          ? "" : "none"}}><EVCTab /></div>
         <div style={{display: tab==="sigtrader"    ? "" : "none"}}><SigTraderTab /></div>
         <div style={{display: tab==="fxtrader"      ? "" : "none"}}><FXTraderTab /></div>
@@ -11296,7 +11789,13 @@ function App() {
   );
 }
 
-ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+ReactDOM.createRoot(document.getElementById("root")).render(
+  <ToastProvider>
+    <LiveDataProvider>
+      <App />
+    </LiveDataProvider>
+  </ToastProvider>
+);
 </script>
 </body>
 </html>

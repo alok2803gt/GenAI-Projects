@@ -1,0 +1,23 @@
+Universe: 86 tickers (production settings only, no grid sweep)
+Pulling 2.5y minute bars for 86 tickers...
+  10/86 minute pulls done
+  20/86 minute pulls done
+  30/86 minute pulls done
+  40/86 minute pulls done
+  50/86 minute pulls done
+  60/86 minute pulls done
+  70/86 minute pulls done
+  80/86 minute pulls done
+Pulling 4.5y daily bars...
+Pulling VIX + SPY for F1 regime gate...
+  simulated 10/86 tickers, 126 real gated alerts so far
+  simulated 20/86 tickers, 215 real gated alerts so far
+  simulated 30/86 tickers, 468 real gated alerts so far
+  simulated 40/86 tickers, 584 real gated alerts so far
+  simulated 50/86 tickers, 732 real gated alerts so far
+  simulated 60/86 tickers, 952 real gated alerts so far
+  simulated 70/86 tickers, 1096 real gated alerts so far
+  simulated 80/86 tickers, 1265 real gated alerts so far
+
+Total simulated REAL gated alerts (production settings): 1420
+Saved to faithful_extended_rows.csv
