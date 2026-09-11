@@ -18802,7 +18802,15 @@ async def _ibkr_reconcile(ib, *, on_startup: bool = False) -> None:
         dt_symbols = set()
     at_symbols  = {k.split("_")[0] for k in at_keys}
     st_symbols  = set(state.get("stock_trader", {}).get("positions", {}).keys())
-    claimed_stk = dt_symbols | at_symbols | st_symbols
+    # harami_daily_trader.py: real live stock positions, own standalone
+    # process (same reason day-trader needs its state file read above) --
+    # without this every real fill Telegrams as "UNTRACKED STOCKS".
+    try:
+        with open("harami_trader_state.json") as _hdf:
+            harami_symbols = {p["ticker"].upper() for p in json.load(_hdf).get("positions", {}).values() if p.get("ticker")}
+    except Exception:
+        harami_symbols = set()
+    claimed_stk = dt_symbols | at_symbols | st_symbols | harami_symbols
 
     # ── 2. Classify each IBKR position ──
     # Tickers the EVC strategy recently closed (may be phantom closes)
@@ -19375,6 +19383,17 @@ def _reconcile_all(ib) -> dict:
         dt_syms = {k.upper() for k in (_dt.get("positions") or {}).keys()}
     except Exception:
         dt_syms = set()
+    # harami_daily_trader.py (real live stock positions, REAL money -- NOT
+    # the chartexpert shadow one) runs as its own standalone process, same
+    # as day-trader, so it's invisible to _recon_iter_all_open() too.
+    # Claim its tracked tickers here or every real fill shows up as
+    # "untracked at IBKR" (a real stock, unlike chartexpert's options).
+    try:
+        with open("harami_trader_state.json") as f:
+            _hd = json.load(f).get("positions", {})
+        harami_syms = {p["ticker"].upper() for p in _hd.values() if p.get("ticker")}
+    except Exception:
+        harami_syms = set()
     # Manual Trader is intentionally excluded from _recon_iter_all_open (it has
     # its own _mt_reconcile_sync), but its legs ARE tracked -- claim them here
     # by normalized localSymbol so they don't show as "untracked".
@@ -19392,7 +19411,7 @@ def _reconcile_all(ib) -> dict:
             continue
         if c.conId in claimed_conids:
             continue
-        if c.secType in ("STK", "CASH") and c.symbol.upper() in (ibkr_idx["stock_syms"] & dt_syms):
+        if c.secType in ("STK", "CASH") and c.symbol.upper() in (ibkr_idx["stock_syms"] & (dt_syms | harami_syms)):
             continue
         if c.secType == "OPT" and _at_contract_key(c) in {r.get("at_key") for r in tracked if r.get("at_key")}:
             continue
@@ -22362,6 +22381,7 @@ INDEPENDENT_TRADER_TASK_NAMES = {
     "goog_condor":   "IBKR-GOOGCondorMonday",
     "safe_income":   "IBKR-SafeIncomeTrader",
     "chartexpert":   "IBKR-ChartExpertAutoTrader",
+    "harami_daily":  "IBKR-HaramiDailyEntry",
 }
 
 
@@ -22424,6 +22444,25 @@ _ALPACA_0DTE_ROW_FILTER = {
 
 
 def _open_positions_for_row(row_id: str) -> list:
+    if row_id == "harami_daily":
+        try:
+            with open("harami_trader_state.json") as f:
+                positions = json.load(f).get("positions", {})
+        except Exception:
+            return []
+        out = []
+        for key, p in positions.items():
+            phase = p.get("phase")
+            if phase in ("pending_entry",):
+                out.append({"pos_id": key, "ticker": p.get("ticker"), "entry_time": p.get("placed_at"),
+                           "summary": f"MOO BUY {p.get('qty')}x placed, awaiting fill (real order, expected ~${p.get('expected_spot'):.2f})"})
+            elif phase == "open":
+                out.append({"pos_id": key, "ticker": p.get("ticker"), "entry_time": p.get("entry_fill_date"),
+                           "summary": f"REAL: {p.get('qty')}x @ ${p.get('entry_price'):.2f}, exit planned {p.get('exit_date')} (5-day hold)"})
+            elif phase == "pending_exit":
+                out.append({"pos_id": key, "ticker": p.get("ticker"), "entry_time": p.get("entry_fill_date"),
+                           "summary": f"MOC SELL placed, awaiting fill (entry was ${p.get('entry_price'):.2f})"})
+        return out
     if row_id == "chartexpert":
         try:
             with open("chartexpert_shadow_state.json") as f:
@@ -22510,6 +22549,7 @@ async def independent_traders_status():
         ("goog_condor", "GOOG Condor", "goog_condor", None, None),
         ("safe_income", "Safe Income Trader", "safe_income", None, None),
         ("chartexpert", "Chartexpert Trade (Shadow)", "chartexpert", None, None),
+        ("harami_daily", "Harami Daily (Live)", "harami_daily", None, None),
     ]:
         task_name = INDEPENDENT_TRADER_TASK_NAMES[task_key]
         info = tasks_info.get(task_name, {})
