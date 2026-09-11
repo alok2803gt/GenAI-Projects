@@ -113,3 +113,36 @@ recomputes only new/"pending" rows -- safe to re-run weekly, sample grows.
 Math sanity-checked against hand calc (exact match). As of build: 3 live
 signals (ISRG 9/9, LMT 9/10, RTX 9/10), all still mid-hold -- nothing to
 conclude yet, by design.
+
+## 15-minute-candle version -- NEGATIVE result (2026-09-10/11)
+
+harami_15m_backtest.py: same pattern definition, same universe (112
+tickers), same bare-vs-downtrend-context discipline as the daily-bar
+version, run on real 1-year 15-min RTH bars (Polygon REST). "SMA20/SMA50"
+here means 20/50 fifteen-minute bars, not 20/50 days.
+
+| hold (bars) | downtrend mean | downtrend n | baseline mean | baseline n | p |
+|---|---|---|---|---|---|
+| 1 (15m)  | -0.008% | 11,619 | +0.004% | 725,370 | 0.053 |
+| 2 (30m)  | -0.006% | 11,617 | +0.007% | 725,258 | 0.075 |
+| 4 (1h)   | **-0.009%** | 11,608 | +0.015% | 725,034 | **0.016** |
+| 8 (2h)   | +0.022% | 11,600 | +0.029% | 724,586 | 0.59 |
+| 13 (~3.25h) | +0.047% | 11,593 | +0.048% | 724,026 | 0.98 |
+| 26 (~1 RTH day) | +0.134% | 11,542 | +0.095% | 722,570 | 0.12 |
+
+**No edge at any horizon.** This is a clean negative, not an underpowered
+one -- every hold has n=11,500+ (well above the daily-bar version's
+n=1,858), so a real effect this size would show up. The one nominally
+significant result (1h hold, p=0.016) is in the WRONG direction: the
+downtrend-context pattern actually underperforms its own matched baseline
+there, not outperforms it. The ~1-day hold (26 bars) is directionally
+consistent with the daily-bar finding (+0.134% vs +0.095% baseline) but
+does not clear significance (p=0.12) despite the large sample -- read as
+noise, not a weaker version of the real effect.
+
+**Conclusion: the daily-bar harami+downtrend edge (RESEARCH_LOG.md above,
+p=0.00007) does not translate to 15-minute intraday bars.** Whatever
+produces the daily effect (overnight information processing, end-of-day
+positioning, multi-session mean reversion) is specific to the daily
+timeframe, not a fractal pattern that repeats at finer resolution. Do not
+build a 15-min version of harami_scanner.py off this data.
