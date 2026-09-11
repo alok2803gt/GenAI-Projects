@@ -40,7 +40,7 @@ import uvicorn
 import yfinance as yf
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from ib_insync import IB, Index, LimitOrder, Option, Order, Stock, util
+from ib_insync import IB, Future, Index, LimitOrder, MarketOrder, Option, Order, Stock, util
 from alpaca_0dte_common import (
     alpaca_client as _alp_client, load_config as _alp_load_config,
     get_alpaca_symbols as _alp_get_symbols, place_condor_sequential as _alp_place_condor,
@@ -752,6 +752,7 @@ _tickers_lock = threading.Lock()
 # default -- populated only on demand (POST /add_ticker_1m), same "queued,
 # streaming loop subscribes within ~10s" pattern as TICKERS/add_ticker.
 ONE_MIN_TICKERS: List[str] = []
+ONE_MIN_ASSET_CLASS: dict = {}   # ticker -> "stock" | "future"; missing = "stock" (2026-09-09, MNQ support)
 _tickers_1m_lock = threading.Lock()
 ONE_MIN_BAR_SIZE = "1 min"
 ONE_MIN_HISTORY_DURATION = "3 D"
@@ -791,6 +792,59 @@ ST_SETUPS: dict = {
     "XOM":  {"signal": "BREAKOUT",     "win_start": "14:00", "win_end": "16:00", "hold_mins": 120, "target_pct": 0.74, "stop_pct": 0.69, "sma50_filter": False},  # WR=68.4%  n=19
     "HD":   {"signal": "BREAKOUT",     "win_start": "10:00", "win_end": "11:00", "hold_mins":  60, "target_pct": 0.30, "stop_pct": 0.43, "sma50_filter": True},   # WR=59.5%  n=42
 }
+
+# ── Signal Trader: MNQ futures config (2026-09-09) ─────────────────────────
+# Deliberately SEPARATE from ST_SETUPS above -- every ST_SETUPS entry is
+# backed by a real 2yr/1h or 60d/15m intraday backtest; these MNQ defaults
+# are NOT backtested, just a conservative starting point for the manual-
+# trigger-first rollout (CEO-confirmed scope, 2026-09-09 -- no automatic
+# breakout-scanner detection for futures yet, see feedback_futures_margin_
+# exception.md memory for the "no margin, ever" exception this required).
+# Long-only, matches Signal Trader's existing bullish-breakout bias -- no
+# short-selling support in this version.
+MNQ_FUTURES_CONFIG: dict = {
+    "target_pct": 0.30, "stop_pct": 0.30, "hold_mins": 60,
+    "max_qty": 1,                # contracts per position -- raise only after a clean live round-trip
+    "win_start": "09:30", "win_end": "16:00",  # regular RTH only; MNQ's near-24h session is out of
+                                                 # scope here (_sigt_in_prime_window's HH:MM check has
+                                                 # no day-of-week/midnight-wrap handling)
+    "roll_buffer_trading_days": 3,  # skip to next quarter if front month expires within this many days
+}
+
+
+async def _resolve_mnq_front_month(ib: IB):
+    """Real front-month MNQ contract via IBKR's own contract-details lookup
+    -- not a hardcoded expiry string, which would silently go stale. No
+    genuine multi-week ROLL logic here (confirmed via codebase search:
+    none exists anywhere, and none is needed) -- Signal Trader positions
+    are same-day, short-hold (MNQ_FUTURES_CONFIG['hold_mins']), so a
+    position is never held across a contract-month boundary. This just
+    skips a front month that's within roll_buffer_trading_days of its own
+    last trading day, so a brand-new position doesn't get opened in a
+    contract that's about to go illiquid."""
+    details = await ib.reqContractDetailsAsync(Future("MNQ", exchange="CME", currency="USD"))
+    if not details:
+        raise RuntimeError("MNQ: reqContractDetails returned nothing -- check CME futures permissions")
+    today = datetime.now(timezone.utc).date()
+    candidates = []
+    for d in details:
+        c = d.contract
+        ltd_str = c.lastTradeDateOrContractMonth
+        if not ltd_str:
+            continue
+        ltd = datetime.strptime(ltd_str[:8], "%Y%m%d").date()
+        if ltd >= today:
+            candidates.append((ltd, c))
+    if not candidates:
+        raise RuntimeError("MNQ: no unexpired contract months returned")
+    candidates.sort(key=lambda x: x[0])
+    buffer_days = MNQ_FUTURES_CONFIG["roll_buffer_trading_days"]
+    for ltd, c in candidates:
+        if (ltd - today).days > buffer_days * 1.5:  # rough calendar-day proxy for trading days
+            return c
+    # every candidate is within the buffer (e.g. right at a real roll point) -- fall back to
+    # the furthest-out one available rather than trading an about-to-expire month
+    return candidates[-1][1]
 
 # ── FX Trader: pairs config (EMA Breakout, 08:00–12:00 ET London/NY overlap) ─
 # Backtest (2yr 1H): EURUSD 74% WR +13pip, GBPUSD 77% +27pip, USDJPY 72% +11pip, AUDUSD 75% +17pip
@@ -1011,8 +1065,19 @@ def on_bar_update_1m(ticker: str, bars, has_new_bar: bool) -> None:
 async def subscribe_ticker_1m(ib: IB, ticker: str) -> None:
     """Independent 1-min real-time bar subscription for charting (Signal
     Trader / any tab), separate from the 5-min TICKERS pipe that feeds the
-    ML model -- see ONE_MIN_TICKERS's module-level comment for why."""
-    contract = Stock(ticker, "SMART", "USD")
+    ML model -- see ONE_MIN_TICKERS's module-level comment for why.
+    Futures support (2026-09-09, MNQ only) -- resolved via the same
+    front-month lookup the trading path uses, not a hardcoded contract.
+    MNQ is always treated as a future even if a caller (e.g. the frontend's
+    generic add-ticker control) forgot to pass asset_class -- MNQ is never
+    a valid US equity symbol, so there's no ambiguity (fix 2026-09-10)."""
+    if ticker == "MNQ" or ONE_MIN_ASSET_CLASS.get(ticker) == "future":
+        if ticker != "MNQ":
+            raise ValueError(f"1m futures charting only supports MNQ currently, got {ticker}")
+        ONE_MIN_ASSET_CLASS[ticker] = "future"
+        contract = await _resolve_mnq_front_month(ib)
+    else:
+        contract = Stock(ticker, "SMART", "USD")
     await ib.qualifyContractsAsync(contract)
     bars = await ib.reqHistoricalDataAsync(
         contract,
@@ -1401,8 +1466,12 @@ async def _subscribe_pending_1m(ib: IB, known: set) -> set:
         try:
             await subscribe_ticker_1m(ib, ticker)
         except Exception as e:
-            log.warning(f"1m subscribe failed [{ticker}]: {e}")
-    return current
+            log.warning(f"1m subscribe failed [{ticker}]: {e} -- will retry next cycle")
+    # Only remember tickers whose subscription actually succeeded. A
+    # transient or contract-type failure (e.g. MNQ mis-typed as a Stock by
+    # a frontend call that didn't pass asset_class) then gets retried on
+    # the next loop instead of being permanently stuck 404 (found 2026-09-10).
+    return {t for t in current if t in state["subscriptions_1m"]}
 
 
 async def _tape_preseed_subscribe(ib: IB, ticker: str) -> None:
@@ -9236,7 +9305,8 @@ async def lifespan(app: FastAPI):
     log.info("News monitor loop started")
     asyncio.create_task(_ibkr_startup_reconcile())
     asyncio.create_task(_ibkr_reconcile_loop())
-    log.info("IBKR reconciliation tasks started (startup + 5-min periodic)")
+    asyncio.create_task(_reconcile_all_loop())
+    log.info("IBKR reconciliation tasks started (startup + 5-min alert-only + 60s auto-correct engine)")
     asyncio.create_task(_telegram_poll_commands_coro())
 
     # Run initial universe screen in background (non-blocking)
@@ -9696,6 +9766,7 @@ async def ibkr_news_set_tickers(req: IbkrNewsTickersRequest):
 # ── Pydantic models ────────────────────────────────────────────────────────
 class AddTickerRequest(BaseModel):
     ticker: str
+    asset_class: str = "stock"   # "stock" | "future" -- only used by /add_ticker_1m (MNQ, 2026-09-09)
 
 
 # ── Bar streaming endpoints ────────────────────────────────────────────────
@@ -9749,11 +9820,27 @@ def get_bars_1m(ticker: str, limit: int = 1200):
 @app.post("/add_ticker_1m")
 def add_ticker_1m(req: AddTickerRequest):
     ticker = req.ticker.upper()
+    asset_class = req.asset_class.lower()
+    if asset_class not in ("stock", "future"):
+        raise HTTPException(400, f"asset_class must be 'stock' or 'future', got {req.asset_class!r}")
+    if ticker == "MNQ":
+        asset_class = "future"   # MNQ is never a valid equity symbol; don't let a stray "stock" call break it
+    if asset_class == "future" and ticker != "MNQ":
+        raise HTTPException(400, "1m futures charting only supports MNQ currently")
     with _tickers_1m_lock:
+        prev = ONE_MIN_ASSET_CLASS.get(ticker)
+        ONE_MIN_ASSET_CLASS[ticker] = asset_class
         if ticker not in ONE_MIN_TICKERS:
             ONE_MIN_TICKERS.append(ticker)
-            log.info(f"Queued {ticker} for 1m streaming — streaming loop will subscribe within 10 s")
-    return {"ok": True, "ticker": ticker}
+            log.info(f"Queued {ticker} ({asset_class}) for 1m streaming — streaming loop will subscribe within 10 s")
+        elif prev != asset_class and ticker in state.get("subscriptions_1m", {}):
+            # asset class changed for an already-subscribed ticker -> drop the
+            # stale subscription so the streaming loop re-subscribes with the
+            # right contract type next cycle
+            state["subscriptions_1m"].pop(ticker, None)
+            state.get("bars_1m", {}).pop(ticker, None)
+            log.info(f"1m: {ticker} asset_class {prev}->{asset_class}, dropped stale sub for re-subscribe")
+    return {"ok": True, "ticker": ticker, "asset_class": asset_class}
 
 
 class ChartAlertRequest(BaseModel):
@@ -12853,6 +12940,29 @@ async def manual_reconcile():
     return {"ok": True, "message": "Reconciliation triggered — check Telegram for results"}
 
 
+@app.get("/reconcile/status")
+def reconcile_status():
+    """Last auto-correct reconciliation cycle: corrections made, open
+    divergences (untracked / partial-leg), skips, and the kill-switch state."""
+    cfg = _reconcile_cfg()
+    out = dict(_reconcile_last_summary)
+    out["autocorrect_enabled"] = cfg["autocorrect_enabled"]
+    out["cycle_seconds"] = cfg["cycle_seconds"]
+    return out
+
+
+@app.post("/reconcile/run")
+async def reconcile_run():
+    """Run one auto-correcting reconciliation cycle right now."""
+    ib = state.get("ib")
+    if not ib or not ib.isConnected():
+        raise HTTPException(503, "IB not connected")
+    with _reconcile_lock:
+        summ = await asyncio.get_event_loop().run_in_executor(None, _reconcile_all, ib)
+        _reconcile_last_summary.update(summ)
+    return summ
+
+
 # ── Trade Journal endpoints ────────────────────────────────────────────────
 
 @app.get("/journal")
@@ -13234,9 +13344,22 @@ def pnl_dashboard():
             if _strat not in _ALPACA_STRATEGY_MAP or _p.get("close_pnl") is None:
                 continue
             _stype = _ALPACA_STRATEGY_MAP[_strat] or f"BUTTERFLY_{_p.get('ticker', '')}"
+            _strike, _right = None, None
+            if _strat == "ashley_signal":
+                _legs = _p.get("legs") or []
+                if _legs:
+                    _strike = _legs[0].get("strike")
+                    _sym = _legs[0].get("symbol") or ""
+                    if len(_sym) >= 9 and _sym[-9] in ("C", "P"):
+                        _right = _sym[-9]
+                    else:
+                        # fall back to parsing pos_id, e.g. "ASHLEY_765.0C_20260826_122634"
+                        _head = _p.get("pos_id", "").rsplit("_", 2)[0]
+                        if _head and _head[-1] in ("C", "P"):
+                            _right = _head[-1]
             closed_trades.append({
                 "id": None, "opened_at": _p.get("entry_time"), "closed_at": _p.get("closed_at"),
-                "ticker": _p.get("ticker"), "expiry": None, "strike": None, "right": None,
+                "ticker": _p.get("ticker"), "expiry": None, "strike": _strike, "right": _right,
                 "action": {"iron_condor_weekly": "SELL_CONDOR", "ashley_signal": "BUY"}.get(_strat, "BUY_BUTTERFLY"),
                 "qty": _p.get("qty", 1), "entry_price": _p.get("net_entry_credit"), "exit_price": None,
                 "pnl": _p.get("close_pnl"), "pnl_pct": None,
@@ -13248,33 +13371,6 @@ def pnl_dashboard():
         closed_trades.sort(key=lambda t: t["closed_at"], reverse=True)
     except Exception as exc:
         log.warning("pnl_dashboard: alpaca registry merge failed: %s", exc)
-
-    # ── Merge in Ashley-signal trades (ashley_signal_trades.json) -- same gap
-    # as above: ashleyklieu_trigger_executor.py computes a real pnl on every
-    # exit but only ever puts it in a Telegram message / oversight_log text
-    # line, never a structured store. Backfilled 2026-09-03 by reconstructing
-    # every real fill from Alpaca's own order history (not just the ones with
-    # a clean "exit FILLED" log line -- 4 of 9 real positions had no matching
-    # close logged in that format at all, including the 764P failed-ladder
-    # loss) rather than parsing log text, which would have missed exactly
-    # those 4. See ashley_signal_trades.json's close_reason per row for how
-    # each was verified.
-    try:
-        with open("ashley_signal_trades.json") as _f:
-            _ashley_reg = json.load(_f)
-        for _t in _ashley_reg.get("closed", []):
-            closed_trades.append({
-                "id": None, "opened_at": _t.get("opened_at"), "closed_at": _t.get("closed_at"),
-                "ticker": _t.get("ticker"), "expiry": None, "strike": _t.get("strike"), "right": _t.get("right"),
-                "action": "BUY", "qty": _t.get("qty", 1), "entry_price": _t.get("entry_price"),
-                "exit_price": _t.get("exit_price"), "pnl": _t.get("pnl"), "pnl_pct": None,
-                "win": _t.get("win"), "exit_reason": "alpaca_registry_close",
-                "strategy_type": "ASHLEY_SIGNAL", "commission": 0.0, "is_paper": 0,
-                "notes": _t.get("close_reason"), "max_profit": None, "dte": None,
-            })
-        closed_trades.sort(key=lambda t: t["closed_at"], reverse=True)
-    except Exception as exc:
-        log.warning("pnl_dashboard: ashley signal registry merge failed: %s", exc)
 
     daily: dict = defaultdict(float)
     for t in closed_trades:
@@ -18684,6 +18780,17 @@ async def _ibkr_reconcile(ib, *, on_startup: bool = False) -> None:
     # Auto-trader: matched by contract key (symbol_right_strike_expiry), no conid stored
     at_keys = set(state["autotrader"].get("positions", {}).keys())
 
+    # Manual Trader: legs matched by localSymbol (no conid stored in the leg
+    # records), same identity _mt_reconcile_sync uses. Without this, every open
+    # MT option leg lands in the 5-min "UNTRACKED OPTIONS" Telegram alert.
+    mt_leg_syms = set()
+    for _mp in state.get("manual_trader", {}).get("positions", {}).values():
+        if _mp.get("phase") == "open":
+            for _lg in _mp.get("legs", []):
+                _ls = str(_lg.get("local_symbol") or "").replace(" ", "").upper()
+                if _ls:
+                    mt_leg_syms.add(_ls)
+
     # Day Trader + Auto-trader + Stock-trader stocks: matched by symbol.
     # Day Trader runs as its own standalone process since 2026-08-27
     # (day_trader_agent.py) -- read its positions from the shared state
@@ -18721,6 +18828,8 @@ async def _ibkr_reconcile(ib, *, on_startup: bool = False) -> None:
                 continue                        # owned by a strategy
             if _at_contract_key(c) in at_keys:
                 continue                        # owned by auto-trader
+            if (c.localSymbol or "").replace(" ", "").upper() in mt_leg_syms:
+                continue                        # owned by Manual Trader
 
             # Unclaimed option — phantom close or truly foreign?
             if c.symbol in evc_closed_tickers:
@@ -18867,6 +18976,480 @@ async def _ibkr_reconcile_loop() -> None:
             await _ibkr_reconcile(ib, on_startup=False)
         except Exception as exc:
             log.warning("RECON periodic: unhandled error: %s", exc)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# REAL-TIME AUTO-CORRECTING RECONCILIATION ENGINE  (2026-09-10)
+# ══════════════════════════════════════════════════════════════════════════════
+# Continuously forces every strategy's own position records to match real
+# IBKR + Alpaca state. Motivated by a live incident: a Signal Trader CVX
+# call was recorded "closed" while still really open at IBKR. Auto-corrects
+# two cases -- PHANTOM CLOSE (record closed but broker still holds it ->
+# reopen) and EXTERNAL CLOSE (record open but broker is flat -> mark
+# closed) -- across every in-process strategy, the alpaca_0dte registry,
+# and (via HTTP /reconcile) the two standalone agents. Every mutation is
+# debounced >=2 cycles, Telegram-alerted, and written to oversight_log. A
+# kill-switch (reconciliation_config.json autocorrect_enabled=false) drops
+# it to detect+alert-only. Runs ALONGSIDE _ibkr_reconcile (kept for its
+# untracked-position alerting) -- this engine owns the auto-correction.
+
+RECONCILE_STATE_PATH  = "reconciliation_state.json"
+RECONCILE_CONFIG_PATH = "reconciliation_config.json"
+_reconcile_lock = threading.Lock()
+_reconcile_last_summary: dict = {
+    "last_run": None, "corrections": [], "alerts": [], "skips": [], "autocorrect_enabled": True,
+}
+_FES_MANUAL_CONID = 773081649   # user's own manual FES futures-option -- never flag (project_fes_position_manual memory)
+DAY_TRADER_AGENT_URL_RECON = "http://localhost:8010"
+SPY_CONDOR_AGENT_URL_RECON = "http://localhost:8011"
+
+
+def _reconcile_cfg() -> dict:
+    try:
+        with open(RECONCILE_CONFIG_PATH) as f:
+            c = json.load(f)
+    except Exception:
+        c = {}
+    return {"autocorrect_enabled": bool(c.get("autocorrect_enabled", True)),
+            "cycle_seconds": int(c.get("cycle_seconds", 60))}
+
+
+def _reconcile_state_load() -> dict:
+    try:
+        with open(RECONCILE_STATE_PATH) as f:
+            return json.load(f)
+    except Exception:
+        return {"absent_counts": {}}   # "strategy/pos_id" -> consecutive all-absent cycle count
+
+
+def _reconcile_state_save(s: dict) -> None:
+    try:
+        with open(RECONCILE_STATE_PATH, "w") as f:
+            json.dump(s, f, indent=2)
+    except Exception as e:
+        log.warning("reconcile state save failed: %s", e)
+
+
+def _recon_iter_all_open():
+    """Yield one normalized open-position record per in-process strategy +
+    the alpaca_0dte registry. Manual Trader is intentionally EXCLUDED --
+    _mt_reconcile_sync already auto-corrects it on every MT monitor tick
+    with the exact same logic (folding it in here would just race)."""
+    def _ci(x):
+        try:
+            return int(x)
+        except Exception:
+            return None
+
+    for pid, p in list(state.get("sig_trader", {}).get("positions", {}).items()):
+        # "closing" counts as tracked-open too: a position stuck mid-close
+        # (SELL filled but the code path was cut off before recording) is
+        # invisible to the monitor AND was invisible here, so nothing ever
+        # reconciled it. The 2-cycle debounce still protects a genuine
+        # in-flight close (its conid is still in ib.positions() until filled).
+        if p.get("phase") not in ("open", "closing"):
+            continue
+        cid = _ci(p.get("conid"))
+        yield {"strategy": "sig_trader", "pos_id": pid, "conids": [cid] if cid else [],
+               "leg_symbols": [], "symbols": [], "n_legs": 1, "venue": "ibkr", "raw": p}
+
+    for pid, p in list(state.get("evc", {}).get("positions", {}).items()):
+        if p.get("phase") not in ("open", None):
+            continue
+        conids = [c for c in (_ci(v) for v in (p.get("conids") or {}).values()) if c]
+        asyms = [s for s in (p.get("alpaca_symbols") or []) if s]
+        yield {"strategy": "evc", "pos_id": pid, "conids": conids, "leg_symbols": asyms,
+               "symbols": [], "n_legs": max(len(conids), len(asyms), 4),
+               "venue": p.get("venue", "alpaca"), "raw": p}
+
+    for sid, sp in list(state.get("spx_0dte", {}).get("spreads", {}).items()):
+        conids = [c for c in (_ci(v) for v in ((sp.get("put_conids") or []) + (sp.get("call_conids") or []))) if c]
+        yield {"strategy": "spx_0dte", "pos_id": sid, "conids": conids, "leg_symbols": [],
+               "symbols": [], "n_legs": max(len(conids), 4), "venue": "ibkr", "raw": sp}
+
+    for tk, p in list(state.get("stock_trader", {}).get("positions", {}).items()):
+        if p.get("phase") == 0:          # 0 = pending buy, not a real position yet
+            continue
+        yield {"strategy": "stock_trader", "pos_id": tk, "conids": [], "leg_symbols": [],
+               "symbols": [tk], "n_legs": 1, "venue": "ibkr", "raw": p}
+
+    for pair, p in list(state.get("fx_trader", {}).get("positions", {}).items()):
+        if p.get("phase") not in ("open", "closing"):
+            continue
+        cid = _ci(p.get("conid"))
+        yield {"strategy": "fx_trader", "pos_id": pair, "conids": [cid] if cid else [],
+               "leg_symbols": [], "symbols": [], "n_legs": 1, "venue": "ibkr", "raw": p,
+               "is_fx": True}
+
+    for key, p in list(state.get("autotrader", {}).get("positions", {}).items()):
+        yield {"strategy": "autotrader", "pos_id": key, "conids": [], "leg_symbols": [],
+               "symbols": [], "at_key": key, "n_legs": 1, "venue": "ibkr", "raw": p,
+               "no_reopen": True}
+
+    try:
+        with open("alpaca_0dte_positions.json") as f:
+            areg = json.load(f)
+        for pid, p in (areg.get("positions") or {}).items():
+            legs = [l.get("symbol") for l in (p.get("legs") or []) if l.get("symbol")]
+            yield {"strategy": "alpaca_registry", "pos_id": pid, "conids": [],
+                   "leg_symbols": legs, "symbols": [], "n_legs": max(len(legs), 1),
+                   "venue": "ibkr", "raw": p, "no_reopen": True,
+                   "registry_strategy": p.get("strategy")}
+    except Exception:
+        pass
+
+
+def _recon_iter_all_closed():
+    """Yield (strategy, pos_id, record) for recently-closed records that
+    still carry enough contract info to be re-opened if the broker turns
+    out to still hold them (the phantom-close case)."""
+    for p in list(state.get("sig_trader", {}).get("closed_today", [])):
+        yield "sig_trader", p.get("pos_id"), p
+    for p in list(state.get("evc", {}).get("closed_today", [])):
+        yield "evc", p.get("pos_id"), p
+    for p in list(state.get("fx_trader", {}).get("closed_today", [])):
+        yield "fx_trader", p.get("pos_id", p.get("pair")), p
+    for p in list(state.get("stock_trader", {}).get("closed_today", [])):
+        yield "stock_trader", p.get("pos_id", p.get("ticker")), p
+
+
+def _recon_present(rec: dict, ibkr_idx: dict, alp_idx: set) -> str:
+    """'all_present' | 'some_present' | 'all_absent' for one normalized record."""
+    hits = 0
+    for cid in rec.get("conids", []):
+        if cid in ibkr_idx["conids"]:
+            hits += 1
+    for sym in rec.get("leg_symbols", []):
+        s = str(sym).replace(" ", "").upper()
+        if s in ibkr_idx["localsyms"] or s in alp_idx:
+            hits += 1
+    for sym in rec.get("symbols", []):
+        if str(sym).upper() in ibkr_idx["stock_syms"]:
+            hits += 1
+    if rec.get("at_key") and rec["at_key"] in ibkr_idx["at_keys"]:
+        hits += 1
+    n = max(rec.get("n_legs", 1), 1)
+    if hits == 0:
+        return "all_absent"
+    return "all_present" if hits >= n else "some_present"
+
+
+def _recon_journal_close(strategy_type: str, ticker) -> None:
+    try:
+        con = sqlite3.connect(JOURNAL_DB_PATH)
+        con.execute("""UPDATE trade_journal SET
+            closed_at=?, exit_reason='reconcile_externally_closed', win=0,
+            notes=COALESCE(notes,'')||' | reconcile: externally closed'
+            WHERE id = (SELECT id FROM trade_journal
+                        WHERE ticker=? AND strategy_type=? AND closed_at IS NULL
+                        ORDER BY id DESC LIMIT 1)""",
+            (_utcnow().isoformat(), ticker, strategy_type))
+        con.commit(); con.close()
+    except Exception as e:
+        log.warning("reconcile journal-close failed (%s/%s): %s", strategy_type, ticker, e)
+
+
+def _recon_apply_close(rec: dict) -> bool:
+    """Move a strategy's open record to its closed container. Returns True on success."""
+    strat, pid, raw = rec["strategy"], rec["pos_id"], rec["raw"]
+    now_z = _utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        if strat == "sig_trader":
+            st = state["sig_trader"]; p = st["positions"].pop(pid, None)
+            if not p:
+                return False
+            p.update({"phase": "closed", "exit_reason": "reconcile_externally_closed",
+                      "exit_price": None, "pnl": None, "closed_at": now_z})
+            st["closed_today"].append(p); _sigt_save_state()
+            _recon_journal_close("signal_trader_futures" if p.get("instrument_type") == "future" else "signal_trader", p.get("ticker"))
+            return True
+        if strat == "evc":
+            ev = state["evc"]; p = ev["positions"].pop(pid, None)
+            if not p:
+                return False
+            p.update({"phase": "externally_closed", "close_reason": "reconcile_externally_closed",
+                      "closed_at": now_z})
+            ev["closed_today"].append(p); _evc_save_state()
+            _recon_journal_close("earnings_vol_crush", p.get("ticker"))
+            return True
+        if strat == "spx_0dte":
+            sx = state["spx_0dte"]; sp = sx["spreads"].pop(pid, None)
+            if not sp:
+                return False
+            sp.update({"phase": "closed", "exit_type": "reconcile_externally_closed", "closed_at": now_z})
+            sx.setdefault("closed_today", []).append(sp); _spx_save_state()
+            _recon_journal_close("SPX_0DTE", "SPX")
+            return True
+        if strat == "stock_trader":
+            stt = state["stock_trader"]; p = stt["positions"].pop(pid, None)
+            if not p:
+                return False
+            p.update({"phase": 2, "close_reason": "reconcile_externally_closed", "closed_at": now_z})
+            stt.setdefault("closed_today", []).append(p); _st_save_state()
+            _recon_journal_close("STOCK_BREAKOUT", pid)
+            return True
+        if strat == "fx_trader":
+            fx = state["fx_trader"]; p = fx["positions"].pop(pid, None)
+            if not p:
+                return False
+            p.update({"phase": "closed", "close_reason": "reconcile_externally_closed", "closed_at": now_z})
+            fx.setdefault("closed_today", []).append(p); _fx_save_state()
+            _recon_journal_close("fx_trader", pid)
+            return True
+        if strat == "autotrader":
+            at = state["autotrader"]
+            if at.get("positions", {}).pop(pid, None) is None:
+                return False
+            _at_save_state()
+            return True
+        if strat == "alpaca_registry":
+            try:
+                from alpaca_0dte_common import close_position as _areg_close
+                return _areg_close(pid, "reconcile_externally_closed", None) is not None
+            except Exception as e:
+                log.warning("reconcile: alpaca registry close failed %s: %s", pid, e)
+                return False
+    except Exception as e:
+        log.warning("reconcile close-apply failed (%s/%s): %s", strat, pid, e)
+    return False
+
+
+def _recon_apply_reopen(strat: str, pid: str, closed_rec: dict) -> bool:
+    """Move a phantom-closed record back to its open container."""
+    try:
+        if strat == "sig_trader":
+            st = state["sig_trader"]
+            st["closed_today"] = [c for c in st["closed_today"] if c.get("pos_id") != pid]
+            closed_rec.update({"phase": "open", "exit_reason": None, "exit_price": None,
+                               "pnl": None, "closed_at": None})
+            st["positions"][pid] = closed_rec; _sigt_save_state()
+            return True
+        if strat == "evc":
+            ev = state["evc"]
+            ev["closed_today"] = [c for c in ev["closed_today"] if c.get("pos_id") != pid]
+            closed_rec.update({"phase": "open", "close_reason": None, "closed_at": None})
+            ev["positions"][pid] = closed_rec; _evc_save_state()
+            return True
+        if strat == "fx_trader":
+            fx = state["fx_trader"]
+            fx["closed_today"] = [c for c in fx.get("closed_today", []) if c.get("pos_id", c.get("pair")) != pid]
+            closed_rec.update({"phase": "open", "close_reason": None, "closed_at": None})
+            fx["positions"][pid] = closed_rec; _fx_save_state()
+            return True
+        if strat == "stock_trader":
+            stt = state["stock_trader"]
+            stt["closed_today"] = [c for c in stt.get("closed_today", []) if c.get("pos_id", c.get("ticker")) != pid]
+            closed_rec.update({"phase": 1, "close_reason": None, "closed_at": None})
+            stt["positions"][pid] = closed_rec; _st_save_state()
+            return True
+    except Exception as e:
+        log.warning("reconcile reopen-apply failed (%s/%s): %s", strat, pid, e)
+    return False
+
+
+def _recon_call_agent(url: str) -> dict | None:
+    try:
+        r = requests.post(f"{url}/reconcile", timeout=5)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        return {"_error": str(e)}
+
+
+def _reconcile_all(ib) -> dict:
+    """One full reconciliation cycle. Returns the summary dict."""
+    cfg = _reconcile_cfg()
+    autocorrect = cfg["autocorrect_enabled"]
+    summary = {"last_run": _utcnow().isoformat(), "corrections": [], "alerts": [],
+               "skips": [], "autocorrect_enabled": autocorrect}
+
+    # ── 1. Ground truth, with hard guards ────────────────────────────────
+    try:
+        raw_positions = [p for p in ib.positions() if p.position != 0]
+    except Exception as e:
+        summary["skips"].append(f"ibkr positions() raised: {e}")
+        return summary
+    tracked = list(_recon_iter_all_open())
+    if not raw_positions and tracked:
+        summary["skips"].append(f"ibkr returned 0 positions while {len(tracked)} tracked -- suspicious, skipping")
+        _oversight_log("programmer", "reconcile_skipped_bad_truth",
+                       f"IBKR positions() empty while {len(tracked)} positions tracked -- cycle skipped, no mutations",
+                       outcome="skipped")
+        return summary
+
+    ibkr_idx = {
+        "conids": {p.contract.conId for p in raw_positions},
+        "localsyms": {(p.contract.localSymbol or "").replace(" ", "").upper() for p in raw_positions},
+        "stock_syms": {p.contract.symbol.upper() for p in raw_positions if p.contract.secType in ("STK", "CASH")},
+        "at_keys": {_at_contract_key(p.contract) for p in raw_positions if p.contract.secType == "OPT"},
+    }
+
+    alp_idx: set = set()
+    need_alpaca = any(r["venue"] == "alpaca" for r in tracked)
+    if need_alpaca:
+        try:
+            _ac = _alp_client(_alp_load_config())
+            _ap = _ac.get_all_positions()
+            if not _ap and any(r["venue"] == "alpaca" for r in tracked):
+                summary["skips"].append("alpaca returned 0 positions while alpaca-venue positions tracked -- skipping alpaca side")
+            else:
+                alp_idx = {str(getattr(x, "symbol", "")).replace(" ", "").upper() for x in _ap}
+        except Exception as e:
+            summary["skips"].append(f"alpaca get_all_positions failed: {e}")
+
+    rstate = _reconcile_state_load()
+    absent_counts = rstate.setdefault("absent_counts", {})
+
+    # ── 2. External-close detection (tracked-open but broker flat) ────────
+    for rec in tracked:
+        key = f"{rec['strategy']}/{rec['pos_id']}"
+        # alpaca-venue positions we couldn't verify (alpaca fetch failed) -> don't touch
+        if rec["venue"] == "alpaca" and not alp_idx and need_alpaca:
+            absent_counts.pop(key, None)
+            continue
+        status = _recon_present(rec, ibkr_idx, alp_idx)
+        if status == "all_present":
+            absent_counts.pop(key, None)
+            continue
+        if status == "some_present":
+            absent_counts.pop(key, None)
+            summary["alerts"].append(f"PARTIAL LEGS: {key} -- some legs present, some gone at broker (not auto-closing)")
+            continue
+        # all_absent
+        absent_counts[key] = absent_counts.get(key, 0) + 1
+        if absent_counts[key] < 2:
+            summary["alerts"].append(f"pending externally-closed (cycle {absent_counts[key]}/2): {key}")
+            continue
+        if not autocorrect:
+            summary["alerts"].append(f"WOULD auto-close (kill-switch off): {key} -- absent {absent_counts[key]} cycles")
+            continue
+        if _recon_apply_close(rec):
+            absent_counts.pop(key, None)
+            msg = f"reconcile: marked {key} externally closed (absent from broker {absent_counts.get(key, 2)}+ cycles)"
+            summary["corrections"].append(msg)
+            _oversight_log("programmer", "reconcile_autocorrect", msg,
+                           rationale="Position record was open but no matching contract in IBKR/Alpaca for >=2 cycles.",
+                           outcome="record moved to closed")
+            _oversight_notify(f"🛠️ Reconcile auto-correct: {key} was open in records but flat at broker -- marked closed.")
+
+    # ── 3. Phantom-close detection (record closed but broker still holds it) ──
+    for strat, pid, crec in _recon_iter_all_closed():
+        if not pid or not crec:
+            continue
+        # build a normalized record from the closed one
+        cid = None
+        try:
+            cid = int(crec.get("conid")) if crec.get("conid") else None
+        except Exception:
+            cid = None
+        nrec = {"strategy": strat, "pos_id": pid,
+                "conids": [cid] if cid else [],
+                "leg_symbols": [l.get("local_symbol") or l.get("symbol") for l in (crec.get("legs") or []) if (l.get("local_symbol") or l.get("symbol"))],
+                "symbols": [crec.get("ticker")] if strat == "stock_trader" and crec.get("ticker") else [],
+                "n_legs": 1}
+        if not (nrec["conids"] or nrec["leg_symbols"] or nrec["symbols"]):
+            continue
+        status = _recon_present(nrec, ibkr_idx, alp_idx)
+        if status == "all_absent":
+            continue
+        # still present at broker -> phantom close
+        if not autocorrect:
+            summary["alerts"].append(f"WOULD reopen (kill-switch off): {strat}/{pid} -- still held at broker")
+            continue
+        if _recon_apply_reopen(strat, pid, crec):
+            msg = f"reconcile: re-opened {strat}/{pid} -- record said closed but broker still holds it (phantom close)"
+            summary["corrections"].append(msg)
+            _oversight_log("programmer", "reconcile_autocorrect", msg,
+                           rationale="Closed record's contract is still present in IBKR/Alpaca.",
+                           outcome="record moved back to open")
+            _oversight_notify(f"🛠️ Reconcile auto-correct: {strat}/{pid} was marked closed but is still open at the broker -- re-opened in tracking.")
+
+    # ── 4. Untracked broker positions (alert only) ──────────────────────
+    claimed_conids = set()
+    for rec in tracked:
+        claimed_conids.update(rec.get("conids", []))
+    # also honor _ibkr_reconcile's own claim sets by reading day-trader/spy-condor state files
+    try:
+        with open("day_trader_state.json") as f:
+            _dt = json.load(f)
+        dt_syms = {k.upper() for k in (_dt.get("positions") or {}).keys()}
+    except Exception:
+        dt_syms = set()
+    # Manual Trader is intentionally excluded from _recon_iter_all_open (it has
+    # its own _mt_reconcile_sync), but its legs ARE tracked -- claim them here
+    # by normalized localSymbol so they don't show as "untracked".
+    mt_claimed_syms = set()
+    for _mp in state.get("manual_trader", {}).get("positions", {}).values():
+        if _mp.get("phase") != "open":
+            continue
+        for _lg in _mp.get("legs", []):
+            _ls = str(_lg.get("local_symbol") or "").replace(" ", "").upper()
+            if _ls:
+                mt_claimed_syms.add(_ls)
+    for p in raw_positions:
+        c = p.contract
+        if c.conId == _FES_MANUAL_CONID:
+            continue
+        if c.conId in claimed_conids:
+            continue
+        if c.secType in ("STK", "CASH") and c.symbol.upper() in (ibkr_idx["stock_syms"] & dt_syms):
+            continue
+        if c.secType == "OPT" and _at_contract_key(c) in {r.get("at_key") for r in tracked if r.get("at_key")}:
+            continue
+        # localSymbol claimed by any multi-leg record, or by Manual Trader?
+        ls = (c.localSymbol or "").replace(" ", "").upper()
+        if ls in mt_claimed_syms:
+            continue
+        if any(ls in {str(s).replace(' ', '').upper() for s in r.get("leg_symbols", [])} for r in tracked):
+            continue
+        summary["alerts"].append(f"UNTRACKED at IBKR: {c.localSymbol or c.symbol} ({c.secType}) qty={p.position} -- no strategy claims it")
+
+    # ── 5. Standalone agents ───────────────────────────────────────────
+    for name, url in (("day_trader", DAY_TRADER_AGENT_URL_RECON), ("spy_weekly_condor", SPY_CONDOR_AGENT_URL_RECON)):
+        res = _recon_call_agent(url)
+        if res is None or res.get("_error"):
+            summary["skips"].append(f"{name} /reconcile unreachable: {res.get('_error') if res else 'no response'}")
+            continue
+        for corr in (res.get("corrections") or []):
+            summary["corrections"].append(f"{name}: {corr}")
+            _oversight_log("programmer", "reconcile_autocorrect", f"{name} agent: {corr}", outcome="agent self-corrected")
+        for al in (res.get("alerts") or []):
+            summary["alerts"].append(f"{name}: {al}")
+
+    _reconcile_state_save(rstate)
+
+    if summary["corrections"]:
+        log.warning("RECONCILE: %d corrections, %d alerts, %d skips",
+                    len(summary["corrections"]), len(summary["alerts"]), len(summary["skips"]))
+    if summary["alerts"] and not summary["corrections"]:
+        # de-dupe noisy repeat alerts: only notify on NEW untracked/partial items once per hour
+        pass
+    return summary
+
+
+async def _reconcile_all_loop() -> None:
+    """Runs the auto-correcting reconciliation cycle on the configured
+    interval, weekdays 04:00-20:00 ET (covers futures + extended hours)."""
+    from zoneinfo import ZoneInfo
+    _ET = ZoneInfo("America/New_York")
+    while True:
+        cfg = _reconcile_cfg()
+        await asyncio.sleep(max(30, cfg["cycle_seconds"]))
+        ib = state.get("ib")
+        if not ib or not ib.isConnected():
+            continue
+        now_et = datetime.now(_ET)
+        if now_et.weekday() >= 5:
+            continue
+        t = now_et.strftime("%H:%M")
+        if not ("04:00" <= t <= "20:00"):
+            continue
+        try:
+            with _reconcile_lock:
+                summ = await asyncio.get_event_loop().run_in_executor(None, _reconcile_all, ib)
+                _reconcile_last_summary.update(summ)
+        except Exception as exc:
+            log.warning("RECONCILE loop: unhandled error: %s", exc, exc_info=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -19036,16 +19619,19 @@ async def _sigt_enter_trade(ib, ticker: str, signal_type: str, spot_price: float
                 f"tgt=${target_spot:.2f} stp=${stop_spot:.2f} dl={deadline.strftime('%H:%MZ')}")
 
         # ── 6. Journal insert ──────────────────────────────────────────────────
+        # Real trade_journal schema -- the pre-2026-09-10 version referenced
+        # columns (direction, entry_date, status) that don't exist, so every
+        # Signal Trader journal write silently failed and no Signal Trader
+        # trade ever reached the P&L dashboard. An open trade = closed_at IS NULL.
         try:
             con = sqlite3.connect(JOURNAL_DB_PATH)
             con.execute("""INSERT INTO trade_journal
-                (ticker, strategy_type, direction, qty, entry_price, entry_date,
-                 status, notes, is_paper)
-                VALUES (?,?,?,?,?,?,?,?,?)""",
-                (ticker, "signal_trader", "LONG_CALL", 1, fill_price,
-                 datetime.now(_ZI("America/New_York")).strftime("%Y-%m-%d %H:%M:%S"), "open",
-                 f"strike={atm_strike} expiry={expiry} spot={spot_price:.2f}",
-                 _is_paper()))
+                (opened_at, ticker, expiry, strike, right, action, qty, entry_price,
+                 spot_price, strategy_type, is_paper, notes)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (_utcnow().isoformat(), ticker, expiry, atm_strike, "C", "BUY", 1, fill_price,
+                 spot_price, "signal_trader", _is_paper(),
+                 f"strike={atm_strike} expiry={expiry} signal={signal_type}"))
             con.commit()
             con.close()
         except Exception as je:
@@ -19058,11 +19644,327 @@ async def _sigt_enter_trade(ib, ticker: str, signal_type: str, spot_price: float
         log.exception("SIG_TRADER _sigt_enter_trade error for %s", ticker)
 
 
+async def _sigt_enter_future_trade(ib, ticker: str = "MNQ", qty: Optional[int] = None) -> dict:
+    """MNQ futures entry -- long only, manual/API-triggered (no breakout-
+    scanner wiring in this version, see MNQ_FUTURES_CONFIG's own comment).
+    Real margin-aware sizing via ib.whatIfOrderAsync (SPAN margin moves
+    with volatility -- more honest than a hardcoded guess), gated through
+    the SAME cro_cfo_capital_budget every other strategy already uses.
+    Returns a result dict rather than logging-and-returning-None like
+    _sigt_enter_trade, so the manual-trigger endpoint can report exactly
+    why an attempt was skipped."""
+    if ticker != "MNQ":
+        return {"ok": False, "reason": "only MNQ supported in this version"}
+    st = state["sig_trader"]
+    cfg = MNQ_FUTURES_CONFIG
+    qty = qty or cfg["max_qty"]
+    if qty > cfg["max_qty"]:
+        return {"ok": False, "reason": f"qty {qty} exceeds max_qty={cfg['max_qty']} -- raise max_qty only after a clean live round-trip"}
+    if any(p.get("ticker") == ticker and p.get("instrument_type") == "future" for p in st["positions"].values()):
+        _sigt_log("SKIP", ticker, "already have open future position")
+        return {"ok": False, "reason": "already have an open MNQ position"}
+
+    try:
+        contract = await _resolve_mnq_front_month(ib)
+        await ib.qualifyContractsAsync(contract)
+
+        tickers = await ib.reqTickersAsync(contract)
+        await asyncio.sleep(2)
+        spot = _spx_mid(tickers[0]) if tickers else 0.0
+        if spot <= 0:
+            _sigt_log("SKIP", ticker, "no valid live quote for front-month MNQ")
+            return {"ok": False, "reason": "no valid live quote"}
+
+        # ── Real margin-aware capital gate (same pattern every other strategy uses) ──
+        # whatIfOrderAsync comes back as an empty list instead of a real
+        # OrderState if the probe order's `tif` isn't explicitly set --
+        # confirmed 2026-09-09: MarketOrder("BUY", qty) alone silently
+        # produces an unusable whatIf response; setting .tif = "DAY"
+        # explicitly is what actually gets a real margin figure back. Fail
+        # closed with a clear reason rather than crashing on a missing
+        # attribute if this ever regresses.
+        probe_order = MarketOrder("BUY", qty)
+        probe_order.tif = "DAY"
+        order_state = await ib.whatIfOrderAsync(contract, probe_order)
+        if not order_state or not hasattr(order_state, "initMarginChange"):
+            _sigt_log("SKIP", ticker, f"whatIfOrder returned no usable margin data ({order_state!r}) -- "
+                                        f"check real-time CME market data subscription")
+            return {"ok": False, "reason": "whatIfOrder returned no usable margin data -- "
+                                             "check real-time CME market data subscription at IBKR"}
+        margin_per_position = float(order_state.initMarginChange or 0)
+        if margin_per_position <= 0:
+            _sigt_log("SKIP", ticker, f"whatIfOrder returned no real margin figure ({order_state.initMarginChange})")
+            return {"ok": False, "reason": "could not determine real margin requirement"}
+
+        budget = _cro_cfo_capital_budget(ib)
+        if margin_per_position > budget["per_strategy_cap"]:
+            _sigt_log("SKIP", ticker, f"margin ${margin_per_position:.0f} > per-strategy cap ${budget['per_strategy_cap']:.0f}")
+            return {"ok": False, "reason": f"margin ${margin_per_position:.0f} exceeds per-strategy cap ${budget['per_strategy_cap']:.0f}"}
+        if margin_per_position > budget["headroom"]:
+            _sigt_log("SKIP", ticker, f"margin ${margin_per_position:.0f} > portfolio headroom ${budget['headroom']:.0f}")
+            return {"ok": False, "reason": f"margin ${margin_per_position:.0f} exceeds portfolio headroom ${budget['headroom']:.0f}"}
+
+        entry_price = round(spot + 0.25, 2)  # small favorable-side offset, same spirit as the options entry
+        order = LimitOrder("BUY", qty, entry_price, tif="DAY")
+        trade = ib.placeOrder(contract, order)
+        _sigt_log("ORDERING", ticker, f"{contract.lastTradeDateOrContractMonth} x{qty} @ ${entry_price:.2f} "
+                                        f"(spot ${spot:.2f}, real margin ${margin_per_position:.0f}/contract)")
+
+        for _ in range(30):
+            await asyncio.sleep(1)
+            if trade.orderStatus.status == "Filled":
+                break
+        if trade.orderStatus.status != "Filled":
+            ib.cancelOrder(order)
+            _sigt_log("SKIP", ticker, f"no fill in 30s (status={trade.orderStatus.status})")
+            return {"ok": False, "reason": f"no fill in 30s (status={trade.orderStatus.status})"}
+
+        fill_price = trade.orderStatus.avgFillPrice or entry_price
+        now_utc = _utcnow()
+        deadline = now_utc + timedelta(minutes=cfg["hold_mins"])
+        pos_id = f"{ticker}_{datetime.now(timezone(timedelta(hours=-4))).strftime('%Y%m%d_%H%M%S')}"
+
+        pos = {
+            "pos_id":            pos_id,
+            "ticker":            ticker,
+            "instrument_type":   "future",
+            "signal_type":       "MANUAL",
+            "entry_time":        now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "deadline":          deadline.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "spot_at_entry":     round(fill_price, 2),
+            "target_spot":       round(fill_price * (1 + cfg["target_pct"] / 100), 2),
+            "stop_spot":         round(fill_price * (1 - cfg["stop_pct"] / 100), 2),
+            "expiry":            contract.lastTradeDateOrContractMonth,
+            "conid":             contract.conId,
+            "qty":               qty,
+            "future_entry_price": round(fill_price, 2),
+            "margin_per_contract": round(margin_per_position, 2),
+            "order_id":          trade.order.orderId,
+            "phase":             "open",
+            "live_pnl":          0.0,
+        }
+        st["positions"][pos_id] = pos
+        _sigt_log("ENTERED", ticker,
+                  f"x{qty} @ ${fill_price:.2f} tgt=${pos['target_spot']:.2f} stp=${pos['stop_spot']:.2f} "
+                  f"dl={deadline.strftime('%H:%MZ')} margin=${margin_per_position:.0f}/contract")
+
+        try:
+            con = sqlite3.connect(JOURNAL_DB_PATH)
+            con.execute("""INSERT INTO trade_journal
+                (opened_at, ticker, expiry, action, qty, entry_price,
+                 spot_price, strategy_type, is_paper, notes)
+                VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                (_utcnow().isoformat(), ticker, contract.lastTradeDateOrContractMonth, "BUY", qty, fill_price,
+                 fill_price, "signal_trader_futures", _is_paper(),
+                 f"MNQ front-month margin=${margin_per_position:.0f}/contract"))
+            con.commit()
+            con.close()
+        except Exception as je:
+            log.warning("SIG_TRADER futures journal insert error: %s", je)
+
+        _sigt_save_state()
+        return {"ok": True, "pos_id": pos_id, "fill_price": fill_price, "qty": qty,
+                "margin_per_contract": margin_per_position}
+
+    except Exception as e:
+        _sigt_log("ERROR", ticker, f"_sigt_enter_future_trade: {e}")
+        log.exception("SIG_TRADER _sigt_enter_future_trade error for %s", ticker)
+        return {"ok": False, "reason": str(e)}
+
+
+def _sigt_ibkr_holds(ib, conid) -> bool | None:
+    """True/False if conid is/ isn't a live IBKR position; None if we can't tell."""
+    if not conid:
+        return None
+    try:
+        return any(p.contract.conId == conid and p.position != 0 for p in ib.positions())
+    except Exception:
+        return None
+
+
+async def _sigt_recover_close_from_fills(ib, pos: dict, pos_id: str, reason: str,
+                                         is_future: bool) -> bool:
+    """The record is open/closing but IBKR no longer holds the contract -- the
+    SELL already went through (or it was closed out of band) and the code was
+    cut off before recording. Reconstruct the exit from the most recent SLD
+    execution for this conid and finalize. Returns True if it finalized (so
+    the caller must NOT place another SELL). Falls back to a null-P&L close if
+    no fill can be found -- either way, never sells."""
+    st = state["sig_trader"]
+    conid = pos.get("conid")
+    ticker = pos.get("ticker", "?")
+    px = None
+    try:
+        for f in reversed(ib.fills()):
+            if f.contract.conId == conid and f.execution.side == "SLD":
+                px = float(f.execution.price)
+                break
+        if px is None:
+            from ib_insync import ExecutionFilter
+            execs = await ib.reqExecutionsAsync(ExecutionFilter())
+            for f in reversed(execs):
+                if f.contract.conId == conid and f.execution.side == "SLD":
+                    px = float(f.execution.price)
+                    break
+    except Exception as e:
+        log.warning("SIG_TRADER recover-from-fills lookup failed %s: %s", pos_id, e)
+
+    now_z = _utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    if px and px > 0:
+        if is_future:
+            pnl = round((px - pos["future_entry_price"]) * 2 * pos.get("qty", 1), 2)
+            strat_type = "signal_trader_futures"
+        else:
+            pnl = round((px - pos["option_entry_price"]) * 100 * pos.get("qty", 1), 2)
+            strat_type = "signal_trader"
+        exit_reason = f"{reason}_recovered"
+        pos.update({"phase": "closed", "exit_price": round(px, 2), "exit_reason": exit_reason,
+                    "pnl": pnl, "closed_at": now_z})
+        _sigt_log("CLOSED", ticker,
+                  f"{exit_reason} close=${px:.2f} pnl=${pnl:+.2f} (SELL already done at IBKR; recovered from fills)")
+    else:
+        pnl = None
+        strat_type = "signal_trader_futures" if is_future else "signal_trader"
+        exit_reason = f"{reason}_broker_flat"
+        pos.update({"phase": "closed", "exit_price": None, "exit_reason": exit_reason,
+                    "pnl": None, "closed_at": now_z})
+        _sigt_log("CLOSED", ticker,
+                  f"{exit_reason}: broker already flat, no SLD fill found -- marked closed, null P&L (did NOT sell)")
+
+    st["closed_today"].append(pos)
+    st["positions"].pop(pos_id, None)
+    try:
+        con = sqlite3.connect(JOURNAL_DB_PATH)
+        con.execute("""UPDATE trade_journal SET
+            closed_at=?, exit_price=?, pnl=?, win=?, exit_reason=?, notes=COALESCE(notes,'')||?
+            WHERE id = (SELECT id FROM trade_journal
+                        WHERE ticker=? AND strategy_type=? AND closed_at IS NULL
+                        ORDER BY id DESC LIMIT 1)""",
+            (_utcnow().isoformat(), px if (px and px > 0) else None, pnl,
+             1 if (pnl or 0) > 0 else 0, exit_reason,
+             f" | exit={exit_reason} pnl={'' if pnl is None else format(pnl, '+.2f')}",
+             ticker, strat_type))
+        con.commit(); con.close()
+    except Exception as je:
+        log.warning("SIG_TRADER recover journal update error: %s", je)
+    _sigt_save_state()
+    return True
+
+
+async def _sigt_close_future_position(ib, pos_id: str, reason: str) -> None:
+    """Close an open MNQ future position -- mirrors _sigt_close_position's
+    limit-then-escalate pattern, but against the future's own live price
+    directly (no separate spot-vs-option-premium translation needed)."""
+    st = state["sig_trader"]
+    pos = st["positions"].get(pos_id)
+    if not pos or pos.get("phase") not in ("open", "closing"):
+        return
+
+    # If IBKR no longer holds this contract, the SELL already happened --
+    # finalize from the fill record instead of placing a duplicate SELL that
+    # would open a naked short. Also unsticks a position left at phase
+    # "closing" by an interrupted prior close.
+    if _sigt_ibkr_holds(ib, pos.get("conid")) is False:
+        await _sigt_recover_close_from_fills(ib, pos, pos_id, reason, is_future=True)
+        return
+
+    pos["phase"] = "closing"
+    ticker = pos["ticker"]
+    qty = pos["qty"]
+
+    try:
+        contract = Future(ticker, pos["expiry"], "CME", currency="USD")
+        contract.conId = pos["conid"]
+        qualified = await ib.qualifyContractsAsync(contract)
+        if qualified:
+            contract = qualified[0]
+
+        tickers = await ib.reqTickersAsync(contract)
+        await asyncio.sleep(2)
+        mid = _spx_mid(tickers[0]) if tickers else 0.0
+        lmt = max(0.25, round(mid - 0.25, 2)) if mid > 0 else None
+
+        if lmt:
+            order = LimitOrder("SELL", qty, lmt, tif="DAY")
+        else:
+            order = MarketOrder("SELL", qty)
+
+        trade = ib.placeOrder(contract, order)
+        for _ in range(15):
+            await asyncio.sleep(1)
+            if trade.orderStatus.status == "Filled":
+                break
+        if trade.orderStatus.status != "Filled":
+            ib.cancelOrder(order)
+            mkt = MarketOrder("SELL", qty)
+            mkt.tif = "DAY"
+            trade = ib.placeOrder(contract, mkt)
+            for _ in range(15):
+                await asyncio.sleep(1)
+                if trade.orderStatus.status == "Filled":
+                    break
+
+        # Fill verification -- same rule as _sigt_close_position: never mark
+        # closed on an unfilled SELL (would leave a real open future position
+        # untracked). Revert to "open" and let the monitor retry.
+        filled = trade.orderStatus.status == "Filled" and (trade.orderStatus.avgFillPrice or 0) > 0
+        if not filled:
+            pos["phase"] = "open"
+            _sigt_log("CLOSE_FAILED", ticker,
+                      f"{reason}: SELL did not fill (status={trade.orderStatus.status}) -- position still OPEN, will retry")
+            _sigt_save_state()
+            return
+
+        close_price = trade.orderStatus.avgFillPrice
+        pnl = round((close_price - pos["future_entry_price"]) * 2 * qty, 2)  # MNQ multiplier = $2/index point
+        pos["phase"] = "closed"
+        pos["exit_price"] = round(close_price, 2)
+        pos["exit_reason"] = reason
+        pos["pnl"] = pnl
+        pos["closed_at"] = _utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        st["closed_today"].append(pos)
+        del st["positions"][pos_id]
+
+        _sigt_log("CLOSED", ticker, f"{reason} close=${close_price:.2f} pnl=${pnl:+.2f}")
+
+        try:
+            con = sqlite3.connect(JOURNAL_DB_PATH)
+            con.execute("""UPDATE trade_journal SET
+                closed_at=?, exit_price=?, pnl=?, win=?, exit_reason=?, notes=COALESCE(notes,'')||?
+                WHERE id = (SELECT id FROM trade_journal
+                            WHERE ticker=? AND strategy_type='signal_trader_futures' AND closed_at IS NULL
+                            ORDER BY id DESC LIMIT 1)""",
+                (_utcnow().isoformat(), close_price, pnl, 1 if pnl > 0 else 0, reason,
+                 f" | exit={reason} pnl={pnl:+.2f}", ticker))
+            con.commit()
+            con.close()
+        except Exception as je:
+            log.warning("SIG_TRADER futures journal update error: %s", je)
+
+        _sigt_save_state()
+
+    except Exception as e:
+        pos["phase"] = "open"  # revert so monitor can retry
+        _sigt_log("ERROR", ticker, f"_sigt_close_future_position {reason}: {e}")
+        log.exception("SIG_TRADER _sigt_close_future_position error %s %s", pos_id, reason)
+
+
 async def _sigt_close_position(ib, pos_id: str, reason: str) -> None:
     """Close an open call position at market and record the result."""
     st = state["sig_trader"]
     pos = st["positions"].get(pos_id)
-    if not pos or pos.get("phase") != "open":
+    if not pos or pos.get("phase") not in ("open", "closing"):
+        return
+
+    # If IBKR no longer holds this contract, the SELL already happened (or it
+    # was closed out of band) -- finalize from the fill record instead of
+    # placing a duplicate SELL that would open a naked short call. Also
+    # unsticks a position left at phase "closing" by an interrupted prior
+    # close (e.g. CVX 215C on 2026-09-10: SELL filled at $2.65 but the coro
+    # was cut off before recording, leaving it stuck and invisible).
+    if _sigt_ibkr_holds(ib, pos.get("conid")) is False:
+        await _sigt_recover_close_from_fills(ib, pos, pos_id, reason, is_future=False)
         return
 
     pos["phase"] = "closing"
@@ -19086,8 +19988,8 @@ async def _sigt_close_position(ib, pos_id: str, reason: str) -> None:
         if lmt:
             order = LimitOrder("SELL", 1, lmt, tif="DAY")
         else:
-            from ib_insync import MarketOrder
             order = MarketOrder("SELL", 1)
+            order.tif = "DAY"   # unset tif -> IBKR rejects with Error 10349 (confirmed 2026-09-10)
 
         trade = ib.placeOrder(contract, order)
         for _ in range(15):
@@ -19097,12 +19999,31 @@ async def _sigt_close_position(ib, pos_id: str, reason: str) -> None:
         if trade.orderStatus.status != "Filled":
             # Escalate to market
             ib.cancelOrder(order)
-            from ib_insync import MarketOrder
             mkt = MarketOrder("SELL", 1)
+            mkt.tif = "DAY"
             trade = ib.placeOrder(contract, mkt)
-            await asyncio.sleep(5)
+            for _ in range(15):
+                await asyncio.sleep(1)
+                if trade.orderStatus.status == "Filled":
+                    break
 
-        close_price = trade.orderStatus.avgFillPrice or mid or pos["option_entry_price"]
+        # ── Fill verification: do NOT mark closed unless the SELL actually
+        # filled. Pre-2026-09-10 this fell straight through to a phantom
+        # close (avgFillPrice=0 -> `or mid` -> a fake exit price), deleting
+        # the position from tracking while it was still real at IBKR --
+        # exactly what happened to CVX 215C on 2026-09-09. If it didn't
+        # fill (pre-market, halted, no quote, rejected), revert phase to
+        # "open" and let the monitor retry next cycle.
+        filled = trade.orderStatus.status == "Filled" and (trade.orderStatus.avgFillPrice or 0) > 0
+        if not filled:
+            pos["phase"] = "open"
+            _sigt_log("CLOSE_FAILED", ticker,
+                      f"{reason}: SELL did not fill (status={trade.orderStatus.status}, "
+                      f"avgFill={trade.orderStatus.avgFillPrice}) -- position still OPEN, will retry")
+            _sigt_save_state()
+            return
+
+        close_price = trade.orderStatus.avgFillPrice
         pnl = round((close_price - pos["option_entry_price"]) * 100, 2)
         pos["phase"] = "closed"
         pos["exit_price"] = round(close_price, 2)
@@ -19119,10 +20040,11 @@ async def _sigt_close_position(ib, pos_id: str, reason: str) -> None:
         try:
             con = sqlite3.connect(JOURNAL_DB_PATH)
             con.execute("""UPDATE trade_journal SET
-                exit_price=?, pnl=?, status=?, notes=notes||?
-                WHERE ticker=? AND strategy_type='signal_trader' AND status='open'
-                ORDER BY rowid DESC LIMIT 1""",
-                (close_price, pnl, "closed",
+                closed_at=?, exit_price=?, pnl=?, win=?, exit_reason=?, notes=COALESCE(notes,'')||?
+                WHERE id = (SELECT id FROM trade_journal
+                            WHERE ticker=? AND strategy_type='signal_trader' AND closed_at IS NULL
+                            ORDER BY id DESC LIMIT 1)""",
+                (_utcnow().isoformat(), close_price, pnl, 1 if pnl > 0 else 0, reason,
                  f" | exit={reason} pnl={pnl:+.2f}", ticker))
             con.commit()
             con.close()
@@ -19138,7 +20060,11 @@ async def _sigt_close_position(ib, pos_id: str, reason: str) -> None:
 
 
 async def _sigt_monitor_coro(ib) -> None:
-    """Check open positions against target/stop/deadline; update live option P&L."""
+    """Check open positions against target/stop/deadline; update live P&L.
+    Dispatches on instrument_type -- options positions get the original
+    stock-spot + option-mid treatment unchanged; MNQ future positions get
+    their own live price checked directly (the future IS the tradable
+    instrument, no separate spot-vs-premium translation needed)."""
     st = state["sig_trader"]
     if not st["positions"]:
         return
@@ -19148,25 +20074,30 @@ async def _sigt_monitor_coro(ib) -> None:
     if not open_positions:
         return
 
-    # ── 1. Batch-fetch live spot prices ──────────────────────────────────────
+    option_positions = {pid: p for pid, p in open_positions.items()
+                         if p.get("instrument_type") != "future"}
+    future_positions = {pid: p for pid, p in open_positions.items()
+                         if p.get("instrument_type") == "future"}
+
+    # ── 1. Batch-fetch live spot prices (options positions only) ─────────────
     from ib_insync import Stock as IbStock, Option as IbOpt
-    tickers_needed = list({p["ticker"] for p in open_positions.values()})
-    spot_contracts = [IbStock(tk, "SMART", "USD") for tk in tickers_needed]
-    spot_tickers = await ib.reqTickersAsync(*spot_contracts)
-    await asyncio.sleep(2)
-
+    tickers_needed = list({p["ticker"] for p in option_positions.values()})
     spot_map: dict = {}
-    for td in spot_tickers:
-        sym = getattr(td.contract, "symbol", None)
-        if sym:
-            px = _spx_safe_px(td.last) or _spx_safe_px(td.close)
-            if px > 0:
-                spot_map[sym] = px
+    if tickers_needed:
+        spot_contracts = [IbStock(tk, "SMART", "USD") for tk in tickers_needed]
+        spot_tickers = await ib.reqTickersAsync(*spot_contracts)
+        await asyncio.sleep(2)
+        for td in spot_tickers:
+            sym = getattr(td.contract, "symbol", None)
+            if sym:
+                px = _spx_safe_px(td.last) or _spx_safe_px(td.close)
+                if px > 0:
+                    spot_map[sym] = px
 
-    # ── 2. Fetch live option mids for all open positions ──────────────────────
+    # ── 2. Fetch live option mids for all open option positions ──────────────
     opt_contracts = []
     pid_to_opt: dict = {}  # pos_id → index in opt_contracts
-    for pos_id, pos in open_positions.items():
+    for pos_id, pos in option_positions.items():
         if not pos.get("conid"):
             continue
         c = IbOpt(pos["ticker"], pos["expiry"], pos["strike"], "C", "SMART", "100", "USD")
@@ -19187,9 +20118,30 @@ async def _sigt_monitor_coro(ib) -> None:
         except Exception as e:
             log.warning("SIG_TRADER option quote error: %s", e)
 
-    # ── 3. Apply target / stop / deadline; update live P&L ───────────────────
+    # ── 2b. Fetch live future prices for all open future positions ───────────
+    future_prices: dict = {}  # pos_id → current live price
+    if future_positions:
+        fut_contracts = []
+        pid_to_fut: dict = {}
+        for pos_id, pos in future_positions.items():
+            c = Future(pos["ticker"], pos["expiry"], "CME", currency="USD")
+            c.conId = pos["conid"]
+            pid_to_fut[pos_id] = len(fut_contracts)
+            fut_contracts.append(c)
+        try:
+            fut_tickers = await ib.reqTickersAsync(*fut_contracts)
+            await asyncio.sleep(2)
+            for pos_id, idx in pid_to_fut.items():
+                if idx < len(fut_tickers):
+                    px = _spx_mid(fut_tickers[idx])
+                    if px > 0:
+                        future_prices[pos_id] = px
+        except Exception as e:
+            log.warning("SIG_TRADER future quote error: %s", e)
+
+    # ── 3. Apply target / stop / deadline; update live P&L (options) ─────────
     now_utc = _utcnow()
-    for pos_id, pos in list(open_positions.items()):
+    for pos_id, pos in list(option_positions.items()):
         tk = pos["ticker"]
         spot = spot_map.get(tk)
 
@@ -19205,7 +20157,16 @@ async def _sigt_monitor_coro(ib) -> None:
         if not spot:
             continue
 
-        deadline = datetime.strptime(pos["deadline"], "%Y-%m-%dT%H:%M:%SZ")
+        # _parse_utc, not raw strptime -- strptime with a literal "Z" in the
+        # format string does NOT attach real tzinfo, producing a naive
+        # datetime that throws "can't compare offset-naive and
+        # offset-aware datetimes" against _utcnow()'s aware result the
+        # moment a position's deadline is actually reached (confirmed live
+        # 2026-09-09: a real CVX position sat unclosed 20+ min past its
+        # deadline because of exactly this -- pre-existing bug, not
+        # introduced by the futures work, but copied into it before this
+        # fix since the pattern was copied from the original code).
+        deadline = _parse_utc(pos["deadline"])
 
         if spot >= pos["target_spot"]:
             await _sigt_close_position(ib, pos_id, "target_hit")
@@ -19213,6 +20174,33 @@ async def _sigt_monitor_coro(ib) -> None:
             await _sigt_close_position(ib, pos_id, "stop_hit")
         elif now_utc >= deadline:
             await _sigt_close_position(ib, pos_id, "time_exit")
+
+    # ── 3b. Apply target / stop / deadline; update live P&L (futures) ────────
+    for pos_id, pos in list(future_positions.items()):
+        price = future_prices.get(pos_id)
+        if price:
+            pos["live_pnl"] = round((price - pos["future_entry_price"]) * 2 * pos["qty"], 2)
+            pos["future_live_price"] = round(price, 2)
+        if not price:
+            continue
+
+        # _parse_utc, not raw strptime -- strptime with a literal "Z" in the
+        # format string does NOT attach real tzinfo, producing a naive
+        # datetime that throws "can't compare offset-naive and
+        # offset-aware datetimes" against _utcnow()'s aware result the
+        # moment a position's deadline is actually reached (confirmed live
+        # 2026-09-09: a real CVX position sat unclosed 20+ min past its
+        # deadline because of exactly this -- pre-existing bug, not
+        # introduced by the futures work, but copied into it before this
+        # fix since the pattern was copied from the original code).
+        deadline = _parse_utc(pos["deadline"])
+
+        if price >= pos["target_spot"]:
+            await _sigt_close_future_position(ib, pos_id, "target_hit")
+        elif price <= pos["stop_spot"]:
+            await _sigt_close_future_position(ib, pos_id, "stop_hit")
+        elif now_utc >= deadline:
+            await _sigt_close_future_position(ib, pos_id, "time_exit")
 
     _sigt_save_state()
 
@@ -19348,13 +20336,42 @@ async def st_close(pos_id: str):
     ib = state.get("ib")
     if not ib or not ib.isConnected():
         raise HTTPException(503, "IBKR not connected")
+    is_future = st["positions"][pos_id].get("instrument_type") == "future"
+    close_fn = _sigt_close_future_position if is_future else _sigt_close_position
     _sigt_log("MANUAL_CLOSE", st["positions"][pos_id]["ticker"], f"manual close {pos_id}")
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(
         None,
-        lambda: _run_in_streaming_loop(_sigt_close_position(ib, pos_id, "manual_close"), timeout=60)
+        lambda: _run_in_streaming_loop(close_fn(ib, pos_id, "manual_close"), timeout=60)
     )
     return {"status": "closing", "pos_id": pos_id}
+
+
+class MNQEnterRequest(BaseModel):
+    qty: Optional[int] = None
+
+
+@app.post("/signal-trader/mnq/enter")
+async def st_mnq_enter(req: MNQEnterRequest):
+    """Manual/API-triggered MNQ futures entry (2026-09-09) -- no breakout-
+    scanner wiring in this version, per confirmed scope. Real margin-aware
+    sizing via ib.whatIfOrderAsync, gated through the same cro_cfo_capital_
+    budget every other strategy uses. See MNQ_FUTURES_CONFIG's own comment
+    for why this is long-only and manual-trigger-first."""
+    st = state["sig_trader"]
+    if not st["enabled"]:
+        raise HTTPException(400, "Signal Trader is disabled -- enable it first")
+    ib = state.get("ib")
+    if not ib or not ib.isConnected():
+        raise HTTPException(503, "IBKR not connected")
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(
+        None,
+        lambda: _run_in_streaming_loop(_sigt_enter_future_trade(ib, "MNQ", req.qty), timeout=60)
+    )
+    if not result.get("ok"):
+        raise HTTPException(400, result.get("reason", "entry failed"))
+    return result
 
 
 @app.post("/signal-trader/positions")
@@ -20771,13 +21788,16 @@ async def _fx_enter_trade(ib, pair: str) -> None:
         )
         try:
             con = sqlite3.connect(JOURNAL_DB_PATH)
+            # Real trade_journal schema -- pre-2026-09-10 this referenced
+            # columns (direction, entry_date, status) that don't exist, so
+            # every FX Trader journal write silently failed and no FX trade
+            # ever reached the P&L dashboard. Open = closed_at IS NULL.
             con.execute("""INSERT INTO trade_journal
-                (ticker, strategy_type, direction, qty, entry_price, entry_date, status, notes, is_paper)
-                VALUES (?,?,?,?,?,?,?,?,?)""",
-                (pair, "fx_trader", direction, qty, fill_px,
-                 datetime.now(_ZI("America/New_York")).strftime("%Y-%m-%d %H:%M:%S"), "open",
-                 f"sl={stop_px:.5f} tp={target_px:.5f} spread={spread_pips}p atr={atr14:.5f}",
-                 _is_paper()))
+                (opened_at, ticker, action, qty, entry_price, strategy_type, is_paper, notes)
+                VALUES (?,?,?,?,?,?,?,?)""",
+                (_utcnow().isoformat(), pair, direction, qty, fill_px,
+                 "fx_trader", _is_paper(),
+                 f"sl={stop_px:.5f} tp={target_px:.5f} spread={spread_pips}p atr={atr14:.5f}"))
             con.commit(); con.close()
         except Exception as je:
             log.warning("FX_TRADER journal insert: %s", je)
@@ -20843,10 +21863,12 @@ async def _fx_close_position(ib, pair: str, reason: str) -> None:
         )
         try:
             con = sqlite3.connect(JOURNAL_DB_PATH)
-            con.execute("""UPDATE trade_journal SET exit_price=?, pnl=?, status=?, notes=notes||?
-                WHERE ticker=? AND strategy_type='fx_trader' AND status='open'
-                ORDER BY rowid DESC LIMIT 1""",
-                (close_px, pnl_usd, "closed",
+            con.execute("""UPDATE trade_journal SET
+                closed_at=?, exit_price=?, pnl=?, win=?, exit_reason=?, notes=COALESCE(notes,'')||?
+                WHERE id = (SELECT id FROM trade_journal
+                            WHERE ticker=? AND strategy_type='fx_trader' AND closed_at IS NULL
+                            ORDER BY id DESC LIMIT 1)""",
+                (_utcnow().isoformat(), close_px, pnl_usd, 1 if pnl_usd > 0 else 0, reason,
                  f" | exit={reason} pips={pips_pnl:+.1f} pnl=${pnl_usd:+.2f}", pair))
             con.commit(); con.close()
         except Exception as je:
@@ -20913,10 +21935,12 @@ async def _fx_monitor_coro(ib) -> None:
             _fx_log("CLOSED", pair, f"{reason} via OCA  pips={pips:+.1f}  pnl=${pnl:+.2f}")
             try:
                 con = sqlite3.connect(JOURNAL_DB_PATH)
-                con.execute("""UPDATE trade_journal SET exit_price=?, pnl=?, status=?, notes=notes||?
-                    WHERE ticker=? AND strategy_type='fx_trader' AND status='open'
-                    ORDER BY rowid DESC LIMIT 1""",
-                    (lp, pnl, "closed",
+                con.execute("""UPDATE trade_journal SET
+                    closed_at=?, exit_price=?, pnl=?, win=?, exit_reason=?, notes=COALESCE(notes,'')||?
+                    WHERE id = (SELECT id FROM trade_journal
+                                WHERE ticker=? AND strategy_type='fx_trader' AND closed_at IS NULL
+                                ORDER BY id DESC LIMIT 1)""",
+                    (_utcnow().isoformat(), lp, pnl, 1 if pnl > 0 else 0, reason,
                      f" | exit={reason} pips={pips:+.1f} pnl=${pnl:+.2f}", pair))
                 con.commit(); con.close()
             except Exception as je:
@@ -21337,6 +22361,7 @@ INDEPENDENT_TRADER_TASK_NAMES = {
     "butterfly_iwm": "IBKR-IWMButterflyWindow",
     "goog_condor":   "IBKR-GOOGCondorMonday",
     "safe_income":   "IBKR-SafeIncomeTrader",
+    "chartexpert":   "IBKR-ChartExpertAutoTrader",
 }
 
 
@@ -21399,6 +22424,24 @@ _ALPACA_0DTE_ROW_FILTER = {
 
 
 def _open_positions_for_row(row_id: str) -> list:
+    if row_id == "chartexpert":
+        try:
+            with open("chartexpert_shadow_state.json") as f:
+                positions = json.load(f).get("open", {})
+        except Exception:
+            return []
+        return [
+            {
+                "pos_id": ticker,
+                "ticker": ticker,
+                "entry_time": p.get("signal_time"),
+                "summary": f"{'SHADOW' if p.get('shadow', True) else 'LIVE'} {p.get('strike')}C exp {p.get('expiry')} -- "
+                           f"bought (simulated) @ ${p.get('option_entry_ask'):.2f}, up-prob {p.get('up_pct')}%, "
+                           f"underlying entry ${p.get('underlying_entry'):.2f} / high ${p.get('high_water_mark'):.2f} "
+                           f"(0.5% trailing stop)",
+            }
+            for ticker, p in positions.items()
+        ]
     if row_id == "safe_income":
         try:
             with open("safe_income_auto_state.json") as f:
@@ -21466,6 +22509,7 @@ async def independent_traders_status():
         ("butterfly_iwm", "Butterflies (IWM)", "butterfly_iwm", None, None),
         ("goog_condor", "GOOG Condor", "goog_condor", None, None),
         ("safe_income", "Safe Income Trader", "safe_income", None, None),
+        ("chartexpert", "Chartexpert Trade (Shadow)", "chartexpert", None, None),
     ]:
         task_name = INDEPENDENT_TRADER_TASK_NAMES[task_key]
         info = tasks_info.get(task_name, {})

@@ -174,22 +174,59 @@ def model_trade(spot: float) -> dict:
         from datetime import date as _date
         chains = ib.reqSecDefOptParams(TICKER, "", "STK",
                                         ib.qualifyContracts(Stock(TICKER, "SMART", "USD"))[0].conId)
-        chain = next((c for c in chains if c.exchange == "SMART"), chains[0])
+        # NFLX carries a stale corporate-action-adjusted option class
+        # ("2NFLX") alongside the standard "NFLX" class. The adjusted one
+        # sorts first in the SMART list but only lists a single stub
+        # expiration/strike, which made the 25-45 DTE search fail and the
+        # old sorted(...)[2] fallback IndexError on a 1-element list. Pick
+        # the standard class by trading-class name, else whichever SMART
+        # chain actually has a populated expiration list.
+        smart_chains = [c for c in chains if c.exchange == "SMART"]
+        chain = next((c for c in smart_chains if c.tradingClass == TICKER), None)
+        if chain is None:
+            chain = max(smart_chains or chains, key=lambda c: len(c.expirations))
         today = _date.today()
-        expiry = None
-        for e in sorted(chain.expirations):
-            dte = (datetime.strptime(e, "%Y%m%d").date() - today).days
-            if 25 <= dte <= 45:
-                expiry = e
-                break
-        expiry = expiry or sorted(chain.expirations)[2]
+        dated = [(e, datetime.strptime(e, "%Y%m%d").date()) for e in sorted(chain.expirations)]
+        dated = [(e, d, (d - today).days) for e, d in dated]
+        # Prefer a standard 3rd-Friday monthly (fullest, most liquid strike
+        # ladder) 20-55 DTE; else the expiry nearest ~35 DTE within 10-70;
+        # else clamp to an early one. chain.strikes is a flat UNION across
+        # every expiry -- weeklies and monthlies list different strike
+        # granularities (NFLX weeklies carry whole-dollar strikes, the
+        # monthly carries the half-dollar ones), so the chosen strike must
+        # still be verified against the specific expiry below.
+        monthlies = [e for e, d, dte in dated
+                     if d.weekday() == 4 and 15 <= d.day <= 21 and 20 <= dte <= 55]
+        if monthlies:
+            expiry = monthlies[0]
+        else:
+            windowed = [(e, dte) for e, d, dte in dated if 10 <= dte <= 70]
+            expiry = min(windowed, key=lambda x: abs(x[1] - 35))[0] if windowed else None
+        if expiry is None and dated:
+            expiry = dated[min(2, len(dated) - 1)][0]
+        if expiry is None:
+            return {"error": "no option expirations listed for NFLX"}
         expiry_alp = f"{expiry[:4]}-{expiry[4:6]}-{expiry[6:8]}"
+
+        def listed_strike(target, candidates):
+            """Nearest strike to `target` that has a real listed contract for
+            THIS expiry (chain.strikes is a cross-expiry union, so a raw
+            nearest-match can pick a strike this expiry doesn't carry)."""
+            for s in sorted(candidates, key=lambda s: abs(s - target))[:16]:
+                q = ib.qualifyContracts(Option(TICKER, expiry, s, "P", "SMART"))
+                if q and q[0].conId:
+                    return s
+            return None
 
         real_strikes = sorted(chain.strikes)
         target_short = spot * (1 - SHORT_OTM_PCT)
-        short_k = min(real_strikes, key=lambda s: abs(s - target_short))
+        short_k = listed_strike(target_short, real_strikes)
+        if short_k is None:
+            return {"error": f"no listed short-leg strike near {target_short:.1f} for {expiry}"}
         target_long = short_k - WIDTH
-        long_k = min([s for s in real_strikes if s < short_k], key=lambda s: abs(s - target_long))
+        long_k = listed_strike(target_long, [s for s in real_strikes if s < short_k])
+        if long_k is None:
+            return {"error": f"no listed long-leg strike near {target_long:.1f} for {expiry}"}
 
         long_q = get_quote(ib, Option(TICKER, expiry, long_k, "P", "SMART"))
         short_q = get_quote(ib, Option(TICKER, expiry, short_k, "P", "SMART"))
@@ -212,12 +249,17 @@ def model_trade(spot: float) -> dict:
     long_sym, short_sym = by_strike[long_k].symbol, by_strike[short_k].symbol
 
     credit = round(short_limit - long_limit, 2)
+    # Report the ACTUAL width (short_k - long_k), not the WIDTH target -- the
+    # chosen expiry's strike ladder may not offer an exact 2-wide pair (the
+    # Oct monthly near this level is 2.5 apart), and max risk must reflect
+    # the spread actually being placed, not the intended one.
+    actual_width = round(short_k - long_k, 2)
     return {
         "expiry": expiry_alp, "short_strike": short_k, "long_strike": long_k,
         "long_symbol": long_sym, "short_symbol": short_sym,
         "long_limit": long_limit, "short_limit": short_limit,
-        "target_credit": credit, "width": WIDTH,
-        "max_risk_per_contract": round(WIDTH * 100 - credit * 100, 2),
+        "target_credit": credit, "width": actual_width, "target_width": WIDTH,
+        "max_risk_per_contract": round(actual_width * 100 - credit * 100, 2),
     }
 
 
@@ -266,7 +308,13 @@ def fire_trade(modeled: dict) -> dict:
             break
 
     return {
-        "expiry": expiry_alp, "short_strike": short_k, "long_strike": long_k,
+        # pull identifiers from `modeled` -- expiry_alp/short_k/long_k are
+        # locals of model_trade() and were never in scope here, so a
+        # successful fill used to NameError right after the orders were
+        # already live at Alpaca (main() then reported "fire failed" while a
+        # real position was open).
+        "expiry": modeled["expiry"], "short_strike": modeled["short_strike"],
+        "long_strike": modeled["long_strike"],
         "long_filled": filled, "short_filled": short_filled,
         "long_order_id": str(long_order.id), "short_order_id": str(short_order.id),
     }

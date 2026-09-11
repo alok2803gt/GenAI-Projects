@@ -40,6 +40,7 @@ any existing task of the same name rather than erroring or duplicating.
 
 $py = "C:\Users\AlokD\AppData\Local\Programs\Python\Python311\python.exe"
 $backendDir = "C:\Projects\GenAI-Projects\ibkr_trader\backend"
+$frontendDir = "C:\Projects\GenAI-Projects\ibkr_trader\frontend"
 $gexScript = "C:\Users\AlokD\.claude\skills\gex-vex-calculator\calc_gex_vex.py"
 $weekdays = @('Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday')
 
@@ -144,22 +145,31 @@ Register-ScheduledTask -TaskName "IBKR-BreakoutShadowFilter" -Action $action13 -
     -Description "Research infra (breakout_research/), NOT part of the live trading system -- read-only against breakout_scanner.py's real alert_history table, never writes to it, never touches breakout_scanner.py or its config. Tags each new real alert with a 5-level quality tier (AVOID / NEUTRAL / PREFER-LOW / PREFER-MID / PREFER-HIGH -- see RESEARCH_LOG.md Iterations 4+7) using pct_b/RSI/vol_ratio from alert_history plus ADX/distance-from-52-week-high computed in real time via yfinance (not live-scanner columns). AVOID validated against 537 real live PRE-BREAKOUT alerts (46.8%->45.7% win rate/-0.09%->-0.37% avg by +5d vs the rest). PREFER-HIGH/MID/LOW sub-ranking validated on the 2.5y gate-accurate offline backtest (monotonic on ret_3d/ret_5d, PREFER-LOW real and negative -- worse than NEUTRAL). Logs every tier to shadow_filter_log.csv for ongoing live out-of-sample validation. Sends ONE Telegram digest per run (never one per alert) for PREFER-HIGH only, per CEO request 2026-08-25 -- every message states plainly this is a research tier, not a trade signal. No trading, no gating -- runs alongside the real scanner, doesn't feed back into it." -Force | Out-Null
 
 Write-Host "Creating IBKR-SPYButterflyFixed (daily weekdays 9:45am) -- PLACES REAL TRADES..."
-$action14 = New-ScheduledTaskAction -Execute $py -Argument "alpaca_0dte_butterfly_trader.py --ticker spy --entry-mode fixed --fire --max-risk-override 500" -WorkingDirectory $backendDir
+# Routed through run_butterfly_entry.ps1 (added 2026-09-09) rather than
+# calling python.exe directly -- Task Scheduler doesn't capture a task's
+# own console output, and this script has several distinct real
+# sys.exit(1) paths (CRO/CFO cap rejection, non-positive debit, entry
+# incomplete, near-S/R gate). Added after IBKR-SPYButterflyFixed exited 1
+# on 2026-09-08 with no resulting position and no way to know why. The
+# wrapper captures stdout/stderr to crash_logs/ and sends a Telegram alert
+# with the tail on any non-zero exit -- a real failure no longer goes
+# unnoticed until someone happens to check.
+$action14 = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$backendDir\run_butterfly_entry.ps1`" -Ticker spy -EntryMode fixed -TaskLabel `"SPY Fixed`"" -WorkingDirectory $backendDir
 $trigger14 = New-ScheduledTaskTrigger -Weekly -DaysOfWeek $weekdays -At "9:45AM"
 Register-ScheduledTask -TaskName "IBKR-SPYButterflyFixed" -Action $action14 -Trigger $trigger14 -Settings $settings `
-    -Description "SPY 0DTE long call butterfly, wing_step=4, single near-S/R check at 9:45 ET (real backtest 2026-09-02: SPY specifically is the strongest ticker under this fixed-check design -- window-scan tested NEGATIVE for SPY, -`$7.36/contract, which is why SPY stays on its own fixed check while QQQ/IWM use window-scan instead). Skips the day entirely (exit code 0, not an error) if the 9:45 spot isn't within 0.3% of the prior day's real high/low. Real trades -- CRO/CFO pre-trade review runs before every order. Alpaca auto-closes the position at 15:45 ET on its own (confirmed live 2026-09-02); the script verifies that rather than racing it, only manually closing as a fallback if the position is unexpectedly still open past 15:47." -Force | Out-Null
+    -Description "SPY 0DTE long call butterfly, wing_step=4, single near-S/R check at 9:45 ET (real backtest 2026-09-02: SPY specifically is the strongest ticker under this fixed-check design -- window-scan tested NEGATIVE for SPY, -`$7.36/contract, which is why SPY stays on its own fixed check while QQQ/IWM use window-scan instead). Skips the day entirely (exit code 0, not an error) if the 9:45 spot isn't within 0.3% of the prior day's real high/low. Real trades -- CRO/CFO pre-trade review runs before every order. Alpaca auto-closes the position at 15:45 ET on its own (confirmed live 2026-09-02); the script verifies that rather than racing it, only manually closing as a fallback if the position is unexpectedly still open past 15:47. Runs via run_butterfly_entry.ps1 (2026-09-09) for real stdout/stderr capture + failure alerting -- see that script's own header for why." -Force | Out-Null
 
 Write-Host "Creating IBKR-QQQButterflyWindow (daily weekdays 9:35am) -- PLACES REAL TRADES..."
-$action15 = New-ScheduledTaskAction -Execute $py -Argument "alpaca_0dte_butterfly_trader.py --ticker qqq --entry-mode window --fire --max-risk-override 500" -WorkingDirectory $backendDir
+$action15 = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$backendDir\run_butterfly_entry.ps1`" -Ticker qqq -EntryMode window -TaskLabel `"QQQ Window`"" -WorkingDirectory $backendDir
 $trigger15 = New-ScheduledTaskTrigger -Weekly -DaysOfWeek $weekdays -At "9:35AM"
 Register-ScheduledTask -TaskName "IBKR-QQQButterflyWindow" -Action $action15 -Trigger $trigger15 -Settings $settings `
-    -Description "QQQ 0DTE long call butterfly, wing_step=4, window-scan entry -- polls every 30s from launch until 10:00 ET for a near-S/R trigger (0.3% of prior day's real high/low), entering the moment it first fires. Real backtest 2026-09-02: this design beats a fixed-9:45 check for QQQ specifically (+`$19.49/contract, 54.1% win vs the fixed check's weaker number). Skips the day (exit code 0) if the window closes with no trigger. Real trades -- CRO/CFO pre-trade review runs before every order. Alpaca auto-closes at 15:45 ET on its own; the script verifies rather than races it." -Force | Out-Null
+    -Description "QQQ 0DTE long call butterfly, wing_step=4, window-scan entry -- polls every 30s from launch until 10:00 ET for a near-S/R trigger (0.3% of prior day's real high/low), entering the moment it first fires. Real backtest 2026-09-02: this design beats a fixed-9:45 check for QQQ specifically (+`$19.49/contract, 54.1% win vs the fixed check's weaker number). Skips the day (exit code 0) if the window closes with no trigger. Real trades -- CRO/CFO pre-trade review runs before every order. Alpaca auto-closes at 15:45 ET on its own; the script verifies rather than races it. Runs via run_butterfly_entry.ps1 (2026-09-09) for real stdout/stderr capture + failure alerting -- see that script's own header for why." -Force | Out-Null
 
 Write-Host "Creating IBKR-IWMButterflyWindow (daily weekdays 9:35am) -- PLACES REAL TRADES..."
-$action16 = New-ScheduledTaskAction -Execute $py -Argument "alpaca_0dte_butterfly_trader.py --ticker iwm --entry-mode window --fire --max-risk-override 500" -WorkingDirectory $backendDir
+$action16 = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$backendDir\run_butterfly_entry.ps1`" -Ticker iwm -EntryMode window -TaskLabel `"IWM Window`"" -WorkingDirectory $backendDir
 $trigger16 = New-ScheduledTaskTrigger -Weekly -DaysOfWeek $weekdays -At "9:35AM"
 Register-ScheduledTask -TaskName "IBKR-IWMButterflyWindow" -Action $action16 -Trigger $trigger16 -Settings $settings `
-    -Description "IWM 0DTE long call butterfly, wing_step=4, window-scan entry -- same design as IBKR-QQQButterflyWindow. Real backtest 2026-09-02: IWM was the STRONGEST ticker under the window-scan design of all three (+`$39.18/contract, 73.5% win, on n=34 -- a real but still relatively thin sample). Skips the day (exit code 0) if the window closes with no trigger. Real trades -- CRO/CFO pre-trade review runs before every order. Alpaca auto-closes at 15:45 ET on its own; the script verifies rather than races it." -Force | Out-Null
+    -Description "IWM 0DTE long call butterfly, wing_step=4, window-scan entry -- same design as IBKR-QQQButterflyWindow. Real backtest 2026-09-02: IWM was the STRONGEST ticker under the window-scan design of all three (+`$39.18/contract, 73.5% win, on n=34 -- a real but still relatively thin sample). Skips the day (exit code 0) if the window closes with no trigger. Real trades -- CRO/CFO pre-trade review runs before every order. Alpaca auto-closes at 15:45 ET on its own; the script verifies rather than races it. Runs via run_butterfly_entry.ps1 (2026-09-09) for real stdout/stderr capture + failure alerting -- see that script's own header for why." -Force | Out-Null
 
 Write-Host "Creating IBKR-QQQButterflyBabysitter (every 10min around the clock; script self-gates to weekday 9:30-16:00 ET)..."
 $action17 = New-ScheduledTaskAction -Execute $py -Argument "qqq_butterfly_babysitter.py" -WorkingDirectory $backendDir
@@ -207,14 +217,16 @@ $alwaysOn = @(
     @{ Name = "IBKR-AshleyExecutorWatchdog";   Script = "run_ashleyklieu_trigger_executor.ps1"; Desc = "At-logon launch of run_ashleyklieu_trigger_executor.ps1, which runs ashleyklieu_trigger_executor.py (price-zone-triggered entry/exit execution on Ashley's signals) with auto-restart on crash." }
     @{ Name = "IBKR-BreakoutScannerWatchdog";  Script = "run_scanner.ps1";                      Desc = "At-logon launch of run_scanner.ps1, which runs breakout_scanner.py (standalone breakout-alert scanner) with auto-restart on crash." }
     @{ Name = "IBKR-SectorCatalystScannerWatchdog"; Script = "run_sector_catalyst_scanner.ps1"; Desc = "At-logon launch of run_sector_catalyst_scanner.ps1, which runs sector_catalyst_scanner.py (Memory/Storage laggard-catchup alert scanner, validated 2026-09-08 -- alert-only, no order placement) with auto-restart on crash." }
+    @{ Name = "IBKR-FrontendWatchdog";         Script = "run_frontend.ps1"; Dir = $frontendDir; Desc = "At-logon launch of run_frontend.ps1, which serves index.html on port 8001 (python -m http.server) with auto-restart on crash. Added 2026-09-10 -- this task never previously existed AND run_frontend.ps1 had a non-ASCII (em-dash) parse bug under Windows PowerShell 5.1, so the frontend had zero crash-recovery." }
 )
 
 foreach ($p in $alwaysOn) {
-    $scriptPath = Join-Path $backendDir $p.Script
+    $taskDir = if ($p.ContainsKey('Dir')) { $p.Dir } else { $backendDir }
+    $scriptPath = Join-Path $taskDir $p.Script
     Write-Host "Creating $($p.Name) (at logon)..."
     $action = New-ScheduledTaskAction -Execute "powershell.exe" `
         -Argument "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPath`"" `
-        -WorkingDirectory $backendDir
+        -WorkingDirectory $taskDir
     $trigger = New-ScheduledTaskTrigger -AtLogOn -User $currentUser
     Register-ScheduledTask -TaskName $p.Name -Action $action -Trigger $trigger -Settings $alwaysOnSettings `
         -Description $p.Desc -Force | Out-Null

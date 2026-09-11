@@ -96,3 +96,20 @@ fired-days across 5 tickers -- 0 mismatches. Sends a real Telegram alert
 with the actual OHLC levels and the backtested plan (enter next open, hold
 5 trading days) for manual review -- places no orders, matching the CEO's
 stated preference for this class of finding.
+
+## Live forward-return scoring -- harami_daily_forward_performance.py (2026-09-10)
+
+The scanner logs `harami_scanner_alert` to oversight_log.jsonl but never
+scores its own signals. This script does: it parses every real fired
+signal, replays it against real subsequent daily bars using the EXACT
+entry/exit convention from harami_backtest.py (enter Open[i+1], exit
+Close[i+1+hold]), and tracks 3/5/10-day-hold forward return vs two
+baselines computed as-of each signal with no lookahead --
+  - matched: that ticker's mean fwd return on trailing days it was also
+    below both SMA20 and SMA50 (reproduces the backtest's +0.486%), and
+  - plain: its unconditional fwd return over the same trailing window.
+Incremental persist to harami_daily_performance_log.csv (gitignored),
+recomputes only new/"pending" rows -- safe to re-run weekly, sample grows.
+Math sanity-checked against hand calc (exact match). As of build: 3 live
+signals (ISRG 9/9, LMT 9/10, RTX 9/10), all still mid-hold -- nothing to
+conclude yet, by design.

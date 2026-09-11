@@ -722,6 +722,57 @@ async def spy_condor_close(pos_id: str):
     return {"status": "closing", "pos_id": pos_id}
 
 
+@app.post("/reconcile")
+async def spy_condor_reconcile():
+    """On-demand reconciliation against real IBKR positions -- called by
+    main.py's central auto-correcting engine (2026-09-10). All 4 legs
+    absent from IBKR -> mark the record externally closed. Some legs
+    present -> alert (never auto-close a partial condor). A closed_today
+    record whose legs IBKR still holds -> alert (phantom close)."""
+    corrections: list = []
+    alerts: list = []
+    if not _ib or not _ib.isConnected():
+        return {"corrections": corrections, "alerts": ["IBKR not connected"]}
+    try:
+        held_conids = {p.contract.conId for p in _ib.positions() if p.position != 0}
+        for pos_id, pos in list(sp["positions"].items()):
+            if pos.get("phase") not in ("open", None):
+                continue
+            leg_conids = [c for c in (pos.get("conids") or {}).values() if c]
+            present = [c for c in leg_conids if c in held_conids]
+            if leg_conids and not present:
+                sp.setdefault("closed_today", []).append({
+                    "pos_id": pos_id, "date": pos.get("date"), "expiry": pos.get("expiry"),
+                    "short_put": pos.get("short_put"), "short_call": pos.get("short_call"),
+                    "net_credit": pos.get("net_credit"), "close_cost": None,
+                    "pnl": None, "pnl_pct": None, "win": None,
+                    "exit_reason": "reconcile_externally_closed",
+                })
+                sp["positions"].pop(pos_id, None)
+                corrections.append(f"externally closed {pos_id} -- all 4 legs absent from IBKR")
+                _spy_log("RECONCILE", f"{pos_id} externally closed -- all legs gone from IBKR")
+                notify(f"SPY condor reconcile: {pos_id} open in records but all legs flat at IBKR -- marked closed.")
+                try:
+                    con = sqlite3.connect(JOURNAL_DB_PATH, check_same_thread=False)
+                    con.execute("""UPDATE trade_journal SET
+                        closed_at=?, exit_reason='reconcile_externally_closed', win=0
+                        WHERE id = (SELECT id FROM trade_journal
+                                    WHERE ticker='SPY' AND strategy_type='spy_weekly_condor' AND closed_at IS NULL
+                                    ORDER BY id DESC LIMIT 1)""", (datetime.now(timezone.utc).isoformat(),))
+                    con.commit(); con.close()
+                except Exception:
+                    pass
+            elif leg_conids and len(present) < len(leg_conids):
+                alerts.append(f"PARTIAL LEGS: {pos_id} -- {len(present)}/{len(leg_conids)} legs at IBKR (not auto-closing)")
+        # phantom-close detection for closed condors is skipped here -- the closed
+        # record doesn't retain leg conids; main.py's engine handles the general case.
+        if corrections:
+            _spy_save_state()
+    except Exception as e:
+        alerts.append(f"reconcile error: {e}")
+    return {"corrections": corrections, "alerts": alerts}
+
+
 @app.post("/spy-condor/enter-now")
 async def spy_condor_enter_now():
     """Manual override: quote and (if it passes review) enter a SPY weekly

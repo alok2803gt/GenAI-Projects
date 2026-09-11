@@ -87,8 +87,13 @@ ibkr_trader/backend/*_baseline.json
 ibkr_trader/backend/*_candidates.json
 ibkr_trader/backend/schedules/session_schedules.json
 ibkr_trader/backend/chart_alerts.json
+ibkr_trader/backend/reconciliation_config.json
 ibkr_trader/backend/harami_scanner_state.json
 ibkr_trader/backend/sector_catalyst_scanner_state.json
+ibkr_trader/backend/candlestick_pattern_research/harami_1m_performance_log.csv
+ibkr_trader/backend/candlestick_pattern_research/harami_daily_performance_log.csv
+ibkr_trader/backend/chartexpert_shots/
+ibkr_trader/backend/chartexpert_shadow_trades.jsonl
 ibkr_trader/backend/ashley_signal_trades.json
 ibkr_trader/backend/ashleyklieu_contracts_override.json
 ibkr_trader/backend/ashleyklieu_fired_today.json

@@ -6896,6 +6896,112 @@ function SigTraderChart({ setups, positions }) {
   );
 }
 
+// ── Charts Tab ─────────────────────────────────────────────────────────────
+// Built 2026-09-11 for the chartexpert screenshot->analysis->Telegram pipeline:
+// dedicated, always-visible 1-min candle charts for SPY, QQQ, MNQ (this
+// account's futures instrument -- there is no live-data path for full-size
+// NQ) that stay fully rendered (no click-to-select) so a headless screenshot
+// of each #chart-panel-<TICKER> div is enough on its own for a chart-reading
+// analysis, without any interaction. Reuses the exact SigTraderChart data
+// pipe (POST /add_ticker_1m + GET /bars-1m/<ticker>) and the same
+// CandleChart component (candles + volume + SMA20/EMA9/RSI) rather than
+// building a second charting stack.
+const CHART_TAB_SYMBOLS = [
+  { ticker: "SPY", label: "SPY" },
+  { ticker: "QQQ", label: "QQQ" },
+  { ticker: "MNQ", label: "MNQ (Micro E-mini Nasdaq futures)" },
+];
+
+function ChartsTab() {
+  const [barsBySymbol, setBarsBySymbol] = useState({});
+  const [loading, setLoading]           = useState({});
+  const subscribedRef = useRef(new Set());
+
+  const ensureSubscribed = useCallback(async (ticker) => {
+    if (subscribedRef.current.has(ticker)) return;
+    subscribedRef.current.add(ticker);
+    try {
+      await apiFetch("/add_ticker_1m", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ticker }),
+      });
+    } catch (_) {}
+  }, []);
+
+  const loadBars = useCallback(async (ticker) => {
+    setLoading(prev => ({ ...prev, [ticker]: true }));
+    try {
+      const b = await apiFetch(`/bars-1m/${ticker}?limit=240`);
+      setBarsBySymbol(prev => ({ ...prev, [ticker]: b || [] }));
+    } catch (_) {
+      setBarsBySymbol(prev => ({ ...prev, [ticker]: prev[ticker] || [] }));
+    } finally {
+      setLoading(prev => ({ ...prev, [ticker]: false }));
+    }
+  }, []);
+
+  useEffect(() => {
+    CHART_TAB_SYMBOLS.forEach(s => { ensureSubscribed(s.ticker); loadBars(s.ticker); });
+    // A never-before-subscribed ticker needs ~10s for the streaming loop to
+    // pick up the /add_ticker_1m queue entry and seed real bars (same delay
+    // SigTraderChart accounts for) -- retry once after that window.
+    const retry = setTimeout(() => CHART_TAB_SYMBOLS.forEach(s => loadBars(s.ticker)), 12000);
+    const poll  = setInterval(() => CHART_TAB_SYMBOLS.forEach(s => loadBars(s.ticker)), 20000);
+    return () => { clearTimeout(retry); clearInterval(poll); };
+  }, [ensureSubscribed, loadBars]);
+
+  return (
+    <div>
+      <div style={{ ...sans, fontSize: 12, color: C.muted, marginBottom: 16 }}>
+        Live 1-min charts (candles, volume, SMA20/EMA9, RSI) for chart-reading analysis --
+        each panel below is designed to be screenshotted on its own for the chartexpert pipeline.
+      </div>
+      {CHART_TAB_SYMBOLS.map(s => {
+        const bars = barsBySymbol[s.ticker] || [];
+        const last = bars.length ? bars[bars.length - 1] : null;
+        const chg  = bars.length > 1 ? (+last.close - +bars[0].open) : null;
+        return (
+          <div key={s.ticker} id={`chart-panel-${s.ticker}`} style={{
+            marginBottom: 28, background: C.card, border: `1px solid ${C.border}`,
+            borderRadius: 8, padding: 16,
+          }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 10 }}>
+              <span style={{ ...mono, fontSize: 16, fontWeight: 700, color: C.text, letterSpacing: 0.5 }}>
+                {s.label}
+              </span>
+              {last && (
+                <span style={{ display: "flex", gap: 10, alignItems: "baseline" }}>
+                  <span style={{ ...mono, fontSize: 18, fontWeight: 700,
+                    color: chg == null ? C.text : chg >= 0 ? C.bull : C.bear }}>
+                    ${(+last.close).toFixed(2)}
+                  </span>
+                  {chg != null && (
+                    <span style={{ ...mono, fontSize: 12, color: chg >= 0 ? C.bull : C.bear }}>
+                      {chg >= 0 ? "+" : ""}{chg.toFixed(2)}
+                    </span>
+                  )}
+                </span>
+              )}
+            </div>
+            {bars.length < 5 ? (
+              <div style={{ ...sans, fontSize: 12, color: C.muted, padding: "48px 0", textAlign: "center" }}>
+                {loading[s.ticker] ? "Loading bars..." : "Waiting for live data (subscribing to 1m stream)..."}
+              </div>
+            ) : (
+              <CandleChart
+                bars={bars}
+                windowSize={120}
+                showVolume={true}
+                indicators={{ sma20: true, ema9: true, rsi: true }}
+              />
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 // ── Signal Trader Tab ─────────────────────────────────────────────────────────
 function SigTraderTab() {
   const [status,  setStatus]  = useState(null);
@@ -8638,6 +8744,7 @@ const INDEPENDENT_TRADERS = [
   { id:"butterfly_iwm",     label:"Butterfly — IWM", strategyTypes:["BUTTERFLY_IWM"] },
   { id:"goog_condor",       label:"GOOG Condor",          strategyTypes:["GOOG_CONDOR"] },
   { id:"safe_income",       label:"Safe Income",          strategyTypes:["SAFE_INCOME"] },
+  { id:"chartexpert",       label:"Chartexpert Trade (Shadow)", strategyTypes:["CHARTEXPERT_SHADOW"] },
 ];
 
 function IndependentTradersTab() {
@@ -11626,6 +11733,7 @@ function App() {
       { id:"analystreports",label:"Analyst Reports"},
     ]},
     { id:"market",   label:"Market Data", tabs: [
+      { id:"charts",     label:"Charts"     },
       { id:"watchlist",  label:"Watchlist"  },
       { id:"tape",       label:"Live Tape"  },
       { id:"instflow",   label:"Inst. Flow" },
@@ -11747,6 +11855,7 @@ function App() {
         <div style={{display: tab==="universe"     ? "" : "none"}}><UniverseTab /></div>
         <div style={{display: tab==="decisions"    ? "" : "none"}}><DecisionsTab /></div>
         <div style={{display: tab==="technicals"   ? "" : "none"}}><TechnicalsTab /></div>
+        <div style={{display: tab==="charts"       ? "" : "none"}}><ChartsTab /></div>
         <div style={{display: tab==="watchlist"    ? "" : "none"}}><WatchlistTab /></div>
         <div style={{display: tab==="tape"         ? "" : "none"}}><TapeTab /></div>
         <div style={{display: tab==="instflow"     ? "" : "none"}}><InstFlowTab /></div>

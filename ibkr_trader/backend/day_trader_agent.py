@@ -1487,6 +1487,41 @@ async def day_trader_close(ticker: str):
     return {"status": "closing", "ticker": ticker, "order_id": closing_trade.order.orderId}
 
 
+@app.post("/reconcile")
+async def day_trader_reconcile():
+    """On-demand reconciliation of this agent's own state against real
+    IBKR positions -- called by main.py's central auto-correcting engine
+    (2026-09-10). External-close: a phase-1 position IBKR no longer holds
+    -> process the exit exactly as monitor_loop would. Phantom-close: a
+    record in closed_today that IBKR still holds -> alert (rare for a
+    same-day strategy; not auto-reopened here)."""
+    corrections: list = []
+    alerts: list = []
+    if not _ib or not _ib.isConnected():
+        return {"corrections": corrections, "alerts": ["IBKR not connected"]}
+    try:
+        for ticker, pos in list(dt["positions"].items()):
+            if pos.get("phase", 0) != 1:
+                continue
+            if ib_real_position_qty(_ib, ticker) <= 0:
+                closing = await ib_last_closing_fill(_ib, ticker)
+                exit_px = round(float(closing.execution.price), 4) if closing else (pos.get("stop_price") or pos.get("entry_price", 0))
+                await _handle_exit_fill(ticker, exit_px)
+                corrections.append(f"externally closed {ticker} @ {exit_px} (IBKR flat)")
+                dt_log("RECONCILE", ticker, f"externally closed @ {exit_px} -- IBKR no longer holds it")
+                notify(f"Day Trader reconcile: {ticker} was open in records but flat at IBKR -- closed @ {exit_px}.")
+        held = {p.contract.symbol for p in _ib.positions() if p.contract.secType == "STK" and p.position != 0}
+        for rec in dt.get("closed_today", []):
+            tk = rec.get("ticker")
+            if tk and tk in held and tk not in dt["positions"]:
+                alerts.append(f"PHANTOM CLOSE: {tk} in closed_today but IBKR still holds it -- needs manual review")
+        if corrections:
+            save_state()
+    except Exception as e:
+        alerts.append(f"reconcile error: {e}")
+    return {"corrections": corrections, "alerts": alerts}
+
+
 @app.get("/day-trader/goal")
 def day_trader_goal():
     cfg = dt["config"]
