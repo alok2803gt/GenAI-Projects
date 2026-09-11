@@ -245,6 +245,100 @@ def get_screener_candidates(tickers: str | None = None, timeout_s: int = 1800,
     return data.get("results", [])
 
 
+def journal_insert_closed(pos: dict, exit_price, pnl, exit_reason: str):
+    """Write a real trade_journal row for a resolved Safe Income position --
+    this strategy had NO journal writes at all before 2026-09-11 (found live:
+    a real position, NKE 33/32P entered 2026-09-03, had zero record anywhere
+    of ever closing -- see oversight_log for the incident). is_paper=0 --
+    this is real money, same convention as every other live strategy."""
+    import sqlite3
+    try:
+        con = sqlite3.connect(BACKEND_DIR / "trade_journal.db")
+        con.execute("""INSERT INTO trade_journal
+            (opened_at, closed_at, ticker, expiry, strike, right, action, qty,
+             entry_price, exit_price, exit_reason, pnl, win, strategy_type, is_paper, notes)
+            VALUES (?, ?, ?, ?, ?, ?, 'CREDIT_SPREAD', 1, ?, ?, ?, ?, ?, 'SAFE_INCOME', 0, ?)""",
+            (pos.get("entered_at"), datetime.now(timezone.utc).isoformat(), pos["ticker"],
+             pos["expiry"], pos["short_k"], pos["right"], pos.get("entry_credit"), exit_price,
+             exit_reason, pnl, 1 if (pnl or 0) > 0 else 0,
+             f"short {pos['short_k']}/long {pos['long_k']} {pos['right']}, hold-to-expiry"))
+        con.commit()
+        con.close()
+    except Exception as e:
+        print(f"  journal_insert_closed failed: {e}")
+
+
+def check_and_close_resolved_alpaca_positions(cfg: dict, state: dict) -> bool:
+    """Real gap fixed 2026-09-11: this script is entry-only by design (see
+    module docstring) and had ZERO mechanism to ever detect or record a
+    position closing, on either broker. Found live: NKE 33/32P (entered
+    2026-09-03, pre-dates the 2026-09-07 IBKR migration, still lives at
+    Alpaca) had the Independent Traders tab correctly showing "1 open" --
+    it's genuinely still open -- but there was no code path that would EVER
+    have noticed or recorded it closing when it eventually does.
+
+    This covers the legacy pre-migration Alpaca legs specifically (this
+    strategy places everything through IBKR since 2026-09-07 -- a NEW
+    IBKR-placed position is instead covered by the general reconciliation
+    engine in main.py, the same mechanism already covering Manual Trader,
+    chartexpert, and harami_daily). Returns True if state changed."""
+    changed = False
+    try:
+        from alpaca.trading.client import TradingClient
+        from alpaca.trading.requests import GetOrdersRequest
+        from alpaca.trading.enums import QueryOrderStatus
+        client = TradingClient(cfg["alpaca_api_key"], cfg["alpaca_secret_key"],
+                                paper=False, url_override=cfg.get("alpaca_base_url"))
+        held = {p.symbol for p in client.get_all_positions()}
+    except Exception as e:
+        print(f"  check_and_close_resolved_alpaca_positions: Alpaca fetch failed, skipping: {e}")
+        return False
+
+    for key, pos in list(state["positions"].items()):
+        short_sym = occ_symbol(pos["ticker"], pos["expiry"], pos["right"], pos["short_k"])
+        long_sym = occ_symbol(pos["ticker"], pos["expiry"], pos["right"], pos["long_k"])
+        if short_sym in held or long_sym in held:
+            continue  # still genuinely open at Alpaca
+
+        # Both legs gone -- try to find real closing fills (opposite side from
+        # entry, filled after entry) to compute a real P&L; fall back to a
+        # null-pnl record with a clear note rather than fabricating a number
+        # (a true worthless-expiration doesn't generate a Alpaca "order" fill
+        # at all, so "no closing order found" is the expected, common case,
+        # not a sign something went wrong).
+        exit_price, pnl, note = None, None, "no closing order found (consistent with worthless expiration/assignment -- real P&L not independently verified)"
+        try:
+            entry_dt = datetime.fromisoformat(pos["entered_at"])
+            short_req = GetOrdersRequest(status=QueryOrderStatus.CLOSED, symbols=[short_sym], limit=10)
+            long_req = GetOrdersRequest(status=QueryOrderStatus.CLOSED, symbols=[long_sym], limit=10)
+            short_closes = [o for o in client.get_orders(short_req)
+                            if o.filled_at and o.side.value.lower() == "buy" and o.filled_at > entry_dt]
+            long_closes = [o for o in client.get_orders(long_req)
+                           if o.filled_at and o.side.value.lower() == "sell" and o.filled_at > entry_dt]
+            if short_closes and long_closes:
+                short_buyback = float(short_closes[-1].filled_avg_price)
+                long_sale = float(long_closes[-1].filled_avg_price)
+                closing_debit = round(short_buyback - long_sale, 4)
+                pnl = round((pos["entry_credit"] - closing_debit) * 100 * QTY, 2)
+                exit_price = closing_debit
+                note = f"real closing fills found: bought back short @ {short_buyback}, sold long @ {long_sale}"
+        except Exception as e:
+            note = f"closing-fill lookup failed ({e}); real P&L not independently verified"
+
+        journal_insert_closed(pos, exit_price, pnl, "resolved_legacy_alpaca_position")
+        log_oversight(
+            f"safe_income_auto {pos['ticker']}: legacy Alpaca position resolved (legs no longer held). {note}",
+            f"trade_journal row written (pnl={'$'+format(pnl,'.2f') if pnl is not None else 'null'}), removed from open state.",
+            "check_and_close_resolved_alpaca_positions -- fixing the zero-exit-tracking gap found 2026-09-11.",
+            pnl_impact=pnl,
+        )
+        telegram(cfg, f"Safe Income: {pos['ticker']} legacy Alpaca position resolved. {note}"
+                      + (f" P&L: ${pnl:+.2f}" if pnl is not None else " P&L not independently verified -- please confirm in Alpaca."))
+        del state["positions"][key]
+        changed = True
+    return changed
+
+
 def existing_position_tickers(ib) -> set[str]:
     """Tickers with ANY currently-open IBKR option position -- this
     strategy's own or any other's. Avoids double-entry / unmonitored
@@ -376,6 +470,13 @@ def main():
 
     cfg = load_config()
     state = load_state()
+
+    # Runs before the market-hours/pause/candidate gates below so a resolved
+    # position gets recorded even on a run that otherwise does nothing --
+    # see check_and_close_resolved_alpaca_positions's docstring for why this
+    # exists (a real position had zero exit-tracking anywhere).
+    if check_and_close_resolved_alpaca_positions(cfg, state):
+        save_state(state)
 
     if PAUSE_FLAG.exists():
         print(f"PAUSED -- {PAUSE_FLAG} exists. Refusing to run until a human clears it.")
@@ -510,14 +611,34 @@ def main():
                 break
 
             real_credit = round(short_px - long_px, 2)
+            entered_at = datetime.now(timezone.utc).isoformat()
             entered.append({"ticker": ticker, "right": right, "short_k": cand["short_k"], "long_k": cand["long_k"],
                              "expiry": expiry, "credit": real_credit, "max_risk": cand["max_risk"]})
             state["positions"][f"{ticker}_{expiry}_{right}"] = {
                 "ticker": ticker, "right": right, "short_k": cand["short_k"], "long_k": cand["long_k"],
-                "expiry": expiry, "entry_credit": real_credit, "entered_at": datetime.now(timezone.utc).isoformat(),
-                "exit_rule": "hold_to_expiry",
+                "expiry": expiry, "entry_credit": real_credit, "entered_at": entered_at,
+                "exit_rule": "hold_to_expiry", "venue": "ibkr",
             }
             save_state(state)
+            # Real gap fixed 2026-09-11: entries never wrote a trade_journal
+            # row at all -- see check_and_close_resolved_alpaca_positions's
+            # docstring. This IBKR-placed leg is now also picked up by the
+            # general reconciliation engine (main.py _recon_iter_all_open /
+            # _recon_apply_close), which UPDATEs this same open row via
+            # _recon_journal_close when the legs disappear from IBKR.
+            try:
+                import sqlite3
+                con = sqlite3.connect(BACKEND_DIR / "trade_journal.db")
+                con.execute("""INSERT INTO trade_journal
+                    (opened_at, ticker, expiry, strike, right, action, qty,
+                     entry_price, strategy_type, is_paper, notes)
+                    VALUES (?, ?, ?, ?, ?, 'CREDIT_SPREAD', 1, ?, 'SAFE_INCOME', 0, ?)""",
+                    (entered_at, ticker, expiry, cand["short_k"], right, real_credit,
+                     f"short {cand['short_k']}/long {cand['long_k']} {right}, hold-to-expiry, max risk ${cand['max_risk']:.0f}"))
+                con.commit()
+                con.close()
+            except Exception as e:
+                print(f"  journal open-row insert failed: {e}")
             log_oversight(
                 f"safe_income_auto {ticker}: ENTERED {right} {cand['short_k']:.0f}/{cand['long_k']:.0f}, "
                 f"real credit ${real_credit:.2f}, max risk ${cand['max_risk']:.0f}",

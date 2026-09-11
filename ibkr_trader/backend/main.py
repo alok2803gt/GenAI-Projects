@@ -18791,6 +18791,22 @@ async def _ibkr_reconcile(ib, *, on_startup: bool = False) -> None:
                 if _ls:
                     mt_leg_syms.add(_ls)
 
+    # Safe Income Trader (safe_income_auto.py, standalone process): OCC-style
+    # leg symbols for its IBKR-venue positions -- without this, every real
+    # 2-leg credit spread it holds lands in "UNTRACKED OPTIONS". The one
+    # pre-2026-09-07-migration Alpaca-venue position is intentionally
+    # excluded (venue != "ibkr") -- it was never an IBKR position to claim.
+    try:
+        with open("safe_income_auto_state.json") as _sif:
+            _si_positions = json.load(_sif).get("positions", {})
+        for _p in _si_positions.values():
+            if _p.get("venue") != "ibkr":
+                continue
+            for _k in (_p.get("short_k"), _p.get("long_k")):
+                mt_leg_syms.add(f"{_p['ticker']}{_p['expiry'][2:]}{_p['right']}{int(round(_k*1000)):08d}".upper())
+    except Exception:
+        pass
+
     # Day Trader + Auto-trader + Stock-trader stocks: matched by symbol.
     # Day Trader runs as its own standalone process since 2026-08-27
     # (day_trader_agent.py) -- read its positions from the shared state
@@ -19094,6 +19110,30 @@ def _recon_iter_all_open():
                "symbols": [], "at_key": key, "n_legs": 1, "venue": "ibkr", "raw": p,
                "no_reopen": True}
 
+    # Safe Income Trader (safe_income_auto.py) -- standalone process, same
+    # reason day-trader/harami_daily need their own state files read here.
+    # Only the IBKR-venue positions (everything placed since the 2026-09-07
+    # Alpaca->IBKR migration) -- the one pre-migration legacy Alpaca position
+    # is covered by safe_income_auto.py's own check_and_close_resolved_
+    # alpaca_positions instead (added 2026-09-11 after a real position had
+    # zero exit-tracking anywhere on either venue). no_reopen: a phantom-
+    # close reopen would need real strike/expiry re-derivation this record
+    # doesn't need for the common case (external close), so keep it simple.
+    try:
+        with open("safe_income_auto_state.json") as f:
+            _si = json.load(f).get("positions", {})
+        for pid, p in _si.items():
+            if p.get("venue") != "ibkr":
+                continue
+            legs = [
+                f"{p['ticker']}{p['expiry'][2:]}{p['right']}{int(round(p['short_k']*1000)):08d}",
+                f"{p['ticker']}{p['expiry'][2:]}{p['right']}{int(round(p['long_k']*1000)):08d}",
+            ]
+            yield {"strategy": "safe_income", "pos_id": pid, "conids": [], "leg_symbols": legs,
+                   "symbols": [], "n_legs": 2, "venue": "ibkr", "raw": p, "no_reopen": True}
+    except Exception:
+        pass
+
     try:
         with open("alpaca_0dte_positions.json") as f:
             areg = json.load(f)
@@ -19209,6 +19249,24 @@ def _recon_apply_close(rec: dict) -> bool:
             if at.get("positions", {}).pop(pid, None) is None:
                 return False
             _at_save_state()
+            return True
+        if strat == "safe_income":
+            try:
+                with open("safe_income_auto_state.json") as f:
+                    _sist = json.load(f)
+            except Exception:
+                return False
+            p = _sist.get("positions", {}).pop(pid, None)
+            if p is None:
+                return False
+            with open("safe_income_auto_state.json", "w") as f:
+                json.dump(_sist, f, indent=2)
+            # Real P&L not derivable here (would need the same closing-fill
+            # lookback safe_income_auto.py's own Alpaca-venue check does) --
+            # _recon_journal_close correctly leaves pnl null rather than
+            # fabricating a number; UPDATEs the real open row this strategy
+            # now writes on entry (fixed 2026-09-11 alongside this).
+            _recon_journal_close("SAFE_INCOME", p.get("ticker"))
             return True
         if strat == "alpaca_registry":
             try:
@@ -22443,7 +22501,32 @@ _ALPACA_0DTE_ROW_FILTER = {
 }
 
 
+def _safe_fmt2(v) -> str:
+    """'{:.2f}'-format a possibly-missing/non-numeric value without raising --
+    confirmed live 2026-09-11: a single missing numeric field in one
+    strategy's state file (e.g. a partial write from an interrupted run)
+    used to 500 the ENTIRE /independent-traders/status endpoint via an
+    uncaught TypeError, blanking every row's visibility, not just the
+    broken one. Returns '?' instead of crashing."""
+    try:
+        return f"{float(v):.2f}"
+    except (TypeError, ValueError):
+        return "?"
+
+
 def _open_positions_for_row(row_id: str) -> list:
+    """Wraps the real per-row lookup so a bad/partial state file for ONE
+    strategy can never take down the whole /independent-traders/status
+    response for every other strategy -- same incident as _safe_fmt2
+    above, belt-and-suspenders at the call boundary too."""
+    try:
+        return _open_positions_for_row_impl(row_id)
+    except Exception as e:
+        log.warning("_open_positions_for_row(%s) failed: %s", row_id, e)
+        return []
+
+
+def _open_positions_for_row_impl(row_id: str) -> list:
     if row_id == "harami_daily":
         try:
             with open("harami_trader_state.json") as f:
@@ -22455,13 +22538,13 @@ def _open_positions_for_row(row_id: str) -> list:
             phase = p.get("phase")
             if phase in ("pending_entry",):
                 out.append({"pos_id": key, "ticker": p.get("ticker"), "entry_time": p.get("placed_at"),
-                           "summary": f"MOO BUY {p.get('qty')}x placed, awaiting fill (real order, expected ~${p.get('expected_spot'):.2f})"})
+                           "summary": f"MOO BUY {p.get('qty')}x placed, awaiting fill (real order, expected ~${_safe_fmt2(p.get('expected_spot'))})"})
             elif phase == "open":
                 out.append({"pos_id": key, "ticker": p.get("ticker"), "entry_time": p.get("entry_fill_date"),
-                           "summary": f"REAL: {p.get('qty')}x @ ${p.get('entry_price'):.2f}, exit planned {p.get('exit_date')} (5-day hold)"})
+                           "summary": f"REAL: {p.get('qty')}x @ ${_safe_fmt2(p.get('entry_price'))}, exit planned {p.get('exit_date')} (5-day hold)"})
             elif phase == "pending_exit":
                 out.append({"pos_id": key, "ticker": p.get("ticker"), "entry_time": p.get("entry_fill_date"),
-                           "summary": f"MOC SELL placed, awaiting fill (entry was ${p.get('entry_price'):.2f})"})
+                           "summary": f"MOC SELL placed, awaiting fill (entry was ${_safe_fmt2(p.get('entry_price'))})"})
         return out
     if row_id == "chartexpert":
         try:
@@ -22475,8 +22558,8 @@ def _open_positions_for_row(row_id: str) -> list:
                 "ticker": ticker,
                 "entry_time": p.get("signal_time"),
                 "summary": f"{'SHADOW' if p.get('shadow', True) else 'LIVE'} {p.get('strike')}C exp {p.get('expiry')} -- "
-                           f"bought (simulated) @ ${p.get('option_entry_ask'):.2f}, up-prob {p.get('up_pct')}%, "
-                           f"underlying entry ${p.get('underlying_entry'):.2f} / high ${p.get('high_water_mark'):.2f} "
+                           f"bought (simulated) @ ${_safe_fmt2(p.get('option_entry_ask'))}, up-prob {p.get('up_pct')}%, "
+                           f"underlying entry ${_safe_fmt2(p.get('underlying_entry'))} / high ${_safe_fmt2(p.get('high_water_mark'))} "
                            f"(0.5% trailing stop)",
             }
             for ticker, p in positions.items()

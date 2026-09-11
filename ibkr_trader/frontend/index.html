@@ -8744,7 +8744,7 @@ const INDEPENDENT_TRADERS = [
   { id:"butterfly_iwm",     label:"Butterfly — IWM", strategyTypes:["BUTTERFLY_IWM"] },
   { id:"goog_condor",       label:"GOOG Condor",          strategyTypes:["GOOG_CONDOR"] },
   { id:"safe_income",       label:"Safe Income",          strategyTypes:["SAFE_INCOME"] },
-  { id:"chartexpert",       label:"Chartexpert Trade (Shadow)", strategyTypes:["CHARTEXPERT_SHADOW"] },
+  { id:"chartexpert",       label:"Chartexpert Trade (Shadow)", strategyTypes:["CHARTEXPERT_SHADOW"], showPaper:true },
   { id:"harami_daily",      label:"Harami Daily (Live)",  strategyTypes:["HARAMI_DAILY"] },
 ];
 
@@ -8776,7 +8776,21 @@ function IndependentTradersTab() {
 
   const fmtWhen = (s) => {
     if (!s) return "—";
-    try { return new Date(s).toLocaleString("en-US", {month:"short", day:"numeric", hour:"numeric", minute:"2-digit"}); }
+    try {
+      // Real bug found 2026-09-11: a bare "YYYY-MM-DD" (no time -- several
+      // journal writers, e.g. Day Trader, only ever store a date) gets
+      // parsed by new Date() as UTC MIDNIGHT, then displayed in the
+      // browser's LOCAL timezone -- on this ET machine that renders as the
+      // PREVIOUS calendar day at a fabricated "8:00 PM" (confirmed live:
+      // every single Day Trader row showed 8:00 PM, one day early). Parse
+      // date-only strings as a local calendar date and don't invent a time
+      // that was never recorded.
+      if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {
+        const [y, m, d] = s.split("-").map(Number);
+        return new Date(y, m - 1, d).toLocaleDateString("en-US", {month:"short", day:"numeric"});
+      }
+      return new Date(s).toLocaleString("en-US", {month:"short", day:"numeric", hour:"numeric", minute:"2-digit"});
+    }
     catch (_) { return s; }
   };
 
@@ -8802,7 +8816,16 @@ function IndependentTradersTab() {
         {INDEPENDENT_TRADERS.map(def => {
           const row = byId[def.id] || {};
           const liveRow = live[def.id];
-          const rowTrades = trades.filter(t => def.strategyTypes.includes(t.strategy_type));
+          // Real bug found 2026-09-11: trades here is unfiltered by is_paper
+          // (pnl_dashboard's own closed_trades never excludes paper/model-
+          // training rows), so every row here was silently blending real
+          // fills with paper data of the SAME strategy_type -- Day Trader's
+          // displayed +$140.30/72 trades was actually 33 REAL trades at
+          // -$9.54 plus 39 paper rows at +$149.84, flipping the sign shown.
+          // Exclude paper rows everywhere except chartexpert, whose entire
+          // row IS the shadow/paper data by design (showPaper:true).
+          const rowTrades = trades.filter(t => def.strategyTypes.includes(t.strategy_type)
+                                              && (def.showPaper || !t.is_paper));
           const totalPnl = rowTrades.reduce((s,t) => s + (t.pnl || 0), 0);
           const wins = rowTrades.filter(t => (t.pnl||0) > 0).length;
           const isOpen = expanded === def.id;
