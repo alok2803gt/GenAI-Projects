@@ -40,6 +40,14 @@ def tg_send(token, chat_id, text):
     if not token or not chat_id:
         print("Telegram not configured")
         return
+    try:
+        sys.path.insert(0, str(BACKEND_DIR))
+        from telegram_alert_gate import alert_enabled
+        if not alert_enabled("condor_babysitters"):
+            print("Telegram alert category 'condor_babysitters' disabled in admin panel — skipping")
+            return
+    except Exception:
+        pass
     r = requests.post(
         f"https://api.telegram.org/bot{token}/sendMessage",
         json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},

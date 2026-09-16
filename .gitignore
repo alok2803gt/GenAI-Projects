@@ -88,6 +88,7 @@ ibkr_trader/backend/*_candidates.json
 ibkr_trader/backend/schedules/session_schedules.json
 ibkr_trader/backend/chart_alerts.json
 ibkr_trader/backend/reconciliation_config.json
+ibkr_trader/backend/telegram_alerts_config.json
 ibkr_trader/backend/harami_scanner_state.json
 ibkr_trader/backend/sector_catalyst_scanner_state.json
 ibkr_trader/backend/candlestick_pattern_research/harami_1m_performance_log.csv

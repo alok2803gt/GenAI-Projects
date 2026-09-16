@@ -11701,6 +11701,142 @@ function CommandPalette({ tabGroups, onNavigate }) {
   );
 }
 
+function TelegramAlertsAdminTab() {
+  const [categories, setCategories] = useState({});   // {key: {label, group}}
+  const [config,     setConfig]     = useState({});   // {key: bool}
+  const [loading,    setLoading]    = useState(true);
+  const [savingKey,  setSavingKey]  = useState(null);
+  const [error,      setError]      = useState(null);
+
+  const load = async () => {
+    try {
+      const r = await apiFetch("/telegram-alerts/config");
+      setCategories(r.categories || {});
+      setConfig(r.config || {});
+      setError(null);
+    } catch (e) {
+      setError(String(e));
+    }
+    setLoading(false);
+  };
+
+  useEffect(() => { load(); }, []);
+
+  const applyPatch = async (patch) => {
+    setConfig(prev => ({ ...prev, ...patch }));  // optimistic
+    try {
+      const r = await apiFetch("/telegram-alerts/config", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(patch),
+      });
+      setConfig(r.config || {});
+      setError(null);
+    } catch (e) {
+      setError(`Failed to save: ${e}`);
+      load();  // revert to real server state on failure
+    }
+  };
+
+  const toggle = async (key, next) => {
+    setSavingKey(key);
+    await applyPatch({ [key]: next });
+    setSavingKey(null);
+  };
+
+  const setGroup = (keys, next) => applyPatch(Object.fromEntries(keys.map(k => [k, next])));
+
+  if (loading) {
+    return <div style={{ ...sans, fontSize:12, color:"#64748b" }}>Loading alert config…</div>;
+  }
+
+  const groups = {};
+  Object.entries(categories).forEach(([key, meta]) => {
+    (groups[meta.group] = groups[meta.group] || []).push({ key, label: meta.label });
+  });
+
+  const totalOn = Object.keys(categories).filter(k => config[k] !== false).length;
+  const totalCount = Object.keys(categories).length;
+
+  return (
+    <div>
+      <div style={{ display:"flex", alignItems:"center", gap:12, marginBottom:6, flexWrap:"wrap" }}>
+        <div style={{ ...sans, fontSize:14, fontWeight:700, color:"#f1f5f9" }}>Telegram Alert Admin</div>
+        <div style={{ ...mono, fontSize:11, color:"#64748b" }}>
+          {totalOn}/{totalCount} categories enabled
+        </div>
+        <button onClick={load} style={{
+          ...sans, fontSize:11, padding:"3px 10px", borderRadius:6, marginLeft:"auto",
+          background:"#1e293b", color:"#94a3b8", border:"1px solid #334155", cursor:"pointer",
+        }}>Refresh</button>
+      </div>
+      <div style={{ ...sans, fontSize:11, color:"#64748b", marginBottom:16, lineHeight:1.6, maxWidth:720 }}>
+        Turn a category off to stop Telegram sends for just that alert type — everything else keeps
+        sending normally. Takes effect on the very next alert everywhere (backend and every standalone
+        trader/scanner/babysitter process), no restart needed.
+      </div>
+      {error && (
+        <div style={{ ...sans, fontSize:12, color:"#f87171", marginBottom:14, padding:"8px 12px", background:"#2d0b0b", borderRadius:6, border:"1px solid #7f1d1d" }}>
+          {error}
+        </div>
+      )}
+
+      {Object.entries(groups).map(([groupName, items]) => {
+        const keys = items.map(it => it.key);
+        const allOn  = keys.every(k => config[k] !== false);
+        const allOff = keys.every(k => config[k] === false);
+        return (
+          <div key={groupName} style={{ marginBottom:22 }}>
+            <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom:8 }}>
+              <div style={{ ...sans, fontSize:12, fontWeight:700, color:"#cbd5e1", textTransform:"uppercase", letterSpacing:0.5 }}>
+                {groupName}
+              </div>
+              <button onClick={() => setGroup(keys, true)} disabled={allOn} style={{
+                ...sans, fontSize:10, padding:"2px 9px", borderRadius:10, background:"transparent",
+                color: allOn ? "#334155" : "#4ade80", border:`1px solid ${allOn ? "#1e293b" : "#16a34a"}`,
+                cursor: allOn ? "default" : "pointer",
+              }}>All on</button>
+              <button onClick={() => setGroup(keys, false)} disabled={allOff} style={{
+                ...sans, fontSize:10, padding:"2px 9px", borderRadius:10, background:"transparent",
+                color: allOff ? "#334155" : "#f87171", border:`1px solid ${allOff ? "#1e293b" : "#dc2626"}`,
+                cursor: allOff ? "default" : "pointer",
+              }}>Mute all</button>
+            </div>
+            <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fill, minmax(280px, 1fr))", gap:8 }}>
+              {items.map(it => {
+                const on = config[it.key] !== false;
+                const saving = savingKey === it.key;
+                return (
+                  <label key={it.key} style={{
+                    display:"flex", alignItems:"center", gap:10, padding:"10px 12px", borderRadius:8,
+                    background: on ? "#0f1f14" : "#1e1416",
+                    border:`1px solid ${on ? "#16653499" : "#7f1d1d99"}`,
+                    cursor: saving ? "wait" : "pointer", opacity: saving ? 0.6 : 1,
+                  }}>
+                    <input
+                      type="checkbox"
+                      checked={on}
+                      disabled={saving}
+                      onChange={e => toggle(it.key, e.target.checked)}
+                      style={{ width:16, height:16, cursor:"pointer", accentColor: on ? "#16a34a" : "#dc2626" }}
+                    />
+                    <div style={{ flex:1, ...sans, fontSize:12, color: on ? "#e2e8f0" : "#94a3b8" }}>
+                      {it.label}
+                    </div>
+                    <span style={{ ...mono, fontSize:9, fontWeight:700, color: on ? "#4ade80" : "#f87171" }}>
+                      {on ? "ON" : "MUTED"}
+                    </span>
+                  </label>
+                );
+              })}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 function App() {
   const [tab, setTab]         = useState("pnl");
   const [connected, setConn]  = useState(false);
@@ -11779,6 +11915,9 @@ function App() {
       { id:"learning",    label:"Learning"     },
       { id:"performance", label:"Performance"  },
       { id:"decisions",   label:"Decisions"    },
+    ]},
+    { id:"admin",    label:"Admin", tabs: [
+      { id:"alertsadmin", label:"Telegram Alerts" },
     ]},
   ];
 
@@ -11885,6 +12024,7 @@ function App() {
         <div style={{display: tab==="learning"     ? "" : "none"}}><LearningTab /></div>
         <div style={{display: tab==="universe"     ? "" : "none"}}><UniverseTab /></div>
         <div style={{display: tab==="decisions"    ? "" : "none"}}><DecisionsTab /></div>
+        <div style={{display: tab==="alertsadmin"  ? "" : "none"}}><TelegramAlertsAdminTab /></div>
         <div style={{display: tab==="technicals"   ? "" : "none"}}><TechnicalsTab /></div>
         <div style={{display: tab==="charts"       ? "" : "none"}}><ChartsTab /></div>
         <div style={{display: tab==="watchlist"    ? "" : "none"}}><WatchlistTab /></div>

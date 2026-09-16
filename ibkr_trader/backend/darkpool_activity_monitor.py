@@ -257,6 +257,12 @@ def _chunk_message(msg: str, max_chars: int = TELEGRAM_MAX_CHARS) -> list[str]:
 
 def telegram(cfg: dict, msg: str):
     import requests
+    try:
+        from telegram_alert_gate import alert_enabled
+        if not alert_enabled("research_desk"):
+            return
+    except Exception:
+        pass
     chunks = _chunk_message(msg)
     for i, chunk in enumerate(chunks, 1):
         text = chunk if len(chunks) == 1 else f"{chunk}\n\n<i>({i}/{len(chunks)})</i>"

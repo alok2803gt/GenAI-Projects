@@ -111,6 +111,12 @@ def load_cfg():
 
 def telegram_text(cfg, text):
     import re
+    try:
+        from telegram_alert_gate import alert_enabled
+        if not alert_enabled("earnings_butterfly"):
+            return
+    except Exception:
+        pass
     html = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
     try:
         requests.post(f"https://api.telegram.org/bot{cfg['telegram_token']}/sendMessage",

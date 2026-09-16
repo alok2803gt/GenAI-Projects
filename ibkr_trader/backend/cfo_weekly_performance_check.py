@@ -49,6 +49,12 @@ def week_start_for(d: date) -> date:
 
 def send_telegram(text: str):
     try:
+        from telegram_alert_gate import alert_enabled
+        if not alert_enabled("system_health"):
+            return False
+    except Exception:
+        pass
+    try:
         with open(CONFIG_PATH) as f:
             cfg = json.load(f)
         token, chat_id = cfg.get("telegram_token"), cfg.get("telegram_chat_id")

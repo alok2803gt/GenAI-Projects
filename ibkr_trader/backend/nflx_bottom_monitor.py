@@ -77,6 +77,12 @@ with open("scanner_config.json") as f:
 def telegram(msg: str):
     import requests
     try:
+        from telegram_alert_gate import alert_enabled
+        if not alert_enabled("research_desk"):
+            return
+    except Exception:
+        pass
+    try:
         requests.post(
             f"https://api.telegram.org/bot{cfg['telegram_token']}/sendMessage",
             json={"chat_id": cfg["telegram_chat_id"], "text": msg, "parse_mode": "HTML"},

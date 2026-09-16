@@ -143,7 +143,7 @@ def main():
             f"hold {HOLD_DAYS} trading days. Manual review only, no order placed."
         )
         print(text)
-        telegram(cfg, text)
+        telegram(cfg, text, category="research_desk")
         entry = {
             "time": datetime.now(timezone.utc).isoformat(), "actor": "trader",
             "category": "harami_scanner_alert", "summary": text.replace("\n", " | "),

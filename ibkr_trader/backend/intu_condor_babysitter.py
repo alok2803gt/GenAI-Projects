@@ -41,6 +41,12 @@ STATE_FILE = "intu_condor_babysitter_state.json"
 
 def telegram(msg: str, high_priority: bool = False):
     try:
+        from telegram_alert_gate import alert_enabled
+        if not alert_enabled("condor_babysitters"):
+            return
+    except Exception:
+        pass
+    try:
         with open("scanner_config.json") as f:
             cfg = json.load(f)
         prefix = "🚨 " if high_priority else "⚠️ "

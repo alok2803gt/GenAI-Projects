@@ -37,6 +37,13 @@ SCANNER_CFG = os.path.join(os.path.dirname(__file__), "..", "scanner_config.json
 
 def send_telegram(msg):
     try:
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+        from telegram_alert_gate import alert_enabled
+        if not alert_enabled("condor_babysitters"):
+            return
+    except Exception:
+        pass
+    try:
         import requests
         with open(SCANNER_CFG) as f:
             cfg = json.load(f)

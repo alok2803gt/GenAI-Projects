@@ -70,6 +70,12 @@ def load_cfg():
 
 def telegram_text(cfg, text):
     try:
+        from telegram_alert_gate import alert_enabled
+        if not alert_enabled("ko_put_spread"):
+            return
+    except Exception:
+        pass
+    try:
         requests.post(f"https://api.telegram.org/bot{cfg['telegram_token']}/sendMessage",
                       data={"chat_id": cfg["telegram_chat_id"], "text": text, "parse_mode": "HTML"},
                       timeout=10)

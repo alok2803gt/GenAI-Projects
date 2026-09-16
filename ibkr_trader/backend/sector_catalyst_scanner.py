@@ -144,7 +144,7 @@ def check_basket(name, tickers, state, cfg):
                  "manual review only, this does not place any order.")
     text = "\n".join(lines)
     print(text)
-    telegram(cfg, text, high_priority=False)
+    telegram(cfg, text, high_priority=False, category="research_desk")
 
     entry = {
         "time": datetime.now(timezone.utc).isoformat(), "actor": "trader",

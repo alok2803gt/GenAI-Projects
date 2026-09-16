@@ -129,6 +129,12 @@ def load_cfg():
 
 
 def telegram_text(cfg, text):
+    try:
+        from telegram_alert_gate import alert_enabled
+        if not alert_enabled("chartexpert"):
+            return
+    except Exception:
+        pass
     html = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
     try:
         requests.post(f"https://api.telegram.org/bot{cfg['telegram_token']}/sendMessage",
@@ -139,6 +145,12 @@ def telegram_text(cfg, text):
 
 
 def telegram_photo(cfg, path, caption):
+    try:
+        from telegram_alert_gate import alert_enabled
+        if not alert_enabled("chartexpert"):
+            return
+    except Exception:
+        pass
     try:
         with open(path, "rb") as f:
             requests.post(f"https://api.telegram.org/bot{cfg['telegram_token']}/sendPhoto",

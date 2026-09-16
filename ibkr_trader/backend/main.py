@@ -1147,7 +1147,7 @@ def _fire_chart_alert(alert: dict, price: float) -> None:
             f"${alert['price']:.2f} (now ${price:.2f})")
     if alert.get("note"):
         text += f" -- {alert['note']}"
-    _oversight_notify(text)
+    _oversight_notify(text, category="chart_price_alerts")
     _oversight_log("trader", "chart_alert_fired", text,
                     rationale=f"User-set price alert on {alert['ticker']} (id={alert['id']}) triggered.",
                     outcome="Telegram sent, alert removed from active list.")
@@ -1190,7 +1190,7 @@ def _check_harami_1m(ticker: str, bars_list: list) -> None:
         f"5-day-hold research (candlestick_pattern_research/, p=0.00007) -- that was "
         f"tested on daily bars with a downtrend-context filter, not here. Visibility only."
     )
-    _oversight_notify(text)
+    _oversight_notify(text, category="harami_1m_alerts")
     _oversight_log("trader", "harami_1m_detected", text,
                     rationale=f"Bare bullish harami pattern matched on {ticker}'s 1-min chart.",
                     outcome="Telegram sent. Unvalidated at this timeframe -- reference only.")
@@ -3163,7 +3163,7 @@ async def _options_uoa_scan_all(ib) -> None:
                + "\n\nReal directional read (options-flow ask/bid-side split + lit-tape "
                  "cross-check -- describes what real trades did, NOT validated as "
                  "predictive of future price):\n" + "\n".join(directional_lines))
-        _oversight_notify(msg)
+        _oversight_notify(msg, category="unusual_options_activity")
 
 
 async def _options_uoa_loop() -> None:
@@ -5929,6 +5929,9 @@ def _send_telegram_sync(token: str, chat_id: str, text: str) -> bool:
 def _spx_notify(text: str) -> None:
     """Fire-and-forget Telegram push for SPX 0DTE trade events."""
     import threading
+    from telegram_alert_gate import alert_enabled
+    if not alert_enabled("spx_0dte"):
+        return
     token, chat_id = _load_telegram_creds()
     if token and chat_id:
         threading.Thread(
@@ -5976,15 +5979,20 @@ def _oversight_log(actor: str, category: str, summary: str, rationale: str = "",
     return entry
 
 
-def _oversight_notify(text: str, high_priority: bool = False) -> None:
+def _oversight_notify(text: str, high_priority: bool = False, category: str = "system_health") -> None:
     """Fire-and-forget Telegram push for oversight decisions/alerts. Normal
     notifications are informational (sent AFTER acting, never a permission
     request). high_priority=True is reserved for: stuck/blocked, resource-
     limited, or a decision that genuinely exceeds the skill's own authority
     (see portfolio-oversight SKILL.md's escalation triggers) -- these get a
     distinct, impossible-to-miss prefix rather than blending into routine
-    updates."""
+    updates. `category` feeds the admin-panel alert gate (telegram_alert_gate.py)
+    -- pass the caller's real feature category; defaults to system_health for
+    generic oversight-loop callers that don't pass one."""
     import threading
+    from telegram_alert_gate import alert_enabled
+    if not alert_enabled(category):
+        return
     token, chat_id = _load_telegram_creds()
     if not (token and chat_id):
         log.warning("Oversight notify: Telegram not configured — alert suppressed: %s", text)
@@ -6335,6 +6343,9 @@ async def _send_eod_performance_digest(session_date: str) -> bool:
     )
     if not msg:
         log.info("EOD performance digest: no enriched alerts for %s — skipped", session_date)
+        return False
+    from telegram_alert_gate import alert_enabled
+    if not alert_enabled("breakout_scanner"):
         return False
     token, chat_id = _load_telegram_creds()
     sent = await asyncio.get_event_loop().run_in_executor(
@@ -8933,7 +8944,7 @@ async def _news_monitor_coro():
             if story["url"]:
                 msg += f"\n{story['url']}"
 
-        _rm_telegram(msg)
+        _rm_telegram(msg, category="news_monitor")
         log.info("NEWS [%s] verified=%s src=%d: %s", sev, verified, n, story["title"][:70])
         sent += 1
         if sent >= max_alrt:
@@ -8990,7 +9001,12 @@ def _rm_resolve(rule: int, position: str):
     rm["violations"] = [v for v in rm["violations"] if not v["resolved"]]
 
 
-def _rm_telegram(text: str):
+def _rm_telegram(text: str, category: str = "risk_gate"):
+    """Shared by Risk Monitor (default category) and News Monitor (which
+    passes category="news_monitor") -- both funnel through this one sender."""
+    from telegram_alert_gate import alert_enabled
+    if not alert_enabled(category):
+        return
     token, chat_id = _load_telegram_creds()
     if token and chat_id:
         try:
@@ -12961,6 +12977,35 @@ async def reconcile_run():
         summ = await asyncio.get_event_loop().run_in_executor(None, _reconcile_all, ib)
         _reconcile_last_summary.update(summ)
     return summ
+
+
+# ── Telegram alert admin panel (added 2026-09-16) ──────────────────────────
+# Per-category on/off gate for Telegram alerts, layered on top of the
+# existing telegram_token/telegram_chat_id "all or nothing" switch. See
+# telegram_alert_gate.py -- every in-process notify function in this file,
+# plus every standalone babysitter/scanner/agent process, reads
+# telegram_alerts_config.json fresh on each send, so a toggle here takes
+# effect on the very next alert everywhere, no restart needed.
+
+@app.get("/telegram-alerts/config")
+def get_telegram_alerts_config():
+    from telegram_alert_gate import ALERT_CATEGORIES, get_alert_config
+    return {
+        "categories": {k: {"label": label, "group": group} for k, (label, group) in ALERT_CATEGORIES.items()},
+        "config": get_alert_config(),
+    }
+
+
+@app.post("/telegram-alerts/config")
+def set_telegram_alerts_config(body: dict):
+    """Body: {category: bool, ...} -- partial update, unknown keys ignored.
+    E.g. {"day_trader": false, "ashley_signals": false} mutes just those two."""
+    from telegram_alert_gate import set_alert_config
+    cfg = set_alert_config(body)
+    _oversight_log("programmer", "telegram_alerts_config_change",
+                    f"Telegram alert categories updated: {body}",
+                    rationale="CEO admin-panel toggle.", outcome=str(cfg))
+    return {"config": cfg}
 
 
 # ── Trade Journal endpoints ────────────────────────────────────────────────
@@ -17278,7 +17323,7 @@ async def _evc_place_condor(ib, quote: dict) -> bool:
                     rationale=f"scenarios: {scenario_summary}",
                     outcome="APPROVED" if review["approved"] else "REJECTED — no orders placed")
     if not review["approved"]:
-        _oversight_notify(f"EVC pre-trade review REJECTED {ticker}: {review_summary}", high_priority=False)
+        _oversight_notify(f"EVC pre-trade review REJECTED {ticker}: {review_summary}", high_priority=False, category="evc")
         return False
 
     contracts = {
@@ -17398,7 +17443,7 @@ async def _evc_place_condor(ib, quote: dict) -> bool:
     if not ok:
         msg = f"EVC/Alpaca: {ticker} condor ENTRY INCOMPLETE (state={fill_state}, fills={fills}) — check Alpaca positions manually NOW."
         _evc_log("ENTRY_INCOMPLETE", ticker, msg)
-        _oversight_notify(msg, high_priority=True)
+        _oversight_notify(msg, high_priority=True, category="evc")
         _oversight_log("trader", "execution_issue",
                         f"EVC/Alpaca {ticker} entry incomplete: state={fill_state} fills={fills}",
                         outcome="needs manual review — possible naked leg")
@@ -17565,7 +17610,7 @@ async def _evc_close_position(ib, pos_id: str, reason: str) -> None:
         client  = _alp_client(alp_cfg)
     except Exception as exc:
         _evc_log("CLOSE_FAILED", ticker, f"Alpaca client init failed: {exc} — CHECK ALPACA MANUALLY")
-        _oversight_notify(f"EVC/Alpaca: {ticker} close FAILED to start (client init: {exc}) — CHECK ALPACA MANUALLY.", high_priority=True)
+        _oversight_notify(f"EVC/Alpaca: {ticker} close FAILED to start (client init: {exc}) — CHECK ALPACA MANUALLY.", high_priority=True, category="evc")
         pos["phase"] = "open"
         return
 
@@ -17575,7 +17620,7 @@ async def _evc_close_position(ib, pos_id: str, reason: str) -> None:
     if not ok:
         msg = f"EVC/Alpaca: {ticker} close INCOMPLETE (fills={fills}) — retrying automatically in the background."
         _evc_log("CLOSE_INCOMPLETE", ticker, msg)
-        _oversight_notify(msg, high_priority=True)
+        _oversight_notify(msg, high_priority=True, category="evc")
         _oversight_log("trader", "execution_issue", f"EVC/Alpaca {ticker} close incomplete: fills={fills}",
                         outcome="left phase=closing -- _evc_retry_incomplete_closes will pick it up next cycle")
         # Record whatever DID fill so a retry never re-submits a leg that's
@@ -17785,7 +17830,7 @@ async def _evc_retry_incomplete_closes(ib) -> None:
                 f"Giving up automated retry now (likely a genuinely unclosable leg, e.g. the recurring "
                 f"'account not eligible to trade uncovered option contracts' quirk on a worthless long "
                 f"option) -- needs a human look. Not retrying again automatically.",
-                high_priority=True)
+                high_priority=True, category="evc")
             pos["close_retry_count"] = -1  # sentinel: retries exhausted, stop picking this up again
         elif attempts % ESCALATE_EVERY_N_ATTEMPTS == 0:
             _oversight_notify(
@@ -17793,7 +17838,7 @@ async def _evc_retry_incomplete_closes(ib) -> None:
                 f"remaining legs: {remaining}. Likely a genuinely unclosable leg (e.g. the recurring "
                 f"'account not eligible to trade uncovered option contracts' quirk on a worthless long "
                 f"option) rather than a transient failure. Still retrying automatically, but take a look.",
-                high_priority=True)
+                high_priority=True, category="evc")
         _evc_save_state()
 
 
@@ -17849,6 +17894,9 @@ async def _evc_entry_coro(ib) -> None:
 def _evc_notify(text: str) -> None:
     """Fire-and-forget Telegram push for EVC events."""
     import threading
+    from telegram_alert_gate import alert_enabled
+    if not alert_enabled("evc"):
+        return
     token, chat_id = _load_telegram_creds()
     if token and chat_id:
         threading.Thread(
@@ -18963,7 +19011,10 @@ async def _ibkr_reconcile(ib, *, on_startup: bool = False) -> None:
 
     msg = f"<b>⚠️ IBKR RECON [{label}]</b>\n\n" + "\n".join(lines)
     log.warning("RECON [%s]: %d issue(s) detected", label, total_issues)
-    _evc_notify(msg)
+    # Was _evc_notify(msg) -- but this alert spans ALL strategies (phantom
+    # close/untracked/ghost open), not just EVC, so it belongs on its own
+    # "reconciliation" gate category, not bundled with EVC's on/off switch.
+    _oversight_notify(msg, category="reconciliation")
 
 
 async def _ibkr_startup_reconcile() -> None:
@@ -19396,7 +19447,7 @@ def _reconcile_all(ib) -> dict:
             _oversight_log("programmer", "reconcile_autocorrect", msg,
                            rationale="Position record was open but no matching contract in IBKR/Alpaca for >=2 cycles.",
                            outcome="record moved to closed")
-            _oversight_notify(f"🛠️ Reconcile auto-correct: {key} was open in records but flat at broker -- marked closed.")
+            _oversight_notify(f"🛠️ Reconcile auto-correct: {key} was open in records but flat at broker -- marked closed.", category="reconciliation")
 
     # ── 3. Phantom-close detection (record closed but broker still holds it) ──
     for strat, pid, crec in _recon_iter_all_closed():
@@ -19428,7 +19479,7 @@ def _reconcile_all(ib) -> dict:
             _oversight_log("programmer", "reconcile_autocorrect", msg,
                            rationale="Closed record's contract is still present in IBKR/Alpaca.",
                            outcome="record moved back to open")
-            _oversight_notify(f"🛠️ Reconcile auto-correct: {strat}/{pid} was marked closed but is still open at the broker -- re-opened in tracking.")
+            _oversight_notify(f"🛠️ Reconcile auto-correct: {strat}/{pid} was marked closed but is still open at the broker -- re-opened in tracking.", category="reconciliation")
 
     # ── 4. Untracked broker positions (alert only) ──────────────────────
     claimed_conids = set()
@@ -20882,19 +20933,21 @@ async def _mt_close_position_coro_inner(ib, pos_id: str, reason: str) -> bool:
         log.warning("MT close %s: PARTIAL fill (%d/%d legs) — banked $%.2f, reverted to open for the remainder",
                      pos_id, len(fills), len(fills) + len(remaining_legs), partial_realized)
         try:
-            import requests as _req
-            with open(os.path.join(os.path.dirname(__file__), "scanner_config.json")) as _f:
-                _cfg = json.load(_f)
-            _remaining_str = ", ".join(l["local_symbol"] for l in remaining_legs)
-            _req.post(
-                f"https://api.telegram.org/bot{_cfg['telegram_token']}/sendMessage",
-                json={"chat_id": _cfg["telegram_chat_id"], "parse_mode": "HTML",
-                      "text": (f"⚠️ <b>Manual Trader: {pos['name']} PARTIAL close</b>\n"
-                               f"Reason: {reason}\n{len(fills)} of {len(fills) + len(remaining_legs)} legs filled "
-                               f"(banked ${partial_realized:+.2f}).\nStill open: {_remaining_str}\n"
-                               f"Reverted to open — will keep retrying / hits hard_close_time backstop.")},
-                timeout=8,
-            )
+            from telegram_alert_gate import alert_enabled
+            if alert_enabled("manual_trader"):
+                import requests as _req
+                with open(os.path.join(os.path.dirname(__file__), "scanner_config.json")) as _f:
+                    _cfg = json.load(_f)
+                _remaining_str = ", ".join(l["local_symbol"] for l in remaining_legs)
+                _req.post(
+                    f"https://api.telegram.org/bot{_cfg['telegram_token']}/sendMessage",
+                    json={"chat_id": _cfg["telegram_chat_id"], "parse_mode": "HTML",
+                          "text": (f"⚠️ <b>Manual Trader: {pos['name']} PARTIAL close</b>\n"
+                                   f"Reason: {reason}\n{len(fills)} of {len(fills) + len(remaining_legs)} legs filled "
+                                   f"(banked ${partial_realized:+.2f}).\nStill open: {_remaining_str}\n"
+                                   f"Reverted to open — will keep retrying / hits hard_close_time backstop.")},
+                    timeout=8,
+                )
         except Exception:
             pass
         return False
@@ -20940,23 +20993,25 @@ async def _mt_close_position_coro_inner(ib, pos_id: str, reason: str) -> bool:
 
     # Telegram
     try:
-        import requests as _req
-        with open(os.path.join(os.path.dirname(__file__), "scanner_config.json")) as _f:
-            _cfg = json.load(_f)
-        _fills_str = "\n".join(f"  {leg['action']} {leg['local_symbol']} close @ ${fills.get(leg['local_symbol'], 'PENDING'):.2f}"
-                               for leg in pos["legs"] if isinstance(fills.get(leg["local_symbol"]), float))
-        _icon = "✅" if realized_pnl >= 0 else "❌"
-        _msg = (
-            f"{_icon} <b>Manual Trader: {pos['name']} CLOSED</b>\n"
-            f"Reason: {reason}\n\n"
-            f"{_fills_str}\n\n"
-            f"Realized P&L: <b>${realized_pnl:+.2f}</b>"
-        )
-        _req.post(
-            f"https://api.telegram.org/bot{_cfg['telegram_token']}/sendMessage",
-            json={"chat_id": _cfg["telegram_chat_id"], "text": _msg, "parse_mode": "HTML"},
-            timeout=8,
-        )
+        from telegram_alert_gate import alert_enabled
+        if alert_enabled("manual_trader"):
+            import requests as _req
+            with open(os.path.join(os.path.dirname(__file__), "scanner_config.json")) as _f:
+                _cfg = json.load(_f)
+            _fills_str = "\n".join(f"  {leg['action']} {leg['local_symbol']} close @ ${fills.get(leg['local_symbol'], 'PENDING'):.2f}"
+                                   for leg in pos["legs"] if isinstance(fills.get(leg["local_symbol"]), float))
+            _icon = "✅" if realized_pnl >= 0 else "❌"
+            _msg = (
+                f"{_icon} <b>Manual Trader: {pos['name']} CLOSED</b>\n"
+                f"Reason: {reason}\n\n"
+                f"{_fills_str}\n\n"
+                f"Realized P&L: <b>${realized_pnl:+.2f}</b>"
+            )
+            _req.post(
+                f"https://api.telegram.org/bot{_cfg['telegram_token']}/sendMessage",
+                json={"chat_id": _cfg["telegram_chat_id"], "text": _msg, "parse_mode": "HTML"},
+                timeout=8,
+            )
     except Exception:
         pass
 
@@ -21143,6 +21198,9 @@ async def _red_day_watch_coro(ib) -> None:
     if chg <= -1.5:
         _red_day_alerted = today_str
         log.info("RED DAY: SPY %.2f (%.2f%%) — premium-sale alert", spot, chg)
+        from telegram_alert_gate import alert_enabled
+        if not alert_enabled("red_day_alert"):
+            return
         try:
             import requests as _req
             with open(os.path.join(os.path.dirname(__file__), "scanner_config.json")) as _f:
@@ -21442,27 +21500,29 @@ async def _mt_place_order_coro(ib, req: "MTEnterRequest") -> dict:
 
     # 6. Telegram entry alert
     try:
-        import requests as _req2
-        with open(os.path.join(os.path.dirname(__file__), "scanner_config.json")) as _f:
-            _cfg = json.load(_f)
-        _legs_str = "\n".join(
-            f"  {'🟢' if l['action']=='BUY' else '🔴'} {l['action']} {l['local_symbol']} @ ${l['fill_price']:.2f}"
-            for l in legs_out
-        )
-        _pt  = f"${req.profit_target_usd:+.2f}" if req.profit_target_usd is not None else "—"
-        _sl  = f"${req.stop_loss_usd:+.2f}"     if req.stop_loss_usd     is not None else "—"
-        _msg = (
-            f"📋 <b>Manual Trader: {name} ENTERED</b>\n"
-            f"Strategy: {req.strategy.replace('_',' ').title()} · {ticker}\n\n"
-            f"{_legs_str}\n\n"
-            f"Fill: <b>${filled_trade.orderStatus.avgFillPrice:.2f}</b>  net_entry=${net_entry:+.2f}\n"
-            f"Profit target: {_pt}  |  Stop loss: {_sl}"
-        )
-        _req2.post(
-            f"https://api.telegram.org/bot{_cfg['telegram_token']}/sendMessage",
-            json={"chat_id": _cfg["telegram_chat_id"], "text": _msg, "parse_mode": "HTML"},
-            timeout=8,
-        )
+        from telegram_alert_gate import alert_enabled
+        if alert_enabled("manual_trader"):
+            import requests as _req2
+            with open(os.path.join(os.path.dirname(__file__), "scanner_config.json")) as _f:
+                _cfg = json.load(_f)
+            _legs_str = "\n".join(
+                f"  {'🟢' if l['action']=='BUY' else '🔴'} {l['action']} {l['local_symbol']} @ ${l['fill_price']:.2f}"
+                for l in legs_out
+            )
+            _pt  = f"${req.profit_target_usd:+.2f}" if req.profit_target_usd is not None else "—"
+            _sl  = f"${req.stop_loss_usd:+.2f}"     if req.stop_loss_usd     is not None else "—"
+            _msg = (
+                f"📋 <b>Manual Trader: {name} ENTERED</b>\n"
+                f"Strategy: {req.strategy.replace('_',' ').title()} · {ticker}\n\n"
+                f"{_legs_str}\n\n"
+                f"Fill: <b>${filled_trade.orderStatus.avgFillPrice:.2f}</b>  net_entry=${net_entry:+.2f}\n"
+                f"Profit target: {_pt}  |  Stop loss: {_sl}"
+            )
+            _req2.post(
+                f"https://api.telegram.org/bot{_cfg['telegram_token']}/sendMessage",
+                json={"chat_id": _cfg["telegram_chat_id"], "text": _msg, "parse_mode": "HTML"},
+                timeout=8,
+            )
     except Exception:
         pass
 
@@ -21569,28 +21629,30 @@ def mt_add_position(req: MTPositionRequest):
 
     # Telegram entry alert
     try:
-        import requests as _req
-        with open(os.path.join(os.path.dirname(__file__), "scanner_config.json")) as _f:
-            _cfg = json.load(_f)
-        _legs_str = "\n".join(
-            f"  {'🟢' if l['action']=='BUY' else '🔴'} {l['action']} {l['local_symbol']} @ ${l['fill_price']:.2f}"
-            for l in legs
-        )
-        _pt  = f"${req.profit_target_usd:+.2f}" if req.profit_target_usd is not None else "—"
-        _sl  = f"${req.stop_loss_usd:+.2f}"     if req.stop_loss_usd     is not None else "—"
-        _hc  = req.hard_close_time or "—"
-        _msg = (
-            f"📋 <b>Manual Trader: {req.name} ENTERED</b>\n"
-            f"Strategy: {req.strategy.replace('_',' ').title()} · {req.ticker}\n\n"
-            f"{_legs_str}\n\n"
-            f"Net entry: <b>${net_entry:+.2f}</b>  ({'+credit' if net_entry>0 else 'debit'})\n"
-            f"Profit target: {_pt}  |  Stop loss: {_sl}  |  Hard close: {_hc}"
-        )
-        _req.post(
-            f"https://api.telegram.org/bot{_cfg['telegram_token']}/sendMessage",
-            json={"chat_id": _cfg["telegram_chat_id"], "text": _msg, "parse_mode": "HTML"},
-            timeout=8,
-        )
+        from telegram_alert_gate import alert_enabled
+        if alert_enabled("manual_trader"):
+            import requests as _req
+            with open(os.path.join(os.path.dirname(__file__), "scanner_config.json")) as _f:
+                _cfg = json.load(_f)
+            _legs_str = "\n".join(
+                f"  {'🟢' if l['action']=='BUY' else '🔴'} {l['action']} {l['local_symbol']} @ ${l['fill_price']:.2f}"
+                for l in legs
+            )
+            _pt  = f"${req.profit_target_usd:+.2f}" if req.profit_target_usd is not None else "—"
+            _sl  = f"${req.stop_loss_usd:+.2f}"     if req.stop_loss_usd     is not None else "—"
+            _hc  = req.hard_close_time or "—"
+            _msg = (
+                f"📋 <b>Manual Trader: {req.name} ENTERED</b>\n"
+                f"Strategy: {req.strategy.replace('_',' ').title()} · {req.ticker}\n\n"
+                f"{_legs_str}\n\n"
+                f"Net entry: <b>${net_entry:+.2f}</b>  ({'+credit' if net_entry>0 else 'debit'})\n"
+                f"Profit target: {_pt}  |  Stop loss: {_sl}  |  Hard close: {_hc}"
+            )
+            _req.post(
+                f"https://api.telegram.org/bot{_cfg['telegram_token']}/sendMessage",
+                json={"chat_id": _cfg["telegram_chat_id"], "text": _msg, "parse_mode": "HTML"},
+                timeout=8,
+            )
     except Exception:
         pass
 
@@ -21779,6 +21841,9 @@ def _fx_load_state() -> None:
 def _fx_pushover(title: str, message: str) -> None:
     """Fire-and-forget Telegram notification for FX Trader trade events."""
     import threading
+    from telegram_alert_gate import alert_enabled
+    if not alert_enabled("fx_trader"):
+        return
     def _send():
         try:
             cfg_path = os.path.join(os.path.dirname(__file__), "scanner_config.json")
