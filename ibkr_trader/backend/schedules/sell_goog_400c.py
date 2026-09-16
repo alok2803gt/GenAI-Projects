@@ -25,6 +25,13 @@ def load_tg():
 
 def tg(token, chat_id, text):
     if not token or not chat_id: return
+    try:
+        sys.path.insert(0, str(SCRIPT_DIR.parent))
+        from telegram_alert_gate import alert_enabled
+        if not alert_enabled("condor_babysitters"):
+            return
+    except Exception:
+        pass
     requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
                   json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"}, timeout=10)
 

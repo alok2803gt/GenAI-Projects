@@ -1,0 +1,359 @@
+[
+  {
+    "date": "2026-06-25",
+    "sum_ret": 1.846,
+    "n_alerts": 15,
+    "wins": 9,
+    "avg_ret": 0.123
+  },
+  {
+    "date": "2026-06-26",
+    "sum_ret": -0.748,
+    "n_alerts": 9,
+    "wins": 5,
+    "avg_ret": -0.083
+  },
+  {
+    "date": "2026-06-29",
+    "sum_ret": -1.05,
+    "n_alerts": 26,
+    "wins": 15,
+    "avg_ret": -0.04
+  },
+  {
+    "date": "2026-07-01",
+    "sum_ret": 16.845,
+    "n_alerts": 19,
+    "wins": 16,
+    "avg_ret": 0.887
+  },
+  {
+    "date": "2026-07-02",
+    "sum_ret": 5.191,
+    "n_alerts": 20,
+    "wins": 13,
+    "avg_ret": 0.26
+  },
+  {
+    "date": "2026-07-06",
+    "sum_ret": 3.573,
+    "n_alerts": 18,
+    "wins": 11,
+    "avg_ret": 0.199
+  },
+  {
+    "date": "2026-07-07",
+    "sum_ret": -14.785,
+    "n_alerts": 19,
+    "wins": 4,
+    "avg_ret": -0.778
+  },
+  {
+    "date": "2026-07-08",
+    "sum_ret": 5.106,
+    "n_alerts": 2,
+    "wins": 2,
+    "avg_ret": 2.553
+  },
+  {
+    "date": "2026-07-09",
+    "sum_ret": 7.984,
+    "n_alerts": 16,
+    "wins": 12,
+    "avg_ret": 0.499
+  },
+  {
+    "date": "2026-07-10",
+    "sum_ret": -28.796,
+    "n_alerts": 24,
+    "wins": 6,
+    "avg_ret": -1.2
+  },
+  {
+    "date": "2026-07-13",
+    "sum_ret": 2.692,
+    "n_alerts": 12,
+    "wins": 7,
+    "avg_ret": 0.224
+  },
+  {
+    "date": "2026-07-14",
+    "sum_ret": -1.02,
+    "n_alerts": 11,
+    "wins": 6,
+    "avg_ret": -0.093
+  },
+  {
+    "date": "2026-07-15",
+    "sum_ret": -7.641,
+    "n_alerts": 18,
+    "wins": 6,
+    "avg_ret": -0.425
+  },
+  {
+    "date": "2026-07-20",
+    "sum_ret": -13.87,
+    "n_alerts": 11,
+    "wins": 3,
+    "avg_ret": -1.261
+  },
+  {
+    "date": "2026-07-21",
+    "sum_ret": 18.1,
+    "n_alerts": 8,
+    "wins": 5,
+    "avg_ret": 2.263
+  },
+  {
+    "date": "2026-07-22",
+    "sum_ret": -6.365,
+    "n_alerts": 7,
+    "wins": 2,
+    "avg_ret": -0.909
+  },
+  {
+    "date": "2026-07-23",
+    "sum_ret": -4.565,
+    "n_alerts": 7,
+    "wins": 2,
+    "avg_ret": -0.652
+  },
+  {
+    "date": "2026-07-24",
+    "sum_ret": -0.394,
+    "n_alerts": 15,
+    "wins": 9,
+    "avg_ret": -0.026
+  },
+  {
+    "date": "2026-07-27",
+    "sum_ret": 10.264,
+    "n_alerts": 19,
+    "wins": 11,
+    "avg_ret": 0.54
+  },
+  {
+    "date": "2026-07-28",
+    "sum_ret": -4.398,
+    "n_alerts": 18,
+    "wins": 11,
+    "avg_ret": -0.244
+  },
+  {
+    "date": "2026-07-29",
+    "sum_ret": -3.727,
+    "n_alerts": 7,
+    "wins": 2,
+    "avg_ret": -0.532
+  },
+  {
+    "date": "2026-07-30",
+    "sum_ret": 3.13,
+    "n_alerts": 4,
+    "wins": 3,
+    "avg_ret": 0.782
+  },
+  {
+    "date": "2026-08-03",
+    "sum_ret": -0.972,
+    "n_alerts": 24,
+    "wins": 12,
+    "avg_ret": -0.04
+  },
+  {
+    "date": "2026-08-04",
+    "sum_ret": 19.825,
+    "n_alerts": 16,
+    "wins": 14,
+    "avg_ret": 1.239
+  },
+  {
+    "date": "2026-08-05",
+    "sum_ret": -6.663,
+    "n_alerts": 11,
+    "wins": 2,
+    "avg_ret": -0.606
+  },
+  {
+    "date": "2026-08-06",
+    "sum_ret": 2.625,
+    "n_alerts": 6,
+    "wins": 4,
+    "avg_ret": 0.438
+  },
+  {
+    "date": "2026-08-07",
+    "sum_ret": 3.592,
+    "n_alerts": 18,
+    "wins": 13,
+    "avg_ret": 0.2
+  },
+  {
+    "date": "2026-08-10",
+    "sum_ret": 8.509,
+    "n_alerts": 23,
+    "wins": 14,
+    "avg_ret": 0.37
+  },
+  {
+    "date": "2026-08-11",
+    "sum_ret": -2.923,
+    "n_alerts": 15,
+    "wins": 4,
+    "avg_ret": -0.195
+  },
+  {
+    "date": "2026-08-12",
+    "sum_ret": 2.866,
+    "n_alerts": 13,
+    "wins": 6,
+    "avg_ret": 0.22
+  },
+  {
+    "date": "2026-08-13",
+    "sum_ret": 18.248,
+    "n_alerts": 28,
+    "wins": 23,
+    "avg_ret": 0.652
+  },
+  {
+    "date": "2026-08-14",
+    "sum_ret": -0.539,
+    "n_alerts": 8,
+    "wins": 4,
+    "avg_ret": -0.067
+  },
+  {
+    "date": "2026-08-17",
+    "sum_ret": -1.593,
+    "n_alerts": 7,
+    "wins": 1,
+    "avg_ret": -0.228
+  },
+  {
+    "date": "2026-08-18",
+    "sum_ret": 1.306,
+    "n_alerts": 19,
+    "wins": 10,
+    "avg_ret": 0.069
+  },
+  {
+    "date": "2026-08-19",
+    "sum_ret": 15.15,
+    "n_alerts": 23,
+    "wins": 14,
+    "avg_ret": 0.659
+  },
+  {
+    "date": "2026-08-20",
+    "sum_ret": -5.924,
+    "n_alerts": 10,
+    "wins": 3,
+    "avg_ret": -0.592
+  },
+  {
+    "date": "2026-08-21",
+    "sum_ret": 9.502,
+    "n_alerts": 28,
+    "wins": 17,
+    "avg_ret": 0.339
+  },
+  {
+    "date": "2026-08-24",
+    "sum_ret": -6.448,
+    "n_alerts": 16,
+    "wins": 9,
+    "avg_ret": -0.403
+  },
+  {
+    "date": "2026-08-25",
+    "sum_ret": 7.31,
+    "n_alerts": 16,
+    "wins": 11,
+    "avg_ret": 0.457
+  },
+  {
+    "date": "2026-08-26",
+    "sum_ret": -5.577,
+    "n_alerts": 17,
+    "wins": 5,
+    "avg_ret": -0.328
+  },
+  {
+    "date": "2026-08-27",
+    "sum_ret": 29.911,
+    "n_alerts": 20,
+    "wins": 15,
+    "avg_ret": 1.496
+  },
+  {
+    "date": "2026-08-28",
+    "sum_ret": -1.813,
+    "n_alerts": 17,
+    "wins": 8,
+    "avg_ret": -0.107
+  },
+  {
+    "date": "2026-08-31",
+    "sum_ret": 6.188,
+    "n_alerts": 15,
+    "wins": 7,
+    "avg_ret": 0.413
+  },
+  {
+    "date": "2026-09-01",
+    "sum_ret": -8.323,
+    "n_alerts": 12,
+    "wins": 3,
+    "avg_ret": -0.694
+  },
+  {
+    "date": "2026-09-02",
+    "sum_ret": 5.14,
+    "n_alerts": 21,
+    "wins": 14,
+    "avg_ret": 0.245
+  },
+  {
+    "date": "2026-09-03",
+    "sum_ret": 0.067,
+    "n_alerts": 27,
+    "wins": 14,
+    "avg_ret": 0.002
+  },
+  {
+    "date": "2026-09-04",
+    "sum_ret": 5.661,
+    "n_alerts": 6,
+    "wins": 4,
+    "avg_ret": 0.944
+  },
+  {
+    "date": "2026-09-08",
+    "sum_ret": -0.258,
+    "n_alerts": 9,
+    "wins": 3,
+    "avg_ret": -0.029
+  },
+  {
+    "date": "2026-09-09",
+    "sum_ret": -4.993,
+    "n_alerts": 13,
+    "wins": 4,
+    "avg_ret": -0.384
+  },
+  {
+    "date": "2026-09-10",
+    "sum_ret": -0.415,
+    "n_alerts": 7,
+    "wins": 3,
+    "avg_ret": -0.059
+  },
+  {
+    "date": "2026-09-11",
+    "sum_ret": -0.001,
+    "n_alerts": 13,
+    "wins": 6,
+    "avg_ret": -0.0
+  }
+]

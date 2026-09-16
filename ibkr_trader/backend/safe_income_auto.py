@@ -179,6 +179,12 @@ def save_state(state: dict):
 def telegram(cfg: dict, msg: str, high_priority: bool = False):
     import requests
     try:
+        from telegram_alert_gate import alert_enabled
+        if not alert_enabled("safe_income"):
+            return
+    except Exception:
+        pass
+    try:
         prefix = "🚨 " if high_priority else ""
         requests.post(
             f"https://api.telegram.org/bot{cfg['telegram_token']}/sendMessage",

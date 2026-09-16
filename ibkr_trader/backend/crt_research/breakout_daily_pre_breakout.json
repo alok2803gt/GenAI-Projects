@@ -1,0 +1,254 @@
+[
+  {
+    "date": "2026-06-25",
+    "sum_ret": 1.454,
+    "n_alerts": 9,
+    "wins": 3,
+    "avg_ret": 0.162
+  },
+  {
+    "date": "2026-06-26",
+    "sum_ret": 1.158,
+    "n_alerts": 5,
+    "wins": 2,
+    "avg_ret": 0.232
+  },
+  {
+    "date": "2026-06-29",
+    "sum_ret": -0.082,
+    "n_alerts": 25,
+    "wins": 14,
+    "avg_ret": -0.003
+  },
+  {
+    "date": "2026-06-30",
+    "sum_ret": -0.297,
+    "n_alerts": 10,
+    "wins": 6,
+    "avg_ret": -0.03
+  },
+  {
+    "date": "2026-07-01",
+    "sum_ret": -0.768,
+    "n_alerts": 3,
+    "wins": 1,
+    "avg_ret": -0.256
+  },
+  {
+    "date": "2026-07-02",
+    "sum_ret": 5.388,
+    "n_alerts": 15,
+    "wins": 12,
+    "avg_ret": 0.359
+  },
+  {
+    "date": "2026-07-06",
+    "sum_ret": -3.902,
+    "n_alerts": 12,
+    "wins": 5,
+    "avg_ret": -0.325
+  },
+  {
+    "date": "2026-07-07",
+    "sum_ret": 2.447,
+    "n_alerts": 4,
+    "wins": 2,
+    "avg_ret": 0.612
+  },
+  {
+    "date": "2026-07-08",
+    "sum_ret": -0.549,
+    "n_alerts": 8,
+    "wins": 4,
+    "avg_ret": -0.069
+  },
+  {
+    "date": "2026-07-09",
+    "sum_ret": 7.437,
+    "n_alerts": 20,
+    "wins": 10,
+    "avg_ret": 0.372
+  },
+  {
+    "date": "2026-07-10",
+    "sum_ret": 2.029,
+    "n_alerts": 8,
+    "wins": 4,
+    "avg_ret": 0.254
+  },
+  {
+    "date": "2026-07-13",
+    "sum_ret": -1.04,
+    "n_alerts": 20,
+    "wins": 12,
+    "avg_ret": -0.052
+  },
+  {
+    "date": "2026-07-14",
+    "sum_ret": 2.408,
+    "n_alerts": 21,
+    "wins": 12,
+    "avg_ret": 0.115
+  },
+  {
+    "date": "2026-07-15",
+    "sum_ret": -0.131,
+    "n_alerts": 20,
+    "wins": 12,
+    "avg_ret": -0.007
+  },
+  {
+    "date": "2026-07-20",
+    "sum_ret": -9.383,
+    "n_alerts": 18,
+    "wins": 6,
+    "avg_ret": -0.521
+  },
+  {
+    "date": "2026-07-21",
+    "sum_ret": -1.41,
+    "n_alerts": 15,
+    "wins": 6,
+    "avg_ret": -0.094
+  },
+  {
+    "date": "2026-07-22",
+    "sum_ret": -3.368,
+    "n_alerts": 11,
+    "wins": 4,
+    "avg_ret": -0.306
+  },
+  {
+    "date": "2026-07-23",
+    "sum_ret": -2.89,
+    "n_alerts": 11,
+    "wins": 5,
+    "avg_ret": -0.263
+  },
+  {
+    "date": "2026-07-24",
+    "sum_ret": -1.014,
+    "n_alerts": 10,
+    "wins": 4,
+    "avg_ret": -0.101
+  },
+  {
+    "date": "2026-07-27",
+    "sum_ret": -1.911,
+    "n_alerts": 8,
+    "wins": 3,
+    "avg_ret": -0.239
+  },
+  {
+    "date": "2026-07-28",
+    "sum_ret": 9.744,
+    "n_alerts": 14,
+    "wins": 9,
+    "avg_ret": 0.696
+  },
+  {
+    "date": "2026-07-29",
+    "sum_ret": -15.79,
+    "n_alerts": 23,
+    "wins": 4,
+    "avg_ret": -0.687
+  },
+  {
+    "date": "2026-07-30",
+    "sum_ret": 8.387,
+    "n_alerts": 15,
+    "wins": 12,
+    "avg_ret": 0.559
+  },
+  {
+    "date": "2026-08-03",
+    "sum_ret": 1.608,
+    "n_alerts": 7,
+    "wins": 3,
+    "avg_ret": 0.23
+  },
+  {
+    "date": "2026-08-04",
+    "sum_ret": 14.39,
+    "n_alerts": 19,
+    "wins": 16,
+    "avg_ret": 0.757
+  },
+  {
+    "date": "2026-08-05",
+    "sum_ret": -7.871,
+    "n_alerts": 16,
+    "wins": 4,
+    "avg_ret": -0.492
+  },
+  {
+    "date": "2026-08-06",
+    "sum_ret": -6.055,
+    "n_alerts": 14,
+    "wins": 7,
+    "avg_ret": -0.432
+  },
+  {
+    "date": "2026-08-07",
+    "sum_ret": 6.6,
+    "n_alerts": 18,
+    "wins": 13,
+    "avg_ret": 0.367
+  },
+  {
+    "date": "2026-08-10",
+    "sum_ret": 6.621,
+    "n_alerts": 24,
+    "wins": 16,
+    "avg_ret": 0.276
+  },
+  {
+    "date": "2026-08-11",
+    "sum_ret": -3.584,
+    "n_alerts": 28,
+    "wins": 13,
+    "avg_ret": -0.128
+  },
+  {
+    "date": "2026-08-12",
+    "sum_ret": 3.059,
+    "n_alerts": 28,
+    "wins": 15,
+    "avg_ret": 0.109
+  },
+  {
+    "date": "2026-08-13",
+    "sum_ret": 8.562,
+    "n_alerts": 12,
+    "wins": 9,
+    "avg_ret": 0.714
+  },
+  {
+    "date": "2026-08-14",
+    "sum_ret": -7.505,
+    "n_alerts": 20,
+    "wins": 7,
+    "avg_ret": -0.375
+  },
+  {
+    "date": "2026-08-17",
+    "sum_ret": -2.75,
+    "n_alerts": 19,
+    "wins": 9,
+    "avg_ret": -0.145
+  },
+  {
+    "date": "2026-08-18",
+    "sum_ret": -2.822,
+    "n_alerts": 15,
+    "wins": 5,
+    "avg_ret": -0.188
+  },
+  {
+    "date": "2026-08-19",
+    "sum_ret": 0.719,
+    "n_alerts": 12,
+    "wins": 7,
+    "avg_ret": 0.06
+  }
+]

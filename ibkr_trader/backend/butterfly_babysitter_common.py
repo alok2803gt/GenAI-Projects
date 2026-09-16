@@ -70,7 +70,20 @@ def safe_px(v) -> float:
         return 0.0
 
 
-def telegram(cfg, text, high_priority=False):
+def telegram(cfg, text, high_priority=False, category="butterfly_babysitters"):
+    """category defaults to "butterfly_babysitters" (this module's own
+    SPY/QQQ/IWM 0DTE butterfly use) -- harami_scanner.py and
+    sector_catalyst_scanner.py also import this same function but pass
+    their own category explicitly since those are different alert types
+    a user should be able to toggle independently in the admin panel."""
+    try:
+        import sys, os
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from telegram_alert_gate import alert_enabled
+        if not alert_enabled(category):
+            return
+    except Exception:
+        pass  # gate module missing/broken -- fail open, never block a live alert on this
     try:
         prefix = "\U0001F6A8 " if high_priority else "\U0001F4E1 "
         requests.post(

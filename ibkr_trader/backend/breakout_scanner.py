@@ -234,6 +234,12 @@ def send_telegram(token: str, chat_id: str, text: str) -> bool:
     if not token or not chat_id:
         log.warning("Telegram not configured — message suppressed")
         return False
+    try:
+        from telegram_alert_gate import alert_enabled
+        if not alert_enabled("breakout_scanner"):
+            return False
+    except Exception:
+        pass
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     try:
         r = requests.post(

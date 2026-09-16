@@ -1,0 +1,347 @@
+<title>Signal Day Ledger</title>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+  :root {
+    --bg: #f2f4f7;
+    --surface: #ffffff;
+    --surface-2: #e9ecf1;
+    --border: #d7dce4;
+    --text: #171b24;
+    --text-dim: #5b6473;
+    --text-faint: #8891a0;
+    --accent: #a8631a;
+    --accent-soft: #f0dcc2;
+    --pos-1: #cdebd2; --pos-2: #9ad6a8; --pos-3: #5cb977; --pos-4: #2f9955; --pos-5: #167a3e;
+    --neg-1: #f6d4cf; --neg-2: #eda89d; --neg-3: #dd7768; --neg-4: #c74b3a; --neg-5: #a52f21;
+    --cell-empty: #e4e7ec;
+    --shadow: 0 1px 2px rgba(23,27,36,0.06), 0 8px 24px rgba(23,27,36,0.05);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #12151b;
+      --surface: #191d25;
+      --surface-2: #20252f;
+      --border: #2b313d;
+      --text: #e7eaf0;
+      --text-dim: #99a1b0;
+      --text-faint: #656e7e;
+      --accent: #d99a4e;
+      --accent-soft: #3a2c19;
+      --pos-1: #16321f; --pos-2: #1c4d2b; --pos-3: #226e37; --pos-4: #2f9a4c; --pos-5: #4fc46e;
+      --neg-1: #3a1f1a; --neg-2: #5c2b22; --neg-3: #86392a; --neg-4: #b8492f; --neg-5: #e2603c;
+      --cell-empty: #1e222b;
+      --shadow: 0 1px 2px rgba(0,0,0,0.3), 0 8px 24px rgba(0,0,0,0.35);
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #12151b;
+    --surface: #191d25;
+    --surface-2: #20252f;
+    --border: #2b313d;
+    --text: #e7eaf0;
+    --text-dim: #99a1b0;
+    --text-faint: #656e7e;
+    --accent: #d99a4e;
+    --accent-soft: #3a2c19;
+    --pos-1: #16321f; --pos-2: #1c4d2b; --pos-3: #226e37; --pos-4: #2f9a4c; --pos-5: #4fc46e;
+    --neg-1: #3a1f1a; --neg-2: #5c2b22; --neg-3: #86392a; --neg-4: #b8492f; --neg-5: #e2603c;
+    --cell-empty: #1e222b;
+    --shadow: 0 1px 2px rgba(0,0,0,0.3), 0 8px 24px rgba(0,0,0,0.35);
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: "IBM Plex Sans", system-ui, sans-serif;
+    padding: 40px 24px 64px;
+  }
+  .wrap { max-width: 980px; margin: 0 auto; }
+
+  header { margin-bottom: 36px; }
+  .eyebrow {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase;
+    color: var(--accent); font-weight: 600; margin-bottom: 10px;
+  }
+  h1 {
+    font-size: 30px; font-weight: 600; margin: 0 0 8px; text-wrap: balance;
+    letter-spacing: -0.01em;
+  }
+  .sub { color: var(--text-dim); font-size: 14.5px; max-width: 62ch; line-height: 1.55; }
+  .sub b { color: var(--text); font-weight: 600; }
+
+  .stat-row {
+    display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px;
+    margin-top: 28px;
+  }
+  .stat {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+    padding: 16px 18px; box-shadow: var(--shadow);
+  }
+  .stat .label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-faint); margin-bottom: 6px; }
+  .stat .value { font-family: "IBM Plex Mono", monospace; font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .stat .value.pos { color: var(--pos-4); }
+  .stat .value.neg { color: var(--neg-4); }
+  .stat .hint { font-size: 12px; color: var(--text-faint); margin-top: 4px; }
+
+  section.panel {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 14px;
+    padding: 26px 28px 24px; margin-top: 24px; box-shadow: var(--shadow);
+  }
+  .panel-head { display: flex; align-items: baseline; justify-content: space-between; flex-wrap: wrap; gap: 8px; margin-bottom: 4px; }
+  .panel-title { font-size: 17px; font-weight: 600; display: flex; align-items: center; gap: 10px; }
+  .status-pill {
+    font-family: "IBM Plex Mono", monospace; font-size: 10.5px; font-weight: 600;
+    letter-spacing: 0.06em; text-transform: uppercase;
+    padding: 3px 9px; border-radius: 100px; border: 1px solid;
+  }
+  .status-pill.live { color: var(--pos-4); border-color: var(--pos-3); background: color-mix(in srgb, var(--pos-3) 14%, transparent); }
+  .status-pill.retired { color: var(--text-dim); border-color: var(--border); background: var(--surface-2); }
+  .panel-range { font-family: "IBM Plex Mono", monospace; font-size: 12px; color: var(--text-faint); }
+  .panel-note { font-size: 13px; color: var(--text-dim); margin: 6px 0 20px; line-height: 1.5; max-width: 68ch; }
+  .panel-note code { font-family: "IBM Plex Mono", monospace; font-size: 12px; background: var(--surface-2); padding: 1px 5px; border-radius: 4px; }
+
+  .cal-scroll { overflow-x: auto; padding-bottom: 4px; }
+  .cal { display: inline-flex; flex-direction: column; gap: 3px; min-width: 100%; }
+  .cal-row { display: flex; gap: 3px; align-items: center; }
+  .cal-daylabel {
+    width: 30px; flex: 0 0 30px; font-family: "IBM Plex Mono", monospace; font-size: 10px;
+    color: var(--text-faint); text-align: right; padding-right: 6px;
+  }
+  .cal-cell {
+    width: 15px; height: 15px; border-radius: 3px; background: var(--cell-empty);
+    position: relative; cursor: default; flex: 0 0 15px;
+    transition: transform 0.08s ease;
+  }
+  .cal-cell.has-data:hover { transform: scale(1.35); z-index: 5; box-shadow: 0 0 0 1px var(--border); }
+  .cal-months { display: flex; gap: 3px; margin-bottom: 2px; padding-left: 36px; }
+  .cal-month-label {
+    font-family: "IBM Plex Mono", monospace; font-size: 10px; color: var(--text-faint);
+    flex: 0 0 auto;
+  }
+
+  .tooltip {
+    position: fixed; pointer-events: none; z-index: 50;
+    background: var(--text); color: var(--bg);
+    font-family: "IBM Plex Mono", monospace; font-size: 11.5px; line-height: 1.5;
+    padding: 8px 11px; border-radius: 7px; box-shadow: var(--shadow);
+    opacity: 0; transition: opacity 0.1s ease; white-space: nowrap;
+  }
+  .tooltip.show { opacity: 1; }
+  .tooltip .t-date { font-weight: 600; margin-bottom: 2px; }
+
+  .legend { display: flex; align-items: center; gap: 14px; margin-top: 18px; flex-wrap: wrap; }
+  .legend-group { display: flex; align-items: center; gap: 4px; }
+  .legend-label { font-size: 11px; color: var(--text-faint); font-family: "IBM Plex Mono", monospace; margin-right: 2px; }
+  .legend-swatch { width: 14px; height: 14px; border-radius: 3px; }
+
+  .panel-foot {
+    display: flex; justify-content: space-between; flex-wrap: wrap; gap: 10px 24px;
+    margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--border);
+    font-size: 12.5px; color: var(--text-dim);
+  }
+  .panel-foot b { color: var(--text); font-variant-numeric: tabular-nums; }
+
+  footer {
+    margin-top: 32px; font-size: 12px; color: var(--text-faint); line-height: 1.6;
+    border-top: 1px solid var(--border); padding-top: 16px;
+  }
+</style>
+
+<div class="wrap">
+  <header>
+    <div class="eyebrow">Breakout Scanner &middot; Real Alert Outcomes</div>
+    <h1>Signal Day Ledger</h1>
+    <div class="sub">Every trading day the scanner fired a real alert, colored by that day's net outcome &mdash;
+      <b>sum of real EOD returns</b> across every alert of that signal type, not a modeled estimate. Pulled straight
+      from <code style="font-family:'IBM Plex Mono',monospace;background:var(--surface-2);padding:1px 5px;border-radius:4px;">alert_performance</code>.</div>
+    <div class="stat-row" id="stat-row"></div>
+  </header>
+
+  <section class="panel" id="panel-breakout"></section>
+  <section class="panel" id="panel-pre_breakout"></section>
+
+  <div class="eyebrow" style="margin-top:40px">Shadow Quality Tiers &middot; Live Out-Of-Sample</div>
+  <h2 style="font-size:19px;font-weight:600;margin:6px 0 8px;">PREFER-HIGH / MEDIUM / LOW</h2>
+  <div class="sub" style="margin-bottom:20px;">breakout_research's real-time 5-tier shadow classifier, joined against each
+    alert's actual outcome. Read-only, forward, out-of-sample &mdash; tags alerts as they fire, never edits
+    breakout_scanner itself.
+    <br><br><b>Why these don't sum to BREAKOUT's +76.8% above:</b> shadow tagging only started 2026-08-25, two months
+    after BREAKOUT itself. Of BREAKOUT's 766 real alerts, 570 fired before tagging existed (+43.9% of the total) and
+    are untagged by design, not missing data. The 196 alerts <i>from</i> 2026-08-25 onward are 100% covered here &mdash;
+    PREFER-HIGH (+33.0%) + PREFER-MEDIUM (&minus;0.1%) = <b>+32.9%</b>, matching BREAKOUT's own real return over that
+    identical window exactly.</div>
+
+  <section class="panel" id="panel-prefer_high"></section>
+  <section class="panel" id="panel-prefer_medium"></section>
+  <div class="panel" id="panel-prefer_low" style="background:var(--surface); border:1px dashed var(--border); border-radius:14px; padding:22px 26px; margin-top:24px; box-shadow:none;">
+    <div class="panel-title" style="margin-bottom:6px;">PREFER-LOW <span class="status-pill retired">no data</span></div>
+    <div class="panel-note" style="margin-bottom:0;">Zero real alerts have ever been tagged PREFER-LOW &mdash; the entire
+      shadow log (196 rows, 2026-08-25 to 2026-09-11) is 169 PREFER-HIGH and 27 PREFER-MID, nothing else. Not an
+      empty-data bug: the classifier's real logic just hasn't produced this tier in this window. Shown honestly rather
+      than filled in with a heatmap that has nothing behind it.</div>
+  </div>
+
+  <footer>
+    Each cell is one real trading day; empty cells mean no alert of that type fired. Color depth scales with the
+    magnitude of that day's summed return, split into five steps per direction from the real min/max observed.
+    Hover any filled cell for the exact date, net return, alert count, and win count.
+  </footer>
+</div>
+
+<div class="tooltip" id="tooltip"></div>
+
+<script>
+const DATA = {"breakout": [{"date": "2026-06-25", "sum_ret": 1.846, "n_alerts": 15, "wins": 9, "avg_ret": 0.123}, {"date": "2026-06-26", "sum_ret": -0.748, "n_alerts": 9, "wins": 5, "avg_ret": -0.083}, {"date": "2026-06-29", "sum_ret": -1.05, "n_alerts": 26, "wins": 15, "avg_ret": -0.04}, {"date": "2026-07-01", "sum_ret": 16.845, "n_alerts": 19, "wins": 16, "avg_ret": 0.887}, {"date": "2026-07-02", "sum_ret": 5.191, "n_alerts": 20, "wins": 13, "avg_ret": 0.26}, {"date": "2026-07-06", "sum_ret": 3.573, "n_alerts": 18, "wins": 11, "avg_ret": 0.199}, {"date": "2026-07-07", "sum_ret": -14.785, "n_alerts": 19, "wins": 4, "avg_ret": -0.778}, {"date": "2026-07-08", "sum_ret": 5.106, "n_alerts": 2, "wins": 2, "avg_ret": 2.553}, {"date": "2026-07-09", "sum_ret": 7.984, "n_alerts": 16, "wins": 12, "avg_ret": 0.499}, {"date": "2026-07-10", "sum_ret": -28.796, "n_alerts": 24, "wins": 6, "avg_ret": -1.2}, {"date": "2026-07-13", "sum_ret": 2.692, "n_alerts": 12, "wins": 7, "avg_ret": 0.224}, {"date": "2026-07-14", "sum_ret": -1.02, "n_alerts": 11, "wins": 6, "avg_ret": -0.093}, {"date": "2026-07-15", "sum_ret": -7.641, "n_alerts": 18, "wins": 6, "avg_ret": -0.425}, {"date": "2026-07-20", "sum_ret": -13.87, "n_alerts": 11, "wins": 3, "avg_ret": -1.261}, {"date": "2026-07-21", "sum_ret": 18.1, "n_alerts": 8, "wins": 5, "avg_ret": 2.263}, {"date": "2026-07-22", "sum_ret": -6.365, "n_alerts": 7, "wins": 2, "avg_ret": -0.909}, {"date": "2026-07-23", "sum_ret": -4.565, "n_alerts": 7, "wins": 2, "avg_ret": -0.652}, {"date": "2026-07-24", "sum_ret": -0.394, "n_alerts": 15, "wins": 9, "avg_ret": -0.026}, {"date": "2026-07-27", "sum_ret": 10.264, "n_alerts": 19, "wins": 11, "avg_ret": 0.54}, {"date": "2026-07-28", "sum_ret": -4.398, "n_alerts": 18, "wins": 11, "avg_ret": -0.244}, {"date": "2026-07-29", "sum_ret": -3.727, "n_alerts": 7, "wins": 2, "avg_ret": -0.532}, {"date": "2026-07-30", "sum_ret": 3.13, "n_alerts": 4, "wins": 3, "avg_ret": 0.782}, {"date": "2026-08-03", "sum_ret": -0.972, "n_alerts": 24, "wins": 12, "avg_ret": -0.04}, {"date": "2026-08-04", "sum_ret": 19.825, "n_alerts": 16, "wins": 14, "avg_ret": 1.239}, {"date": "2026-08-05", "sum_ret": -6.663, "n_alerts": 11, "wins": 2, "avg_ret": -0.606}, {"date": "2026-08-06", "sum_ret": 2.625, "n_alerts": 6, "wins": 4, "avg_ret": 0.438}, {"date": "2026-08-07", "sum_ret": 3.592, "n_alerts": 18, "wins": 13, "avg_ret": 0.2}, {"date": "2026-08-10", "sum_ret": 8.509, "n_alerts": 23, "wins": 14, "avg_ret": 0.37}, {"date": "2026-08-11", "sum_ret": -2.923, "n_alerts": 15, "wins": 4, "avg_ret": -0.195}, {"date": "2026-08-12", "sum_ret": 2.866, "n_alerts": 13, "wins": 6, "avg_ret": 0.22}, {"date": "2026-08-13", "sum_ret": 18.248, "n_alerts": 28, "wins": 23, "avg_ret": 0.652}, {"date": "2026-08-14", "sum_ret": -0.539, "n_alerts": 8, "wins": 4, "avg_ret": -0.067}, {"date": "2026-08-17", "sum_ret": -1.593, "n_alerts": 7, "wins": 1, "avg_ret": -0.228}, {"date": "2026-08-18", "sum_ret": 1.306, "n_alerts": 19, "wins": 10, "avg_ret": 0.069}, {"date": "2026-08-19", "sum_ret": 15.15, "n_alerts": 23, "wins": 14, "avg_ret": 0.659}, {"date": "2026-08-20", "sum_ret": -5.924, "n_alerts": 10, "wins": 3, "avg_ret": -0.592}, {"date": "2026-08-21", "sum_ret": 9.502, "n_alerts": 28, "wins": 17, "avg_ret": 0.339}, {"date": "2026-08-24", "sum_ret": -6.448, "n_alerts": 16, "wins": 9, "avg_ret": -0.403}, {"date": "2026-08-25", "sum_ret": 7.31, "n_alerts": 16, "wins": 11, "avg_ret": 0.457}, {"date": "2026-08-26", "sum_ret": -5.577, "n_alerts": 17, "wins": 5, "avg_ret": -0.328}, {"date": "2026-08-27", "sum_ret": 29.911, "n_alerts": 20, "wins": 15, "avg_ret": 1.496}, {"date": "2026-08-28", "sum_ret": -1.813, "n_alerts": 17, "wins": 8, "avg_ret": -0.107}, {"date": "2026-08-31", "sum_ret": 6.188, "n_alerts": 15, "wins": 7, "avg_ret": 0.413}, {"date": "2026-09-01", "sum_ret": -8.323, "n_alerts": 12, "wins": 3, "avg_ret": -0.694}, {"date": "2026-09-02", "sum_ret": 5.14, "n_alerts": 21, "wins": 14, "avg_ret": 0.245}, {"date": "2026-09-03", "sum_ret": 0.067, "n_alerts": 27, "wins": 14, "avg_ret": 0.002}, {"date": "2026-09-04", "sum_ret": 5.661, "n_alerts": 6, "wins": 4, "avg_ret": 0.944}, {"date": "2026-09-08", "sum_ret": -0.258, "n_alerts": 9, "wins": 3, "avg_ret": -0.029}, {"date": "2026-09-09", "sum_ret": -4.993, "n_alerts": 13, "wins": 4, "avg_ret": -0.384}, {"date": "2026-09-10", "sum_ret": -0.415, "n_alerts": 7, "wins": 3, "avg_ret": -0.059}, {"date": "2026-09-11", "sum_ret": -0.001, "n_alerts": 13, "wins": 6, "avg_ret": -0.0}], "pre_breakout": [{"date": "2026-06-25", "sum_ret": 1.454, "n_alerts": 9, "wins": 3, "avg_ret": 0.162}, {"date": "2026-06-26", "sum_ret": 1.158, "n_alerts": 5, "wins": 2, "avg_ret": 0.232}, {"date": "2026-06-29", "sum_ret": -0.082, "n_alerts": 25, "wins": 14, "avg_ret": -0.003}, {"date": "2026-06-30", "sum_ret": -0.297, "n_alerts": 10, "wins": 6, "avg_ret": -0.03}, {"date": "2026-07-01", "sum_ret": -0.768, "n_alerts": 3, "wins": 1, "avg_ret": -0.256}, {"date": "2026-07-02", "sum_ret": 5.388, "n_alerts": 15, "wins": 12, "avg_ret": 0.359}, {"date": "2026-07-06", "sum_ret": -3.902, "n_alerts": 12, "wins": 5, "avg_ret": -0.325}, {"date": "2026-07-07", "sum_ret": 2.447, "n_alerts": 4, "wins": 2, "avg_ret": 0.612}, {"date": "2026-07-08", "sum_ret": -0.549, "n_alerts": 8, "wins": 4, "avg_ret": -0.069}, {"date": "2026-07-09", "sum_ret": 7.437, "n_alerts": 20, "wins": 10, "avg_ret": 0.372}, {"date": "2026-07-10", "sum_ret": 2.029, "n_alerts": 8, "wins": 4, "avg_ret": 0.254}, {"date": "2026-07-13", "sum_ret": -1.04, "n_alerts": 20, "wins": 12, "avg_ret": -0.052}, {"date": "2026-07-14", "sum_ret": 2.408, "n_alerts": 21, "wins": 12, "avg_ret": 0.115}, {"date": "2026-07-15", "sum_ret": -0.131, "n_alerts": 20, "wins": 12, "avg_ret": -0.007}, {"date": "2026-07-20", "sum_ret": -9.383, "n_alerts": 18, "wins": 6, "avg_ret": -0.521}, {"date": "2026-07-21", "sum_ret": -1.41, "n_alerts": 15, "wins": 6, "avg_ret": -0.094}, {"date": "2026-07-22", "sum_ret": -3.368, "n_alerts": 11, "wins": 4, "avg_ret": -0.306}, {"date": "2026-07-23", "sum_ret": -2.89, "n_alerts": 11, "wins": 5, "avg_ret": -0.263}, {"date": "2026-07-24", "sum_ret": -1.014, "n_alerts": 10, "wins": 4, "avg_ret": -0.101}, {"date": "2026-07-27", "sum_ret": -1.911, "n_alerts": 8, "wins": 3, "avg_ret": -0.239}, {"date": "2026-07-28", "sum_ret": 9.744, "n_alerts": 14, "wins": 9, "avg_ret": 0.696}, {"date": "2026-07-29", "sum_ret": -15.79, "n_alerts": 23, "wins": 4, "avg_ret": -0.687}, {"date": "2026-07-30", "sum_ret": 8.387, "n_alerts": 15, "wins": 12, "avg_ret": 0.559}, {"date": "2026-08-03", "sum_ret": 1.608, "n_alerts": 7, "wins": 3, "avg_ret": 0.23}, {"date": "2026-08-04", "sum_ret": 14.39, "n_alerts": 19, "wins": 16, "avg_ret": 0.757}, {"date": "2026-08-05", "sum_ret": -7.871, "n_alerts": 16, "wins": 4, "avg_ret": -0.492}, {"date": "2026-08-06", "sum_ret": -6.055, "n_alerts": 14, "wins": 7, "avg_ret": -0.432}, {"date": "2026-08-07", "sum_ret": 6.6, "n_alerts": 18, "wins": 13, "avg_ret": 0.367}, {"date": "2026-08-10", "sum_ret": 6.621, "n_alerts": 24, "wins": 16, "avg_ret": 0.276}, {"date": "2026-08-11", "sum_ret": -3.584, "n_alerts": 28, "wins": 13, "avg_ret": -0.128}, {"date": "2026-08-12", "sum_ret": 3.059, "n_alerts": 28, "wins": 15, "avg_ret": 0.109}, {"date": "2026-08-13", "sum_ret": 8.562, "n_alerts": 12, "wins": 9, "avg_ret": 0.714}, {"date": "2026-08-14", "sum_ret": -7.505, "n_alerts": 20, "wins": 7, "avg_ret": -0.375}, {"date": "2026-08-17", "sum_ret": -2.75, "n_alerts": 19, "wins": 9, "avg_ret": -0.145}, {"date": "2026-08-18", "sum_ret": -2.822, "n_alerts": 15, "wins": 5, "avg_ret": -0.188}, {"date": "2026-08-19", "sum_ret": 0.719, "n_alerts": 12, "wins": 7, "avg_ret": 0.06}]};
+
+DATA.prefer_high = [{"date": "2026-08-25", "sum_ret": 8.65, "n_alerts": 10, "wins": 7, "avg_ret": 0.865}, {"date": "2026-08-26", "sum_ret": -4.532, "n_alerts": 11, "wins": 2, "avg_ret": -0.412}, {"date": "2026-08-27", "sum_ret": 27.876, "n_alerts": 18, "wins": 14, "avg_ret": 1.549}, {"date": "2026-08-28", "sum_ret": -3.485, "n_alerts": 15, "wins": 6, "avg_ret": -0.232}, {"date": "2026-08-31", "sum_ret": 6.385, "n_alerts": 14, "wins": 7, "avg_ret": 0.456}, {"date": "2026-09-01", "sum_ret": -8.237, "n_alerts": 11, "wins": 3, "avg_ret": -0.749}, {"date": "2026-09-02", "sum_ret": 3.933, "n_alerts": 20, "wins": 13, "avg_ret": 0.197}, {"date": "2026-09-03", "sum_ret": 2.49, "n_alerts": 23, "wins": 13, "avg_ret": 0.108}, {"date": "2026-09-04", "sum_ret": 5.661, "n_alerts": 6, "wins": 4, "avg_ret": 0.944}, {"date": "2026-09-08", "sum_ret": -0.258, "n_alerts": 9, "wins": 3, "avg_ret": -0.029}, {"date": "2026-09-09", "sum_ret": -4.993, "n_alerts": 13, "wins": 4, "avg_ret": -0.384}, {"date": "2026-09-10", "sum_ret": -0.709, "n_alerts": 6, "wins": 2, "avg_ret": -0.118}, {"date": "2026-09-11", "sum_ret": 0.259, "n_alerts": 10, "wins": 5, "avg_ret": 0.026}];
+DATA.prefer_medium = [{"date": "2026-08-25", "sum_ret": -1.34, "n_alerts": 6, "wins": 4, "avg_ret": -0.223}, {"date": "2026-08-26", "sum_ret": -1.045, "n_alerts": 6, "wins": 3, "avg_ret": -0.174}, {"date": "2026-08-27", "sum_ret": 2.035, "n_alerts": 2, "wins": 1, "avg_ret": 1.018}, {"date": "2026-08-28", "sum_ret": 1.672, "n_alerts": 2, "wins": 2, "avg_ret": 0.836}, {"date": "2026-08-31", "sum_ret": -0.197, "n_alerts": 1, "wins": 0, "avg_ret": -0.197}, {"date": "2026-09-01", "sum_ret": -0.086, "n_alerts": 1, "wins": 0, "avg_ret": -0.086}, {"date": "2026-09-02", "sum_ret": 1.208, "n_alerts": 1, "wins": 1, "avg_ret": 1.208}, {"date": "2026-09-03", "sum_ret": -2.422, "n_alerts": 4, "wins": 1, "avg_ret": -0.606}, {"date": "2026-09-10", "sum_ret": 0.294, "n_alerts": 1, "wins": 1, "avg_ret": 0.294}, {"date": "2026-09-11", "sum_ret": -0.259, "n_alerts": 3, "wins": 1, "avg_ret": -0.086}];
+
+const META = {
+  breakout: { title: "BREAKOUT", statusLabel: "live", statusClass: "live",
+    note: "The scanner's only currently-active alert type (%B &gt; 95 with confirming relative volume)." },
+  pre_breakout: { title: "PRE-BREAKOUT", statusLabel: "retired 2026-08-19", statusClass: "retired",
+    note: "Retired 2026-08-19 after a real backtest found no edge (49-51% win rate) &mdash; kept internally only to validate BREAKOUT quality via the entry path. Data stops the day it was cut." },
+  prefer_high: { title: "PREFER-HIGH", statusLabel: "live shadow", statusClass: "live",
+    note: "BREAKOUT with ADX&lt;30, or PRE-BREAKOUT clearing &ge;2 of 3 quality checks. Backtested (537 alerts): win rate 57.6%&rarr;59.9%, avg +1.09%&rarr;+1.39% (+3d&rarr;+5d)." },
+  prefer_medium: { title: "PREFER-MEDIUM", statusLabel: "live shadow", statusClass: "live",
+    note: "Clears exactly 1 of the within-PREFER quality checks &mdash; the middle tier between PREFER-HIGH and PREFER-LOW. Real sample here is thin (10 days, several with just 1-2 alerts) &mdash; read directionally, not as a settled result." }
+};
+
+function posBucket(v, max) {
+  const t = v / max;
+  if (t > 0.8) return 5; if (t > 0.55) return 4; if (t > 0.3) return 3; if (t > 0.08) return 2; return 1;
+}
+function negBucket(v, min) {
+  const t = v / min; // min is negative, v is negative -> t positive
+  if (t > 0.8) return 5; if (t > 0.55) return 4; if (t > 0.3) return 3; if (t > 0.08) return 2; return 1;
+}
+
+function buildCalendar(key) {
+  const rows = DATA[key];
+  const meta = META[key];
+  const byDate = {};
+  rows.forEach(r => byDate[r.date] = r);
+
+  const dates = rows.map(r => new Date(r.date + "T12:00:00"));
+  const start = new Date(Math.min(...dates));
+  const end = new Date(Math.max(...dates));
+  // align start to the Monday of its week
+  const startMonday = new Date(start);
+  const dow = (start.getDay() + 6) % 7; // 0=Mon
+  startMonday.setDate(start.getDate() - dow);
+
+  const maxPos = Math.max(...rows.map(r => r.sum_ret).filter(v => v > 0), 0.01);
+  const minNeg = Math.min(...rows.map(r => r.sum_ret).filter(v => v < 0), -0.01);
+
+  const weeks = [];
+  let cur = new Date(startMonday);
+  while (cur <= end) {
+    const week = [];
+    for (let d = 0; d < 5; d++) { // Mon-Fri only
+      const iso = cur.toISOString().slice(0, 10);
+      week.push(iso);
+      cur.setDate(cur.getDate() + 1);
+    }
+    cur.setDate(cur.getDate() + 2); // skip Sat/Sun
+    weeks.push(week);
+  }
+
+  const panel = document.getElementById(`panel-${key}`);
+  const dayLabels = ["Mon", "Tue", "Wed", "Thu", "Fri"];
+
+  let monthsHtml = '<div class="cal-months">';
+  let lastMonth = null;
+  weeks.forEach(week => {
+    const d = new Date(week[0] + "T12:00:00");
+    const m = d.toLocaleDateString("en-US", { month: "short" });
+    monthsHtml += `<div class="cal-month-label" style="width:15px">${m !== lastMonth ? m : ""}</div>`;
+    lastMonth = m;
+  });
+  monthsHtml += '</div>';
+
+  let calHtml = '<div class="cal">';
+  for (let d = 0; d < 5; d++) {
+    calHtml += `<div class="cal-row"><div class="cal-daylabel">${dayLabels[d]}</div>`;
+    weeks.forEach(week => {
+      const iso = week[d];
+      const rec = byDate[iso];
+      let cls = "cal-cell";
+      let style = "";
+      if (rec) {
+        cls += " has-data";
+        if (rec.sum_ret > 0) style = `background:var(--pos-${posBucket(rec.sum_ret, maxPos)})`;
+        else if (rec.sum_ret < 0) style = `background:var(--neg-${negBucket(rec.sum_ret, minNeg)})`;
+        else style = "background:var(--surface-2)";
+      }
+      calHtml += `<div class="${cls}" style="${style}" data-date="${iso}" data-key="${key}"></div>`;
+    });
+    calHtml += `</div>`;
+  }
+  calHtml += '</div>';
+
+  const posDays = rows.filter(r => r.sum_ret > 0).length;
+  const negDays = rows.filter(r => r.sum_ret < 0).length;
+  const cum = rows.reduce((s, r) => s + r.sum_ret, 0);
+
+  panel.innerHTML = `
+    <div class="panel-head">
+      <div class="panel-title">${meta.title} <span class="status-pill ${meta.statusClass}">${meta.statusLabel}</span></div>
+      <div class="panel-range">${rows[0].date} &rarr; ${rows[rows.length - 1].date} &middot; ${rows.length} trading days</div>
+    </div>
+    <div class="panel-note">${meta.note}</div>
+    ${monthsHtml}
+    <div class="cal-scroll">${calHtml}</div>
+    <div class="legend">
+      <div class="legend-group"><span class="legend-label">neg</span>
+        ${[5,4,3,2,1].map(i => `<span class="legend-swatch" style="background:var(--neg-${i})"></span>`).join("")}
+      </div>
+      <div class="legend-group">
+        ${[1,2,3,4,5].map(i => `<span class="legend-swatch" style="background:var(--pos-${i})"></span>`).join("")}
+        <span class="legend-label">pos</span>
+      </div>
+      <div class="legend-group"><span class="legend-swatch" style="background:var(--cell-empty)"></span><span class="legend-label">no alert</span></div>
+    </div>
+    <div class="panel-foot">
+      <span>Positive days: <b>${posDays}</b> &middot; Negative days: <b>${negDays}</b></span>
+      <span>Cumulative sum-of-EOD-return: <b class="${cum >= 0 ? '' : ''}" style="color:${cum >= 0 ? 'var(--pos-4)' : 'var(--neg-4)'}">${cum >= 0 ? "+" : ""}${cum.toFixed(2)}%</b></span>
+    </div>
+  `;
+}
+
+buildCalendar("breakout");
+buildCalendar("pre_breakout");
+buildCalendar("prefer_high");
+buildCalendar("prefer_medium");
+
+// header stats
+function fmtPct(v) { return (v >= 0 ? "+" : "") + v.toFixed(1) + "%"; }
+const bo = DATA.breakout, pbo = DATA.pre_breakout;
+const boCum = bo.reduce((s, r) => s + r.sum_ret, 0);
+const pboCum = pbo.reduce((s, r) => s + r.sum_ret, 0);
+const boPos = bo.filter(r => r.sum_ret > 0).length;
+const pboPos = pbo.filter(r => r.sum_ret > 0).length;
+document.getElementById("stat-row").innerHTML = `
+  <div class="stat"><div class="label">BREAKOUT days</div><div class="value">${bo.length}</div><div class="hint">${boPos} positive / ${bo.length - boPos} negative</div></div>
+  <div class="stat"><div class="label">BREAKOUT cumulative</div><div class="value ${boCum >= 0 ? 'pos' : 'neg'}">${fmtPct(boCum)}</div><div class="hint">sum of daily EOD returns</div></div>
+  <div class="stat"><div class="label">PRE-BREAKOUT days</div><div class="value">${pbo.length}</div><div class="hint">${pboPos} positive / ${pbo.length - pboPos} negative</div></div>
+  <div class="stat"><div class="label">PRE-BREAKOUT cumulative</div><div class="value ${pboCum >= 0 ? 'pos' : 'neg'}">${fmtPct(pboCum)}</div><div class="hint">stopped 2026-08-19</div></div>
+`;
+
+// tooltip
+const tip = document.getElementById("tooltip");
+document.addEventListener("mousemove", e => {
+  const cell = e.target.closest(".cal-cell.has-data");
+  if (!cell) { tip.classList.remove("show"); return; }
+  const rec = DATA[cell.dataset.key].find(r => r.date === cell.dataset.date);
+  const d = new Date(rec.date + "T12:00:00");
+  const dateStr = d.toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" });
+  tip.innerHTML = `<div class="t-date">${dateStr}</div>` +
+    `net ${rec.sum_ret >= 0 ? "+" : ""}${rec.sum_ret.toFixed(2)}%  &middot;  ${rec.n_alerts} alerts  &middot;  ${rec.wins}W/${rec.n_alerts - rec.wins}L`;
+  tip.style.left = (e.clientX + 14) + "px";
+  tip.style.top = (e.clientY + 14) + "px";
+  tip.classList.add("show");
+});
+</script>

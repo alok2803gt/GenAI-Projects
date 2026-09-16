@@ -65,6 +65,12 @@ BACKEND = "http://localhost:8000"
 
 
 def telegram(text, high_priority=False):
+    try:
+        from telegram_alert_gate import alert_enabled
+        if not alert_enabled("spx_0dte"):
+            return
+    except Exception:
+        pass
     cfg = load_config()
     prefix = "\U0001F6A8 " if high_priority else ""
     try:

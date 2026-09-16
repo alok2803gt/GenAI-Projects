@@ -63,6 +63,12 @@ def load_config():
 
 def telegram(token, chat_id, msg, high_priority=False):
     try:
+        from telegram_alert_gate import alert_enabled
+        if not alert_enabled("ashley_signals"):
+            return
+    except Exception:
+        pass
+    try:
         prefix = "🚨 " if high_priority else "📡 "
         requests.post(
             f"https://api.telegram.org/bot{token}/sendMessage",

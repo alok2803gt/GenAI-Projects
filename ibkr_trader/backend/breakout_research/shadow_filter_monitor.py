@@ -72,6 +72,14 @@ def _load_telegram_creds() -> tuple[str, str] | tuple[None, None]:
 
 def telegram(msg: str):
     import requests
+    try:
+        import sys
+        sys.path.insert(0, str(BACKEND_DIR))
+        from telegram_alert_gate import alert_enabled
+        if not alert_enabled("research_desk"):
+            return
+    except Exception:
+        pass
     token, chat_id = _load_telegram_creds()
     if not token or not chat_id:
         print("  (Telegram creds not found in scanner_config.json -- skipping send)")

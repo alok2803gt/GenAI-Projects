@@ -124,6 +124,12 @@ def _send_telegram_sync(text: str) -> None:
 
 
 def notify(text: str, high_priority: bool = False) -> None:
+    try:
+        from telegram_alert_gate import alert_enabled
+        if not alert_enabled("spy_weekly_condor"):
+            return
+    except Exception:
+        pass
     prefix = "\U0001F6A8\U0001F6A8 HIGH PRIORITY — ACTION NEEDED \U0001F6A8\U0001F6A8\n" if high_priority \
         else "\U0001F6E0️ SPY Weekly Condor agent:\n"
     threading.Thread(target=_send_telegram_sync, args=(prefix + text,), daemon=True).start()

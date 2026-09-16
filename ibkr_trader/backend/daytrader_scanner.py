@@ -342,6 +342,12 @@ def send_telegram(token: str, chat_id: str, text: str) -> bool:
     if not token or not chat_id:
         return False
     try:
+        from telegram_alert_gate import alert_enabled
+        if not alert_enabled("daytrader_scanner"):
+            return False
+    except Exception:
+        pass
+    try:
         r = requests.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
             json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},

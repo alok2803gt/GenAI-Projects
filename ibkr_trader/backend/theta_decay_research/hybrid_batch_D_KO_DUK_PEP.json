@@ -1,0 +1,62 @@
+[
+  {
+    "ticker": "D",
+    "n_trials": 65,
+    "skipped_earnings_windows": 52,
+    "pct_trials_with_tightened_wing": 0.9846,
+    "win_rate": 0.7231,
+    "stop_loss_hit_rate": 0.2769,
+    "breach_no_recover_rate": 0.0,
+    "avg_days_to_50pct_target": 13.7,
+    "median_captured_pct": 0.5,
+    "mean_captured_pct": -0.1346,
+    "expectancy_per_dollar_credit_sold": 0.2249,
+    "worst_trial_captured_pct": -3.8355,
+    "avg_entry_credit_$": 21.89
+  },
+  {
+    "ticker": "KO",
+    "n_trials": 45,
+    "skipped_earnings_windows": 49,
+    "pct_trials_with_tightened_wing": 0.9778,
+    "win_rate": 0.7333,
+    "stop_loss_hit_rate": 0.2667,
+    "breach_no_recover_rate": 0.0,
+    "avg_days_to_50pct_target": 11.8,
+    "median_captured_pct": 0.5,
+    "mean_captured_pct": 0.0164,
+    "expectancy_per_dollar_credit_sold": 0.1482,
+    "worst_trial_captured_pct": -2.487,
+    "avg_entry_credit_$": 6.4
+  },
+  {
+    "ticker": "DUK",
+    "n_trials": 63,
+    "skipped_earnings_windows": 51,
+    "pct_trials_with_tightened_wing": 0.9841,
+    "win_rate": 0.6508,
+    "stop_loss_hit_rate": 0.3492,
+    "breach_no_recover_rate": 0.0,
+    "avg_days_to_50pct_target": 10.8,
+    "median_captured_pct": 0.5,
+    "mean_captured_pct": -0.319,
+    "expectancy_per_dollar_credit_sold": -0.1716,
+    "worst_trial_captured_pct": -4.0273,
+    "avg_entry_credit_$": 11.0
+  },
+  {
+    "ticker": "PEP",
+    "n_trials": 64,
+    "skipped_earnings_windows": 51,
+    "pct_trials_with_tightened_wing": 1.0,
+    "win_rate": 0.8125,
+    "stop_loss_hit_rate": 0.1875,
+    "breach_no_recover_rate": 0.0,
+    "avg_days_to_50pct_target": 13.2,
+    "median_captured_pct": 0.5,
+    "mean_captured_pct": 0.0293,
+    "expectancy_per_dollar_credit_sold": 0.2544,
+    "worst_trial_captured_pct": -8.412,
+    "avg_entry_credit_$": 8.94
+  }
+]

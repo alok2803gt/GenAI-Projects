@@ -120,6 +120,7 @@ so there's no partial way to "trade around" the event once the gate would
 otherwise pass.
 """
 import argparse
+import json
 import sys
 import time
 from datetime import date, datetime
@@ -127,8 +128,14 @@ from datetime import date, datetime
 import yfinance as yf
 from ib_insync import IB
 
-from butterfly_babysitter_common import compute_live_gex, telegram
+from butterfly_babysitter_common import compute_live_gex, telegram, oversight_log
 from macro_calendar import is_macro_day
+
+# crt_research/ isn't a package (matches this codebase's flat-file convention
+# elsewhere) -- path-append rather than relative-import.
+import os as _os
+sys.path.insert(0, _os.path.join(_os.path.dirname(__file__), "crt_research"))
+from crt_signal import get_crt_signal  # noqa: E402
 
 from alpaca_0dte_common import (
     get_quotes_batch, etf_option, etf_spot, get_real_strikes_0dte,
@@ -331,6 +338,27 @@ def price_legs(ib, ticker, wing_step, expiry_ibkr, S0):
 # near the body) -- confirms the original "no early profit target" design
 # was right on the profit side; the new value is loss-side only.
 STOP_LOSS_PCT_BY_TICKER = {"qqq": 0.50}
+
+# CRT (Candle Range Theory) exit-management gate -- added 2026-09-12 per real
+# backtest (crt_research/crt_spy_0dte_backtest.py, 2y real 5-min bars per
+# ticker): a real 9:30-9:45 sweep-and-reclaim of the prior day's range
+# predicts a meaningfully tighter rest-of-day range -- exactly what this
+# butterfly wants. Deliberately does NOT touch entry (the wing_step=4
+# backtest is calibrated to a real 9:45 entry; CRT can't resolve until
+# ~10:15, so touching entry timing/sizing would invalidate that separately-
+# validated assumption) -- only shortens the hard-close time on the
+# ALREADY-OPEN position when CRT does NOT confirm by then, on the reasoning
+# that a non-confirming morning is more likely a trend day than a pin day.
+# The specific 13:00 cutoff itself is an engineering choice informed by the
+# finding, not independently backtested -- flagged honestly, unlike the
+# range-compression correlation itself which is real.
+#   SPY: p=0.0014 (15-min window), robust across a 10-25min neighborhood.
+#   IWM: p=0.0035 (15-min window) -- added 2026-09-12, same real effect.
+#   QQQ: p=0.0512 at 15-min -- borderline, NOT added yet pending more
+#        parameter points (see crt_research/ for the ongoing check).
+CRT_GATE_TICKERS = {"spy", "iwm"}
+CRT_CHECK_TIME = (10, 15)     # ET -- earliest the CRT signal can resolve (see crt_signal.py)
+CRT_EARLY_CLOSE_TIME = "13:00"  # used instead of HARD_CLOSE_TIME when CRT does not confirm
 
 
 def _close_and_record(ib2, ticker, contracts, today_ibkr, strikes, close_limits,
@@ -589,9 +617,44 @@ def main():
     ib2 = IB()
     ib2.errorEvent += lambda reqId, code, msg, contract: None
     ib2.connect("127.0.0.1", TWS_PORT, clientId=CLIENT_ID[ticker] + 100, timeout=20)
+    crt_checked = False
     try:
         while True:
             now = now_et()
+
+            # CRT exit-management check (SPY only, see CRT_GATE_TICKERS comment above) --
+            # runs once, the first monitor tick at/after CRT_CHECK_TIME.
+            if ticker in CRT_GATE_TICKERS and not crt_checked and \
+                    (now.hour, now.minute) >= CRT_CHECK_TIME:
+                crt_checked = True
+                try:
+                    crt = get_crt_signal(ib2, ticker.upper())
+                except Exception as e:
+                    crt = None
+                    print(f"CRT check failed ({e}) -- leaving hard-close at {HARD_CLOSE_TIME} (fail-safe default).")
+                cfg = load_config()
+                if crt is None:
+                    print("CRT check returned no signal -- leaving hard-close at default.")
+                elif crt["crt_day"]:
+                    print(f"CRT CONFIRMED ({crt['direction']}, swept at {crt['sweep_time']}) -- "
+                          f"real backtest says today's more likely to stay range-bound. "
+                          f"Keeping hard-close at {HARD_CLOSE_TIME}.")
+                    telegram(cfg, f"{ticker.upper()} 0DTE: CRT confirmed today ({crt['direction']}) -- holding to {HARD_CLOSE_TIME} as usual.")
+                    oversight_log(ticker, f"CRT confirmed ({crt['direction']}), keeping hard-close at {HARD_CLOSE_TIME}",
+                                  rationale=f"crt_research/crt_{ticker}_0dte_results_sweep15_reclaim30.json", outcome=json.dumps(crt))
+                else:
+                    hard_close_dt = datetime.strptime(
+                        f"{entry_time.strftime('%Y-%m-%d')} {CRT_EARLY_CLOSE_TIME}", "%Y-%m-%d %H:%M"
+                    ).replace(tzinfo=entry_time.tzinfo)
+                    print(f"CRT NOT confirmed today (ref high/low {crt['ref_high']}/{crt['ref_low']}, "
+                          f"no valid sweep+reclaim by {CRT_CHECK_TIME[0]}:{CRT_CHECK_TIME[1]:02d}) -- "
+                          f"real backtest correlates this with a WIDER rest-of-day range. "
+                          f"Moving hard-close up to {CRT_EARLY_CLOSE_TIME} ET instead of {HARD_CLOSE_TIME}.")
+                    telegram(cfg, f"{ticker.upper()} 0DTE: CRT did NOT confirm today -- moving hard-close up to "
+                             f"{CRT_EARLY_CLOSE_TIME} ET (was {HARD_CLOSE_TIME}) per the real range-compression backtest.")
+                    oversight_log(ticker, f"CRT not confirmed, moving hard-close to {CRT_EARLY_CLOSE_TIME} (was {HARD_CLOSE_TIME})",
+                                  rationale=f"crt_research/crt_{ticker}_0dte_results_sweep15_reclaim30.json", outcome=json.dumps(crt))
+
             value, mon_quotes = butterfly_mark(ib2, ticker, today_ibkr, strikes)
             if value is None:
                 print(f"[{now.strftime('%H:%M:%S')}] quote gap, will retry next cycle")

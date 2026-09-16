@@ -88,6 +88,7 @@ ibkr_trader/backend/*_candidates.json
 ibkr_trader/backend/schedules/session_schedules.json
 ibkr_trader/backend/chart_alerts.json
 ibkr_trader/backend/reconciliation_config.json
+ibkr_trader/backend/telegram_alerts_config.json
 ibkr_trader/backend/harami_scanner_state.json
 ibkr_trader/backend/sector_catalyst_scanner_state.json
 ibkr_trader/backend/candlestick_pattern_research/harami_1m_performance_log.csv
@@ -135,6 +136,22 @@ ibkr_trader/backend/**/results.json
 ibkr_trader/backend/**/*_results.json
 ibkr_trader/backend/**/*_bars.json
 ibkr_trader/backend/**/minute_bars*.json
+
+# Same philosophy, extended 2026-09-16 for the crt_research/ and
+# theta_decay_research/ desks: raw per-day/per-alert backtest result
+# dumps and real-market-bar caches are regeneratable by re-running the
+# (kept) script against IBKR/yfinance -- only the scripts themselves and
+# the small, curated summary JSONs (combined_heatmap_data.json,
+# shadow_tier_data.json, prefer_high_alerts.json, breakout_daily_*.json,
+# batch_*.json) carry real authored value worth keeping in git.
+ibkr_trader/backend/**/*_bars_cache.csv
+ibkr_trader/backend/**/crt_*_results*.json
+ibkr_trader/backend/**/breakout_harami_split.json
+ibkr_trader/backend/**/breakout_5d_returns.json
+ibkr_trader/backend/*_cache.xml
+ibkr_trader/backend/*.db.bak*
+ibkr_trader/backend/**/*.db-shm
+ibkr_trader/backend/**/*.db-wal
 ibkr_trader/backend/**/*_rows.csv
 ibkr_trader/backend/**/forward_returns_*.csv
 ibkr_trader/backend/**/quality_score_*.csv

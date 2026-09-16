@@ -1,0 +1,122 @@
+[
+  {
+    "backtest": {
+      "ticker": "SPY",
+      "n_trials": 49,
+      "win_rate": 0.7755,
+      "stop_loss_hit_rate": 0.2245,
+      "breach_no_recover_rate": 0.0,
+      "pct_trials_hit_50pct_target": 0.7755,
+      "avg_days_to_50pct_target": 9.2,
+      "pct_hit_target_within_half_dte": 0.6939,
+      "median_captured_pct": 0.5,
+      "mean_captured_pct": 0.0084,
+      "expectancy_per_dollar_credit_sold": 0.2796,
+      "worst_trial_captured_pct": -3.5987,
+      "worst_trial_outcome": "stopped_out"
+    },
+    "live_diagnostic": {
+      "ticker": "SPY",
+      "live_iv_atm": 0.1284,
+      "current_realized_vol_20d": 0.0903,
+      "live_iv_over_rv_ratio": 1.42,
+      "current_rv_percentile_vs_6mo_own_history": 7.5
+    }
+  },
+  {
+    "backtest": {
+      "ticker": "QQQ",
+      "n_trials": 66,
+      "win_rate": 0.6212,
+      "stop_loss_hit_rate": 0.3636,
+      "breach_no_recover_rate": 0.0152,
+      "pct_trials_hit_50pct_target": 0.6212,
+      "avg_days_to_50pct_target": 10.3,
+      "pct_hit_target_within_half_dte": 0.6061,
+      "median_captured_pct": 0.5,
+      "mean_captured_pct": -0.2693,
+      "expectancy_per_dollar_credit_sold": 0.0389,
+      "worst_trial_captured_pct": -3.0122,
+      "worst_trial_outcome": "stopped_out"
+    },
+    "live_diagnostic": {
+      "ticker": "QQQ",
+      "live_iv_atm": 0.1871,
+      "current_realized_vol_20d": 0.1299,
+      "live_iv_over_rv_ratio": 1.44,
+      "current_rv_percentile_vs_6mo_own_history": 3.7
+    }
+  },
+  {
+    "backtest": {
+      "ticker": "NVDA",
+      "n_trials": 70,
+      "win_rate": 0.6,
+      "stop_loss_hit_rate": 0.3143,
+      "breach_no_recover_rate": 0.0857,
+      "pct_trials_hit_50pct_target": 0.6,
+      "avg_days_to_50pct_target": 21.4,
+      "pct_hit_target_within_half_dte": 0.1714,
+      "median_captured_pct": 0.5,
+      "mean_captured_pct": -0.1469,
+      "expectancy_per_dollar_credit_sold": -0.0337,
+      "worst_trial_captured_pct": -2.0093,
+      "worst_trial_outcome": "stopped_out"
+    },
+    "live_diagnostic": {
+      "ticker": "NVDA",
+      "live_iv_atm": 0.338,
+      "current_realized_vol_20d": 0.4376,
+      "live_iv_over_rv_ratio": 0.77,
+      "current_rv_percentile_vs_6mo_own_history": 71.0
+    }
+  },
+  {
+    "backtest": {
+      "ticker": "AAPL",
+      "n_trials": 67,
+      "win_rate": 0.6418,
+      "stop_loss_hit_rate": 0.3582,
+      "breach_no_recover_rate": 0.0,
+      "pct_trials_hit_50pct_target": 0.6418,
+      "avg_days_to_50pct_target": 13.5,
+      "pct_hit_target_within_half_dte": 0.4776,
+      "median_captured_pct": 0.5,
+      "mean_captured_pct": -0.2337,
+      "expectancy_per_dollar_credit_sold": -0.0448,
+      "worst_trial_captured_pct": -4.2517,
+      "worst_trial_outcome": "stopped_out"
+    },
+    "live_diagnostic": {
+      "ticker": "AAPL",
+      "live_iv_atm": 0.2752,
+      "current_realized_vol_20d": 0.242,
+      "live_iv_over_rv_ratio": 1.14,
+      "current_rv_percentile_vs_6mo_own_history": 37.4
+    }
+  },
+  {
+    "backtest": {
+      "ticker": "GOOGL",
+      "n_trials": 70,
+      "win_rate": 0.5429,
+      "stop_loss_hit_rate": 0.4571,
+      "breach_no_recover_rate": 0.0,
+      "pct_trials_hit_50pct_target": 0.5429,
+      "avg_days_to_50pct_target": 17.0,
+      "pct_hit_target_within_half_dte": 0.3,
+      "median_captured_pct": 0.5,
+      "mean_captured_pct": -0.5841,
+      "expectancy_per_dollar_credit_sold": -0.1968,
+      "worst_trial_captured_pct": -9.183,
+      "worst_trial_outcome": "stopped_out"
+    },
+    "live_diagnostic": {
+      "ticker": "GOOGL",
+      "live_iv_atm": 0.2998,
+      "current_realized_vol_20d": 0.208,
+      "live_iv_over_rv_ratio": 1.44,
+      "current_rv_percentile_vs_6mo_own_history": 1.9
+    }
+  }
+]

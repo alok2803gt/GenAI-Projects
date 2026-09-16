@@ -223,6 +223,12 @@ def _send_telegram_sync(text: str) -> None:
 
 
 def notify(text: str, high_priority: bool = False) -> None:
+    try:
+        from telegram_alert_gate import alert_enabled
+        if not alert_enabled("day_trader"):
+            return
+    except Exception:
+        pass
     prefix = "🚨🚨 HIGH PRIORITY — ACTION NEEDED 🚨🚨\n" if high_priority else "🛠️ Day Trader agent:\n"
     threading.Thread(target=_send_telegram_sync, args=(prefix + text,), daemon=True).start()
 

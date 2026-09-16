@@ -235,6 +235,12 @@ def reconcile_open_positions(ib, setups: list[dict], contracts: dict) -> dict:
 
 def telegram(msg, high_priority=True):
     try:
+        from telegram_alert_gate import alert_enabled
+        if not alert_enabled("ashley_signals"):
+            return
+    except Exception:
+        pass
+    try:
         prefix = "\U0001F6A8 " if high_priority else "\U0001F4E1 "
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
