@@ -1712,43 +1712,15 @@ def run_eod_summary(
                          + (f" — {len(bo_tickers)} breakout, {len(pre_tickers)} pre-breakout" if bo_tickers and pre_tickers else "")
                          + "</i>")
 
-        # ── #11: Same-day alert-to-close performance ─────────────────────────
-        # Query alert_history for first alert price per ticker today, then
-        # compare with _hist_cache EOD close to show intraday return.
-        if total > 0:
-            try:
-                _perf_date = datetime.now(ET).strftime("%Y-%m-%d")
-                _pcon = sqlite3.connect(TAPE_DB, check_same_thread=False)
-                _perf_rows = _pcon.execute(
-                    "SELECT ticker, price FROM alert_history "
-                    "WHERE session_date = ? AND price IS NOT NULL ORDER BY fired_at ASC",
-                    (_perf_date,),
-                ).fetchall()
-                _pcon.close()
-                _alert_prices: dict[str, float] = {}
-                for _ptk, _ppx in _perf_rows:
-                    if _ptk not in _alert_prices and _ppx:
-                        _alert_prices[_ptk] = float(_ppx)
-                _rets, _wins, _losses = [], [], []
-                for _ptk, _entry in _alert_prices.items():
-                    _df = _hist_cache.get(_ptk)
-                    if _df is None or _df.empty or _entry <= 0:
-                        continue
-                    _eod_px = float(_df["Close"].iloc[-1])
-                    _ret = (_eod_px / _entry - 1) * 100
-                    _rets.append(_ret)
-                    (_wins if _ret >= 0 else _losses).append(_ptk)
-                if _rets:
-                    _avg = sum(_rets) / len(_rets)
-                    _wr  = len(_wins) / len(_rets) * 100
-                    lines.append(
-                        f"\n📈 <b>Today's alert performance</b> ({len(_rets)} tracked): "
-                        f"{len(_wins)}W/{len(_losses)}L | "
-                        f"Win rate: {_wr:.0f}% | Avg return: {_avg:+.2f}%"
-                    )
-            except Exception as _pe:
-                log.debug("Same-day performance calc failed: %s", _pe)
-
+        # Same-day alert-to-close performance used to be computed here too,
+        # from this process's own _hist_cache close -- removed 2026-09-15.
+        # It duplicated (and routinely disagreed with) the backend's own
+        # EOD Alert Performance digest 9 minutes later: two different close-
+        # price vendors sampled minutes apart, with no way to audit either
+        # one after the fact since this one was never persisted. The
+        # backend's alert_performance-table-backed digest is the sole
+        # source of truth for win-rate/return now; it also breaks results
+        # out by BREAKOUT vs PRE-BREAKOUT, which this inline calc never did.
         lines.append("\n🌙 EOD watchlist incoming at 4:15 ET — setups for tomorrow.")
         send_telegram(token, chat_id, "\n".join(lines))
         log.info("EOD summary sent: %d alerts today (%d BO, %d PRE)",

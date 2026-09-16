@@ -41,7 +41,8 @@ PACE_S = 0.3
 
 def load_universe() -> dict:
     import sys
-    sys.path.insert(0, r"C:\Users\AlokD\.claude\skills\darkpool-levels-calculator")
+    from pathlib import Path
+    sys.path.insert(0, str(Path.home() / ".claude" / "skills" / "darkpool-levels-calculator"))
     import calc_darkpool_levels as m
     return dict(m.UNIVERSE)
 

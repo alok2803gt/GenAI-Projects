@@ -87,8 +87,8 @@ def market_is_open() -> bool:
     return open_t <= now <= close_t
 
 BACKEND_DIR = Path(__file__).parent
-SCREENER_PATH = r"C:\Users\AlokD\.claude\skills\safe-income-screener\screen.py"
-PYTHON = r"C:\Users\AlokD\AppData\Local\Programs\Python\Python311\python.exe"
+SCREENER_PATH = str(Path.home() / ".claude" / "skills" / "safe-income-screener" / "screen.py")
+PYTHON = sys.executable
 STATE_FILE = BACKEND_DIR / "safe_income_auto_state.json"
 LOG_FILE = BACKEND_DIR / "oversight_log.jsonl"
 PAUSE_FLAG = BACKEND_DIR / "safe_income_auto_PAUSED.flag"

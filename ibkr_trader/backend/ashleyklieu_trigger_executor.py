@@ -52,6 +52,7 @@ import asyncio
 import json
 import re
 import sys
+import time
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -473,7 +474,24 @@ async def run_daily_watch(setups, headers, last_message_id, alert_message_id=Non
     today_yymmdd = date.today().strftime("%y%m%d")
 
     ib = IB()
-    await ib.connectAsync("127.0.0.1", 7496, clientId=994, timeout=15)
+    # Retry the initial connect for up to 10 min -- real failure mode seen
+    # 2026-09-15: Ashley's Discord alert was found fine right at 9:30, but
+    # TWS's API port wasn't listening yet for a few minutes after market
+    # open, and this was the one connect() in the whole live-trading fleet
+    # with no retry around it. Day Trader / SPY Weekly Condor both already
+    # retry their own connect and recovered on their own that same morning;
+    # this brings Ashley in line. Safe to retry freely here specifically --
+    # nothing below this point has run yet, so a retry can't double an order.
+    _connect_deadline = time.monotonic() + 600
+    while True:
+        try:
+            await ib.connectAsync("127.0.0.1", 7496, clientId=994, timeout=15)
+            break
+        except Exception as exc:
+            if time.monotonic() >= _connect_deadline:
+                raise
+            print(f"IBKR connect failed, retrying: {exc}")
+            await asyncio.sleep(15)
 
     spy = Stock("SPY", "SMART", "USD")
     await ib.qualifyContractsAsync(spy)

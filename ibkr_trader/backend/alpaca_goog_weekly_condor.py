@@ -147,7 +147,12 @@ def pick_strikes(ib, expiry_ibkr, spot, otm_pct, width_pct):
     stk = Stock(TICKER, "SMART", "USD")
     ib.qualifyContracts(stk)
     chains = ib.reqSecDefOptParams(stk.symbol, "", stk.secType, stk.conId)
-    smart = [c for c in chains if c.exchange == "SMART"]
+    # GOOG has two SMART chain entries: tradingClass "GOOG" (the real weekly
+    # chain, 18 expirations) and "2GOOG" (a legacy/adjusted listing with only
+    # one expiration far out). Filtering on exchange alone picks whichever the
+    # API happens to return first -- confirmed 2026-09-14 to non-deterministically
+    # grab "2GOOG" and fail to find any near-term expiry.
+    smart = [c for c in chains if c.exchange == "SMART" and c.tradingClass == TICKER]
     if not smart or expiry_ibkr not in smart[0].expirations:
         return None, f"expiry {expiry_ibkr} not found in SMART chain"
     strikes = sorted(smart[0].strikes)

@@ -71,6 +71,9 @@ from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import accuracy_score
 import joblib
 import os
+import re
+import sys
+from pathlib import Path
 try:
     from ibkr_technicals import router as technicals_router
     _technicals_router_ok = True
@@ -6006,9 +6009,9 @@ def _oversight_notify(text: str, high_priority: bool = False) -> None:
 # dropped, never executed. Uses long-polling (getUpdates), not a webhook --
 # this box has no public HTTPS endpoint, and polling needs no port-forwarding
 # or cert setup.
-_TG_SCREENER_PATH = r"C:\Users\AlokD\.claude\skills\safe-income-screener\screen.py"
-_TG_GEXVEX_PATH   = r"C:\Users\AlokD\.claude\skills\gex-vex-calculator\calc_gex_vex.py"
-_TG_PYTHON        = r"C:\Users\AlokD\AppData\Local\Programs\Python\Python311\python.exe"
+_TG_SCREENER_PATH = str(Path.home() / ".claude" / "skills" / "safe-income-screener" / "screen.py")
+_TG_GEXVEX_PATH   = str(Path.home() / ".claude" / "skills" / "gex-vex-calculator" / "calc_gex_vex.py")
+_TG_PYTHON        = sys.executable
 
 
 async def _telegram_run_script(script_path: str, args: list[str], token: str, chat_id: str, label: str) -> None:
@@ -6318,8 +6321,26 @@ def _format_eod_performance_digest(session_date: str) -> str | None:
         f"Total alerts: {total}",
         f"Win rate: {win_rate}% ({wins}W / {total - wins}L)",
         f"Avg return: {avg_ret:+.2f}%\n",
-        "🏆 <b>Top winners:</b>",
     ]
+
+    # By signal type -- BREAKOUT (confirmed move) and PRE-BREAKOUT (early/
+    # unconfirmed) are structurally different signals; a single blended win
+    # rate hides whether one tier is carrying or dragging the other.
+    by_type: dict[str, list] = {}
+    for r in rows:
+        by_type.setdefault(r["signal_type"], []).append(r)
+    if len(by_type) > 1:
+        lines.append("<b>By signal type:</b>")
+        for sig_type in sorted(by_type, key=lambda s: -len(by_type[s])):
+            trows = by_type[sig_type]
+            t_wins = sum(1 for r in trows if r["is_win"] == 1)
+            t_n = len(trows)
+            t_wr = round(t_wins / t_n * 100, 1)
+            t_avg = round(sum(r["eod_return_pct"] for r in trows) / t_n, 2)
+            lines.append(f"  {sig_type:13s} {t_wr}% ({t_wins}W/{t_n - t_wins}L)  avg {t_avg:+.2f}%  n={t_n}")
+        lines.append("")
+
+    lines.append("🏆 <b>Top winners:</b>")
     for r in top_winners:
         lines.append(f"  {r['ticker']:6s} {r['signal_type']:14s} {r['eod_return_pct']:+.2f}%")
     lines.append("\n📉 <b>Top losers:</b>")
@@ -22445,18 +22466,151 @@ INDEPENDENT_TRADER_TASK_NAMES = {
 
 _TASK_SCHEDULER_SCRIPT = os.path.join(os.path.dirname(__file__), "query_scheduled_tasks.ps1")
 
+# macOS side of the same lookup -- launchd is this Mac's equivalent of Windows
+# Task Scheduler for the "no live HTTP server, fires on a schedule" traders.
+# Only the traders that actually have a launchd job set up are listed here.
+# harami_daily is really 3 separate jobs (scanner 4:10pm, entry 4:20pm, exit
+# 3:45pm ET) -- represented here by the entry job specifically, matching
+# IBKR-HaramiDailyEntry's own naming above; scanner/exit aren't individually
+# surfaced on this one dashboard row. safe_income runs twice daily (10am +
+# 3pm ET weekdays, CEO decision 2026-09-16) -- one launchd job,
+# StartCalendarInterval has both times, both surfaced via the normal
+# next-run computation (whichever is soonest). chartexpert (weekday 9:35am
+# ET, SHADOW MODE only -- never places real orders) was blocked on Playwright
+# refusing to install any browser on macOS 12/Monterey; fixed 2026-09-16 by
+# pinning playwright==1.40.0 (the newest version that still supports mac12)
+# plus waiting for the chart's real <canvas> to mount instead of a fixed
+# delay, since every fresh Playwright run hits the frontend's documented
+# ~10-12s "never-before-subscribed" cold start on every ticker, every run.
+INDEPENDENT_TRADER_LAUNCHD_LABELS = {
+    "ashley":        "com.ibkrtrader.ashley",
+    "butterfly_spy": "com.ibkrtrader.spybutterfly",
+    "butterfly_qqq": "com.ibkrtrader.qqqbutterfly",
+    "butterfly_iwm": "com.ibkrtrader.iwmbutterfly",
+    "goog_condor":   "com.ibkrtrader.googcondor",
+    "harami_daily":  "com.ibkrtrader.haramientry",
+    "safe_income":   "com.ibkrtrader.safeincome",
+    "chartexpert":   "com.ibkrtrader.chartexpert",
+}
+INDEPENDENT_TRADER_LAUNCHD_LOGS = {
+    "ashley":        "ashleyklieu_trigger_executor_launchd.log",
+    "butterfly_spy": "spy_butterfly_launchd.log",
+    "butterfly_qqq": "qqq_butterfly_launchd.log",
+    "butterfly_iwm": "iwm_butterfly_launchd.log",
+    "goog_condor":   "goog_condor_launchd.log",
+    "harami_daily":  "harami_entry_launchd.log",
+    "safe_income":   "safe_income_launchd.log",
+    "chartexpert":   "chartexpert_launchd.log",
+}
+
+
+def _next_launchd_fire_time(label: str):
+    """Reads a launchd job's own plist (plutil -convert json, not hardcoded
+    -- stays correct if a schedule ever changes) and computes the next real
+    StartCalendarInterval fire time from now. Handles both a single dict
+    and an array of dicts (e.g. harami's 5 weekday entries). launchd's
+    Weekday convention: 0 or 7 = Sunday, 1-6 = Monday-Saturday -- normalized
+    here to match Python's date.isoweekday() (1=Monday...7=Sunday). Returns
+    None for jobs with no StartCalendarInterval at all (KeepAlive daemons
+    like Ashley/Day Trader/SPY Weekly Condor -- those don't have a "next
+    run" in this sense, they're just continuously running)."""
+    from zoneinfo import ZoneInfo as _ZI
+    plist_path = os.path.expanduser(f"~/Library/LaunchAgents/{label}.plist")
+    try:
+        proc = subprocess.run(
+            ["plutil", "-convert", "json", "-o", "-", plist_path],
+            capture_output=True, text=True, timeout=5)
+        if proc.returncode != 0:
+            return None
+        data = json.loads(proc.stdout)
+        sci = data.get("StartCalendarInterval")
+        if not sci:
+            return None
+        entries = sci if isinstance(sci, list) else [sci]
+    except Exception:
+        return None
+
+    et = _ZI("America/New_York")
+    now = datetime.now(et)
+    candidates = []
+    for spec in entries:
+        hour = spec.get("Hour")
+        if hour is None:
+            continue
+        minute = spec.get("Minute", 0)
+        weekday = spec.get("Weekday")
+        weekday_norm = 7 if weekday == 0 else weekday  # launchd 0/7=Sun -> Python isoweekday 7=Sun
+        for add_days in range(9):  # search up to a week+ ahead
+            d = (now + timedelta(days=add_days)).date()
+            candidate = datetime(d.year, d.month, d.day, hour, minute, tzinfo=et)
+            if candidate <= now:
+                continue
+            if weekday_norm is not None and candidate.isoweekday() != weekday_norm:
+                continue
+            candidates.append(candidate)
+            break
+    return min(candidates).isoformat() if candidates else None
+
+
+def _query_launchd_sync() -> dict:
+    """macOS equivalent of the Task Scheduler query below. launchd has no
+    single "list everything with next-run time" call the way Task Scheduler
+    does, so this shells out to `launchctl print` once per known label.
+    LastRunTime is approximated from the wrapper's own log file mtime (real
+    last-output timestamp, not a launchd-reported field). NextRunTime comes
+    from _next_launchd_fire_time() above, parsed from each job's own plist.
+    Returns {task_key: {State, LastRunTime, NextRunTime, LastTaskResult}},
+    keyed by the short trader key (not a launchd label)."""
+    uid = os.getuid()
+    out = {}
+    for key, label in INDEPENDENT_TRADER_LAUNCHD_LABELS.items():
+        entry = {"State": None, "LastRunTime": None, "NextRunTime": None, "LastTaskResult": None}
+        entry["NextRunTime"] = _next_launchd_fire_time(label)
+        try:
+            proc = subprocess.run(
+                ["launchctl", "print", f"gui/{uid}/{label}"],
+                capture_output=True, text=True, timeout=5)
+            if proc.returncode != 0:
+                entry["State"] = "not loaded"
+            else:
+                m_state = re.search(r"state = (.+)", proc.stdout)
+                m_exit  = re.search(r"last exit code = (.+)", proc.stdout)
+                entry["State"] = m_state.group(1).strip() if m_state else "unknown"
+                entry["LastTaskResult"] = m_exit.group(1).strip() if m_exit else None
+        except Exception as exc:
+            log.warning("launchctl query failed for %s (%s): %s", key, label, exc)
+        log_path = os.path.join(os.path.dirname(__file__), INDEPENDENT_TRADER_LAUNCHD_LOGS[key])
+        try:
+            entry["LastRunTime"] = datetime.fromtimestamp(
+                os.path.getmtime(log_path), tz=timezone.utc
+            ).isoformat()
+        except OSError:
+            pass
+        out[key] = entry
+    return out
+
 
 def _query_task_scheduler_sync() -> dict:
     """Sync -- always called via run_in_executor, never directly in an
     async context. Returns {task_name: {State, LastRunTime, NextRunTime,
     LastTaskResult}}. Real subprocess call (~1-2s) -- this is why this
     lives behind its own slow-poll REST endpoint, not folded into the 3s
-    /ws/live broadcast. Runs a real .ps1 file (query_scheduled_tasks.ps1)
+    /ws/live broadcast. On macOS, delegates to _query_launchd_sync() (this
+    account's actual scheduler here) and re-keys the result by the Windows
+    task name so the rest of this function's callers don't need to know
+    which OS they're on. Runs a real .ps1 file (query_scheduled_tasks.ps1)
     rather than an inline -Command string -- an inline string with nested
     quotes (ToString("o") inside a PSCustomObject inside a ForEach-Object)
     hit real PowerShell argument-parsing quote-stripping and silently
     failed every call (confirmed live 2026-09-07); a real file with
     -File sidesteps that whole class of bug."""
+    if sys.platform == "darwin":
+        by_key = _query_launchd_sync()
+        return {
+            INDEPENDENT_TRADER_TASK_NAMES[key]: info
+            for key, info in by_key.items()
+            if key in INDEPENDENT_TRADER_TASK_NAMES
+        }
     names = list(INDEPENDENT_TRADER_TASK_NAMES.values())
     try:
         proc = subprocess.run(

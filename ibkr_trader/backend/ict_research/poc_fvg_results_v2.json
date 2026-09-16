@@ -1,0 +1,4260 @@
+{
+  "lb60_tight5.0_buf0.3_cw5_pw3_pt0.25_tf0.75_fvgFalse": {
+    "lookback": 60,
+    "range_tightness_mult": 5.0,
+    "buffer_mult": 0.3,
+    "confirm_window": 5,
+    "pullback_window": 3,
+    "pullback_tolerance": 0.25,
+    "target_fraction": 0.75,
+    "require_fvg": false,
+    "overall": {
+      "n_trades": 267,
+      "win_rate_pct": 29.59,
+      "avg_ret_pct": -0.0776,
+      "total_ret_sum_pct": -20.73,
+      "best_pct": 0.6918,
+      "worst_pct": -1.1476,
+      "max_drawdown_pct": -20.81,
+      "exit_reasons": {
+        "stop": 133,
+        "target": 46,
+        "eod": 39,
+        "time": 49
+      }
+    },
+    "index_etfs": {
+      "n_trades": 51,
+      "win_rate_pct": 25.49,
+      "avg_ret_pct": -0.0582,
+      "total_ret_sum_pct": -2.97,
+      "best_pct": 0.3076,
+      "worst_pct": -0.3057,
+      "max_drawdown_pct": -2.83,
+      "exit_reasons": {
+        "time": 14,
+        "stop": 25,
+        "eod": 4,
+        "target": 8
+      }
+    },
+    "single_stocks": {
+      "n_trades": 216,
+      "win_rate_pct": 30.56,
+      "avg_ret_pct": -0.0822,
+      "total_ret_sum_pct": -17.76,
+      "best_pct": 0.6918,
+      "worst_pct": -1.1476,
+      "max_drawdown_pct": -17.96,
+      "exit_reasons": {
+        "stop": 108,
+        "target": 38,
+        "eod": 35,
+        "time": 35
+      }
+    },
+    "by_regime": {
+      "HIGH_VOL": {
+        "n_trades": 120,
+        "win_rate_pct": 31.67,
+        "avg_ret_pct": -0.0796,
+        "total_ret_sum_pct": -9.56,
+        "best_pct": 0.6757,
+        "worst_pct": -1.1476,
+        "max_drawdown_pct": -9.79,
+        "exit_reasons": {
+          "stop": 57,
+          "target": 22,
+          "eod": 15,
+          "time": 26
+        }
+      },
+      "LOW_VOL": {
+        "n_trades": 147,
+        "win_rate_pct": 27.89,
+        "avg_ret_pct": -0.076,
+        "total_ret_sum_pct": -11.17,
+        "best_pct": 0.6918,
+        "worst_pct": -0.8414,
+        "max_drawdown_pct": -11.2,
+        "exit_reasons": {
+          "stop": 76,
+          "target": 24,
+          "time": 23,
+          "eod": 24
+        }
+      }
+    },
+    "by_ticker": {
+      "AAPL": {
+        "n_trades": 29,
+        "win_rate_pct": 34.48,
+        "avg_ret_pct": -0.0496,
+        "total_ret_sum_pct": -1.44,
+        "best_pct": 0.5951,
+        "worst_pct": -0.3845,
+        "max_drawdown_pct": -1.49,
+        "exit_reasons": {
+          "stop": 16,
+          "target": 6,
+          "eod": 3,
+          "time": 4
+        }
+      },
+      "MSFT": {
+        "n_trades": 20,
+        "win_rate_pct": 45.0,
+        "avg_ret_pct": -0.0003,
+        "total_ret_sum_pct": -0.01,
+        "best_pct": 0.3491,
+        "worst_pct": -0.2256,
+        "max_drawdown_pct": -0.6,
+        "exit_reasons": {
+          "stop": 6,
+          "target": 7,
+          "time": 4,
+          "eod": 3
+        }
+      },
+      "NVDA": {
+        "n_trades": 21,
+        "win_rate_pct": 38.1,
+        "avg_ret_pct": -0.0615,
+        "total_ret_sum_pct": -1.29,
+        "best_pct": 0.6757,
+        "worst_pct": -0.4741,
+        "max_drawdown_pct": -1.35,
+        "exit_reasons": {
+          "stop": 11,
+          "eod": 4,
+          "time": 2,
+          "target": 4
+        }
+      },
+      "SPY": {
+        "n_trades": 15,
+        "win_rate_pct": 13.33,
+        "avg_ret_pct": -0.0846,
+        "total_ret_sum_pct": -1.27,
+        "best_pct": 0.0835,
+        "worst_pct": -0.1735,
+        "max_drawdown_pct": -1.1,
+        "exit_reasons": {
+          "time": 4,
+          "stop": 8,
+          "eod": 2,
+          "target": 1
+        }
+      },
+      "GOOGL": {
+        "n_trades": 29,
+        "win_rate_pct": 24.14,
+        "avg_ret_pct": -0.0783,
+        "total_ret_sum_pct": -2.27,
+        "best_pct": 0.2693,
+        "worst_pct": -0.2816,
+        "max_drawdown_pct": -2.3,
+        "exit_reasons": {
+          "time": 5,
+          "stop": 14,
+          "eod": 7,
+          "target": 3
+        }
+      },
+      "AMZN": {
+        "n_trades": 29,
+        "win_rate_pct": 27.59,
+        "avg_ret_pct": -0.0778,
+        "total_ret_sum_pct": -2.26,
+        "best_pct": 0.3175,
+        "worst_pct": -0.2595,
+        "max_drawdown_pct": -2.12,
+        "exit_reasons": {
+          "stop": 14,
+          "target": 4,
+          "eod": 7,
+          "time": 4
+        }
+      },
+      "TSLA": {
+        "n_trades": 24,
+        "win_rate_pct": 29.17,
+        "avg_ret_pct": -0.1446,
+        "total_ret_sum_pct": -3.47,
+        "best_pct": 0.3882,
+        "worst_pct": -0.8414,
+        "max_drawdown_pct": -3.5,
+        "exit_reasons": {
+          "time": 5,
+          "eod": 4,
+          "stop": 12,
+          "target": 3
+        }
+      },
+      "META": {
+        "n_trades": 17,
+        "win_rate_pct": 17.65,
+        "avg_ret_pct": -0.138,
+        "total_ret_sum_pct": -2.35,
+        "best_pct": 0.1761,
+        "worst_pct": -0.4606,
+        "max_drawdown_pct": -2.15,
+        "exit_reasons": {
+          "stop": 9,
+          "time": 6,
+          "eod": 1,
+          "target": 1
+        }
+      },
+      "AMD": {
+        "n_trades": 25,
+        "win_rate_pct": 32.0,
+        "avg_ret_pct": -0.1427,
+        "total_ret_sum_pct": -3.57,
+        "best_pct": 0.6442,
+        "worst_pct": -1.1476,
+        "max_drawdown_pct": -3.92,
+        "exit_reasons": {
+          "stop": 15,
+          "target": 5,
+          "time": 1,
+          "eod": 4
+        }
+      },
+      "CRWD": {
+        "n_trades": 22,
+        "win_rate_pct": 27.27,
+        "avg_ret_pct": -0.0507,
+        "total_ret_sum_pct": -1.11,
+        "best_pct": 0.6918,
+        "worst_pct": -0.5207,
+        "max_drawdown_pct": -1.88,
+        "exit_reasons": {
+          "time": 4,
+          "eod": 2,
+          "stop": 11,
+          "target": 5
+        }
+      },
+      "QQQ": {
+        "n_trades": 15,
+        "win_rate_pct": 20.0,
+        "avg_ret_pct": -0.0727,
+        "total_ret_sum_pct": -1.09,
+        "best_pct": 0.1065,
+        "worst_pct": -0.2214,
+        "max_drawdown_pct": -1.1,
+        "exit_reasons": {
+          "eod": 2,
+          "time": 6,
+          "stop": 7
+        }
+      },
+      "IWM": {
+        "n_trades": 21,
+        "win_rate_pct": 38.1,
+        "avg_ret_pct": -0.029,
+        "total_ret_sum_pct": -0.61,
+        "best_pct": 0.3076,
+        "worst_pct": -0.3057,
+        "max_drawdown_pct": -1.17,
+        "exit_reasons": {
+          "target": 7,
+          "time": 4,
+          "stop": 10
+        }
+      }
+    }
+  },
+  "lb60_tight5.0_buf0.3_cw5_pw3_pt0.25_tf0.75_fvgTrue": {
+    "lookback": 60,
+    "range_tightness_mult": 5.0,
+    "buffer_mult": 0.3,
+    "confirm_window": 5,
+    "pullback_window": 3,
+    "pullback_tolerance": 0.25,
+    "target_fraction": 0.75,
+    "require_fvg": true,
+    "overall": {
+      "n_trades": 127,
+      "win_rate_pct": 30.71,
+      "avg_ret_pct": -0.0639,
+      "total_ret_sum_pct": -8.12,
+      "best_pct": 0.6918,
+      "worst_pct": -0.9693,
+      "max_drawdown_pct": -9.01,
+      "exit_reasons": {
+        "stop": 61,
+        "eod": 13,
+        "target": 27,
+        "time": 26
+      }
+    },
+    "index_etfs": {
+      "n_trades": 31,
+      "win_rate_pct": 19.35,
+      "avg_ret_pct": -0.0774,
+      "total_ret_sum_pct": -2.4,
+      "best_pct": 0.1065,
+      "worst_pct": -0.2214,
+      "max_drawdown_pct": -2.36,
+      "exit_reasons": {
+        "eod": 3,
+        "time": 10,
+        "stop": 16,
+        "target": 2
+      }
+    },
+    "single_stocks": {
+      "n_trades": 96,
+      "win_rate_pct": 34.38,
+      "avg_ret_pct": -0.0596,
+      "total_ret_sum_pct": -5.72,
+      "best_pct": 0.6918,
+      "worst_pct": -0.9693,
+      "max_drawdown_pct": -6.8,
+      "exit_reasons": {
+        "stop": 45,
+        "eod": 10,
+        "target": 25,
+        "time": 16
+      }
+    },
+    "by_regime": {
+      "HIGH_VOL": {
+        "n_trades": 64,
+        "win_rate_pct": 34.38,
+        "avg_ret_pct": -0.0585,
+        "total_ret_sum_pct": -3.74,
+        "best_pct": 0.6757,
+        "worst_pct": -0.9693,
+        "max_drawdown_pct": -4.29,
+        "exit_reasons": {
+          "stop": 29,
+          "eod": 6,
+          "target": 14,
+          "time": 15
+        }
+      },
+      "LOW_VOL": {
+        "n_trades": 63,
+        "win_rate_pct": 26.98,
+        "avg_ret_pct": -0.0695,
+        "total_ret_sum_pct": -4.38,
+        "best_pct": 0.6918,
+        "worst_pct": -0.8414,
+        "max_drawdown_pct": -5.33,
+        "exit_reasons": {
+          "stop": 32,
+          "target": 13,
+          "time": 11,
+          "eod": 7
+        }
+      }
+    },
+    "by_ticker": {
+      "AAPL": {
+        "n_trades": 12,
+        "win_rate_pct": 41.67,
+        "avg_ret_pct": 0.0026,
+        "total_ret_sum_pct": 0.03,
+        "best_pct": 0.5951,
+        "worst_pct": -0.2579,
+        "max_drawdown_pct": -0.46,
+        "exit_reasons": {
+          "stop": 6,
+          "eod": 1,
+          "target": 4,
+          "time": 1
+        }
+      },
+      "MSFT": {
+        "n_trades": 12,
+        "win_rate_pct": 50.0,
+        "avg_ret_pct": 0.0313,
+        "total_ret_sum_pct": 0.38,
+        "best_pct": 0.3491,
+        "worst_pct": -0.2256,
+        "max_drawdown_pct": -0.34,
+        "exit_reasons": {
+          "stop": 3,
+          "time": 3,
+          "target": 5,
+          "eod": 1
+        }
+      },
+      "NVDA": {
+        "n_trades": 7,
+        "win_rate_pct": 42.86,
+        "avg_ret_pct": 0.0435,
+        "total_ret_sum_pct": 0.3,
+        "best_pct": 0.6757,
+        "worst_pct": -0.3191,
+        "max_drawdown_pct": -0.32,
+        "exit_reasons": {
+          "time": 1,
+          "stop": 2,
+          "target": 3,
+          "eod": 1
+        }
+      },
+      "SPY": {
+        "n_trades": 6,
+        "win_rate_pct": 0.0,
+        "avg_ret_pct": -0.1045,
+        "total_ret_sum_pct": -0.63,
+        "best_pct": -0.0328,
+        "worst_pct": -0.187,
+        "max_drawdown_pct": -0.58,
+        "exit_reasons": {
+          "eod": 1,
+          "time": 2,
+          "stop": 3
+        }
+      },
+      "GOOGL": {
+        "n_trades": 14,
+        "win_rate_pct": 28.57,
+        "avg_ret_pct": -0.0571,
+        "total_ret_sum_pct": -0.8,
+        "best_pct": 0.2693,
+        "worst_pct": -0.2816,
+        "max_drawdown_pct": -0.72,
+        "exit_reasons": {
+          "stop": 6,
+          "eod": 3,
+          "time": 3,
+          "target": 2
+        }
+      },
+      "AMZN": {
+        "n_trades": 15,
+        "win_rate_pct": 33.33,
+        "avg_ret_pct": -0.0746,
+        "total_ret_sum_pct": -1.12,
+        "best_pct": 0.3175,
+        "worst_pct": -0.2595,
+        "max_drawdown_pct": -1.29,
+        "exit_reasons": {
+          "stop": 8,
+          "target": 3,
+          "time": 2,
+          "eod": 2
+        }
+      },
+      "TSLA": {
+        "n_trades": 4,
+        "win_rate_pct": 25.0,
+        "avg_ret_pct": -0.308,
+        "total_ret_sum_pct": -1.23,
+        "best_pct": 0.3507,
+        "worst_pct": -0.8414,
+        "max_drawdown_pct": -0.52,
+        "exit_reasons": {
+          "stop": 3,
+          "target": 1
+        }
+      },
+      "META": {
+        "n_trades": 8,
+        "win_rate_pct": 12.5,
+        "avg_ret_pct": -0.1653,
+        "total_ret_sum_pct": -1.32,
+        "best_pct": 0.1384,
+        "worst_pct": -0.4442,
+        "max_drawdown_pct": -1.31,
+        "exit_reasons": {
+          "time": 3,
+          "stop": 4,
+          "target": 1
+        }
+      },
+      "AMD": {
+        "n_trades": 12,
+        "win_rate_pct": 41.67,
+        "avg_ret_pct": -0.0647,
+        "total_ret_sum_pct": -0.78,
+        "best_pct": 0.6442,
+        "worst_pct": -0.9693,
+        "max_drawdown_pct": -1.06,
+        "exit_reasons": {
+          "stop": 6,
+          "eod": 2,
+          "target": 4
+        }
+      },
+      "CRWD": {
+        "n_trades": 12,
+        "win_rate_pct": 25.0,
+        "avg_ret_pct": -0.0987,
+        "total_ret_sum_pct": -1.18,
+        "best_pct": 0.6918,
+        "worst_pct": -0.5207,
+        "max_drawdown_pct": -1.59,
+        "exit_reasons": {
+          "time": 3,
+          "stop": 7,
+          "target": 2
+        }
+      },
+      "QQQ": {
+        "n_trades": 11,
+        "win_rate_pct": 27.27,
+        "avg_ret_pct": -0.0694,
+        "total_ret_sum_pct": -0.76,
+        "best_pct": 0.1065,
+        "worst_pct": -0.2214,
+        "max_drawdown_pct": -0.87,
+        "exit_reasons": {
+          "time": 5,
+          "stop": 5,
+          "eod": 1
+        }
+      },
+      "IWM": {
+        "n_trades": 14,
+        "win_rate_pct": 21.43,
+        "avg_ret_pct": -0.0721,
+        "total_ret_sum_pct": -1.01,
+        "best_pct": 0.0894,
+        "worst_pct": -0.1679,
+        "max_drawdown_pct": -1.14,
+        "exit_reasons": {
+          "time": 3,
+          "target": 2,
+          "stop": 8,
+          "eod": 1
+        }
+      }
+    }
+  },
+  "lb60_tight5.0_buf0.3_cw5_pw5_pt0.25_tf0.75_fvgFalse": {
+    "lookback": 60,
+    "range_tightness_mult": 5.0,
+    "buffer_mult": 0.3,
+    "confirm_window": 5,
+    "pullback_window": 5,
+    "pullback_tolerance": 0.25,
+    "target_fraction": 0.75,
+    "require_fvg": false,
+    "overall": {
+      "n_trades": 311,
+      "win_rate_pct": 31.51,
+      "avg_ret_pct": -0.0761,
+      "total_ret_sum_pct": -23.67,
+      "best_pct": 0.7644,
+      "worst_pct": -1.1476,
+      "max_drawdown_pct": -24.02,
+      "exit_reasons": {
+        "stop": 151,
+        "time": 59,
+        "target": 57,
+        "eod": 44
+      }
+    },
+    "index_etfs": {
+      "n_trades": 60,
+      "win_rate_pct": 26.67,
+      "avg_ret_pct": -0.0601,
+      "total_ret_sum_pct": -3.6,
+      "best_pct": 0.3076,
+      "worst_pct": -0.3057,
+      "max_drawdown_pct": -3.46,
+      "exit_reasons": {
+        "time": 17,
+        "stop": 27,
+        "eod": 7,
+        "target": 9
+      }
+    },
+    "single_stocks": {
+      "n_trades": 251,
+      "win_rate_pct": 32.67,
+      "avg_ret_pct": -0.08,
+      "total_ret_sum_pct": -20.07,
+      "best_pct": 0.7644,
+      "worst_pct": -1.1476,
+      "max_drawdown_pct": -20.97,
+      "exit_reasons": {
+        "stop": 124,
+        "time": 42,
+        "target": 48,
+        "eod": 37
+      }
+    },
+    "by_regime": {
+      "HIGH_VOL": {
+        "n_trades": 143,
+        "win_rate_pct": 33.57,
+        "avg_ret_pct": -0.0774,
+        "total_ret_sum_pct": -11.07,
+        "best_pct": 0.6757,
+        "worst_pct": -1.1476,
+        "max_drawdown_pct": -11.64,
+        "exit_reasons": {
+          "stop": 65,
+          "target": 27,
+          "eod": 19,
+          "time": 32
+        }
+      },
+      "LOW_VOL": {
+        "n_trades": 168,
+        "win_rate_pct": 29.76,
+        "avg_ret_pct": -0.075,
+        "total_ret_sum_pct": -12.6,
+        "best_pct": 0.7644,
+        "worst_pct": -0.8414,
+        "max_drawdown_pct": -12.79,
+        "exit_reasons": {
+          "stop": 86,
+          "time": 27,
+          "target": 30,
+          "eod": 25
+        }
+      }
+    },
+    "by_ticker": {
+      "AAPL": {
+        "n_trades": 34,
+        "win_rate_pct": 35.29,
+        "avg_ret_pct": -0.053,
+        "total_ret_sum_pct": -1.8,
+        "best_pct": 0.5951,
+        "worst_pct": -0.3898,
+        "max_drawdown_pct": -2.11,
+        "exit_reasons": {
+          "stop": 18,
+          "time": 5,
+          "target": 7,
+          "eod": 4
+        }
+      },
+      "MSFT": {
+        "n_trades": 27,
+        "win_rate_pct": 48.15,
+        "avg_ret_pct": 0.0061,
+        "total_ret_sum_pct": 0.17,
+        "best_pct": 0.3491,
+        "worst_pct": -0.2515,
+        "max_drawdown_pct": -0.51,
+        "exit_reasons": {
+          "stop": 9,
+          "target": 10,
+          "time": 5,
+          "eod": 3
+        }
+      },
+      "NVDA": {
+        "n_trades": 27,
+        "win_rate_pct": 44.44,
+        "avg_ret_pct": -0.0342,
+        "total_ret_sum_pct": -0.92,
+        "best_pct": 0.6757,
+        "worst_pct": -0.4741,
+        "max_drawdown_pct": -1.66,
+        "exit_reasons": {
+          "stop": 12,
+          "eod": 6,
+          "time": 3,
+          "target": 6
+        }
+      },
+      "SPY": {
+        "n_trades": 19,
+        "win_rate_pct": 15.79,
+        "avg_ret_pct": -0.0809,
+        "total_ret_sum_pct": -1.54,
+        "best_pct": 0.1366,
+        "worst_pct": -0.2664,
+        "max_drawdown_pct": -1.36,
+        "exit_reasons": {
+          "time": 5,
+          "stop": 9,
+          "eod": 3,
+          "target": 2
+        }
+      },
+      "GOOGL": {
+        "n_trades": 31,
+        "win_rate_pct": 29.03,
+        "avg_ret_pct": -0.0671,
+        "total_ret_sum_pct": -2.08,
+        "best_pct": 0.2693,
+        "worst_pct": -0.2816,
+        "max_drawdown_pct": -2.29,
+        "exit_reasons": {
+          "time": 6,
+          "target": 5,
+          "eod": 7,
+          "stop": 13
+        }
+      },
+      "AMZN": {
+        "n_trades": 32,
+        "win_rate_pct": 21.88,
+        "avg_ret_pct": -0.0971,
+        "total_ret_sum_pct": -3.11,
+        "best_pct": 0.3175,
+        "worst_pct": -0.3092,
+        "max_drawdown_pct": -2.92,
+        "exit_reasons": {
+          "stop": 17,
+          "target": 4,
+          "eod": 7,
+          "time": 4
+        }
+      },
+      "TSLA": {
+        "n_trades": 26,
+        "win_rate_pct": 30.77,
+        "avg_ret_pct": -0.1398,
+        "total_ret_sum_pct": -3.63,
+        "best_pct": 0.3882,
+        "worst_pct": -0.8414,
+        "max_drawdown_pct": -3.67,
+        "exit_reasons": {
+          "time": 6,
+          "eod": 3,
+          "stop": 14,
+          "target": 3
+        }
+      },
+      "META": {
+        "n_trades": 19,
+        "win_rate_pct": 21.05,
+        "avg_ret_pct": -0.1244,
+        "total_ret_sum_pct": -2.36,
+        "best_pct": 0.1761,
+        "worst_pct": -0.4606,
+        "max_drawdown_pct": -2.17,
+        "exit_reasons": {
+          "stop": 9,
+          "time": 8,
+          "eod": 1,
+          "target": 1
+        }
+      },
+      "AMD": {
+        "n_trades": 29,
+        "win_rate_pct": 31.03,
+        "avg_ret_pct": -0.1816,
+        "total_ret_sum_pct": -5.27,
+        "best_pct": 0.6442,
+        "worst_pct": -1.1476,
+        "max_drawdown_pct": -5.21,
+        "exit_reasons": {
+          "stop": 18,
+          "target": 5,
+          "time": 2,
+          "eod": 4
+        }
+      },
+      "CRWD": {
+        "n_trades": 26,
+        "win_rate_pct": 30.77,
+        "avg_ret_pct": -0.0407,
+        "total_ret_sum_pct": -1.06,
+        "best_pct": 0.7644,
+        "worst_pct": -0.5684,
+        "max_drawdown_pct": -3.03,
+        "exit_reasons": {
+          "time": 3,
+          "eod": 2,
+          "stop": 14,
+          "target": 7
+        }
+      },
+      "QQQ": {
+        "n_trades": 18,
+        "win_rate_pct": 22.22,
+        "avg_ret_pct": -0.0715,
+        "total_ret_sum_pct": -1.29,
+        "best_pct": 0.1065,
+        "worst_pct": -0.2214,
+        "max_drawdown_pct": -1.32,
+        "exit_reasons": {
+          "eod": 3,
+          "time": 8,
+          "stop": 7
+        }
+      },
+      "IWM": {
+        "n_trades": 23,
+        "win_rate_pct": 39.13,
+        "avg_ret_pct": -0.034,
+        "total_ret_sum_pct": -0.78,
+        "best_pct": 0.3076,
+        "worst_pct": -0.3057,
+        "max_drawdown_pct": -1.13,
+        "exit_reasons": {
+          "target": 7,
+          "time": 4,
+          "stop": 11,
+          "eod": 1
+        }
+      }
+    }
+  },
+  "lb60_tight5.0_buf0.3_cw5_pw5_pt0.25_tf0.75_fvgTrue": {
+    "lookback": 60,
+    "range_tightness_mult": 5.0,
+    "buffer_mult": 0.3,
+    "confirm_window": 5,
+    "pullback_window": 5,
+    "pullback_tolerance": 0.25,
+    "target_fraction": 0.75,
+    "require_fvg": true,
+    "overall": {
+      "n_trades": 168,
+      "win_rate_pct": 34.52,
+      "avg_ret_pct": -0.0643,
+      "total_ret_sum_pct": -10.81,
+      "best_pct": 0.6918,
+      "worst_pct": -0.9693,
+      "max_drawdown_pct": -12.68,
+      "exit_reasons": {
+        "time": 37,
+        "stop": 72,
+        "eod": 23,
+        "target": 36
+      }
+    },
+    "index_etfs": {
+      "n_trades": 38,
+      "win_rate_pct": 23.68,
+      "avg_ret_pct": -0.0697,
+      "total_ret_sum_pct": -2.65,
+      "best_pct": 0.1366,
+      "worst_pct": -0.2664,
+      "max_drawdown_pct": -2.38,
+      "exit_reasons": {
+        "stop": 17,
+        "time": 12,
+        "eod": 6,
+        "target": 3
+      }
+    },
+    "single_stocks": {
+      "n_trades": 130,
+      "win_rate_pct": 37.69,
+      "avg_ret_pct": -0.0628,
+      "total_ret_sum_pct": -8.16,
+      "best_pct": 0.6918,
+      "worst_pct": -0.9693,
+      "max_drawdown_pct": -10.22,
+      "exit_reasons": {
+        "time": 25,
+        "stop": 55,
+        "eod": 17,
+        "target": 33
+      }
+    },
+    "by_regime": {
+      "HIGH_VOL": {
+        "n_trades": 85,
+        "win_rate_pct": 35.29,
+        "avg_ret_pct": -0.0619,
+        "total_ret_sum_pct": -5.26,
+        "best_pct": 0.6757,
+        "worst_pct": -0.9693,
+        "max_drawdown_pct": -5.71,
+        "exit_reasons": {
+          "stop": 36,
+          "eod": 13,
+          "target": 17,
+          "time": 19
+        }
+      },
+      "LOW_VOL": {
+        "n_trades": 83,
+        "win_rate_pct": 33.73,
+        "avg_ret_pct": -0.0668,
+        "total_ret_sum_pct": -5.54,
+        "best_pct": 0.6918,
+        "worst_pct": -0.8414,
+        "max_drawdown_pct": -7.28,
+        "exit_reasons": {
+          "time": 18,
+          "stop": 36,
+          "target": 19,
+          "eod": 10
+        }
+      }
+    },
+    "by_ticker": {
+      "AAPL": {
+        "n_trades": 16,
+        "win_rate_pct": 43.75,
+        "avg_ret_pct": -0.0175,
+        "total_ret_sum_pct": -0.28,
+        "best_pct": 0.5951,
+        "worst_pct": -0.3659,
+        "max_drawdown_pct": -0.81,
+        "exit_reasons": {
+          "time": 3,
+          "stop": 7,
+          "eod": 2,
+          "target": 4
+        }
+      },
+      "MSFT": {
+        "n_trades": 17,
+        "win_rate_pct": 64.71,
+        "avg_ret_pct": 0.0773,
+        "total_ret_sum_pct": 1.31,
+        "best_pct": 0.3491,
+        "worst_pct": -0.2419,
+        "max_drawdown_pct": -0.29,
+        "exit_reasons": {
+          "target": 9,
+          "time": 4,
+          "stop": 3,
+          "eod": 1
+        }
+      },
+      "NVDA": {
+        "n_trades": 11,
+        "win_rate_pct": 54.55,
+        "avg_ret_pct": 0.0603,
+        "total_ret_sum_pct": 0.66,
+        "best_pct": 0.6757,
+        "worst_pct": -0.3191,
+        "max_drawdown_pct": -0.5,
+        "exit_reasons": {
+          "time": 2,
+          "eod": 3,
+          "stop": 2,
+          "target": 4
+        }
+      },
+      "SPY": {
+        "n_trades": 10,
+        "win_rate_pct": 10.0,
+        "avg_ret_pct": -0.0895,
+        "total_ret_sum_pct": -0.89,
+        "best_pct": 0.1366,
+        "worst_pct": -0.2664,
+        "max_drawdown_pct": -0.63,
+        "exit_reasons": {
+          "stop": 4,
+          "time": 3,
+          "eod": 2,
+          "target": 1
+        }
+      },
+      "GOOGL": {
+        "n_trades": 19,
+        "win_rate_pct": 36.84,
+        "avg_ret_pct": -0.0327,
+        "total_ret_sum_pct": -0.62,
+        "best_pct": 0.2693,
+        "worst_pct": -0.2816,
+        "max_drawdown_pct": -0.8,
+        "exit_reasons": {
+          "target": 5,
+          "eod": 5,
+          "stop": 5,
+          "time": 4
+        }
+      },
+      "AMZN": {
+        "n_trades": 19,
+        "win_rate_pct": 26.32,
+        "avg_ret_pct": -0.105,
+        "total_ret_sum_pct": -2.0,
+        "best_pct": 0.3175,
+        "worst_pct": -0.3092,
+        "max_drawdown_pct": -2.04,
+        "exit_reasons": {
+          "stop": 11,
+          "target": 3,
+          "time": 2,
+          "eod": 3
+        }
+      },
+      "TSLA": {
+        "n_trades": 7,
+        "win_rate_pct": 28.57,
+        "avg_ret_pct": -0.199,
+        "total_ret_sum_pct": -1.39,
+        "best_pct": 0.3507,
+        "worst_pct": -0.8414,
+        "max_drawdown_pct": -1.25,
+        "exit_reasons": {
+          "time": 1,
+          "stop": 4,
+          "eod": 1,
+          "target": 1
+        }
+      },
+      "META": {
+        "n_trades": 10,
+        "win_rate_pct": 20.0,
+        "avg_ret_pct": -0.1341,
+        "total_ret_sum_pct": -1.34,
+        "best_pct": 0.1503,
+        "worst_pct": -0.4442,
+        "max_drawdown_pct": -1.33,
+        "exit_reasons": {
+          "time": 5,
+          "stop": 4,
+          "target": 1
+        }
+      },
+      "AMD": {
+        "n_trades": 16,
+        "win_rate_pct": 37.5,
+        "avg_ret_pct": -0.1425,
+        "total_ret_sum_pct": -2.28,
+        "best_pct": 0.6442,
+        "worst_pct": -0.9693,
+        "max_drawdown_pct": -2.45,
+        "exit_reasons": {
+          "stop": 9,
+          "eod": 2,
+          "target": 4,
+          "time": 1
+        }
+      },
+      "CRWD": {
+        "n_trades": 15,
+        "win_rate_pct": 20.0,
+        "avg_ret_pct": -0.1484,
+        "total_ret_sum_pct": -2.23,
+        "best_pct": 0.6918,
+        "worst_pct": -0.5684,
+        "max_drawdown_pct": -2.49,
+        "exit_reasons": {
+          "time": 3,
+          "stop": 10,
+          "target": 2
+        }
+      },
+      "QQQ": {
+        "n_trades": 13,
+        "win_rate_pct": 30.77,
+        "avg_ret_pct": -0.0602,
+        "total_ret_sum_pct": -0.78,
+        "best_pct": 0.1065,
+        "worst_pct": -0.2214,
+        "max_drawdown_pct": -0.91,
+        "exit_reasons": {
+          "time": 6,
+          "stop": 5,
+          "eod": 2
+        }
+      },
+      "IWM": {
+        "n_trades": 15,
+        "win_rate_pct": 26.67,
+        "avg_ret_pct": -0.0647,
+        "total_ret_sum_pct": -0.97,
+        "best_pct": 0.0894,
+        "worst_pct": -0.1679,
+        "max_drawdown_pct": -1.1,
+        "exit_reasons": {
+          "time": 3,
+          "target": 2,
+          "stop": 8,
+          "eod": 2
+        }
+      }
+    }
+  },
+  "lb60_tight5.0_buf0.3_cw5_pw7_pt0.25_tf0.75_fvgFalse": {
+    "lookback": 60,
+    "range_tightness_mult": 5.0,
+    "buffer_mult": 0.3,
+    "confirm_window": 5,
+    "pullback_window": 7,
+    "pullback_tolerance": 0.25,
+    "target_fraction": 0.75,
+    "require_fvg": false,
+    "overall": {
+      "n_trades": 335,
+      "win_rate_pct": 30.75,
+      "avg_ret_pct": -0.0863,
+      "total_ret_sum_pct": -28.92,
+      "best_pct": 1.3341,
+      "worst_pct": -1.1476,
+      "max_drawdown_pct": -28.88,
+      "exit_reasons": {
+        "stop": 162,
+        "time": 70,
+        "target": 58,
+        "eod": 45
+      }
+    },
+    "index_etfs": {
+      "n_trades": 68,
+      "win_rate_pct": 26.47,
+      "avg_ret_pct": -0.0627,
+      "total_ret_sum_pct": -4.27,
+      "best_pct": 0.3076,
+      "worst_pct": -0.3057,
+      "max_drawdown_pct": -4.12,
+      "exit_reasons": {
+        "time": 20,
+        "stop": 31,
+        "eod": 7,
+        "target": 10
+      }
+    },
+    "single_stocks": {
+      "n_trades": 267,
+      "win_rate_pct": 31.84,
+      "avg_ret_pct": -0.0923,
+      "total_ret_sum_pct": -24.65,
+      "best_pct": 1.3341,
+      "worst_pct": -1.1476,
+      "max_drawdown_pct": -25.17,
+      "exit_reasons": {
+        "stop": 131,
+        "time": 50,
+        "target": 48,
+        "eod": 38
+      }
+    },
+    "by_regime": {
+      "HIGH_VOL": {
+        "n_trades": 156,
+        "win_rate_pct": 32.05,
+        "avg_ret_pct": -0.0838,
+        "total_ret_sum_pct": -13.07,
+        "best_pct": 0.6757,
+        "worst_pct": -1.1476,
+        "max_drawdown_pct": -13.26,
+        "exit_reasons": {
+          "stop": 71,
+          "target": 29,
+          "eod": 20,
+          "time": 36
+        }
+      },
+      "LOW_VOL": {
+        "n_trades": 179,
+        "win_rate_pct": 29.61,
+        "avg_ret_pct": -0.0885,
+        "total_ret_sum_pct": -15.84,
+        "best_pct": 1.3341,
+        "worst_pct": -0.8414,
+        "max_drawdown_pct": -15.79,
+        "exit_reasons": {
+          "stop": 91,
+          "time": 34,
+          "target": 29,
+          "eod": 25
+        }
+      }
+    },
+    "by_ticker": {
+      "AAPL": {
+        "n_trades": 35,
+        "win_rate_pct": 31.43,
+        "avg_ret_pct": -0.0671,
+        "total_ret_sum_pct": -2.35,
+        "best_pct": 0.5951,
+        "worst_pct": -0.3898,
+        "max_drawdown_pct": -2.28,
+        "exit_reasons": {
+          "stop": 19,
+          "time": 5,
+          "target": 7,
+          "eod": 4
+        }
+      },
+      "MSFT": {
+        "n_trades": 28,
+        "win_rate_pct": 46.43,
+        "avg_ret_pct": -0.0027,
+        "total_ret_sum_pct": -0.08,
+        "best_pct": 0.3491,
+        "worst_pct": -0.2515,
+        "max_drawdown_pct": -0.75,
+        "exit_reasons": {
+          "stop": 9,
+          "target": 10,
+          "time": 6,
+          "eod": 3
+        }
+      },
+      "NVDA": {
+        "n_trades": 28,
+        "win_rate_pct": 42.86,
+        "avg_ret_pct": -0.0531,
+        "total_ret_sum_pct": -1.49,
+        "best_pct": 0.6757,
+        "worst_pct": -0.4741,
+        "max_drawdown_pct": -1.66,
+        "exit_reasons": {
+          "stop": 13,
+          "eod": 6,
+          "time": 4,
+          "target": 5
+        }
+      },
+      "SPY": {
+        "n_trades": 22,
+        "win_rate_pct": 18.18,
+        "avg_ret_pct": -0.0789,
+        "total_ret_sum_pct": -1.74,
+        "best_pct": 0.1366,
+        "worst_pct": -0.2664,
+        "max_drawdown_pct": -1.56,
+        "exit_reasons": {
+          "time": 5,
+          "stop": 11,
+          "eod": 3,
+          "target": 3
+        }
+      },
+      "GOOGL": {
+        "n_trades": 35,
+        "win_rate_pct": 25.71,
+        "avg_ret_pct": -0.1068,
+        "total_ret_sum_pct": -3.74,
+        "best_pct": 0.2693,
+        "worst_pct": -0.956,
+        "max_drawdown_pct": -3.95,
+        "exit_reasons": {
+          "time": 8,
+          "target": 5,
+          "eod": 8,
+          "stop": 14
+        }
+      },
+      "AMZN": {
+        "n_trades": 34,
+        "win_rate_pct": 23.53,
+        "avg_ret_pct": -0.0916,
+        "total_ret_sum_pct": -3.12,
+        "best_pct": 0.3175,
+        "worst_pct": -0.3092,
+        "max_drawdown_pct": -2.93,
+        "exit_reasons": {
+          "stop": 18,
+          "target": 4,
+          "eod": 7,
+          "time": 5
+        }
+      },
+      "TSLA": {
+        "n_trades": 26,
+        "win_rate_pct": 30.77,
+        "avg_ret_pct": -0.1398,
+        "total_ret_sum_pct": -3.63,
+        "best_pct": 0.3882,
+        "worst_pct": -0.8414,
+        "max_drawdown_pct": -3.67,
+        "exit_reasons": {
+          "time": 6,
+          "eod": 3,
+          "stop": 14,
+          "target": 3
+        }
+      },
+      "META": {
+        "n_trades": 21,
+        "win_rate_pct": 33.33,
+        "avg_ret_pct": -0.0279,
+        "total_ret_sum_pct": -0.59,
+        "best_pct": 1.3341,
+        "worst_pct": -0.4606,
+        "max_drawdown_pct": -2.0,
+        "exit_reasons": {
+          "stop": 8,
+          "target": 3,
+          "time": 9,
+          "eod": 1
+        }
+      },
+      "AMD": {
+        "n_trades": 30,
+        "win_rate_pct": 33.33,
+        "avg_ret_pct": -0.1542,
+        "total_ret_sum_pct": -4.63,
+        "best_pct": 0.6442,
+        "worst_pct": -1.1476,
+        "max_drawdown_pct": -4.57,
+        "exit_reasons": {
+          "stop": 18,
+          "target": 6,
+          "time": 2,
+          "eod": 4
+        }
+      },
+      "CRWD": {
+        "n_trades": 30,
+        "win_rate_pct": 23.33,
+        "avg_ret_pct": -0.168,
+        "total_ret_sum_pct": -5.04,
+        "best_pct": 0.5998,
+        "worst_pct": -0.7142,
+        "max_drawdown_pct": -5.93,
+        "exit_reasons": {
+          "time": 5,
+          "eod": 2,
+          "stop": 18,
+          "target": 5
+        }
+      },
+      "QQQ": {
+        "n_trades": 20,
+        "win_rate_pct": 20.0,
+        "avg_ret_pct": -0.0788,
+        "total_ret_sum_pct": -1.58,
+        "best_pct": 0.1065,
+        "worst_pct": -0.2214,
+        "max_drawdown_pct": -1.61,
+        "exit_reasons": {
+          "eod": 3,
+          "time": 8,
+          "stop": 9
+        }
+      },
+      "IWM": {
+        "n_trades": 26,
+        "win_rate_pct": 38.46,
+        "avg_ret_pct": -0.0367,
+        "total_ret_sum_pct": -0.95,
+        "best_pct": 0.3076,
+        "worst_pct": -0.3057,
+        "max_drawdown_pct": -1.29,
+        "exit_reasons": {
+          "target": 7,
+          "time": 7,
+          "stop": 11,
+          "eod": 1
+        }
+      }
+    }
+  },
+  "lb60_tight5.0_buf0.3_cw5_pw7_pt0.25_tf0.75_fvgTrue": {
+    "lookback": 60,
+    "range_tightness_mult": 5.0,
+    "buffer_mult": 0.3,
+    "confirm_window": 5,
+    "pullback_window": 7,
+    "pullback_tolerance": 0.25,
+    "target_fraction": 0.75,
+    "require_fvg": true,
+    "overall": {
+      "n_trades": 196,
+      "win_rate_pct": 33.67,
+      "avg_ret_pct": -0.0822,
+      "total_ret_sum_pct": -16.11,
+      "best_pct": 0.6757,
+      "worst_pct": -0.9693,
+      "max_drawdown_pct": -16.98,
+      "exit_reasons": {
+        "time": 46,
+        "stop": 85,
+        "eod": 24,
+        "target": 41
+      }
+    },
+    "index_etfs": {
+      "n_trades": 45,
+      "win_rate_pct": 26.67,
+      "avg_ret_pct": -0.067,
+      "total_ret_sum_pct": -3.01,
+      "best_pct": 0.1366,
+      "worst_pct": -0.2664,
+      "max_drawdown_pct": -2.77,
+      "exit_reasons": {
+        "stop": 20,
+        "time": 13,
+        "eod": 6,
+        "target": 6
+      }
+    },
+    "single_stocks": {
+      "n_trades": 151,
+      "win_rate_pct": 35.76,
+      "avg_ret_pct": -0.0868,
+      "total_ret_sum_pct": -13.1,
+      "best_pct": 0.6757,
+      "worst_pct": -0.9693,
+      "max_drawdown_pct": -14.13,
+      "exit_reasons": {
+        "time": 33,
+        "stop": 65,
+        "eod": 18,
+        "target": 35
+      }
+    },
+    "by_regime": {
+      "HIGH_VOL": {
+        "n_trades": 101,
+        "win_rate_pct": 34.65,
+        "avg_ret_pct": -0.068,
+        "total_ret_sum_pct": -6.86,
+        "best_pct": 0.6757,
+        "worst_pct": -0.9693,
+        "max_drawdown_pct": -6.81,
+        "exit_reasons": {
+          "stop": 43,
+          "eod": 14,
+          "target": 21,
+          "time": 23
+        }
+      },
+      "LOW_VOL": {
+        "n_trades": 95,
+        "win_rate_pct": 32.63,
+        "avg_ret_pct": -0.0974,
+        "total_ret_sum_pct": -9.25,
+        "best_pct": 0.5951,
+        "worst_pct": -0.8414,
+        "max_drawdown_pct": -10.83,
+        "exit_reasons": {
+          "time": 23,
+          "stop": 42,
+          "target": 20,
+          "eod": 10
+        }
+      }
+    },
+    "by_ticker": {
+      "AAPL": {
+        "n_trades": 21,
+        "win_rate_pct": 38.1,
+        "avg_ret_pct": -0.0353,
+        "total_ret_sum_pct": -0.74,
+        "best_pct": 0.5951,
+        "worst_pct": -0.3659,
+        "max_drawdown_pct": -1.1,
+        "exit_reasons": {
+          "time": 4,
+          "stop": 10,
+          "eod": 2,
+          "target": 5
+        }
+      },
+      "MSFT": {
+        "n_trades": 18,
+        "win_rate_pct": 61.11,
+        "avg_ret_pct": 0.0595,
+        "total_ret_sum_pct": 1.07,
+        "best_pct": 0.3491,
+        "worst_pct": -0.2419,
+        "max_drawdown_pct": -0.29,
+        "exit_reasons": {
+          "target": 9,
+          "time": 5,
+          "stop": 3,
+          "eod": 1
+        }
+      },
+      "NVDA": {
+        "n_trades": 12,
+        "win_rate_pct": 50.0,
+        "avg_ret_pct": 0.0083,
+        "total_ret_sum_pct": 0.1,
+        "best_pct": 0.6757,
+        "worst_pct": -0.3191,
+        "max_drawdown_pct": -0.5,
+        "exit_reasons": {
+          "time": 3,
+          "eod": 3,
+          "stop": 3,
+          "target": 3
+        }
+      },
+      "SPY": {
+        "n_trades": 13,
+        "win_rate_pct": 15.38,
+        "avg_ret_pct": -0.0841,
+        "total_ret_sum_pct": -1.09,
+        "best_pct": 0.1366,
+        "worst_pct": -0.2664,
+        "max_drawdown_pct": -0.83,
+        "exit_reasons": {
+          "stop": 6,
+          "time": 3,
+          "eod": 2,
+          "target": 2
+        }
+      },
+      "GOOGL": {
+        "n_trades": 22,
+        "win_rate_pct": 31.82,
+        "avg_ret_pct": -0.087,
+        "total_ret_sum_pct": -1.91,
+        "best_pct": 0.2693,
+        "worst_pct": -0.956,
+        "max_drawdown_pct": -2.1,
+        "exit_reasons": {
+          "target": 5,
+          "eod": 6,
+          "stop": 6,
+          "time": 5
+        }
+      },
+      "AMZN": {
+        "n_trades": 21,
+        "win_rate_pct": 23.81,
+        "avg_ret_pct": -0.1077,
+        "total_ret_sum_pct": -2.26,
+        "best_pct": 0.3175,
+        "worst_pct": -0.3092,
+        "max_drawdown_pct": -2.24,
+        "exit_reasons": {
+          "stop": 12,
+          "target": 3,
+          "time": 3,
+          "eod": 3
+        }
+      },
+      "TSLA": {
+        "n_trades": 8,
+        "win_rate_pct": 37.5,
+        "avg_ret_pct": -0.1313,
+        "total_ret_sum_pct": -1.05,
+        "best_pct": 0.3507,
+        "worst_pct": -0.8414,
+        "max_drawdown_pct": -0.91,
+        "exit_reasons": {
+          "time": 1,
+          "stop": 4,
+          "target": 2,
+          "eod": 1
+        }
+      },
+      "META": {
+        "n_trades": 12,
+        "win_rate_pct": 33.33,
+        "avg_ret_pct": -0.0908,
+        "total_ret_sum_pct": -1.09,
+        "best_pct": 0.1931,
+        "worst_pct": -0.4442,
+        "max_drawdown_pct": -1.42,
+        "exit_reasons": {
+          "target": 2,
+          "time": 6,
+          "stop": 4
+        }
+      },
+      "AMD": {
+        "n_trades": 17,
+        "win_rate_pct": 41.18,
+        "avg_ret_pct": -0.0965,
+        "total_ret_sum_pct": -1.64,
+        "best_pct": 0.6442,
+        "worst_pct": -0.9693,
+        "max_drawdown_pct": -2.45,
+        "exit_reasons": {
+          "stop": 9,
+          "eod": 2,
+          "target": 5,
+          "time": 1
+        }
+      },
+      "CRWD": {
+        "n_trades": 20,
+        "win_rate_pct": 15.0,
+        "avg_ret_pct": -0.2788,
+        "total_ret_sum_pct": -5.58,
+        "best_pct": 0.299,
+        "worst_pct": -0.7142,
+        "max_drawdown_pct": -5.67,
+        "exit_reasons": {
+          "time": 5,
+          "stop": 14,
+          "target": 1
+        }
+      },
+      "QQQ": {
+        "n_trades": 15,
+        "win_rate_pct": 26.67,
+        "avg_ret_pct": -0.0714,
+        "total_ret_sum_pct": -1.07,
+        "best_pct": 0.1065,
+        "worst_pct": -0.2214,
+        "max_drawdown_pct": -1.2,
+        "exit_reasons": {
+          "time": 6,
+          "stop": 7,
+          "eod": 2
+        }
+      },
+      "IWM": {
+        "n_trades": 17,
+        "win_rate_pct": 35.29,
+        "avg_ret_pct": -0.0499,
+        "total_ret_sum_pct": -0.85,
+        "best_pct": 0.0894,
+        "worst_pct": -0.1679,
+        "max_drawdown_pct": -0.93,
+        "exit_reasons": {
+          "time": 4,
+          "target": 4,
+          "stop": 7,
+          "eod": 2
+        }
+      }
+    }
+  },
+  "lb60_tight5.0_buf0.3_cw5_pw10_pt0.25_tf0.75_fvgFalse": {
+    "lookback": 60,
+    "range_tightness_mult": 5.0,
+    "buffer_mult": 0.3,
+    "confirm_window": 5,
+    "pullback_window": 10,
+    "pullback_tolerance": 0.25,
+    "target_fraction": 0.75,
+    "require_fvg": false,
+    "overall": {
+      "n_trades": 350,
+      "win_rate_pct": 32.0,
+      "avg_ret_pct": -0.0845,
+      "total_ret_sum_pct": -29.56,
+      "best_pct": 1.3341,
+      "worst_pct": -1.1476,
+      "max_drawdown_pct": -29.54,
+      "exit_reasons": {
+        "stop": 163,
+        "time": 78,
+        "target": 62,
+        "eod": 47
+      }
+    },
+    "index_etfs": {
+      "n_trades": 73,
+      "win_rate_pct": 27.4,
+      "avg_ret_pct": -0.0595,
+      "total_ret_sum_pct": -4.34,
+      "best_pct": 0.3076,
+      "worst_pct": -0.3057,
+      "max_drawdown_pct": -4.2,
+      "exit_reasons": {
+        "time": 23,
+        "stop": 31,
+        "eod": 7,
+        "target": 12
+      }
+    },
+    "single_stocks": {
+      "n_trades": 277,
+      "win_rate_pct": 33.21,
+      "avg_ret_pct": -0.091,
+      "total_ret_sum_pct": -25.22,
+      "best_pct": 1.3341,
+      "worst_pct": -1.1476,
+      "max_drawdown_pct": -25.82,
+      "exit_reasons": {
+        "stop": 132,
+        "time": 55,
+        "target": 50,
+        "eod": 40
+      }
+    },
+    "by_regime": {
+      "HIGH_VOL": {
+        "n_trades": 163,
+        "win_rate_pct": 33.13,
+        "avg_ret_pct": -0.0845,
+        "total_ret_sum_pct": -13.78,
+        "best_pct": 0.6757,
+        "worst_pct": -1.1476,
+        "max_drawdown_pct": -13.98,
+        "exit_reasons": {
+          "stop": 72,
+          "target": 30,
+          "eod": 21,
+          "time": 40
+        }
+      },
+      "LOW_VOL": {
+        "n_trades": 187,
+        "win_rate_pct": 31.02,
+        "avg_ret_pct": -0.0844,
+        "total_ret_sum_pct": -15.78,
+        "best_pct": 1.3341,
+        "worst_pct": -0.8414,
+        "max_drawdown_pct": -15.86,
+        "exit_reasons": {
+          "stop": 91,
+          "time": 38,
+          "target": 32,
+          "eod": 26
+        }
+      }
+    },
+    "by_ticker": {
+      "AAPL": {
+        "n_trades": 38,
+        "win_rate_pct": 36.84,
+        "avg_ret_pct": -0.0529,
+        "total_ret_sum_pct": -2.01,
+        "best_pct": 0.5951,
+        "worst_pct": -0.3898,
+        "max_drawdown_pct": -1.95,
+        "exit_reasons": {
+          "stop": 19,
+          "time": 6,
+          "target": 7,
+          "eod": 6
+        }
+      },
+      "MSFT": {
+        "n_trades": 31,
+        "win_rate_pct": 48.39,
+        "avg_ret_pct": -0.0031,
+        "total_ret_sum_pct": -0.1,
+        "best_pct": 0.3491,
+        "worst_pct": -0.4795,
+        "max_drawdown_pct": -1.05,
+        "exit_reasons": {
+          "stop": 9,
+          "target": 12,
+          "time": 7,
+          "eod": 3
+        }
+      },
+      "NVDA": {
+        "n_trades": 31,
+        "win_rate_pct": 45.16,
+        "avg_ret_pct": -0.0453,
+        "total_ret_sum_pct": -1.4,
+        "best_pct": 0.6757,
+        "worst_pct": -0.4741,
+        "max_drawdown_pct": -1.38,
+        "exit_reasons": {
+          "stop": 14,
+          "eod": 6,
+          "time": 5,
+          "target": 6
+        }
+      },
+      "SPY": {
+        "n_trades": 22,
+        "win_rate_pct": 18.18,
+        "avg_ret_pct": -0.0789,
+        "total_ret_sum_pct": -1.74,
+        "best_pct": 0.1366,
+        "worst_pct": -0.2664,
+        "max_drawdown_pct": -1.56,
+        "exit_reasons": {
+          "time": 5,
+          "stop": 11,
+          "eod": 3,
+          "target": 3
+        }
+      },
+      "GOOGL": {
+        "n_trades": 36,
+        "win_rate_pct": 25.0,
+        "avg_ret_pct": -0.1162,
+        "total_ret_sum_pct": -4.18,
+        "best_pct": 0.2693,
+        "worst_pct": -0.956,
+        "max_drawdown_pct": -4.39,
+        "exit_reasons": {
+          "time": 8,
+          "target": 5,
+          "eod": 8,
+          "stop": 15
+        }
+      },
+      "AMZN": {
+        "n_trades": 34,
+        "win_rate_pct": 23.53,
+        "avg_ret_pct": -0.0916,
+        "total_ret_sum_pct": -3.12,
+        "best_pct": 0.3175,
+        "worst_pct": -0.3092,
+        "max_drawdown_pct": -2.93,
+        "exit_reasons": {
+          "stop": 18,
+          "target": 4,
+          "eod": 7,
+          "time": 5
+        }
+      },
+      "TSLA": {
+        "n_trades": 27,
+        "win_rate_pct": 29.63,
+        "avg_ret_pct": -0.1507,
+        "total_ret_sum_pct": -4.07,
+        "best_pct": 0.3882,
+        "worst_pct": -0.8414,
+        "max_drawdown_pct": -4.1,
+        "exit_reasons": {
+          "time": 7,
+          "eod": 3,
+          "stop": 14,
+          "target": 3
+        }
+      },
+      "META": {
+        "n_trades": 21,
+        "win_rate_pct": 33.33,
+        "avg_ret_pct": -0.0279,
+        "total_ret_sum_pct": -0.59,
+        "best_pct": 1.3341,
+        "worst_pct": -0.4606,
+        "max_drawdown_pct": -2.0,
+        "exit_reasons": {
+          "stop": 8,
+          "target": 3,
+          "time": 9,
+          "eod": 1
+        }
+      },
+      "AMD": {
+        "n_trades": 30,
+        "win_rate_pct": 33.33,
+        "avg_ret_pct": -0.1679,
+        "total_ret_sum_pct": -5.04,
+        "best_pct": 0.6442,
+        "worst_pct": -1.1476,
+        "max_drawdown_pct": -4.99,
+        "exit_reasons": {
+          "stop": 18,
+          "target": 5,
+          "time": 3,
+          "eod": 4
+        }
+      },
+      "CRWD": {
+        "n_trades": 29,
+        "win_rate_pct": 24.14,
+        "avg_ret_pct": -0.1626,
+        "total_ret_sum_pct": -4.72,
+        "best_pct": 0.5998,
+        "worst_pct": -0.7142,
+        "max_drawdown_pct": -5.68,
+        "exit_reasons": {
+          "time": 5,
+          "eod": 2,
+          "stop": 17,
+          "target": 5
+        }
+      },
+      "QQQ": {
+        "n_trades": 22,
+        "win_rate_pct": 22.73,
+        "avg_ret_pct": -0.0683,
+        "total_ret_sum_pct": -1.5,
+        "best_pct": 0.1065,
+        "worst_pct": -0.2214,
+        "max_drawdown_pct": -1.62,
+        "exit_reasons": {
+          "eod": 3,
+          "time": 9,
+          "target": 1,
+          "stop": 9
+        }
+      },
+      "IWM": {
+        "n_trades": 29,
+        "win_rate_pct": 37.93,
+        "avg_ret_pct": -0.0381,
+        "total_ret_sum_pct": -1.11,
+        "best_pct": 0.3076,
+        "worst_pct": -0.3057,
+        "max_drawdown_pct": -1.23,
+        "exit_reasons": {
+          "time": 9,
+          "target": 8,
+          "stop": 11,
+          "eod": 1
+        }
+      }
+    }
+  },
+  "lb60_tight5.0_buf0.3_cw5_pw10_pt0.25_tf0.75_fvgTrue": {
+    "lookback": 60,
+    "range_tightness_mult": 5.0,
+    "buffer_mult": 0.3,
+    "confirm_window": 5,
+    "pullback_window": 10,
+    "pullback_tolerance": 0.25,
+    "target_fraction": 0.75,
+    "require_fvg": true,
+    "overall": {
+      "n_trades": 220,
+      "win_rate_pct": 35.91,
+      "avg_ret_pct": -0.0785,
+      "total_ret_sum_pct": -17.27,
+      "best_pct": 0.6757,
+      "worst_pct": -0.9693,
+      "max_drawdown_pct": -18.01,
+      "exit_reasons": {
+        "time": 59,
+        "stop": 90,
+        "eod": 26,
+        "target": 45
+      }
+    },
+    "index_etfs": {
+      "n_trades": 51,
+      "win_rate_pct": 31.37,
+      "avg_ret_pct": -0.0585,
+      "total_ret_sum_pct": -2.98,
+      "best_pct": 0.1366,
+      "worst_pct": -0.2664,
+      "max_drawdown_pct": -2.73,
+      "exit_reasons": {
+        "stop": 20,
+        "time": 17,
+        "eod": 6,
+        "target": 8
+      }
+    },
+    "single_stocks": {
+      "n_trades": 169,
+      "win_rate_pct": 37.28,
+      "avg_ret_pct": -0.0845,
+      "total_ret_sum_pct": -14.28,
+      "best_pct": 0.6757,
+      "worst_pct": -0.9693,
+      "max_drawdown_pct": -15.52,
+      "exit_reasons": {
+        "time": 42,
+        "stop": 70,
+        "eod": 20,
+        "target": 37
+      }
+    },
+    "by_regime": {
+      "HIGH_VOL": {
+        "n_trades": 111,
+        "win_rate_pct": 36.94,
+        "avg_ret_pct": -0.0656,
+        "total_ret_sum_pct": -7.28,
+        "best_pct": 0.6757,
+        "worst_pct": -0.9693,
+        "max_drawdown_pct": -7.4,
+        "exit_reasons": {
+          "stop": 46,
+          "eod": 15,
+          "target": 23,
+          "time": 27
+        }
+      },
+      "LOW_VOL": {
+        "n_trades": 109,
+        "win_rate_pct": 34.86,
+        "avg_ret_pct": -0.0916,
+        "total_ret_sum_pct": -9.98,
+        "best_pct": 0.5951,
+        "worst_pct": -0.8414,
+        "max_drawdown_pct": -11.2,
+        "exit_reasons": {
+          "time": 32,
+          "stop": 44,
+          "target": 22,
+          "eod": 11
+        }
+      }
+    },
+    "by_ticker": {
+      "AAPL": {
+        "n_trades": 24,
+        "win_rate_pct": 41.67,
+        "avg_ret_pct": -0.0268,
+        "total_ret_sum_pct": -0.64,
+        "best_pct": 0.5951,
+        "worst_pct": -0.3659,
+        "max_drawdown_pct": -0.99,
+        "exit_reasons": {
+          "time": 4,
+          "stop": 11,
+          "eod": 4,
+          "target": 5
+        }
+      },
+      "MSFT": {
+        "n_trades": 21,
+        "win_rate_pct": 61.9,
+        "avg_ret_pct": 0.0516,
+        "total_ret_sum_pct": 1.08,
+        "best_pct": 0.3491,
+        "worst_pct": -0.4795,
+        "max_drawdown_pct": -0.55,
+        "exit_reasons": {
+          "target": 11,
+          "time": 6,
+          "stop": 3,
+          "eod": 1
+        }
+      },
+      "NVDA": {
+        "n_trades": 15,
+        "win_rate_pct": 46.67,
+        "avg_ret_pct": -0.0214,
+        "total_ret_sum_pct": -0.32,
+        "best_pct": 0.6757,
+        "worst_pct": -0.3191,
+        "max_drawdown_pct": -0.81,
+        "exit_reasons": {
+          "time": 4,
+          "eod": 3,
+          "stop": 5,
+          "target": 3
+        }
+      },
+      "SPY": {
+        "n_trades": 14,
+        "win_rate_pct": 21.43,
+        "avg_ret_pct": -0.0763,
+        "total_ret_sum_pct": -1.07,
+        "best_pct": 0.1366,
+        "worst_pct": -0.2664,
+        "max_drawdown_pct": -0.8,
+        "exit_reasons": {
+          "stop": 6,
+          "time": 4,
+          "eod": 2,
+          "target": 2
+        }
+      },
+      "GOOGL": {
+        "n_trades": 25,
+        "win_rate_pct": 28.0,
+        "avg_ret_pct": -0.1084,
+        "total_ret_sum_pct": -2.71,
+        "best_pct": 0.2693,
+        "worst_pct": -0.956,
+        "max_drawdown_pct": -2.89,
+        "exit_reasons": {
+          "target": 5,
+          "eod": 6,
+          "stop": 8,
+          "time": 6
+        }
+      },
+      "AMZN": {
+        "n_trades": 23,
+        "win_rate_pct": 26.09,
+        "avg_ret_pct": -0.1017,
+        "total_ret_sum_pct": -2.34,
+        "best_pct": 0.3175,
+        "worst_pct": -0.3092,
+        "max_drawdown_pct": -2.32,
+        "exit_reasons": {
+          "stop": 12,
+          "target": 3,
+          "time": 5,
+          "eod": 3
+        }
+      },
+      "TSLA": {
+        "n_trades": 10,
+        "win_rate_pct": 40.0,
+        "avg_ret_pct": -0.1264,
+        "total_ret_sum_pct": -1.26,
+        "best_pct": 0.3507,
+        "worst_pct": -0.8414,
+        "max_drawdown_pct": -1.12,
+        "exit_reasons": {
+          "time": 3,
+          "stop": 4,
+          "target": 2,
+          "eod": 1
+        }
+      },
+      "META": {
+        "n_trades": 14,
+        "win_rate_pct": 35.71,
+        "avg_ret_pct": -0.0947,
+        "total_ret_sum_pct": -1.33,
+        "best_pct": 0.1931,
+        "worst_pct": -0.4442,
+        "max_drawdown_pct": -1.66,
+        "exit_reasons": {
+          "target": 2,
+          "time": 7,
+          "stop": 5
+        }
+      },
+      "AMD": {
+        "n_trades": 17,
+        "win_rate_pct": 41.18,
+        "avg_ret_pct": -0.1207,
+        "total_ret_sum_pct": -2.05,
+        "best_pct": 0.6442,
+        "worst_pct": -0.9693,
+        "max_drawdown_pct": -2.45,
+        "exit_reasons": {
+          "stop": 9,
+          "eod": 2,
+          "target": 4,
+          "time": 2
+        }
+      },
+      "CRWD": {
+        "n_trades": 20,
+        "win_rate_pct": 20.0,
+        "avg_ret_pct": -0.2356,
+        "total_ret_sum_pct": -4.71,
+        "best_pct": 0.5406,
+        "worst_pct": -0.7142,
+        "max_drawdown_pct": -5.46,
+        "exit_reasons": {
+          "time": 5,
+          "stop": 13,
+          "target": 2
+        }
+      },
+      "QQQ": {
+        "n_trades": 17,
+        "win_rate_pct": 29.41,
+        "avg_ret_pct": -0.0588,
+        "total_ret_sum_pct": -1.0,
+        "best_pct": 0.1065,
+        "worst_pct": -0.2214,
+        "max_drawdown_pct": -1.22,
+        "exit_reasons": {
+          "time": 7,
+          "target": 1,
+          "stop": 7,
+          "eod": 2
+        }
+      },
+      "IWM": {
+        "n_trades": 20,
+        "win_rate_pct": 40.0,
+        "avg_ret_pct": -0.0457,
+        "total_ret_sum_pct": -0.91,
+        "best_pct": 0.1274,
+        "worst_pct": -0.2114,
+        "max_drawdown_pct": -0.8,
+        "exit_reasons": {
+          "time": 6,
+          "target": 5,
+          "stop": 7,
+          "eod": 2
+        }
+      }
+    }
+  },
+  "lb60_tight5.0_buf0.5_cw5_pw3_pt0.25_tf0.75_fvgFalse": {
+    "lookback": 60,
+    "range_tightness_mult": 5.0,
+    "buffer_mult": 0.5,
+    "confirm_window": 5,
+    "pullback_window": 3,
+    "pullback_tolerance": 0.25,
+    "target_fraction": 0.75,
+    "require_fvg": false,
+    "overall": {
+      "n_trades": 191,
+      "win_rate_pct": 32.98,
+      "avg_ret_pct": -0.0587,
+      "total_ret_sum_pct": -11.21,
+      "best_pct": 0.6918,
+      "worst_pct": -0.8414,
+      "max_drawdown_pct": -12.16,
+      "exit_reasons": {
+        "stop": 82,
+        "target": 39,
+        "eod": 32,
+        "time": 38
+      }
+    },
+    "index_etfs": {
+      "n_trades": 37,
+      "win_rate_pct": 27.03,
+      "avg_ret_pct": -0.0545,
+      "total_ret_sum_pct": -2.02,
+      "best_pct": 0.3076,
+      "worst_pct": -0.3057,
+      "max_drawdown_pct": -1.95,
+      "exit_reasons": {
+        "time": 11,
+        "stop": 16,
+        "eod": 5,
+        "target": 5
+      }
+    },
+    "single_stocks": {
+      "n_trades": 154,
+      "win_rate_pct": 34.42,
+      "avg_ret_pct": -0.0597,
+      "total_ret_sum_pct": -9.19,
+      "best_pct": 0.6918,
+      "worst_pct": -0.8414,
+      "max_drawdown_pct": -10.68,
+      "exit_reasons": {
+        "stop": 66,
+        "target": 34,
+        "eod": 27,
+        "time": 27
+      }
+    },
+    "by_regime": {
+      "HIGH_VOL": {
+        "n_trades": 82,
+        "win_rate_pct": 40.24,
+        "avg_ret_pct": -0.0376,
+        "total_ret_sum_pct": -3.08,
+        "best_pct": 0.6757,
+        "worst_pct": -0.6119,
+        "max_drawdown_pct": -4.12,
+        "exit_reasons": {
+          "target": 19,
+          "eod": 11,
+          "time": 22,
+          "stop": 30
+        }
+      },
+      "LOW_VOL": {
+        "n_trades": 109,
+        "win_rate_pct": 27.52,
+        "avg_ret_pct": -0.0745,
+        "total_ret_sum_pct": -8.12,
+        "best_pct": 0.6918,
+        "worst_pct": -0.8414,
+        "max_drawdown_pct": -8.85,
+        "exit_reasons": {
+          "stop": 52,
+          "target": 20,
+          "time": 16,
+          "eod": 21
+        }
+      }
+    },
+    "by_ticker": {
+      "AAPL": {
+        "n_trades": 23,
+        "win_rate_pct": 47.83,
+        "avg_ret_pct": -0.0113,
+        "total_ret_sum_pct": -0.26,
+        "best_pct": 0.5951,
+        "worst_pct": -0.3845,
+        "max_drawdown_pct": -1.11,
+        "exit_reasons": {
+          "stop": 9,
+          "target": 6,
+          "eod": 3,
+          "time": 5
+        }
+      },
+      "MSFT": {
+        "n_trades": 16,
+        "win_rate_pct": 43.75,
+        "avg_ret_pct": -0.0043,
+        "total_ret_sum_pct": -0.07,
+        "best_pct": 0.3491,
+        "worst_pct": -0.2256,
+        "max_drawdown_pct": -0.78,
+        "exit_reasons": {
+          "stop": 4,
+          "target": 6,
+          "time": 3,
+          "eod": 3
+        }
+      },
+      "NVDA": {
+        "n_trades": 17,
+        "win_rate_pct": 41.18,
+        "avg_ret_pct": -0.0569,
+        "total_ret_sum_pct": -0.97,
+        "best_pct": 0.6757,
+        "worst_pct": -0.4741,
+        "max_drawdown_pct": -1.2,
+        "exit_reasons": {
+          "stop": 8,
+          "eod": 3,
+          "time": 2,
+          "target": 4
+        }
+      },
+      "SPY": {
+        "n_trades": 12,
+        "win_rate_pct": 16.67,
+        "avg_ret_pct": -0.0783,
+        "total_ret_sum_pct": -0.94,
+        "best_pct": 0.0835,
+        "worst_pct": -0.1735,
+        "max_drawdown_pct": -0.77,
+        "exit_reasons": {
+          "time": 3,
+          "stop": 7,
+          "eod": 1,
+          "target": 1
+        }
+      },
+      "GOOGL": {
+        "n_trades": 17,
+        "win_rate_pct": 29.41,
+        "avg_ret_pct": -0.0555,
+        "total_ret_sum_pct": -0.94,
+        "best_pct": 0.2693,
+        "worst_pct": -0.2816,
+        "max_drawdown_pct": -1.24,
+        "exit_reasons": {
+          "eod": 6,
+          "stop": 6,
+          "target": 3,
+          "time": 2
+        }
+      },
+      "AMZN": {
+        "n_trades": 22,
+        "win_rate_pct": 27.27,
+        "avg_ret_pct": -0.0662,
+        "total_ret_sum_pct": -1.46,
+        "best_pct": 0.387,
+        "worst_pct": -0.2595,
+        "max_drawdown_pct": -1.48,
+        "exit_reasons": {
+          "stop": 10,
+          "target": 4,
+          "eod": 6,
+          "time": 2
+        }
+      },
+      "TSLA": {
+        "n_trades": 13,
+        "win_rate_pct": 30.77,
+        "avg_ret_pct": -0.1388,
+        "total_ret_sum_pct": -1.8,
+        "best_pct": 0.3882,
+        "worst_pct": -0.8414,
+        "max_drawdown_pct": -1.97,
+        "exit_reasons": {
+          "eod": 2,
+          "time": 2,
+          "stop": 7,
+          "target": 2
+        }
+      },
+      "META": {
+        "n_trades": 12,
+        "win_rate_pct": 25.0,
+        "avg_ret_pct": -0.0834,
+        "total_ret_sum_pct": -1.0,
+        "best_pct": 0.211,
+        "worst_pct": -0.3011,
+        "max_drawdown_pct": -1.13,
+        "exit_reasons": {
+          "stop": 5,
+          "time": 5,
+          "target": 2
+        }
+      },
+      "AMD": {
+        "n_trades": 16,
+        "win_rate_pct": 25.0,
+        "avg_ret_pct": -0.1415,
+        "total_ret_sum_pct": -2.26,
+        "best_pct": 0.6442,
+        "worst_pct": -0.6119,
+        "max_drawdown_pct": -2.47,
+        "exit_reasons": {
+          "stop": 10,
+          "time": 1,
+          "target": 3,
+          "eod": 2
+        }
+      },
+      "CRWD": {
+        "n_trades": 18,
+        "win_rate_pct": 33.33,
+        "avg_ret_pct": -0.0236,
+        "total_ret_sum_pct": -0.42,
+        "best_pct": 0.6918,
+        "worst_pct": -0.5207,
+        "max_drawdown_pct": -1.69,
+        "exit_reasons": {
+          "time": 5,
+          "eod": 2,
+          "stop": 7,
+          "target": 4
+        }
+      },
+      "QQQ": {
+        "n_trades": 11,
+        "win_rate_pct": 27.27,
+        "avg_ret_pct": -0.0609,
+        "total_ret_sum_pct": -0.67,
+        "best_pct": 0.1065,
+        "worst_pct": -0.2214,
+        "max_drawdown_pct": -0.68,
+        "exit_reasons": {
+          "eod": 3,
+          "time": 5,
+          "stop": 3
+        }
+      },
+      "IWM": {
+        "n_trades": 14,
+        "win_rate_pct": 35.71,
+        "avg_ret_pct": -0.029,
+        "total_ret_sum_pct": -0.41,
+        "best_pct": 0.3076,
+        "worst_pct": -0.3057,
+        "max_drawdown_pct": -0.94,
+        "exit_reasons": {
+          "target": 4,
+          "time": 3,
+          "stop": 6,
+          "eod": 1
+        }
+      }
+    }
+  },
+  "lb60_tight5.0_buf0.5_cw5_pw3_pt0.25_tf0.75_fvgTrue": {
+    "lookback": 60,
+    "range_tightness_mult": 5.0,
+    "buffer_mult": 0.5,
+    "confirm_window": 5,
+    "pullback_window": 3,
+    "pullback_tolerance": 0.25,
+    "target_fraction": 0.75,
+    "require_fvg": true,
+    "overall": {
+      "n_trades": 99,
+      "win_rate_pct": 34.34,
+      "avg_ret_pct": -0.0458,
+      "total_ret_sum_pct": -4.54,
+      "best_pct": 0.6918,
+      "worst_pct": -0.8414,
+      "max_drawdown_pct": -5.8,
+      "exit_reasons": {
+        "stop": 43,
+        "eod": 12,
+        "target": 25,
+        "time": 19
+      }
+    },
+    "index_etfs": {
+      "n_trades": 22,
+      "win_rate_pct": 22.73,
+      "avg_ret_pct": -0.065,
+      "total_ret_sum_pct": -1.43,
+      "best_pct": 0.1065,
+      "worst_pct": -0.2214,
+      "max_drawdown_pct": -1.39,
+      "exit_reasons": {
+        "eod": 3,
+        "time": 8,
+        "stop": 10,
+        "target": 1
+      }
+    },
+    "single_stocks": {
+      "n_trades": 77,
+      "win_rate_pct": 37.66,
+      "avg_ret_pct": -0.0404,
+      "total_ret_sum_pct": -3.11,
+      "best_pct": 0.6918,
+      "worst_pct": -0.8414,
+      "max_drawdown_pct": -4.98,
+      "exit_reasons": {
+        "stop": 33,
+        "eod": 9,
+        "target": 24,
+        "time": 11
+      }
+    },
+    "by_regime": {
+      "HIGH_VOL": {
+        "n_trades": 46,
+        "win_rate_pct": 43.48,
+        "avg_ret_pct": -0.0128,
+        "total_ret_sum_pct": -0.59,
+        "best_pct": 0.6757,
+        "worst_pct": -0.5207,
+        "max_drawdown_pct": -2.49,
+        "exit_reasons": {
+          "eod": 5,
+          "target": 14,
+          "stop": 15,
+          "time": 12
+        }
+      },
+      "LOW_VOL": {
+        "n_trades": 53,
+        "win_rate_pct": 26.42,
+        "avg_ret_pct": -0.0745,
+        "total_ret_sum_pct": -3.95,
+        "best_pct": 0.6918,
+        "worst_pct": -0.8414,
+        "max_drawdown_pct": -4.88,
+        "exit_reasons": {
+          "stop": 28,
+          "target": 11,
+          "time": 7,
+          "eod": 7
+        }
+      }
+    },
+    "by_ticker": {
+      "AAPL": {
+        "n_trades": 9,
+        "win_rate_pct": 55.56,
+        "avg_ret_pct": 0.0726,
+        "total_ret_sum_pct": 0.65,
+        "best_pct": 0.5951,
+        "worst_pct": -0.2579,
+        "max_drawdown_pct": -0.19,
+        "exit_reasons": {
+          "stop": 3,
+          "eod": 1,
+          "target": 4,
+          "time": 1
+        }
+      },
+      "MSFT": {
+        "n_trades": 10,
+        "win_rate_pct": 40.0,
+        "avg_ret_pct": -0.0008,
+        "total_ret_sum_pct": -0.01,
+        "best_pct": 0.3491,
+        "worst_pct": -0.2256,
+        "max_drawdown_pct": -0.51,
+        "exit_reasons": {
+          "stop": 3,
+          "target": 4,
+          "time": 2,
+          "eod": 1
+        }
+      },
+      "NVDA": {
+        "n_trades": 6,
+        "win_rate_pct": 50.0,
+        "avg_ret_pct": 0.0809,
+        "total_ret_sum_pct": 0.49,
+        "best_pct": 0.6757,
+        "worst_pct": -0.3191,
+        "max_drawdown_pct": -0.32,
+        "exit_reasons": {
+          "time": 1,
+          "stop": 1,
+          "target": 3,
+          "eod": 1
+        }
+      },
+      "SPY": {
+        "n_trades": 5,
+        "win_rate_pct": 0.0,
+        "avg_ret_pct": -0.0847,
+        "total_ret_sum_pct": -0.42,
+        "best_pct": -0.0328,
+        "worst_pct": -0.1382,
+        "max_drawdown_pct": -0.38,
+        "exit_reasons": {
+          "eod": 1,
+          "time": 1,
+          "stop": 3
+        }
+      },
+      "GOOGL": {
+        "n_trades": 9,
+        "win_rate_pct": 44.44,
+        "avg_ret_pct": -0.0086,
+        "total_ret_sum_pct": -0.08,
+        "best_pct": 0.2693,
+        "worst_pct": -0.2816,
+        "max_drawdown_pct": -0.63,
+        "exit_reasons": {
+          "eod": 3,
+          "target": 2,
+          "time": 1,
+          "stop": 3
+        }
+      },
+      "AMZN": {
+        "n_trades": 13,
+        "win_rate_pct": 30.77,
+        "avg_ret_pct": -0.0709,
+        "total_ret_sum_pct": -0.92,
+        "best_pct": 0.3175,
+        "worst_pct": -0.2595,
+        "max_drawdown_pct": -1.07,
+        "exit_reasons": {
+          "stop": 7,
+          "target": 3,
+          "time": 1,
+          "eod": 2
+        }
+      },
+      "TSLA": {
+        "n_trades": 4,
+        "win_rate_pct": 25.0,
+        "avg_ret_pct": -0.308,
+        "total_ret_sum_pct": -1.23,
+        "best_pct": 0.3507,
+        "worst_pct": -0.8414,
+        "max_drawdown_pct": -0.52,
+        "exit_reasons": {
+          "stop": 3,
+          "target": 1
+        }
+      },
+      "META": {
+        "n_trades": 7,
+        "win_rate_pct": 28.57,
+        "avg_ret_pct": -0.0871,
+        "total_ret_sum_pct": -0.61,
+        "best_pct": 0.211,
+        "worst_pct": -0.3011,
+        "max_drawdown_pct": -0.73,
+        "exit_reasons": {
+          "time": 2,
+          "stop": 3,
+          "target": 2
+        }
+      },
+      "AMD": {
+        "n_trades": 9,
+        "win_rate_pct": 33.33,
+        "avg_ret_pct": -0.0645,
+        "total_ret_sum_pct": -0.58,
+        "best_pct": 0.6442,
+        "worst_pct": -0.5172,
+        "max_drawdown_pct": -1.1,
+        "exit_reasons": {
+          "stop": 5,
+          "target": 3,
+          "eod": 1
+        }
+      },
+      "CRWD": {
+        "n_trades": 10,
+        "win_rate_pct": 30.0,
+        "avg_ret_pct": -0.0817,
+        "total_ret_sum_pct": -0.82,
+        "best_pct": 0.6918,
+        "worst_pct": -0.5207,
+        "max_drawdown_pct": -1.39,
+        "exit_reasons": {
+          "time": 3,
+          "stop": 5,
+          "target": 2
+        }
+      },
+      "QQQ": {
+        "n_trades": 9,
+        "win_rate_pct": 33.33,
+        "avg_ret_pct": -0.056,
+        "total_ret_sum_pct": -0.5,
+        "best_pct": 0.1065,
+        "worst_pct": -0.2214,
+        "max_drawdown_pct": -0.61,
+        "exit_reasons": {
+          "time": 5,
+          "stop": 3,
+          "eod": 1
+        }
+      },
+      "IWM": {
+        "n_trades": 8,
+        "win_rate_pct": 25.0,
+        "avg_ret_pct": -0.0629,
+        "total_ret_sum_pct": -0.5,
+        "best_pct": 0.0894,
+        "worst_pct": -0.1679,
+        "max_drawdown_pct": -0.63,
+        "exit_reasons": {
+          "time": 2,
+          "target": 1,
+          "eod": 1,
+          "stop": 4
+        }
+      }
+    }
+  },
+  "lb60_tight5.0_buf0.5_cw5_pw5_pt0.25_tf0.75_fvgFalse": {
+    "lookback": 60,
+    "range_tightness_mult": 5.0,
+    "buffer_mult": 0.5,
+    "confirm_window": 5,
+    "pullback_window": 5,
+    "pullback_tolerance": 0.25,
+    "target_fraction": 0.75,
+    "require_fvg": false,
+    "overall": {
+      "n_trades": 227,
+      "win_rate_pct": 33.92,
+      "avg_ret_pct": -0.0642,
+      "total_ret_sum_pct": -14.56,
+      "best_pct": 0.7644,
+      "worst_pct": -0.8414,
+      "max_drawdown_pct": -15.6,
+      "exit_reasons": {
+        "stop": 98,
+        "time": 48,
+        "target": 45,
+        "eod": 36
+      }
+    },
+    "index_etfs": {
+      "n_trades": 44,
+      "win_rate_pct": 27.27,
+      "avg_ret_pct": -0.0628,
+      "total_ret_sum_pct": -2.76,
+      "best_pct": 0.3076,
+      "worst_pct": -0.3057,
+      "max_drawdown_pct": -2.69,
+      "exit_reasons": {
+        "time": 14,
+        "stop": 18,
+        "eod": 7,
+        "target": 5
+      }
+    },
+    "single_stocks": {
+      "n_trades": 183,
+      "win_rate_pct": 35.52,
+      "avg_ret_pct": -0.0645,
+      "total_ret_sum_pct": -11.8,
+      "best_pct": 0.7644,
+      "worst_pct": -0.8414,
+      "max_drawdown_pct": -13.38,
+      "exit_reasons": {
+        "stop": 80,
+        "time": 34,
+        "target": 40,
+        "eod": 29
+      }
+    },
+    "by_regime": {
+      "HIGH_VOL": {
+        "n_trades": 100,
+        "win_rate_pct": 41.0,
+        "avg_ret_pct": -0.0432,
+        "total_ret_sum_pct": -4.32,
+        "best_pct": 0.6757,
+        "worst_pct": -0.6119,
+        "max_drawdown_pct": -5.32,
+        "exit_reasons": {
+          "target": 22,
+          "eod": 15,
+          "time": 28,
+          "stop": 35
+        }
+      },
+      "LOW_VOL": {
+        "n_trades": 127,
+        "win_rate_pct": 28.35,
+        "avg_ret_pct": -0.0806,
+        "total_ret_sum_pct": -10.24,
+        "best_pct": 0.7644,
+        "worst_pct": -0.8414,
+        "max_drawdown_pct": -11.31,
+        "exit_reasons": {
+          "stop": 63,
+          "time": 20,
+          "target": 23,
+          "eod": 21
+        }
+      }
+    },
+    "by_ticker": {
+      "AAPL": {
+        "n_trades": 28,
+        "win_rate_pct": 42.86,
+        "avg_ret_pct": -0.0335,
+        "total_ret_sum_pct": -0.94,
+        "best_pct": 0.5951,
+        "worst_pct": -0.3898,
+        "max_drawdown_pct": -1.87,
+        "exit_reasons": {
+          "stop": 12,
+          "time": 6,
+          "target": 6,
+          "eod": 4
+        }
+      },
+      "MSFT": {
+        "n_trades": 20,
+        "win_rate_pct": 50.0,
+        "avg_ret_pct": 0.0213,
+        "total_ret_sum_pct": 0.43,
+        "best_pct": 0.3491,
+        "worst_pct": -0.2419,
+        "max_drawdown_pct": -0.63,
+        "exit_reasons": {
+          "stop": 5,
+          "target": 9,
+          "time": 3,
+          "eod": 3
+        }
+      },
+      "NVDA": {
+        "n_trades": 23,
+        "win_rate_pct": 39.13,
+        "avg_ret_pct": -0.0636,
+        "total_ret_sum_pct": -1.46,
+        "best_pct": 0.6757,
+        "worst_pct": -0.4741,
+        "max_drawdown_pct": -1.51,
+        "exit_reasons": {
+          "stop": 11,
+          "eod": 5,
+          "time": 3,
+          "target": 4
+        }
+      },
+      "SPY": {
+        "n_trades": 14,
+        "win_rate_pct": 14.29,
+        "avg_ret_pct": -0.0941,
+        "total_ret_sum_pct": -1.32,
+        "best_pct": 0.0835,
+        "worst_pct": -0.2664,
+        "max_drawdown_pct": -1.14,
+        "exit_reasons": {
+          "time": 4,
+          "stop": 8,
+          "eod": 1,
+          "target": 1
+        }
+      },
+      "GOOGL": {
+        "n_trades": 19,
+        "win_rate_pct": 36.84,
+        "avg_ret_pct": -0.0397,
+        "total_ret_sum_pct": -0.75,
+        "best_pct": 0.2693,
+        "worst_pct": -0.2816,
+        "max_drawdown_pct": -1.15,
+        "exit_reasons": {
+          "target": 5,
+          "eod": 5,
+          "stop": 6,
+          "time": 3
+        }
+      },
+      "AMZN": {
+        "n_trades": 24,
+        "win_rate_pct": 25.0,
+        "avg_ret_pct": -0.0834,
+        "total_ret_sum_pct": -2.0,
+        "best_pct": 0.387,
+        "worst_pct": -0.3092,
+        "max_drawdown_pct": -1.82,
+        "exit_reasons": {
+          "stop": 12,
+          "target": 4,
+          "eod": 6,
+          "time": 2
+        }
+      },
+      "TSLA": {
+        "n_trades": 13,
+        "win_rate_pct": 30.77,
+        "avg_ret_pct": -0.1388,
+        "total_ret_sum_pct": -1.8,
+        "best_pct": 0.3882,
+        "worst_pct": -0.8414,
+        "max_drawdown_pct": -1.97,
+        "exit_reasons": {
+          "eod": 2,
+          "time": 2,
+          "stop": 7,
+          "target": 2
+        }
+      },
+      "META": {
+        "n_trades": 14,
+        "win_rate_pct": 28.57,
+        "avg_ret_pct": -0.0728,
+        "total_ret_sum_pct": -1.02,
+        "best_pct": 0.211,
+        "worst_pct": -0.3011,
+        "max_drawdown_pct": -1.13,
+        "exit_reasons": {
+          "stop": 5,
+          "time": 7,
+          "target": 2
+        }
+      },
+      "AMD": {
+        "n_trades": 21,
+        "win_rate_pct": 28.57,
+        "avg_ret_pct": -0.1755,
+        "total_ret_sum_pct": -3.69,
+        "best_pct": 0.6442,
+        "worst_pct": -0.8405,
+        "max_drawdown_pct": -3.63,
+        "exit_reasons": {
+          "stop": 13,
+          "time": 3,
+          "target": 3,
+          "eod": 2
+        }
+      },
+      "CRWD": {
+        "n_trades": 21,
+        "win_rate_pct": 33.33,
+        "avg_ret_pct": -0.0267,
+        "total_ret_sum_pct": -0.56,
+        "best_pct": 0.7644,
+        "worst_pct": -0.5684,
+        "max_drawdown_pct": -2.59,
+        "exit_reasons": {
+          "time": 5,
+          "eod": 2,
+          "stop": 9,
+          "target": 5
+        }
+      },
+      "QQQ": {
+        "n_trades": 14,
+        "win_rate_pct": 28.57,
+        "avg_ret_pct": -0.0619,
+        "total_ret_sum_pct": -0.87,
+        "best_pct": 0.1065,
+        "worst_pct": -0.2214,
+        "max_drawdown_pct": -0.9,
+        "exit_reasons": {
+          "eod": 4,
+          "time": 7,
+          "stop": 3
+        }
+      },
+      "IWM": {
+        "n_trades": 16,
+        "win_rate_pct": 37.5,
+        "avg_ret_pct": -0.0362,
+        "total_ret_sum_pct": -0.58,
+        "best_pct": 0.3076,
+        "worst_pct": -0.3057,
+        "max_drawdown_pct": -0.99,
+        "exit_reasons": {
+          "target": 4,
+          "time": 3,
+          "stop": 7,
+          "eod": 2
+        }
+      }
+    }
+  },
+  "lb60_tight5.0_buf0.5_cw5_pw5_pt0.25_tf0.75_fvgTrue": {
+    "lookback": 60,
+    "range_tightness_mult": 5.0,
+    "buffer_mult": 0.5,
+    "confirm_window": 5,
+    "pullback_window": 5,
+    "pullback_tolerance": 0.25,
+    "target_fraction": 0.75,
+    "require_fvg": true,
+    "overall": {
+      "n_trades": 135,
+      "win_rate_pct": 37.04,
+      "avg_ret_pct": -0.0556,
+      "total_ret_sum_pct": -7.51,
+      "best_pct": 0.6918,
+      "worst_pct": -0.8414,
+      "max_drawdown_pct": -9.18,
+      "exit_reasons": {
+        "time": 28,
+        "stop": 55,
+        "eod": 20,
+        "target": 32
+      }
+    },
+    "index_etfs": {
+      "n_trades": 27,
+      "win_rate_pct": 25.93,
+      "avg_ret_pct": -0.0663,
+      "total_ret_sum_pct": -1.79,
+      "best_pct": 0.1065,
+      "worst_pct": -0.2664,
+      "max_drawdown_pct": -1.52,
+      "exit_reasons": {
+        "stop": 11,
+        "time": 10,
+        "eod": 5,
+        "target": 1
+      }
+    },
+    "single_stocks": {
+      "n_trades": 108,
+      "win_rate_pct": 39.81,
+      "avg_ret_pct": -0.0529,
+      "total_ret_sum_pct": -5.72,
+      "best_pct": 0.6918,
+      "worst_pct": -0.8414,
+      "max_drawdown_pct": -8.11,
+      "exit_reasons": {
+        "time": 18,
+        "stop": 44,
+        "eod": 15,
+        "target": 31
+      }
+    },
+    "by_regime": {
+      "HIGH_VOL": {
+        "n_trades": 63,
+        "win_rate_pct": 42.86,
+        "avg_ret_pct": -0.0279,
+        "total_ret_sum_pct": -1.76,
+        "best_pct": 0.6757,
+        "worst_pct": -0.5684,
+        "max_drawdown_pct": -3.38,
+        "exit_reasons": {
+          "eod": 11,
+          "target": 16,
+          "stop": 20,
+          "time": 16
+        }
+      },
+      "LOW_VOL": {
+        "n_trades": 72,
+        "win_rate_pct": 31.94,
+        "avg_ret_pct": -0.0798,
+        "total_ret_sum_pct": -5.74,
+        "best_pct": 0.6918,
+        "worst_pct": -0.8414,
+        "max_drawdown_pct": -7.39,
+        "exit_reasons": {
+          "time": 12,
+          "stop": 35,
+          "target": 16,
+          "eod": 9
+        }
+      }
+    },
+    "by_ticker": {
+      "AAPL": {
+        "n_trades": 13,
+        "win_rate_pct": 53.85,
+        "avg_ret_pct": 0.0264,
+        "total_ret_sum_pct": 0.34,
+        "best_pct": 0.5951,
+        "worst_pct": -0.3659,
+        "max_drawdown_pct": -0.62,
+        "exit_reasons": {
+          "time": 3,
+          "stop": 4,
+          "eod": 2,
+          "target": 4
+        }
+      },
+      "MSFT": {
+        "n_trades": 14,
+        "win_rate_pct": 57.14,
+        "avg_ret_pct": 0.0624,
+        "total_ret_sum_pct": 0.87,
+        "best_pct": 0.3491,
+        "worst_pct": -0.2419,
+        "max_drawdown_pct": -0.45,
+        "exit_reasons": {
+          "target": 8,
+          "time": 2,
+          "stop": 3,
+          "eod": 1
+        }
+      },
+      "NVDA": {
+        "n_trades": 11,
+        "win_rate_pct": 45.45,
+        "avg_ret_pct": 0.0113,
+        "total_ret_sum_pct": 0.12,
+        "best_pct": 0.6757,
+        "worst_pct": -0.3191,
+        "max_drawdown_pct": -0.5,
+        "exit_reasons": {
+          "time": 2,
+          "eod": 3,
+          "stop": 3,
+          "target": 3
+        }
+      },
+      "SPY": {
+        "n_trades": 7,
+        "win_rate_pct": 0.0,
+        "avg_ret_pct": -0.1146,
+        "total_ret_sum_pct": -0.8,
+        "best_pct": -0.0328,
+        "worst_pct": -0.2664,
+        "max_drawdown_pct": -0.54,
+        "exit_reasons": {
+          "stop": 4,
+          "time": 2,
+          "eod": 1
+        }
+      },
+      "GOOGL": {
+        "n_trades": 14,
+        "win_rate_pct": 50.0,
+        "avg_ret_pct": 0.0072,
+        "total_ret_sum_pct": 0.1,
+        "best_pct": 0.2693,
+        "worst_pct": -0.2816,
+        "max_drawdown_pct": -0.77,
+        "exit_reasons": {
+          "target": 5,
+          "eod": 4,
+          "time": 2,
+          "stop": 3
+        }
+      },
+      "AMZN": {
+        "n_trades": 16,
+        "win_rate_pct": 25.0,
+        "avg_ret_pct": -0.0995,
+        "total_ret_sum_pct": -1.59,
+        "best_pct": 0.3175,
+        "worst_pct": -0.3092,
+        "max_drawdown_pct": -1.61,
+        "exit_reasons": {
+          "stop": 9,
+          "target": 3,
+          "eod": 3,
+          "time": 1
+        }
+      },
+      "TSLA": {
+        "n_trades": 5,
+        "win_rate_pct": 40.0,
+        "avg_ret_pct": -0.199,
+        "total_ret_sum_pct": -1.0,
+        "best_pct": 0.3507,
+        "worst_pct": -0.8414,
+        "max_drawdown_pct": -0.52,
+        "exit_reasons": {
+          "stop": 3,
+          "eod": 1,
+          "target": 1
+        }
+      },
+      "META": {
+        "n_trades": 9,
+        "win_rate_pct": 33.33,
+        "avg_ret_pct": -0.0699,
+        "total_ret_sum_pct": -0.63,
+        "best_pct": 0.211,
+        "worst_pct": -0.3011,
+        "max_drawdown_pct": -0.73,
+        "exit_reasons": {
+          "time": 4,
+          "stop": 3,
+          "target": 2
+        }
+      },
+      "AMD": {
+        "n_trades": 13,
+        "win_rate_pct": 30.77,
+        "avg_ret_pct": -0.1602,
+        "total_ret_sum_pct": -2.08,
+        "best_pct": 0.6442,
+        "worst_pct": -0.8405,
+        "max_drawdown_pct": -2.03,
+        "exit_reasons": {
+          "stop": 8,
+          "target": 3,
+          "eod": 1,
+          "time": 1
+        }
+      },
+      "CRWD": {
+        "n_trades": 13,
+        "win_rate_pct": 23.08,
+        "avg_ret_pct": -0.143,
+        "total_ret_sum_pct": -1.86,
+        "best_pct": 0.6918,
+        "worst_pct": -0.5684,
+        "max_drawdown_pct": -2.29,
+        "exit_reasons": {
+          "time": 3,
+          "stop": 8,
+          "target": 2
+        }
+      },
+      "QQQ": {
+        "n_trades": 11,
+        "win_rate_pct": 36.36,
+        "avg_ret_pct": -0.0476,
+        "total_ret_sum_pct": -0.52,
+        "best_pct": 0.1065,
+        "worst_pct": -0.2214,
+        "max_drawdown_pct": -0.66,
+        "exit_reasons": {
+          "time": 6,
+          "stop": 3,
+          "eod": 2
+        }
+      },
+      "IWM": {
+        "n_trades": 9,
+        "win_rate_pct": 33.33,
+        "avg_ret_pct": -0.0516,
+        "total_ret_sum_pct": -0.46,
+        "best_pct": 0.0894,
+        "worst_pct": -0.1679,
+        "max_drawdown_pct": -0.63,
+        "exit_reasons": {
+          "time": 2,
+          "target": 1,
+          "eod": 2,
+          "stop": 4
+        }
+      }
+    }
+  },
+  "lb60_tight5.0_buf0.5_cw5_pw7_pt0.25_tf0.75_fvgFalse": {
+    "lookback": 60,
+    "range_tightness_mult": 5.0,
+    "buffer_mult": 0.5,
+    "confirm_window": 5,
+    "pullback_window": 7,
+    "pullback_tolerance": 0.25,
+    "target_fraction": 0.75,
+    "require_fvg": false,
+    "overall": {
+      "n_trades": 247,
+      "win_rate_pct": 34.41,
+      "avg_ret_pct": -0.065,
+      "total_ret_sum_pct": -16.05,
+      "best_pct": 1.3341,
+      "worst_pct": -0.8414,
+      "max_drawdown_pct": -16.7,
+      "exit_reasons": {
+        "stop": 105,
+        "time": 58,
+        "target": 48,
+        "eod": 36
+      }
+    },
+    "index_etfs": {
+      "n_trades": 50,
+      "win_rate_pct": 28.0,
+      "avg_ret_pct": -0.0638,
+      "total_ret_sum_pct": -3.19,
+      "best_pct": 0.3076,
+      "worst_pct": -0.3057,
+      "max_drawdown_pct": -3.12,
+      "exit_reasons": {
+        "time": 17,
+        "stop": 20,
+        "eod": 7,
+        "target": 6
+      }
+    },
+    "single_stocks": {
+      "n_trades": 197,
+      "win_rate_pct": 36.04,
+      "avg_ret_pct": -0.0653,
+      "total_ret_sum_pct": -12.86,
+      "best_pct": 1.3341,
+      "worst_pct": -0.8414,
+      "max_drawdown_pct": -14.05,
+      "exit_reasons": {
+        "stop": 85,
+        "time": 41,
+        "target": 42,
+        "eod": 29
+      }
+    },
+    "by_regime": {
+      "HIGH_VOL": {
+        "n_trades": 108,
+        "win_rate_pct": 39.81,
+        "avg_ret_pct": -0.0448,
+        "total_ret_sum_pct": -4.83,
+        "best_pct": 0.6757,
+        "worst_pct": -0.6119,
+        "max_drawdown_pct": -5.46,
+        "exit_reasons": {
+          "target": 24,
+          "eod": 15,
+          "stop": 38,
+          "time": 31
+        }
+      },
+      "LOW_VOL": {
+        "n_trades": 139,
+        "win_rate_pct": 30.22,
+        "avg_ret_pct": -0.0807,
+        "total_ret_sum_pct": -11.21,
+        "best_pct": 1.3341,
+        "worst_pct": -0.8414,
+        "max_drawdown_pct": -11.35,
+        "exit_reasons": {
+          "stop": 67,
+          "time": 27,
+          "target": 24,
+          "eod": 21
+        }
+      }
+    },
+    "by_ticker": {
+      "AAPL": {
+        "n_trades": 29,
+        "win_rate_pct": 37.93,
+        "avg_ret_pct": -0.0497,
+        "total_ret_sum_pct": -1.44,
+        "best_pct": 0.5951,
+        "worst_pct": -0.3898,
+        "max_drawdown_pct": -1.99,
+        "exit_reasons": {
+          "stop": 13,
+          "time": 6,
+          "target": 6,
+          "eod": 4
+        }
+      },
+      "MSFT": {
+        "n_trades": 22,
+        "win_rate_pct": 45.45,
+        "avg_ret_pct": -0.0091,
+        "total_ret_sum_pct": -0.2,
+        "best_pct": 0.3491,
+        "worst_pct": -0.385,
+        "max_drawdown_pct": -0.79,
+        "exit_reasons": {
+          "stop": 6,
+          "target": 9,
+          "time": 4,
+          "eod": 3
+        }
+      },
+      "NVDA": {
+        "n_trades": 26,
+        "win_rate_pct": 42.31,
+        "avg_ret_pct": -0.0586,
+        "total_ret_sum_pct": -1.52,
+        "best_pct": 0.6757,
+        "worst_pct": -0.4741,
+        "max_drawdown_pct": -1.41,
+        "exit_reasons": {
+          "stop": 12,
+          "time": 5,
+          "eod": 5,
+          "target": 4
+        }
+      },
+      "SPY": {
+        "n_trades": 16,
+        "win_rate_pct": 18.75,
+        "avg_ret_pct": -0.0896,
+        "total_ret_sum_pct": -1.43,
+        "best_pct": 0.0835,
+        "worst_pct": -0.2664,
+        "max_drawdown_pct": -1.26,
+        "exit_reasons": {
+          "time": 4,
+          "stop": 9,
+          "eod": 1,
+          "target": 2
+        }
+      },
+      "GOOGL": {
+        "n_trades": 19,
+        "win_rate_pct": 36.84,
+        "avg_ret_pct": -0.0397,
+        "total_ret_sum_pct": -0.75,
+        "best_pct": 0.2693,
+        "worst_pct": -0.2816,
+        "max_drawdown_pct": -1.15,
+        "exit_reasons": {
+          "target": 5,
+          "eod": 5,
+          "stop": 6,
+          "time": 3
+        }
+      },
+      "AMZN": {
+        "n_trades": 25,
+        "win_rate_pct": 28.0,
+        "avg_ret_pct": -0.0777,
+        "total_ret_sum_pct": -1.94,
+        "best_pct": 0.387,
+        "worst_pct": -0.3092,
+        "max_drawdown_pct": -1.76,
+        "exit_reasons": {
+          "stop": 12,
+          "target": 4,
+          "eod": 6,
+          "time": 3
+        }
+      },
+      "TSLA": {
+        "n_trades": 13,
+        "win_rate_pct": 30.77,
+        "avg_ret_pct": -0.1388,
+        "total_ret_sum_pct": -1.8,
+        "best_pct": 0.3882,
+        "worst_pct": -0.8414,
+        "max_drawdown_pct": -1.97,
+        "exit_reasons": {
+          "eod": 2,
+          "time": 2,
+          "stop": 7,
+          "target": 2
+        }
+      },
+      "META": {
+        "n_trades": 17,
+        "win_rate_pct": 41.18,
+        "avg_ret_pct": 0.0333,
+        "total_ret_sum_pct": 0.57,
+        "best_pct": 1.3341,
+        "worst_pct": -0.3011,
+        "max_drawdown_pct": -1.13,
+        "exit_reasons": {
+          "stop": 5,
+          "target": 4,
+          "time": 8
+        }
+      },
+      "AMD": {
+        "n_trades": 22,
+        "win_rate_pct": 31.82,
+        "avg_ret_pct": -0.1385,
+        "total_ret_sum_pct": -3.05,
+        "best_pct": 0.6442,
+        "worst_pct": -0.8405,
+        "max_drawdown_pct": -3.0,
+        "exit_reasons": {
+          "stop": 13,
+          "time": 3,
+          "target": 4,
+          "eod": 2
+        }
+      },
+      "CRWD": {
+        "n_trades": 24,
+        "win_rate_pct": 29.17,
+        "avg_ret_pct": -0.1129,
+        "total_ret_sum_pct": -2.71,
+        "best_pct": 0.6918,
+        "worst_pct": -0.7142,
+        "max_drawdown_pct": -3.48,
+        "exit_reasons": {
+          "time": 7,
+          "eod": 2,
+          "stop": 11,
+          "target": 4
+        }
+      },
+      "QQQ": {
+        "n_trades": 15,
+        "win_rate_pct": 26.67,
+        "avg_ret_pct": -0.067,
+        "total_ret_sum_pct": -1.01,
+        "best_pct": 0.1065,
+        "worst_pct": -0.2214,
+        "max_drawdown_pct": -1.04,
+        "exit_reasons": {
+          "eod": 4,
+          "time": 7,
+          "stop": 4
+        }
+      },
+      "IWM": {
+        "n_trades": 19,
+        "win_rate_pct": 36.84,
+        "avg_ret_pct": -0.0394,
+        "total_ret_sum_pct": -0.75,
+        "best_pct": 0.3076,
+        "worst_pct": -0.3057,
+        "max_drawdown_pct": -1.16,
+        "exit_reasons": {
+          "target": 4,
+          "time": 6,
+          "stop": 7,
+          "eod": 2
+        }
+      }
+    }
+  },
+  "lb60_tight5.0_buf0.5_cw5_pw7_pt0.25_tf0.75_fvgTrue": {
+    "lookback": 60,
+    "range_tightness_mult": 5.0,
+    "buffer_mult": 0.5,
+    "confirm_window": 5,
+    "pullback_window": 7,
+    "pullback_tolerance": 0.25,
+    "target_fraction": 0.75,
+    "require_fvg": true,
+    "overall": {
+      "n_trades": 160,
+      "win_rate_pct": 38.12,
+      "avg_ret_pct": -0.06,
+      "total_ret_sum_pct": -9.6,
+      "best_pct": 0.6918,
+      "worst_pct": -0.8414,
+      "max_drawdown_pct": -10.47,
+      "exit_reasons": {
+        "time": 40,
+        "stop": 64,
+        "eod": 20,
+        "target": 36
+      }
+    },
+    "index_etfs": {
+      "n_trades": 32,
+      "win_rate_pct": 28.12,
+      "avg_ret_pct": -0.0657,
+      "total_ret_sum_pct": -2.1,
+      "best_pct": 0.1065,
+      "worst_pct": -0.2664,
+      "max_drawdown_pct": -1.93,
+      "exit_reasons": {
+        "stop": 13,
+        "time": 11,
+        "eod": 5,
+        "target": 3
+      }
+    },
+    "single_stocks": {
+      "n_trades": 128,
+      "win_rate_pct": 40.62,
+      "avg_ret_pct": -0.0585,
+      "total_ret_sum_pct": -7.49,
+      "best_pct": 0.6918,
+      "worst_pct": -0.8414,
+      "max_drawdown_pct": -8.66,
+      "exit_reasons": {
+        "time": 29,
+        "stop": 51,
+        "eod": 15,
+        "target": 33
+      }
+    },
+    "by_regime": {
+      "HIGH_VOL": {
+        "n_trades": 74,
+        "win_rate_pct": 43.24,
+        "avg_ret_pct": -0.0263,
+        "total_ret_sum_pct": -1.95,
+        "best_pct": 0.6757,
+        "worst_pct": -0.5684,
+        "max_drawdown_pct": -3.43,
+        "exit_reasons": {
+          "eod": 11,
+          "target": 18,
+          "stop": 24,
+          "time": 21
+        }
+      },
+      "LOW_VOL": {
+        "n_trades": 86,
+        "win_rate_pct": 33.72,
+        "avg_ret_pct": -0.0889,
+        "total_ret_sum_pct": -7.65,
+        "best_pct": 0.6918,
+        "worst_pct": -0.8414,
+        "max_drawdown_pct": -8.67,
+        "exit_reasons": {
+          "time": 19,
+          "stop": 40,
+          "target": 18,
+          "eod": 9
+        }
+      }
+    },
+    "by_ticker": {
+      "AAPL": {
+        "n_trades": 18,
+        "win_rate_pct": 44.44,
+        "avg_ret_pct": -0.0114,
+        "total_ret_sum_pct": -0.2,
+        "best_pct": 0.5951,
+        "worst_pct": -0.3659,
+        "max_drawdown_pct": -1.0,
+        "exit_reasons": {
+          "time": 5,
+          "stop": 7,
+          "eod": 2,
+          "target": 4
+        }
+      },
+      "MSFT": {
+        "n_trades": 16,
+        "win_rate_pct": 50.0,
+        "avg_ret_pct": 0.0155,
+        "total_ret_sum_pct": 0.25,
+        "best_pct": 0.3491,
+        "worst_pct": -0.385,
+        "max_drawdown_pct": -0.69,
+        "exit_reasons": {
+          "target": 8,
+          "time": 3,
+          "stop": 4,
+          "eod": 1
+        }
+      },
+      "NVDA": {
+        "n_trades": 14,
+        "win_rate_pct": 50.0,
+        "avg_ret_pct": 0.0046,
+        "total_ret_sum_pct": 0.06,
+        "best_pct": 0.6757,
+        "worst_pct": -0.3191,
+        "max_drawdown_pct": -0.68,
+        "exit_reasons": {
+          "time": 4,
+          "eod": 3,
+          "stop": 4,
+          "target": 3
+        }
+      },
+      "SPY": {
+        "n_trades": 9,
+        "win_rate_pct": 11.11,
+        "avg_ret_pct": -0.1019,
+        "total_ret_sum_pct": -0.92,
+        "best_pct": 0.0266,
+        "worst_pct": -0.2664,
+        "max_drawdown_pct": -0.65,
+        "exit_reasons": {
+          "stop": 5,
+          "time": 2,
+          "eod": 1,
+          "target": 1
+        }
+      },
+      "GOOGL": {
+        "n_trades": 14,
+        "win_rate_pct": 50.0,
+        "avg_ret_pct": 0.0072,
+        "total_ret_sum_pct": 0.1,
+        "best_pct": 0.2693,
+        "worst_pct": -0.2816,
+        "max_drawdown_pct": -0.77,
+        "exit_reasons": {
+          "target": 5,
+          "eod": 4,
+          "time": 2,
+          "stop": 3
+        }
+      },
+      "AMZN": {
+        "n_trades": 17,
+        "win_rate_pct": 23.53,
+        "avg_ret_pct": -0.1053,
+        "total_ret_sum_pct": -1.79,
+        "best_pct": 0.3175,
+        "worst_pct": -0.3092,
+        "max_drawdown_pct": -1.81,
+        "exit_reasons": {
+          "stop": 9,
+          "target": 3,
+          "eod": 3,
+          "time": 2
+        }
+      },
+      "TSLA": {
+        "n_trades": 5,
+        "win_rate_pct": 40.0,
+        "avg_ret_pct": -0.199,
+        "total_ret_sum_pct": -1.0,
+        "best_pct": 0.3507,
+        "worst_pct": -0.8414,
+        "max_drawdown_pct": -0.52,
+        "exit_reasons": {
+          "stop": 3,
+          "eod": 1,
+          "target": 1
+        }
+      },
+      "META": {
+        "n_trades": 11,
+        "win_rate_pct": 45.45,
+        "avg_ret_pct": -0.0343,
+        "total_ret_sum_pct": -0.38,
+        "best_pct": 0.211,
+        "worst_pct": -0.3011,
+        "max_drawdown_pct": -0.82,
+        "exit_reasons": {
+          "target": 3,
+          "time": 5,
+          "stop": 3
+        }
+      },
+      "AMD": {
+        "n_trades": 15,
+        "win_rate_pct": 40.0,
+        "avg_ret_pct": -0.0875,
+        "total_ret_sum_pct": -1.31,
+        "best_pct": 0.6442,
+        "worst_pct": -0.8405,
+        "max_drawdown_pct": -1.85,
+        "exit_reasons": {
+          "stop": 8,
+          "target": 4,
+          "time": 2,
+          "eod": 1
+        }
+      },
+      "CRWD": {
+        "n_trades": 18,
+        "win_rate_pct": 27.78,
+        "avg_ret_pct": -0.1792,
+        "total_ret_sum_pct": -3.23,
+        "best_pct": 0.6918,
+        "worst_pct": -0.7142,
+        "max_drawdown_pct": -3.32,
+        "exit_reasons": {
+          "time": 6,
+          "stop": 10,
+          "target": 2
+        }
+      },
+      "QQQ": {
+        "n_trades": 12,
+        "win_rate_pct": 33.33,
+        "avg_ret_pct": -0.0552,
+        "total_ret_sum_pct": -0.66,
+        "best_pct": 0.1065,
+        "worst_pct": -0.2214,
+        "max_drawdown_pct": -0.79,
+        "exit_reasons": {
+          "time": 6,
+          "stop": 4,
+          "eod": 2
+        }
+      },
+      "IWM": {
+        "n_trades": 11,
+        "win_rate_pct": 36.36,
+        "avg_ret_pct": -0.0475,
+        "total_ret_sum_pct": -0.52,
+        "best_pct": 0.0894,
+        "worst_pct": -0.1679,
+        "max_drawdown_pct": -0.63,
+        "exit_reasons": {
+          "time": 3,
+          "target": 2,
+          "eod": 2,
+          "stop": 4
+        }
+      }
+    }
+  },
+  "lb60_tight5.0_buf0.5_cw5_pw10_pt0.25_tf0.75_fvgFalse": {
+    "lookback": 60,
+    "range_tightness_mult": 5.0,
+    "buffer_mult": 0.5,
+    "confirm_window": 5,
+    "pullback_window": 10,
+    "pullback_tolerance": 0.25,
+    "target_fraction": 0.75,
+    "require_fvg": false,
+    "overall": {
+      "n_trades": 259,
+      "win_rate_pct": 34.75,
+      "avg_ret_pct": -0.0668,
+      "total_ret_sum_pct": -17.3,
+      "best_pct": 1.3341,
+      "worst_pct": -0.8414,
+      "max_drawdown_pct": -17.97,
+      "exit_reasons": {
+        "stop": 107,
+        "time": 65,
+        "target": 50,
+        "eod": 37
+      }
+    },
+    "index_etfs": {
+      "n_trades": 54,
+      "win_rate_pct": 27.78,
+      "avg_ret_pct": -0.062,
+      "total_ret_sum_pct": -3.35,
+      "best_pct": 0.3076,
+      "worst_pct": -0.3057,
+      "max_drawdown_pct": -3.28,
+      "exit_reasons": {
+        "time": 20,
+        "stop": 20,
+        "eod": 7,
+        "target": 7
+      }
+    },
+    "single_stocks": {
+      "n_trades": 205,
+      "win_rate_pct": 36.59,
+      "avg_ret_pct": -0.0681,
+      "total_ret_sum_pct": -13.95,
+      "best_pct": 1.3341,
+      "worst_pct": -0.8414,
+      "max_drawdown_pct": -15.48,
+      "exit_reasons": {
+        "stop": 87,
+        "time": 45,
+        "target": 43,
+        "eod": 30
+      }
+    },
+    "by_regime": {
+      "HIGH_VOL": {
+        "n_trades": 113,
+        "win_rate_pct": 39.82,
+        "avg_ret_pct": -0.0512,
+        "total_ret_sum_pct": -5.79,
+        "best_pct": 0.6757,
+        "worst_pct": -0.6119,
+        "max_drawdown_pct": -6.43,
+        "exit_reasons": {
+          "target": 24,
+          "eod": 15,
+          "time": 35,
+          "stop": 39
+        }
+      },
+      "LOW_VOL": {
+        "n_trades": 146,
+        "win_rate_pct": 30.82,
+        "avg_ret_pct": -0.0788,
+        "total_ret_sum_pct": -11.51,
+        "best_pct": 1.3341,
+        "worst_pct": -0.8414,
+        "max_drawdown_pct": -11.73,
+        "exit_reasons": {
+          "stop": 68,
+          "time": 30,
+          "target": 26,
+          "eod": 22
+        }
+      }
+    },
+    "by_ticker": {
+      "AAPL": {
+        "n_trades": 31,
+        "win_rate_pct": 41.94,
+        "avg_ret_pct": -0.0409,
+        "total_ret_sum_pct": -1.27,
+        "best_pct": 0.5951,
+        "worst_pct": -0.3898,
+        "max_drawdown_pct": -1.83,
+        "exit_reasons": {
+          "stop": 13,
+          "time": 7,
+          "target": 6,
+          "eod": 5
+        }
+      },
+      "MSFT": {
+        "n_trades": 25,
+        "win_rate_pct": 48.0,
+        "avg_ret_pct": -0.0088,
+        "total_ret_sum_pct": -0.22,
+        "best_pct": 0.3491,
+        "worst_pct": -0.4795,
+        "max_drawdown_pct": -1.1,
+        "exit_reasons": {
+          "stop": 6,
+          "target": 11,
+          "time": 5,
+          "eod": 3
+        }
+      },
+      "NVDA": {
+        "n_trades": 27,
+        "win_rate_pct": 40.74,
+        "avg_ret_pct": -0.0636,
+        "total_ret_sum_pct": -1.72,
+        "best_pct": 0.6757,
+        "worst_pct": -0.4741,
+        "max_drawdown_pct": -1.6,
+        "exit_reasons": {
+          "stop": 13,
+          "time": 5,
+          "eod": 5,
+          "target": 4
+        }
+      },
+      "SPY": {
+        "n_trades": 16,
+        "win_rate_pct": 18.75,
+        "avg_ret_pct": -0.0896,
+        "total_ret_sum_pct": -1.43,
+        "best_pct": 0.0835,
+        "worst_pct": -0.2664,
+        "max_drawdown_pct": -1.26,
+        "exit_reasons": {
+          "time": 4,
+          "stop": 9,
+          "eod": 1,
+          "target": 2
+        }
+      },
+      "GOOGL": {
+        "n_trades": 21,
+        "win_rate_pct": 33.33,
+        "avg_ret_pct": -0.061,
+        "total_ret_sum_pct": -1.28,
+        "best_pct": 0.2693,
+        "worst_pct": -0.3697,
+        "max_drawdown_pct": -1.47,
+        "exit_reasons": {
+          "target": 5,
+          "eod": 5,
+          "stop": 8,
+          "time": 3
+        }
+      },
+      "AMZN": {
+        "n_trades": 25,
+        "win_rate_pct": 28.0,
+        "avg_ret_pct": -0.0777,
+        "total_ret_sum_pct": -1.94,
+        "best_pct": 0.387,
+        "worst_pct": -0.3092,
+        "max_drawdown_pct": -1.76,
+        "exit_reasons": {
+          "stop": 12,
+          "target": 4,
+          "eod": 6,
+          "time": 3
+        }
+      },
+      "TSLA": {
+        "n_trades": 14,
+        "win_rate_pct": 28.57,
+        "avg_ret_pct": -0.1599,
+        "total_ret_sum_pct": -2.24,
+        "best_pct": 0.3882,
+        "worst_pct": -0.8414,
+        "max_drawdown_pct": -2.21,
+        "exit_reasons": {
+          "eod": 2,
+          "time": 3,
+          "stop": 7,
+          "target": 2
+        }
+      },
+      "META": {
+        "n_trades": 17,
+        "win_rate_pct": 41.18,
+        "avg_ret_pct": 0.0333,
+        "total_ret_sum_pct": 0.57,
+        "best_pct": 1.3341,
+        "worst_pct": -0.3011,
+        "max_drawdown_pct": -1.13,
+        "exit_reasons": {
+          "stop": 5,
+          "target": 4,
+          "time": 8
+        }
+      },
+      "AMD": {
+        "n_trades": 22,
+        "win_rate_pct": 31.82,
+        "avg_ret_pct": -0.1572,
+        "total_ret_sum_pct": -3.46,
+        "best_pct": 0.6442,
+        "worst_pct": -0.8405,
+        "max_drawdown_pct": -3.41,
+        "exit_reasons": {
+          "stop": 13,
+          "time": 4,
+          "target": 3,
+          "eod": 2
+        }
+      },
+      "CRWD": {
+        "n_trades": 23,
+        "win_rate_pct": 30.43,
+        "avg_ret_pct": -0.1038,
+        "total_ret_sum_pct": -2.39,
+        "best_pct": 0.6918,
+        "worst_pct": -0.7142,
+        "max_drawdown_pct": -3.48,
+        "exit_reasons": {
+          "time": 7,
+          "eod": 2,
+          "stop": 10,
+          "target": 4
+        }
+      },
+      "QQQ": {
+        "n_trades": 16,
+        "win_rate_pct": 25.0,
+        "avg_ret_pct": -0.0636,
+        "total_ret_sum_pct": -1.02,
+        "best_pct": 0.1065,
+        "worst_pct": -0.2214,
+        "max_drawdown_pct": -1.05,
+        "exit_reasons": {
+          "eod": 4,
+          "time": 8,
+          "stop": 4
+        }
+      },
+      "IWM": {
+        "n_trades": 22,
+        "win_rate_pct": 36.36,
+        "avg_ret_pct": -0.0409,
+        "total_ret_sum_pct": -0.9,
+        "best_pct": 0.3076,
+        "worst_pct": -0.3057,
+        "max_drawdown_pct": -1.1,
+        "exit_reasons": {
+          "time": 8,
+          "target": 5,
+          "stop": 7,
+          "eod": 2
+        }
+      }
+    }
+  },
+  "lb60_tight5.0_buf0.5_cw5_pw10_pt0.25_tf0.75_fvgTrue": {
+    "lookback": 60,
+    "range_tightness_mult": 5.0,
+    "buffer_mult": 0.5,
+    "confirm_window": 5,
+    "pullback_window": 10,
+    "pullback_tolerance": 0.25,
+    "target_fraction": 0.75,
+    "require_fvg": true,
+    "overall": {
+      "n_trades": 178,
+      "win_rate_pct": 39.33,
+      "avg_ret_pct": -0.0604,
+      "total_ret_sum_pct": -10.74,
+      "best_pct": 0.6918,
+      "worst_pct": -0.8414,
+      "max_drawdown_pct": -11.62,
+      "exit_reasons": {
+        "time": 49,
+        "stop": 69,
+        "eod": 21,
+        "target": 39
+      }
+    },
+    "index_etfs": {
+      "n_trades": 37,
+      "win_rate_pct": 32.43,
+      "avg_ret_pct": -0.0583,
+      "total_ret_sum_pct": -2.16,
+      "best_pct": 0.1274,
+      "worst_pct": -0.2664,
+      "max_drawdown_pct": -1.98,
+      "exit_reasons": {
+        "stop": 13,
+        "time": 15,
+        "eod": 5,
+        "target": 4
+      }
+    },
+    "single_stocks": {
+      "n_trades": 141,
+      "win_rate_pct": 41.13,
+      "avg_ret_pct": -0.0609,
+      "total_ret_sum_pct": -8.59,
+      "best_pct": 0.6918,
+      "worst_pct": -0.8414,
+      "max_drawdown_pct": -9.88,
+      "exit_reasons": {
+        "time": 34,
+        "stop": 56,
+        "eod": 16,
+        "target": 35
+      }
+    },
+    "by_regime": {
+      "HIGH_VOL": {
+        "n_trades": 82,
+        "win_rate_pct": 43.9,
+        "avg_ret_pct": -0.0319,
+        "total_ret_sum_pct": -2.62,
+        "best_pct": 0.6757,
+        "worst_pct": -0.5684,
+        "max_drawdown_pct": -3.23,
+        "exit_reasons": {
+          "eod": 11,
+          "target": 19,
+          "stop": 27,
+          "time": 25
+        }
+      },
+      "LOW_VOL": {
+        "n_trades": 96,
+        "win_rate_pct": 35.42,
+        "avg_ret_pct": -0.0846,
+        "total_ret_sum_pct": -8.13,
+        "best_pct": 0.6918,
+        "worst_pct": -0.8414,
+        "max_drawdown_pct": -9.08,
+        "exit_reasons": {
+          "time": 24,
+          "stop": 42,
+          "target": 20,
+          "eod": 10
+        }
+      }
+    },
+    "by_ticker": {
+      "AAPL": {
+        "n_trades": 20,
+        "win_rate_pct": 45.0,
+        "avg_ret_pct": -0.0136,
+        "total_ret_sum_pct": -0.27,
+        "best_pct": 0.5951,
+        "worst_pct": -0.3659,
+        "max_drawdown_pct": -1.06,
+        "exit_reasons": {
+          "time": 5,
+          "stop": 8,
+          "eod": 3,
+          "target": 4
+        }
+      },
+      "MSFT": {
+        "n_trades": 19,
+        "win_rate_pct": 52.63,
+        "avg_ret_pct": 0.0137,
+        "total_ret_sum_pct": 0.26,
+        "best_pct": 0.3491,
+        "worst_pct": -0.4795,
+        "max_drawdown_pct": -1.0,
+        "exit_reasons": {
+          "target": 10,
+          "time": 4,
+          "stop": 4,
+          "eod": 1
+        }
+      },
+      "NVDA": {
+        "n_trades": 16,
+        "win_rate_pct": 43.75,
+        "avg_ret_pct": -0.0268,
+        "total_ret_sum_pct": -0.43,
+        "best_pct": 0.6757,
+        "worst_pct": -0.3191,
+        "max_drawdown_pct": -0.87,
+        "exit_reasons": {
+          "time": 4,
+          "eod": 3,
+          "stop": 6,
+          "target": 3
+        }
+      },
+      "SPY": {
+        "n_trades": 10,
+        "win_rate_pct": 20.0,
+        "avg_ret_pct": -0.0892,
+        "total_ret_sum_pct": -0.89,
+        "best_pct": 0.0266,
+        "worst_pct": -0.2664,
+        "max_drawdown_pct": -0.63,
+        "exit_reasons": {
+          "stop": 5,
+          "time": 3,
+          "eod": 1,
+          "target": 1
+        }
+      },
+      "GOOGL": {
+        "n_trades": 16,
+        "win_rate_pct": 43.75,
+        "avg_ret_pct": -0.0282,
+        "total_ret_sum_pct": -0.45,
+        "best_pct": 0.2693,
+        "worst_pct": -0.3697,
+        "max_drawdown_pct": -0.96,
+        "exit_reasons": {
+          "target": 5,
+          "eod": 4,
+          "stop": 5,
+          "time": 2
+        }
+      },
+      "AMZN": {
+        "n_trades": 18,
+        "win_rate_pct": 27.78,
+        "avg_ret_pct": -0.0989,
+        "total_ret_sum_pct": -1.78,
+        "best_pct": 0.3175,
+        "worst_pct": -0.3092,
+        "max_drawdown_pct": -1.8,
+        "exit_reasons": {
+          "stop": 9,
+          "target": 3,
+          "eod": 3,
+          "time": 3
+        }
+      },
+      "TSLA": {
+        "n_trades": 7,
+        "win_rate_pct": 42.86,
+        "avg_ret_pct": -0.1726,
+        "total_ret_sum_pct": -1.21,
+        "best_pct": 0.3507,
+        "worst_pct": -0.8414,
+        "max_drawdown_pct": -1.0,
+        "exit_reasons": {
+          "time": 2,
+          "stop": 3,
+          "eod": 1,
+          "target": 1
+        }
+      },
+      "META": {
+        "n_trades": 12,
+        "win_rate_pct": 41.67,
+        "avg_ret_pct": -0.0515,
+        "total_ret_sum_pct": -0.62,
+        "best_pct": 0.211,
+        "worst_pct": -0.3011,
+        "max_drawdown_pct": -1.06,
+        "exit_reasons": {
+          "target": 3,
+          "time": 5,
+          "stop": 4
+        }
+      },
+      "AMD": {
+        "n_trades": 15,
+        "win_rate_pct": 40.0,
+        "avg_ret_pct": -0.115,
+        "total_ret_sum_pct": -1.73,
+        "best_pct": 0.6442,
+        "worst_pct": -0.8405,
+        "max_drawdown_pct": -1.85,
+        "exit_reasons": {
+          "stop": 8,
+          "target": 3,
+          "time": 3,
+          "eod": 1
+        }
+      },
+      "CRWD": {
+        "n_trades": 18,
+        "win_rate_pct": 33.33,
+        "avg_ret_pct": -0.1313,
+        "total_ret_sum_pct": -2.36,
+        "best_pct": 0.6918,
+        "worst_pct": -0.7142,
+        "max_drawdown_pct": -3.13,
+        "exit_reasons": {
+          "time": 6,
+          "stop": 9,
+          "target": 3
+        }
+      },
+      "QQQ": {
+        "n_trades": 13,
+        "win_rate_pct": 30.77,
+        "avg_ret_pct": -0.0519,
+        "total_ret_sum_pct": -0.67,
+        "best_pct": 0.1065,
+        "worst_pct": -0.2214,
+        "max_drawdown_pct": -0.81,
+        "exit_reasons": {
+          "time": 7,
+          "stop": 4,
+          "eod": 2
+        }
+      },
+      "IWM": {
+        "n_trades": 14,
+        "win_rate_pct": 42.86,
+        "avg_ret_pct": -0.0421,
+        "total_ret_sum_pct": -0.59,
+        "best_pct": 0.1274,
+        "worst_pct": -0.2114,
+        "max_drawdown_pct": -0.5,
+        "exit_reasons": {
+          "time": 5,
+          "target": 3,
+          "eod": 2,
+          "stop": 4
+        }
+      }
+    }
+  }
+}

@@ -8,3 +8,10 @@ numpy==1.26.4
 joblib==1.4.2
 pydantic==2.7.1
 yfinance>=0.2.40
+# Pinned to 1.40.0 (not latest): Playwright dropped macOS 12/Monterey browser-binary
+# support in a later release ("does not support chromium on mac12"). 1.40.0 (Nov 2023)
+# is the newest version confirmed (2026-09-16) to still download+launch Chromium on
+# this OS. Installed with --no-deps since its declared greenlet==3.0.1/pyee==11.0.1
+# pins don't have wheels for this Python version; newer greenlet/pyee work fine at
+# runtime despite the pip warning. Do not `pip install -U playwright` on this Mac.
+playwright==1.40.0

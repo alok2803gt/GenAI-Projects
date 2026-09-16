@@ -24,7 +24,8 @@ from datetime import date, timedelta
 from pathlib import Path
 
 BACKEND_DIR = Path(__file__).parent
-PYTHON = r"C:\Users\AlokD\AppData\Local\Programs\Python\Python311\python.exe"
+PYTHON = sys.executable   # was hardcoded to a Windows-only path; whatever interpreter
+                           # is running this wrapper is the right one to run the child with
 SCRIPT = BACKEND_DIR / "alpaca_goog_weekly_condor.py"
 CLIENT_ID = 1680
 

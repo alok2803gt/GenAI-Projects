@@ -215,8 +215,23 @@ def ensure_subscribed_and_shoot():
         page.get_by_text("Market Data", exact=True).click()
         page.wait_for_timeout(300)
         page.get_by_text("Charts", exact=True).click()
-        page.wait_for_timeout(4000)
         for t in SYMBOLS:
+            # The frontend only mounts the actual chart (a <canvas> from
+            # Lightweight Charts) once bars.length >= 5; before that the panel
+            # just shows "Loading bars..." text. Every Playwright run is a
+            # brand-new browser context, so every ticker hits the frontend's
+            # documented ~10-12s "never-before-subscribed" cold-start path on
+            # EVERY run, not just the first ever. A fixed short wait here
+            # (previously 4s, flat, before this loop) sometimes fired before
+            # that cold start finished, producing a screenshot of the "Loading
+            # bars..." placeholder -- which chartexpert then correctly, if
+            # uselessly, read as "no chart to analyze". Wait for the real
+            # condition (canvas exists) per symbol instead of guessing a delay.
+            try:
+                page.wait_for_selector(f"#chart-panel-{t} canvas", timeout=25000)
+            except Exception:
+                print(f"  [{t}] chart never rendered (still 'Loading bars...' after 25s) -- skipping, not screenshotting a blank panel")
+                continue
             path = SHOT_DIR / f"{t}_{now_et().strftime('%Y%m%d_%H%M%S')}.png"
             try:
                 page.locator(f"#chart-panel-{t}").screenshot(path=str(path), timeout=10000)

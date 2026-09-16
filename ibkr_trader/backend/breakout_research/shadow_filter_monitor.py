@@ -54,8 +54,8 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 HERE = Path(__file__).parent
-BACKEND_DIR = r"C:\Projects\GenAI-Projects\ibkr_trader\backend"
-TAPE_DB = f"{BACKEND_DIR}\\tape_data.db"
+BACKEND_DIR = HERE.parent   # was hardcoded to a Windows-only path
+TAPE_DB = str(BACKEND_DIR / "tape_data.db")
 STATE_FILE = HERE / "shadow_filter_state.json"
 LOG_FILE = HERE / "shadow_filter_log.csv"
 ET = ZoneInfo("America/New_York")
@@ -63,7 +63,7 @@ ET = ZoneInfo("America/New_York")
 
 def _load_telegram_creds() -> tuple[str, str] | tuple[None, None]:
     try:
-        with open(f"{BACKEND_DIR}\\scanner_config.json") as f:
+        with open(BACKEND_DIR / "scanner_config.json") as f:
             cfg = json.load(f)
         return cfg.get("telegram_token"), cfg.get("telegram_chat_id")
     except Exception:
