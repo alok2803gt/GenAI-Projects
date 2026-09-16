@@ -8738,6 +8738,7 @@ function SPY0DTETab() {
 const INDEPENDENT_TRADERS = [
   { id:"day_trader",        label:"Day Trader",           strategyTypes:["DAY_BREAKOUT"] },
   { id:"spy_weekly_condor", label:"SPY Weekly Condor",    strategyTypes:["spy_weekly_condor"] },
+  { id:"manual_trader",     label:"Manual Trader",        strategyTypes:["manual_trader"] },
   { id:"ashley",            label:"Ashley (Signal Copy)", strategyTypes:["ASHLEY_SIGNAL"] },
   { id:"butterfly_spy",     label:"Butterfly — SPY", strategyTypes:["BUTTERFLY_SPY"] },
   { id:"butterfly_qqq",     label:"Butterfly — QQQ", strategyTypes:["BUTTERFLY_QQQ"] },
@@ -8841,16 +8842,22 @@ function IndependentTradersTab() {
             if (reachable && !ibkrOk) {
               statusEl = <span style={{display:"flex", gap:6}}>{statusEl}<Pill color={C.bear}>IBKR DOWN</Pill></span>;
             }
+          } else if (row.kind === "in_process") {
+            // Lives inside this same backend (Manual Trader) -- reachable by
+            // definition if this endpoint responded at all, so just show its
+            // own monitor-armed state, no separate health/IBKR check needed.
+            statusEl = <Pill color={row.enabled ? C.bull : C.muted}>{row.enabled ? "● LIVE" : "○ DISABLED"}</Pill>;
           } else {
             statusEl = <Pill color={taskStateColor(row.task_state)}>{row.task_state || "UNKNOWN"}</Pill>;
           }
 
           // Real open-position count -- always_on rows get it live via /ws/live
-          // (open_position_count), scheduled rows via /independent-traders/status's
-          // own registry read (added 2026-09-08 after a real incident where
-          // scheduled-strategy positions were open for hours with zero visibility
-          // anywhere in this tab -- see open_positions below for the detail view).
-          const openPositions = row.kind === "scheduled" ? (row.open_positions || []) : null;
+          // (open_position_count), scheduled + in_process rows via
+          // /independent-traders/status's own registry read (added 2026-09-08
+          // after a real incident where scheduled-strategy positions were open
+          // for hours with zero visibility anywhere in this tab -- see
+          // open_positions below for the detail view).
+          const openPositions = (row.kind === "scheduled" || row.kind === "in_process") ? (row.open_positions || []) : null;
           const openCount = row.kind === "always_on"
             ? (liveRow?.reachable ? (liveRow.open_position_count ?? 0) : null)
             : openPositions.length;

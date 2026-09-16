@@ -1,0 +1,98 @@
+[
+  {
+    "backtest": {
+      "ticker": "BTSG",
+      "n_trials": 61,
+      "win_rate": 0.4754,
+      "stop_loss_hit_rate": 0.4754,
+      "breach_no_recover_rate": 0.0492,
+      "pct_trials_hit_50pct_target": 0.4754,
+      "avg_days_to_50pct_target": 21.2,
+      "pct_hit_target_within_half_dte": 0.1311,
+      "median_captured_pct": -0.5413,
+      "mean_captured_pct": -0.4513,
+      "expectancy_per_dollar_credit_sold": -0.4265,
+      "worst_trial_captured_pct": -4.4111,
+      "worst_trial_outcome": "stopped_out"
+    },
+    "live_diagnostic": {
+      "ticker": "BTSG",
+      "live_iv_atm": 0.4722,
+      "current_realized_vol_20d": 0.4692,
+      "live_iv_over_rv_ratio": 1.01,
+      "current_rv_percentile_vs_6mo_own_history": 74.8
+    }
+  },
+  {
+    "backtest": {
+      "ticker": "KRYS",
+      "n_trials": 70,
+      "win_rate": 0.4714,
+      "stop_loss_hit_rate": 0.4857,
+      "breach_no_recover_rate": 0.0429,
+      "pct_trials_hit_50pct_target": 0.4714,
+      "avg_days_to_50pct_target": 22.7,
+      "pct_hit_target_within_half_dte": 0.1,
+      "median_captured_pct": -0.99,
+      "mean_captured_pct": -0.4595,
+      "expectancy_per_dollar_credit_sold": -0.3394,
+      "worst_trial_captured_pct": -2.5417,
+      "worst_trial_outcome": "stopped_out"
+    },
+    "live_diagnostic": {
+      "ticker": "KRYS",
+      "live_iv_atm": 0.4377,
+      "current_realized_vol_20d": 0.3157,
+      "live_iv_over_rv_ratio": 1.39,
+      "current_rv_percentile_vs_6mo_own_history": 18.7
+    }
+  },
+  {
+    "backtest": {
+      "ticker": "CYTK",
+      "n_trials": 70,
+      "win_rate": 0.6714,
+      "stop_loss_hit_rate": 0.2429,
+      "breach_no_recover_rate": 0.0857,
+      "pct_trials_hit_50pct_target": 0.6714,
+      "avg_days_to_50pct_target": 23.9,
+      "pct_hit_target_within_half_dte": 0.0429,
+      "median_captured_pct": 0.5,
+      "mean_captured_pct": -0.0406,
+      "expectancy_per_dollar_credit_sold": 0.0667,
+      "worst_trial_captured_pct": -2.4381,
+      "worst_trial_outcome": "stopped_out"
+    },
+    "live_diagnostic": {
+      "ticker": "CYTK",
+      "live_iv_atm": 0.5252,
+      "current_realized_vol_20d": 0.3827,
+      "live_iv_over_rv_ratio": 1.37,
+      "current_rv_percentile_vs_6mo_own_history": 57.9
+    }
+  },
+  {
+    "backtest": {
+      "ticker": "ONB",
+      "n_trials": 69,
+      "win_rate": 0.5942,
+      "stop_loss_hit_rate": 0.3913,
+      "breach_no_recover_rate": 0.0145,
+      "pct_trials_hit_50pct_target": 0.5942,
+      "avg_days_to_50pct_target": 17.1,
+      "pct_hit_target_within_half_dte": 0.3478,
+      "median_captured_pct": 0.5,
+      "mean_captured_pct": -0.3655,
+      "expectancy_per_dollar_credit_sold": -0.0465,
+      "worst_trial_captured_pct": -5.5912,
+      "worst_trial_outcome": "stopped_out"
+    },
+    "live_diagnostic": {
+      "ticker": "ONB",
+      "live_iv_atm": 0.353,
+      "current_realized_vol_20d": 0.176,
+      "live_iv_over_rv_ratio": 2.01,
+      "current_rv_percentile_vs_6mo_own_history": 17.8
+    }
+  }
+]

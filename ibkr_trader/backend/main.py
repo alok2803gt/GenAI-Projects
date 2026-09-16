@@ -20848,18 +20848,66 @@ async def _mt_close_position_coro_inner(ib, pos_id: str, reason: str) -> bool:
         log.warning("MT close %s: no fills received, position reverted to open", pos_id)
         return False
 
-    # Compute realized P&L from fills.
-    # For unfilled legs (falls back to fill_price), contribution is zero.
-    # Use live_pnl as close_pnl when fills are partial (some legs missed).
+    # Partial fill: some legs closed, some didn't. Do NOT silently mark the
+    # whole position "closed" here — that orphans the unfilled leg(s) from
+    # every future monitor tick and the hard_close_time backstop, and the
+    # journal/close_pnl would silently ignore real money still at risk in
+    # them. (Real bug, found 2026-09-11: an ADBE call fly's upper wing sat
+    # genuinely held at IBKR for over an hour after this code unconditionally
+    # recorded the position phase="closed" with a pnl that treated the
+    # unfilled leg as a zero-impact no-op.) Instead: bank the realized P&L
+    # from the legs that DID fill, shrink the position down to just what's
+    # left, and put it back to "open" so normal monitoring + the hard-close
+    # backstop keep watching the remainder. The banked amount is added back
+    # in once the position actually fully closes (see below).
+    if not all_filled:
+        partial_realized = 0.0
+        remaining_legs = []
+        for leg in pos["legs"]:
+            sym = leg["local_symbol"]
+            if sym in fills:
+                sign = 1 if leg["action"] == "BUY" else -1
+                partial_realized += sign * (fills[sym] - leg["fill_price"]) * leg["qty"] * leg.get("multiplier", 100)
+            else:
+                remaining_legs.append(leg)
+        partial_realized = round(partial_realized, 2)
+        pos["partial_realized_pnl"] = round(pos.get("partial_realized_pnl", 0.0) + partial_realized, 2)
+        pos["legs"] = remaining_legs
+        pos["phase"] = "open"
+        _mt_save_state()
+        _mt_log("PARTIAL_CLOSE_RETRY", pos_id,
+                f"{reason} — {len(fills)}/{len(fills) + len(remaining_legs)} legs filled "
+                f"(banked ${partial_realized:+.2f}, running total ${pos['partial_realized_pnl']:+.2f}), "
+                f"{len(remaining_legs)} leg(s) still open — reverted to open, normal monitor/hard-close will retry")
+        log.warning("MT close %s: PARTIAL fill (%d/%d legs) — banked $%.2f, reverted to open for the remainder",
+                     pos_id, len(fills), len(fills) + len(remaining_legs), partial_realized)
+        try:
+            import requests as _req
+            with open(os.path.join(os.path.dirname(__file__), "scanner_config.json")) as _f:
+                _cfg = json.load(_f)
+            _remaining_str = ", ".join(l["local_symbol"] for l in remaining_legs)
+            _req.post(
+                f"https://api.telegram.org/bot{_cfg['telegram_token']}/sendMessage",
+                json={"chat_id": _cfg["telegram_chat_id"], "parse_mode": "HTML",
+                      "text": (f"⚠️ <b>Manual Trader: {pos['name']} PARTIAL close</b>\n"
+                               f"Reason: {reason}\n{len(fills)} of {len(fills) + len(remaining_legs)} legs filled "
+                               f"(banked ${partial_realized:+.2f}).\nStill open: {_remaining_str}\n"
+                               f"Reverted to open — will keep retrying / hits hard_close_time backstop.")},
+                timeout=8,
+            )
+        except Exception:
+            pass
+        return False
+
+    # Compute realized P&L from fills, plus anything already banked from an
+    # earlier partial close of this same position.
     realized_pnl = 0.0
     for leg in pos["legs"]:
         sym   = leg["local_symbol"]
         close = fills.get(sym, leg["fill_price"])
         sign  = 1 if leg["action"] == "BUY" else -1
         realized_pnl += sign * (close - leg["fill_price"]) * leg["qty"] * leg.get("multiplier", 100)
-    realized_pnl = round(realized_pnl, 2)
-    if not all_filled and realized_pnl == 0:
-        realized_pnl = round(pos.get("live_pnl", 0.0), 2)
+    realized_pnl = round(realized_pnl + pos.get("partial_realized_pnl", 0.0), 2)
 
     from zoneinfo import ZoneInfo as _ZI
     now_str = datetime.now(_ZI("America/New_York")).isoformat()
@@ -20918,23 +20966,56 @@ async def _mt_close_position_coro_inner(ib, pos_id: str, reason: str) -> bool:
 def _mt_reconcile_sync(ib) -> None:
     """Cross-check MT state against live IBKR portfolio.
 
-    Two corrections:
+    Three corrections:
+      0. "closing" positions whose legs are ALL still fully held at IBKR
+         (exact original qty) with zero working orders on those legs →
+         the close attempt never actually touched the position (crashed,
+         got interrupted by the wrapper's 120s timeout, or was cancelled
+         mid-flight) — revert to "open" so normal monitoring resumes.
+         Never retries the close itself; a stuck "closing" state should
+         resolve back to the last known-good phase, not attempt another
+         action nobody asked for.
       1. Open positions whose legs are all gone from IBKR → mark externally_closed.
       2. Closed positions with empty close_fills whose legs are still in IBKR → re-open.
     """
     mt = state["manual_trader"]
     try:
-        ibkr_held = {
-            item.contract.localSymbol
+        ibkr_held_qty = {
+            item.contract.localSymbol: item.position
             for item in ib.portfolio()
             if item.position != 0
         }
+        ibkr_held = set(ibkr_held_qty.keys())
     except Exception as ex:
         log.warning("MT reconcile: cannot read portfolio: %s", ex)
         return
 
+    try:
+        working_syms = {t.contract.localSymbol for t in ib.openTrades()}
+    except Exception as ex:
+        log.warning("MT reconcile: cannot read open orders: %s", ex)
+        working_syms = None  # unknown → be conservative, skip case 0 below
+
     from zoneinfo import ZoneInfo as _ZI
     now_str = datetime.now(_ZI("America/New_York")).isoformat()
+
+    # 0. "closing" → "open" if every leg is still exactly intact and nothing's working
+    if working_syms is not None:
+        for pos_id, pos in list(mt["positions"].items()):
+            if pos.get("phase") != "closing":
+                continue
+            legs = pos.get("legs", [])
+            expected_qty = {
+                l["local_symbol"]: (l["qty"] if l["action"] == "BUY" else -l["qty"])
+                for l in legs
+            }
+            intact = all(ibkr_held_qty.get(sym) == qty for sym, qty in expected_qty.items())
+            no_working_orders = not any(sym in working_syms for sym in expected_qty)
+            if intact and no_working_orders:
+                pos["phase"] = "open"
+                _mt_log("RECON", pos_id, "unstuck: closing→open — all legs intact at IBKR, no working orders (interrupted close)")
+                log.info("MT reconcile: %s unstuck from closing→open (legs intact, no working orders)", pos_id)
+        _mt_save_state()
 
     # 1. Open → externally_closed if all legs absent from IBKR
     for pos_id, pos in list(mt["positions"].items()):
@@ -21289,9 +21370,19 @@ async def _mt_place_order_coro(ib, req: "MTEnterRequest") -> dict:
         ib.errorEvent -= _on_order_error
 
     if not filled_trade:
+        # Real bug found 2026-09-11 (first live KO put-spread entry): the final
+        # reprice attempt's order was left Submitted/live at IBKR, uncancelled,
+        # while this raised -- the caller sees a clean failure but a real
+        # working order keeps sitting at the broker with no one watching it.
+        # Cancel whatever's still outstanding before giving up for real.
+        try:
+            ib.cancelOrder(order)
+            await asyncio.sleep(1)
+        except Exception:
+            pass
         raise ValueError(
             f"Order did not fill after {req.reprice_steps + 1} attempts "
-            f"(${req.limit_price:.2f} → ${price:.2f})"
+            f"(${req.limit_price:.2f} → ${price:.2f}) -- final order cancelled"
         )
 
     # 4. Build leg fill prices from portfolio averageCost
@@ -22527,6 +22618,24 @@ def _open_positions_for_row(row_id: str) -> list:
 
 
 def _open_positions_for_row_impl(row_id: str) -> list:
+    if row_id == "manual_trader":
+        # In-process state, not a file read -- MT lives in this same backend.
+        positions = state.get("manual_trader", {}).get("positions", {})
+        out = []
+        for pid, p in positions.items():
+            legs = p.get("legs", [])
+            leg_summary = ", ".join(f"{l.get('action')} {l.get('qty')}x {l.get('strike')}{l.get('right') or ''}"
+                                     for l in legs) if legs else "?"
+            live_pnl = p.get("live_pnl")
+            out.append({
+                "pos_id": pid,
+                "ticker": p.get("ticker"),
+                "entry_time": p.get("entry_time"),
+                "summary": f"{leg_summary} -- net entry ${_safe_fmt2(p.get('net_entry'))}"
+                           + (f", live P&L ${_safe_fmt2(live_pnl)}" if live_pnl is not None else "")
+                           + (f", closes by {p.get('hard_close_time')} ET" if p.get("hard_close_time") else ""),
+            })
+        return out
     if row_id == "harami_daily":
         try:
             with open("harami_trader_state.json") as f:
@@ -22618,11 +22727,23 @@ async def independent_traders_status():
         loop.run_in_executor(None, _live_snapshot_standalone_agent, f"{SPY_CONDOR_AGENT_URL}/health"),
     )
 
+    mt = state.get("manual_trader", {})
     rows = [
         {"id": "day_trader", "label": "Day Trader", "kind": "always_on",
          "reachable": dt_health is not None, "health": dt_health},
         {"id": "spy_weekly_condor", "label": "SPY Weekly Condor", "kind": "always_on",
          "reachable": spy_health is not None, "health": spy_health},
+        # "in_process": lives inside THIS backend (no separate process/health
+        # endpoint like day_trader/spy_weekly_condor above, no Task Scheduler
+        # entry like the rows below) -- positions are placed manually via the
+        # UI, not by a standing signal, so "enabled" here just means its own
+        # monitor loop (profit target/stop/hard-close) is armed. Added
+        # 2026-09-11 after a real gap: a -$176 real loss across 3 MT
+        # positions (ORCL/ADBE earnings butterflies) was invisible anywhere
+        # in this tab -- MT had no row at all.
+        {"id": "manual_trader", "label": "Manual Trader", "kind": "in_process",
+         "enabled": mt.get("enabled", False),
+         "open_positions": _open_positions_for_row("manual_trader")},
     ]
     for row_id, label, task_key, state_file, activity_key in [
         ("ashley", "Ashley", "ashley", "ashleyklieu_trigger_executor_state.json", "last_processed_date"),
