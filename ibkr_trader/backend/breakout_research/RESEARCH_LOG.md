@@ -345,3 +345,43 @@ itself).
 5. Report every real backtested candidate strategy, including ones that
    fail, with real parameter grids and multiple regimes -- same standard
    as this account's other opportunity-evaluation work.
+
+---
+
+## 2026-09-29 — BREAKOUT under market-adjustment + date-clustering: edge does not survive
+
+This log's headline (+1.75%/+1.83% at 3d/5d, 53-54% WR) is RAW, long-only,
+unadjusted. Grepping this file for "market-adjust", "date-clust", "excess
+return", "benchmark" returns zero hits. Those are the two corrections that
+collapsed Inside Day Reversal from t=7.37 to t=0.48, and they had never been
+applied here. `breakout_adjusted_study.py` applies them.
+
+Signal reproduced from `breakout_scanner.py`: pct_b > 95 on Bollinger(20,2)
+AND volume ratio >= the ticker's trailing-252d 95th percentile. Entry next
+open, exit at the close n sessions later.
+
+**5-day horizon, the two corrections isolated:**
+
+| | explored 112 | independent 407 |
+|---|---|---|
+| raw, per-trade t | 1.15 (+0.176%) | **2.42** (+0.186%) |
+| market-adjusted, per-trade t | −1.12 (−0.160pp) | 0.19 (+0.014pp) |
+| date-clustered only, t | 1.53 | 2.00 |
+| **BOTH, t** | **0.11** (+0.021pp) | **0.53** (+0.065pp) |
+
+On the 407-ticker panel the raw per-trade t is 2.42 — it would pass a naive
+significance test. Each correction independently removes it, and together the
+edge is gone. BREAKOUT fires 2.2-4.8 names on the same session, which is
+exactly why clustering matters: one market-wide thrust is ONE event.
+
+Win rates reproduce at 49.5-51.6%, below the 53-54% in the earlier entries.
+**Caveat:** this tests the RAW signal definition. The live scanner additionally
+applies the F1-F11 gate stack (regime, rel-strength, close-quality,
+gap-reverse, intraday-RS, ADX, path-quality, duration, liquidity), which is NOT
+reproduced here, and live uses intraday-projected volume. The gates could carry
+edge the raw signal lacks — but the earlier +1.75% figure was itself measured
+on gated alert history and is not reproduced by any construction tried here.
+
+**Conclusion:** the apparent BREAKOUT edge is beta plus clustering, not alpha.
+It should not be traded automatically, and the Telegram alerts should be read
+as "this name is moving", not "this name will outperform".

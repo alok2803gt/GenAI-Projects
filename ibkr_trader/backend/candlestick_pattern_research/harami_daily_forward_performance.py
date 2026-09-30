@@ -49,7 +49,7 @@ MIN_N_FOR_CONCLUSION = 20
 #    | Today: 350.21 -> 353.24 (bullish, inside prior body)
 #    | Close $353.24 vs SMA20 $377.15 / SMA50 $378.87 (both below -- ...) | Backtested plan ..."
 _RE = re.compile(
-    r"Bullish Harami \+ downtrend:\s*(?P<ticker>[A-Z][A-Z.\-]*)\s*\((?P<date>\d{4}-\d{2}-\d{2})\)"
+    r"(?:Bullish Harami \+ downtrend|Inside Day Reversal):\s*(?P<ticker>[A-Z][A-Z.\-]*)\s*\((?P<date>\d{4}-\d{2}-\d{2})\)"
     r".*?Prior day:\s*(?P<po>[\d.]+)\s*->\s*(?P<pc>[\d.]+)"
     r".*?Today:\s*(?P<to>[\d.]+)\s*->\s*(?P<tc>[\d.]+)"
     r".*?SMA20\s*\$(?P<sma20>[\d.]+)\s*/\s*SMA50\s*\$(?P<sma50>[\d.]+)",

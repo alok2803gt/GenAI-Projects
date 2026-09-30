@@ -1,0 +1,1 @@
+DEVIATION (recorded 2026-09-22T17:10:40Z, before any SPX data was downloaded): Polygon plan only serves SPXW history from 2024-09-23 (probe: 2024-06-03 -> 403, 2024-09-23 -> 200). Test B period becomes 2024-09-23 .. 2026-09-21. Nothing else changes.

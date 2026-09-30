@@ -1,0 +1,73 @@
+WARNING regime condition 'vrp_rich_realized' disabled: input data not supplied
+WARNING regime condition 'vrp_rich_implied' disabled: input data not supplied
+WARNING regime condition 'vol_stress' disabled: input data not supplied
+WARNING regime condition 'calm_vol' disabled: input data not supplied
+bars 487,256, sessions 1254 (2021-09-22 .. 2026-09-21)
+DEVELOPMENT period: sessions before 2025-09-22 (1003 sessions). Holdout (251 sessions) is locked.
+inputs: SPY OHLCV only -> realized-vol IV proxy; VRP and VIX regime conditions disabled
+
+1) REGIME AT 10:00 (development sessions): {'Neutral': 902, 'Chop': 69, 'Breakout': 32}
+
+2) 10:00 CALL vs REALIZED DAY TYPE (development sessions, ex-post)
+realized  chop day  mixed  trend day   All
+called                                    
+Breakout        10      9         13    32
+Chop            21     22         26    69
+Neutral        247    305        350   902
+All            278    336        389  1003
+
+3) MODELS (204s) -- direction: 42 folds, spread: 42 folds; median trees after early stopping: direction 83, spread 44; folds calibrated (>= 100/class): 40/42 and 17/42
+
+   DIRECTION model (30-min barriers, used for long options)  -- t < 0 means better than that baseline
+                     n  log_loss   brier  auc_magnitude  auc_direction  t_vs_base_rate  t_vs_logistic
+variant                                                                                              
+lgb_raw          11264    1.0320  0.6222         0.7040         0.5172        -10.4342         0.0274
+lgb_isotonic     11264    1.0394  0.6244         0.7030         0.5199         -6.7019         2.6789
+lgb_temperature  11264    1.0318  0.6221         0.7044         0.5158        -10.3995        -0.0414
+base_rate        11264    1.0658  0.6453         0.6134         0.4889             NaN         8.2264
+logistic         11264    1.0314  0.6219         0.7028         0.5118         -8.2264            NaN
+
+   SPREAD model (inside +/-0.524 implied move until 15:45, used for spreads)  -- t < 0 means better than that baseline
+                    n  log_loss   brier  auc_magnitude  auc_direction  t_vs_base_rate  t_vs_logistic
+variant                                                                                             
+lgb_raw          6067    1.0069  0.6155         0.6347         0.5093         -3.2218         1.1407
+lgb_isotonic     6067    1.0088  0.6159         0.6370         0.5122         -1.9510         1.5811
+lgb_temperature  6067    1.0065  0.6153         0.6350         0.5086         -3.3583         1.0438
+base_rate        6067    1.0158  0.6193         0.5864         0.4984             NaN         2.6942
+logistic         6067    1.0024  0.6139         0.6685         0.5038         -2.6942            NaN
+
+4) CALIBRATION ERROR BY SESSION PHASE (direction model, engine variant 'lgb_temperature'; phase 0=open 1=AM 2=lunch 3=PM 4=close)
+          n  ece_down  ece_chop  ece_up
+phase                                  
+0       870    0.0297    0.0904  0.0703
+1      2609    0.0091    0.0248  0.0133
+2      3473    0.0125    0.0133  0.0034
+3      2586    0.0046    0.0317  0.0221
+4      1726    0.0184    0.0437  0.0280
+
+5) ENGINE -- EV rule, THEORETICAL Black-Scholes prices -- plumbing only
+   lambda 0.0: {'eligible': 9019, 'traded': 106, 'abstain_ev': 8913, 'no_quote': 0, 'no_credit': 0}
+   lambda 0.25: {'eligible': 11663, 'traded': 76, 'abstain_ev': 11587, 'no_quote': 0, 'no_credit': 0}
+   lambda 0.5: {'eligible': 12084, 'traded': 68, 'abstain_ev': 12016, 'no_quote': 0, 'no_credit': 0}
+ lam              kind  n  win  avg_usd  total_usd  avg_ev_usd  worst_usd
+0.00         long_call 24 0.58    21.75     522.06        6.04    -100.28
+0.00          long_put 15 0.47    -4.72     -70.77        6.39     -75.60
+0.00 short_call_spread 29 0.72     1.71      49.69       27.40    -159.70
+0.00  short_put_spread 38 0.84    17.06     648.38       26.30    -153.59
+0.25         long_call  7 0.14   -51.96    -363.74        6.00     -93.73
+0.25          long_put  2 0.50   -23.74     -47.47        6.11     -58.84
+0.25 short_call_spread 30 0.70    -1.61     -48.41       26.11    -170.64
+0.25  short_put_spread 37 0.81    15.17     561.35       25.37    -157.46
+0.50         long_call  1 0.00   -71.43     -71.43        5.19     -71.43
+0.50 short_call_spread 30 0.70    -3.34    -100.10       25.05    -181.57
+0.50  short_put_spread 37 0.81    13.92     514.96       24.31    -161.33
+   engine invariants (lambda 0.25): ALL PASS
+   per-trade audit records: data/trades_audit_lambda025.csv
+
+6) ABLATION -- continuous indicators + gap vs session-reset indicators + gap (direction model)
+                   n  log_loss   brier  auc_magnitude  auc_direction
+variant                                                             
+continuous     11264    1.0318  0.6221         0.7044         0.5158
+session_reset   9524    1.0400  0.6251         0.6618         0.5204
+
+done in 398s

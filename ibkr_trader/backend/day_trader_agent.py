@@ -244,11 +244,19 @@ def oversight_log(summary: str, rationale: str = "", outcome: str = "") -> None:
 
 
 def dt_log(action: str, ticker: str, detail: str) -> None:
-    entry = {"time": datetime.now(ET).strftime("%H:%M:%S ET"), "action": action,
+    now = datetime.now(ET)
+    entry = {"time": now.strftime("%H:%M:%S ET"), "action": action,
               "ticker": ticker, "detail": detail}
     dt["decisions"].append(entry)
     dt["decisions"] = dt["decisions"][-200:]
-    line = f"[{entry['time']}] {action} {ticker}: {detail}"
+    # The DATE belongs in the durable log line (2026-09-29). Without it every
+    # line read "[09:30:21 ET] ..." and an append-only log spanning weeks could
+    # not be attributed to a day -- which produced a real misdiagnosis: a grep
+    # of these lines was read as "~120 candidates rejected on composite score
+    # yesterday" when the dated scanner log showed 8 candidates ABOVE the score
+    # threshold that day, all rejected by the ATR/sigma gates instead. The
+    # in-memory `decisions` entry keeps the time-only shape the API serves.
+    line = f"[{now.strftime('%Y-%m-%d %H:%M:%S')} ET] {action} {ticker}: {detail}"
     print(line)
     event_log.info(line)  # durable, append-mode -- survives a restart done for any unrelated reason
 
@@ -482,11 +490,30 @@ async def fetch_entry_metrics(ib: IB, ticker: str) -> dict:
             await asyncio.sleep(5)
     if len(bars) < 15:
         return {}
-    closes = [b.close for b in bars]
-    highs  = [b.high for b in bars]
-    lows   = [b.low for b in bars]
+    # Real bug fixed 2026-09-23: atr_mult and std_score used bars[-1], which
+    # during the session is TODAY'S STILL-FORMING bar. The entry gate runs at
+    # 09:30:21, so "today's range" was ~21 seconds old and compared against
+    # 1.8x ATR14 -- unsatisfiable by construction (live evidence 2026-09-22:
+    # MRNA 0.18x, CHTR 0.15x, STX 0.25x, every candidate rejected, zero
+    # entries ever). Same for std_score, whose |today's return| was ~0 against
+    # a 3.7 sigma threshold. The RVOL block below already excluded the forming
+    # bar via bars[:-1] and its comment states ATR/DMA "implicitly rely on
+    # complete prior sessions" -- they did not. Now they do: every gate reads
+    # the last COMPLETED session, which is what is actually measurable at the
+    # open and what the 500-ticker/5yr study these thresholds come from used.
+    now_et = datetime.now(ET)
+    last_bar_date = getattr(bars[-1], "date", None)
+    if isinstance(last_bar_date, datetime):
+        last_bar_date = last_bar_date.date()
+    forming = (last_bar_date == now_et.date()) and now_et.hour < 16
+    series = bars[:-1] if forming else bars
+    if len(series) < 15:
+        return {}
+    closes = [b.close for b in series]
+    highs  = [b.high for b in series]
+    lows   = [b.low for b in series]
     trs = []
-    for i in range(1, len(bars)):
+    for i in range(1, len(series)):
         trs.append(max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1])))
     atr14 = sum(trs[-14:]) / 14 if len(trs) >= 14 else sum(trs) / max(len(trs), 1)
     dma23 = sum(closes[-23:]) / 23 if len(closes) >= 23 else sum(closes) / len(closes)
@@ -511,12 +538,13 @@ async def fetch_entry_metrics(ib: IB, ticker: str) -> dict:
     # removing the top 3/5/10 winners from each side (z=1.73, t=1.51 --
     # real and consistent across every threshold 0.8x-2.0x tested, not
     # overwhelming at any single one).
-    hist_bars = bars[:-1]
+    hist_bars = series          # already completed sessions only (see `forming` above)
     avg_daily_vol = (sum(b.volume for b in hist_bars[-20:]) / len(hist_bars[-20:])
                       if len(hist_bars) >= 5 else None)
     return {"atr14": round(atr14, 4), "atr_pct": round(atr_pct, 3), "dma23": round(dma23, 4),
             "atr_mult": round(atr_mult, 2), "std_score": round(std_score, 2), "price": closes[-1],
-            "avg_daily_vol": round(avg_daily_vol, 1) if avg_daily_vol else None}
+            "avg_daily_vol": round(avg_daily_vol, 1) if avg_daily_vol else None,
+            "bar_basis": "last_completed_session" if forming else "latest_bar"}
 
 
 def get_net_liq(ib: IB) -> float:
@@ -1572,6 +1600,16 @@ async def main():
     except Exception as exc:
         print(f"reqAllOpenOrdersAsync at startup failed (non-fatal): {exc}")
 
+    # Per-execution commission capture (added 2026-09-28). This process holds
+    # the longest-lived connection of the day, so its startup snapshot is the
+    # one most likely to catch fills placed by short-lived scheduled jobs.
+    try:
+        import commission_ledger
+        commission_ledger.attach(_ib, strategy="day_trader")
+        await commission_ledger.snapshot_async(_ib, strategy="day_trader")
+    except Exception as exc:
+        print(f"commission_ledger setup failed (non-fatal): {exc}")
+
     # Real-time confirmation (2026-09-07): register the tick handler, and
     # re-subscribe any watches restored from before this restart -- a fresh
     # IB() socket has no memory of the old process's reqMktData streams.
@@ -1594,6 +1632,11 @@ async def main():
         await asyncio.gather(server.serve(), monitor_loop(_ib), connection_watchdog(_ib))
     finally:
         if _ib.isConnected():
+            try:
+                import commission_ledger
+                await commission_ledger.snapshot_async(_ib, strategy="day_trader")
+            except Exception as exc:
+                print(f"commission_ledger snapshot failed (non-fatal): {exc}")
             _ib.disconnect()
 
 

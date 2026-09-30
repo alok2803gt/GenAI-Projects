@@ -33,6 +33,12 @@ if _BACKEND_DIR not in sys.path:
     sys.path.insert(0, _BACKEND_DIR)  # butterfly_babysitter_common/alpaca_0dte_common live one level up
 
 from butterfly_babysitter_common import telegram
+
+# 2026-09-23: IBKR daily bars are the PRIMARY harami source (yfinance returned no
+# data at all for 2026-09-22, 0/112 tickers, and silently missed a real signal).
+# With --shadow this scanner still alerts to Telegram for comparison but writes NO
+# harami_scanner_alert entries, so harami_daily_trader.py trades only IBKR signals.
+SHADOW = "--shadow" in sys.argv
 from alpaca_0dte_common import load_config
 
 HERE = Path(__file__).parent
@@ -135,7 +141,7 @@ def main():
     print(f"Scanned {len(UNIVERSE)} tickers, {len(hits)} real bullish-harami+downtrend hit(s) today.")
     for h in hits:
         text = (
-            f"\U0001F56F️ Bullish Harami + downtrend: {h['ticker']} ({h['date']})\n"
+            f"\U0001F56F️ Inside Day Reversal: {h['ticker']} ({h['date']})\n"
             f"Prior day: {h['prior_open']:.2f} -> {h['prior_close']:.2f} (bearish)\n"
             f"Today: {h['today_open']:.2f} -> {h['today_close']:.2f} (bullish, inside prior body)\n"
             f"Close ${h['today_close']:.2f} vs SMA20 ${h['sma20']:.2f} / SMA50 ${h['sma50']:.2f} (both below -- real downtrend context)\n"
@@ -144,6 +150,8 @@ def main():
         )
         print(text)
         telegram(cfg, text, category="research_desk")
+        if SHADOW:          # cross-check run: never write the alert the entry job trades on
+            continue
         entry = {
             "time": datetime.now(timezone.utc).isoformat(), "actor": "trader",
             "category": "harami_scanner_alert", "summary": text.replace("\n", " | "),
@@ -152,6 +160,14 @@ def main():
         }
         with open(BACKEND_DIR / "oversight_log.jsonl", "a") as f:
             f.write(json.dumps(entry) + "\n")
+
+    if SHADOW:      # cross-check record the IBKR primary scanner reads back
+        import json as _json
+        from datetime import datetime as _dt, timezone as _tz
+        rec = {"time": _dt.now(_tz.utc).isoformat(), "date": today_str,
+               "hits": sorted(h["ticker"] for h in hits), "scanned": len(UNIVERSE)}
+        with open(HERE / "harami_scanner_yf_shadow.jsonl", "a", encoding="utf-8") as f:
+            f.write(_json.dumps(rec) + "\n")
 
     save_state(state)
 

@@ -15,6 +15,18 @@ Architecture
               scan_universe()      — reads _hist_cache, no network calls
   Interval:   3 minutes (was 15 min; now feasible because scan takes ~5s)
 
+Gate numbering
+--------------
+  F1 regime, F2 rel-strength, F5 close-quality, F6 gap-reverse, F7 intraday-RS,
+  F8 ADX, F9 path-quality (BREAKOUT must arrive via PRE-BREAKOUT), F10 PRE-BO
+  duration, F11 liquidity floor.
+  F3 (pullback) and F4 (CVD proxy) exist ONLY in main.py's backtest endpoint --
+  neither is implemented here, so the backtest's filter stack and this live
+  stack are NOT the same population (see BACKTEST_VS_LIVE.md).
+  F11 was called "F9 liquidity" until 2026-09-21, colliding with the F9
+  path-quality gate below -- two different gates logging the same name made
+  "F9 dropped N" ambiguous in exactly the logs used to diagnose alert drops.
+
 Signal definitions
 ------------------
   BREAKOUT     — %B > 95 AND volume ≥ per-ticker 95th-pct ratio (90th for
@@ -1007,7 +1019,7 @@ def compute_indicators(ticker: str, hist: pd.DataFrame) -> dict | None:
             "prior_5d_ret": round(prior_5d_ret, 2),
             "vol_trend":    vol_trend,
             "bb_bwidth":    round(bb_bwidth, 2),
-            "avg_dollar_vol": avg_dollar_vol,   # 20d avg $ volume -- F9 liquidity floor
+            "avg_dollar_vol": avg_dollar_vol,   # 20d avg $ volume -- F11 liquidity floor
             # S/R levels (swing-based, 60-bar lookback, excl. today)
             "sr_resistance": sr_resistance,
             "sr_support":    sr_support,
@@ -1298,7 +1310,7 @@ def apply_quality_filters(candidates: list[dict], regime: dict, cfg: dict) -> li
     min_avg_dollar_vol = cfg.get("min_avg_dollar_vol", 5_000_000)
     earnings_blackout_days = cfg.get("earnings_blackout_days", 2)
     kept      = []
-    n_f2 = n_f5 = n_f6 = n_f7 = n_f8 = n_f9 = n_f10 = 0
+    n_f2 = n_f5 = n_f6 = n_f7 = n_f8 = n_f11 = n_f10 = 0
 
     # Pre-compute 20d return for each sector benchmark ETF from the hist cache
     sector_etf_ret20: dict[str, float] = {}
@@ -1386,7 +1398,7 @@ def apply_quality_filters(candidates: list[dict], regime: dict, cfg: dict) -> li
             n_f8 += 1
             continue
 
-        # F9: liquidity floor -- price and dollar-volume, independent of the
+        # F11: liquidity floor -- price and dollar-volume, independent of the
         # ratio-based vol_ratio/vol_90pct fields above. A ratio-based volume
         # filter (e.g. "0.75x average") says nothing about ABSOLUTE liquidity:
         # a thinly-traded name can pass on relative volume alone. Added
@@ -1395,10 +1407,10 @@ def apply_quality_filters(candidates: list[dict], regime: dict, cfg: dict) -> li
         price = ind.get("price", 0.0)
         dollar_vol = ind.get("avg_dollar_vol", 0.0)
         if price < min_price or dollar_vol < min_avg_dollar_vol:
-            log.info("F9 liquidity gate dropped %s: price=$%.2f (min $%.2f), "
+            log.info("F11 liquidity gate dropped %s: price=$%.2f (min $%.2f), "
                      "avg_$vol=$%.0f (min $%.0f)",
                      tk, price, min_price, dollar_vol, min_avg_dollar_vol)
-            n_f9 += 1
+            n_f11 += 1
             continue
 
         # F10: earnings blackout -- a name approaching earnings can trip %B/RSI/
@@ -1414,12 +1426,12 @@ def apply_quality_filters(candidates: list[dict], regime: dict, cfg: dict) -> li
 
         kept.append(ind)
 
-    if n_f2 or n_f5 or n_f6 or n_f7 or n_f8 or n_f9 or n_f10:
+    if n_f2 or n_f5 or n_f6 or n_f7 or n_f8 or n_f11 or n_f10:
         log.info(
             "Quality filters: dropped %d (F2 rel-str), %d (F5 close-qual), "
-            "%d (F6 gap-rev), %d (F7 intraday-RS), %d (F8 ADX), %d (F9 liquidity), "
+            "%d (F6 gap-rev), %d (F7 intraday-RS), %d (F8 ADX), %d (F11 liquidity), "
             "%d (F10 earnings)",
-            n_f2, n_f5, n_f6, n_f7, n_f8, n_f9, n_f10,
+            n_f2, n_f5, n_f6, n_f7, n_f8, n_f11, n_f10,
         )
     return kept
 

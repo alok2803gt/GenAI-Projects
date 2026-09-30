@@ -42,9 +42,14 @@ import json
 import os
 from datetime import date, timedelta
 
+import sys
+
 import requests
 import yfinance as yf
 from ib_insync import IB, Option, Stock
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from alpaca_0dte_common import cro_cfo_capital_budget  # noqa: E402
 
 BACKEND_URL = "http://localhost:8000"
 TARGET_DTE = 35
@@ -193,6 +198,32 @@ def find_strikes_and_credit(ib: IB) -> dict:
     }
 
 
+def pretrade_review(structure: dict, budget: dict) -> dict:
+    """CRO/CFO blocking gate -- added 2026-09-21. Until then this was the ONLY
+    live strategy with no capital check at all: neither this script nor Manual
+    Trader's /manual-trader/enter validates size against the account, so a
+    ~$400-500 defined-risk spread could go on a ~$2,100 account unchallenged.
+    Same two tests every other strategy's pre-trade review applies: the
+    per-trade cap (default 5% of combined net liq -- no per-strategy override
+    has been granted for KO, unlike GOOG's 15%) AND the real remaining
+    portfolio headroom. Max risk here is the true defined-risk max loss,
+    (width - credit) x 100, not the -100%-of-credit stop Manual Trader applies
+    after entry -- the gate must bound what the structure CAN lose."""
+    max_risk = round(structure["width_$"] - structure["mid_credit_$"], 2)
+    net_liq = budget["combined_net_liq"]
+    findings = [f"CFO: max risk ${max_risk:,.0f} = {(max_risk / net_liq if net_liq else 1.0):.1%} of combined net liq ${net_liq:,.0f}",
+                f"CFO: per-trade cap ${budget['per_strategy_cap']:,.0f} ({budget['per_strategy_cap_pct']:.0%}), "
+                f"portfolio headroom ${budget['headroom']:,.0f} of ${budget['total_budget']:,.0f} total budget"]
+    approved = True
+    if max_risk > budget["per_strategy_cap"]:
+        findings.append(f"EXCEEDS per-trade cap (${budget['per_strategy_cap']:,.0f})")
+        approved = False
+    if max_risk > budget["headroom"]:
+        findings.append("EXCEEDS remaining portfolio headroom")
+        approved = False
+    return {"approved": approved, "findings": findings, "max_risk": max_risk}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true")
@@ -214,6 +245,11 @@ def main():
     ib.reqMarketDataType(1)
     try:
         structure = find_strikes_and_credit(ib)
+        try:
+            budget = cro_cfo_capital_budget(ib)
+        except Exception as e:
+            budget = None
+            budget_err = e
     finally:
         ib.disconnect()
 
@@ -229,6 +265,26 @@ def main():
                        f"${structure['mid_credit_$']} below ${MIN_CONSERVATIVE_CREDIT:.0f} floor",
                        rationale=json.dumps(structure))
         return
+
+    # CRO/CFO gate -- blocking. Fails CLOSED if the budget couldn't be computed.
+    if budget is None:
+        msg = f"KO put spread: budget check failed ({budget_err}) -- NOT entering (fail closed)."
+        print(msg)
+        oversight_log("risk_manager", "ko_put_spread_rejected", msg, outcome="REJECTED -- no order placed")
+        telegram_text(load_cfg(), "\u26a0\ufe0f " + msg)
+        return
+    review = pretrade_review(structure, budget)
+    print("--- CRO/CFO pre-trade review ---")
+    for f in review["findings"]:
+        print(f"  {f}")
+    if not review["approved"]:
+        msg = (f"KO put spread {structure['short_k']}P/{structure['long_k']}P exp {structure['expiry']}: "
+               f"REJECTED by pre-trade review -- " + "; ".join(review["findings"]))
+        print(msg + ("  (DRY RUN: nothing would be placed)" if args.dry_run else ""))
+        oversight_log("risk_manager", "ko_put_spread_rejected", msg, outcome="REJECTED -- no order placed",
+                      rationale=json.dumps(structure))
+        return
+    print("CRO/CFO gate: PASSED.")
 
     target_limit = structure["mid_credit_per_share"]
     profit_target_usd = round(structure["mid_credit_$"] * 0.50, 2)

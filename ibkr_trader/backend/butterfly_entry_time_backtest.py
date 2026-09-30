@@ -24,9 +24,35 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 
 import numpy as np
 import pandas as pd
-import yfinance as yf
 
 import butterfly_0dte_backtest_v2 as v2
+
+# Daily history comes from IBKR, not yfinance (changed 2026-09-23): Yahoo
+# silently returned NO data at all for the 2026-09-22 session -- 0/112 tickers
+# in the harami universe and all three ETFs here (their history jumps
+# 09-21 -> 09-23). A missing session would both drop that day's trade and
+# mis-anchor the NEXT day's prior-day high/low S/R gate, which is the very
+# filter this backtest conditions on. IBKR returned 112/112 those same days.
+def ibkr_daily_history(ticker: str, days: int = 300) -> pd.DataFrame:   # IBKR caps "D" durations at 365
+    """Daily OHLC from IBKR, indexed by naive midnight timestamps -- same
+    shape the rest of this script expects from yfinance."""
+    from ib_insync import IB, Stock
+    ib = IB()
+    ib.connect("127.0.0.1", 7496, clientId=2460, timeout=20)
+    try:
+        c = Stock(ticker, "SMART", "USD")
+        ib.qualifyContracts(c)
+        dur = f"{days} D" if days <= 365 else f"{(days + 364) // 365} Y"   # IBKR caps "D" at 365
+        bars = ib.reqHistoricalData(c, endDateTime="", durationStr=dur,
+                                    barSizeSetting="1 day", whatToShow="TRADES", useRTH=True)
+    finally:
+        ib.disconnect()
+    if not bars:
+        raise RuntimeError(f"IBKR returned no daily bars for {ticker} ({days} D)")
+    df = pd.DataFrame([{"Date": b.date, "Open": b.open, "High": b.high, "Low": b.low,
+                        "Close": b.close, "Volume": b.volume} for b in bars])
+    df["Date"] = pd.to_datetime(df["Date"])
+    return df.set_index("Date").sort_index()
 
 ENTRY_TIMES = {"09:35": (9, 35), "09:45": (9, 45), "10:00": (10, 0)}
 WING_STEP = 4
@@ -52,38 +78,61 @@ def get_morning_underlying_price_at(ticker, d, hh, mm):
     return float(best["c"]) if best else None
 
 
+_OPT_BAR_CACHE: dict = {}
+
+
 def get_morning_option_price_at(occ_ticker, d, hh, mm):
-    uw_id = occ_ticker[2:] if occ_ticker.startswith("O:") else occ_ticker
-    data = v2._uw_get(f"/api/option-contract/{uw_id}/intraday", {"date": d.isoformat()})
-    if not data:
+    """Option price at hh:mm ET from POLYGON 1-minute option bars.
+
+    Was Unusual Whales' /option-contract/{id}/intraday tape until 2026-09-23,
+    when every UW endpoint began returning 401 ("token revoked, regenerated,
+    or belongs to a different account") -- the same key had returned 200
+    earlier that morning. Polygon also reaches ~2 years back against UW's
+    ~90-day plan window, so this is a straight upgrade in sample size as well
+    as a fix. Same +/-ENTRY_SEARCH_WINDOW_MIN tolerance as before, so a minute
+    with no print falls back to the nearest one within that window.
+    """
+    key = (occ_ticker, d)
+    if key not in _OPT_BAR_CACHE:
+        data = v2._polygon_get(f"/v2/aggs/ticker/{occ_ticker}/range/1/minute/{d.isoformat()}/{d.isoformat()}",
+                               {"adjusted": "true", "sort": "asc", "limit": 50000})
+        _OPT_BAR_CACHE[key] = (data or {}).get("results") or []
+    bars = _OPT_BAR_CACHE[key]
+    if not bars:
         return None
-    rows = data.get("data") or []
-    if not rows:
-        return None
-    target = datetime(d.year, d.month, d.day, hh, mm, tzinfo=timezone.utc) + timedelta(hours=4)
+    target_ms = (datetime(d.year, d.month, d.day, hh, mm, tzinfo=timezone.utc)
+                 + timedelta(hours=4)).timestamp() * 1000
     best, best_diff = None, None
-    for row in rows:
-        try:
-            ts = datetime.fromisoformat(row["start_time"].replace("Z", "+00:00"))
-        except Exception:
-            continue
-        diff = abs((ts - target).total_seconds())
+    for b in bars:
+        diff = abs(b["t"] - target_ms) / 1000.0
         if diff > v2.ENTRY_SEARCH_WINDOW_MIN * 60:
             continue
         if best_diff is None or diff < best_diff:
-            best, best_diff = row, diff
-    return float(best["close"]) if best else None
+            best, best_diff = b, diff
+    return float(best["c"]) if best else None
+
+
+def contract_grid_polygon(ticker, d, spot, n_strikes=12):
+    """OCC tickers for whole-dollar strikes around spot (SPY/QQQ/IWM all list
+    $1 strikes), replacing UW's contract grid."""
+    base = int(round(spot))
+    out = {}
+    for k in range(base - n_strikes, base + n_strikes + 1):
+        out[float(k)] = f"O:{ticker}{d:%y%m%d}C{int(k * 1000):08d}"
+    return out
 
 
 def main():
-    earliest = v2.uw_earliest_available_date()
+    # Was UW's ~90-day plan window; Polygon option bars reach ~2 years, so the
+    # sample is now ~5x larger (2026-09-23: UW returned 401 on every endpoint).
+    earliest = date.today() - timedelta(days=730)
     sr_hist_cache = {}
     rows = []
 
     for ticker in v2.ETF_UNIVERSE:
         print(f"\n=== {ticker} ===", flush=True)
-        hist = yf.Ticker(ticker).history(period="1y", interval="1d", auto_adjust=False, actions=False)
-        hist.index = pd.to_datetime(hist.index).tz_localize(None).normalize()
+        hist = ibkr_daily_history(ticker, days=760)
+        hist.index = pd.to_datetime(hist.index).normalize()
         sr_hist_cache[ticker] = hist
         trading_days = [d for d in hist.index.date if earliest <= d < date.today()]
         close_map = dict(zip(hist.index.date, hist["Close"].values))
@@ -104,7 +153,7 @@ def main():
                 dist_low = abs(spot - prior_low) / spot
                 near_sr = dist_high < 0.003 or dist_low < 0.003
 
-                call_map = v2.get_contract_grid_0dte(ticker, d)
+                call_map = contract_grid_polygon(ticker, d, spot)
                 if len(call_map) < 2 * WING_STEP + 1:
                     continue
                 strikes_sorted = sorted(call_map.keys())

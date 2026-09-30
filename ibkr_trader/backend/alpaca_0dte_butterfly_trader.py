@@ -193,6 +193,9 @@ def near_sr_gate(ticker: str, spot: float) -> tuple[bool, str]:
     return near, detail
 
 
+NLV_FLOOR_FOR_BODY = 2050.0    # IBKR needs $2,000 NLV to accept the short body leg
+                                 # (error 201); $50 buffer so an intraday tick
+                                 # below the line cannot orphan the wings.
 WINDOW_SCAN_END = (10, 0)      # 10:00 ET -- matches the backtest's scan window
 WINDOW_POLL_INTERVAL_S = 30    # live poll cadence; backtest checked every real 1-min bar,
                                  # this is a faithful-enough live approximation, not an
@@ -550,6 +553,32 @@ def main():
     # even read-only -- cro_cfo_capital_budget's `client` param is optional
     # for exactly this case (see its own docstring).
     budget = cro_cfo_capital_budget(ib)
+
+    # ── IBKR uncovered-option NLV floor (added 2026-09-23 after a real incident) ──
+    # A legged-in butterfly sells the 2x body AFTER both wings are on, and IBKR
+    # evaluates that order on its own: below $2,000 net liq it rejects with
+    # error 201 ("WE CANNOT ACCEPT THIS ORDER BECAUSE IT WOULD RESULT IN AN
+    # UNCOVERED OPTION POSITION. YOU MUST HAVE AT LEAST USD 2000 NLV..."). On
+    # 2026-09-23 net liq was $1,999.85 -- fifteen cents under -- so QQQ's wings
+    # filled, the body was rejected, the process exited, and the account was
+    # left holding an unmanaged 0DTE pair with an ITM leg (~$74k assignment
+    # exposure) that needed a hand-built closer. MLEG combos are not an option
+    # on this account (task 2026-08-12-003), so there is no way to submit the
+    # butterfly atomically. Checking BEFORE the first wing is the only way to
+    # fail safely: no legs on, nothing to unwind.
+    nlv = budget["ibkr_net_liq"]
+    if nlv < NLV_FLOOR_FOR_BODY:
+        msg = (f"{ticker.upper()} butterfly ABORTED before any leg: net liq ${nlv:,.2f} is below the "
+               f"${NLV_FLOOR_FOR_BODY:,.0f} floor IBKR requires to sell the 2x body (error 201). "
+               f"Entering would leave orphaned wings, as on 2026-09-23.")
+        print(f"\nREJECTED: {msg}")
+        telegram(load_config(), msg, high_priority=True)
+        oversight_log(ticker, msg,
+                      rationale="Pre-trade NLV floor check added after the 2026-09-23 orphaned-wings incident.",
+                      outcome="No orders placed; no legs on, nothing to unwind.")
+        ib.disconnect()
+        sys.exit(0)
+
     effective_cap = budget["per_strategy_cap"]
     if args.max_risk_override is not None:
         print(f"\nCEO OVERRIDE: per-strategy cap set to ${args.max_risk_override:.2f} for this run "

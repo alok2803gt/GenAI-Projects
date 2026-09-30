@@ -76,6 +76,11 @@ ET = ZoneInfo("America/New_York")
 CHANNEL_ID = "1540614267152371752"
 TARGET_USERNAME = "ashleyklieu"
 DISCORD_POLL_EVERY_N_TICKS = 3   # entry loop ticks at 5s -> Discord checked ~every 15s
+WATCH_START_ET = (9, 0)          # start WATCHING Discord for her post at 9:00 ET (CEO, 2026-09-23:
+                                 # she posts "sometime before 9:30", so the watcher must be up before
+                                 # the open; parsing a post is harmless pre-market)
+EXEC_START_ET = (9, 30)          # but place NO orders before the real open -- options do not trade
+                                 # pre-market, so the entry/exit watch waits here until 9:30 ET
 WAIT_CUTOFF_ET = (13, 0)         # give up waiting for today's alert past 1:00 PM ET -- loosened
                                   # from 11:00 (CEO instruction 2026-08-27) after she posted her
                                   # daily setups at 12:20 PM ET that day, past the old cutoff,
@@ -100,6 +105,32 @@ ENTRY_PATTERN = re.compile(
     r"(\d+(?:\.\d+)?)\s*([CP])\b[^0-9]{0,15}Entry:?\s*(\d+(?:\.\d+)?)\s*(?:to|-)\s*(\d+(?:\.\d+)?)",
     re.IGNORECASE,
 )
+
+# REAL INCIDENT 2026-09-29: she took profit on 765C at 10:51 ("765 TP"), then
+# at 10:52 marked the level done by STRIKING IT THROUGH in a NEW message
+# (~~765 C | Entry: 764.2 - 764.5 ~~), and at 11:06 posted "Next two levels in
+# play are here". This executor only re-parses EDITS to the original daily
+# alert, so it never learned the level was retired -- and at 11:00:52 it bought
+# the 765C into a setup she had closed nine minutes earlier. The exit logic
+# could not save it either: at 10:51 there was no open position, so her "765 TP"
+# was correctly ignored. Retirement has to be handled on the ENTRY side.
+#
+# Discord strikethrough is ~~text~~. Any setup named inside a struck-through
+# span is treated as retired for the rest of the day.
+STRIKETHROUGH_RE = re.compile(r"~~(.+?)~~", re.DOTALL)
+
+
+def retired_setups_from(content: str, setups: list[dict]) -> set:
+    """Names of setups Ashley has struck through in this message."""
+    out = set()
+    for span in STRIKETHROUGH_RE.findall(content or ""):
+        for m in ENTRY_PATTERN.finditer(span):
+            strike, right = m.group(1), m.group(2).upper()
+            for s in setups:
+                if abs(float(s["strike"]) - float(strike)) < 1e-6 and s["right"] == right:
+                    out.add(s["name"])
+    return out
+
 
 EXIT_PHRASES = [
     "took profit", "take profit", "tp hit", "closed my", "closed the",
@@ -361,6 +392,38 @@ def fetch_message(headers, message_id: str) -> dict | None:
         return None
 
 
+def recover_todays_alert(headers, state, today_iso):
+    """Restart recovery for a mid-day restart. Real bug found 2026-09-18/20:
+    state["last_message_id"] is the alert's OWN id while the day's watch is
+    running, and wait_for_daily_setups() polls `after=last_message_id` -- so it
+    can never see today's already-consumed alert again. A restart mid-day (with
+    a position open) would sit there waiting for a NEW alert, never reach
+    run_daily_watch(), and so never reach reconcile_open_positions() -- the open
+    position would go unmonitored. Fix: main() persists the alert's id + parsed
+    setups + date when it first consumes it; here we re-fetch that exact message
+    by id (picks up an edit made while we were down), falling back to the cached
+    setups if Discord is unreachable. Returns (setups, edited_ts) or None if
+    there is nothing to recover for today."""
+    if state.get("alert_date") != today_iso or not state.get("alert_message_id"):
+        return None
+    cached = state.get("alert_setups") or []
+    msg = None
+    for attempt in range(4):
+        msg = fetch_message(headers, state["alert_message_id"])
+        if msg:
+            break
+        import time as _t
+        _t.sleep(5)
+    if msg:
+        fresh = setups_from_content((msg.get("content") or "").strip())
+        if fresh:
+            return fresh, msg.get("edited_timestamp")
+    if cached:
+        print("Restart recovery: could not re-fetch today's alert from Discord -- using the cached setups.")
+        return cached, state.get("alert_edited_ts")
+    return None
+
+
 def wait_for_daily_setups(headers, state):
     """Poll Discord until ashleyklieu posts a message containing >=1 real
     '<strike><right> Entry: <lo> to <hi>' match, or WAIT_CUTOFF_ET passes.
@@ -470,7 +533,25 @@ async def close_position(ib, name, pos, setups, reason_text):
     return ok
 
 
+def seconds_until(hh, mm, now=None):
+    """Seconds from `now` until hh:mm ET today (0 if already past)."""
+    now = now or datetime.now(ET)
+    target = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    return max((target - now).total_seconds(), 0.0)
+
+
 async def run_daily_watch(setups, headers, last_message_id, alert_message_id=None, alert_edited_ts=None):
+    # Her post can land before the open (watcher starts at WATCH_START_ET), but
+    # nothing tradable exists until 9:30 -- hold the entry/exit machinery here
+    # rather than connecting to IBKR and pricing options pre-market.
+    wait_s = seconds_until(*EXEC_START_ET)
+    if wait_s > 0:
+        msg = (f"Ashley setups parsed pre-market ({[s['name'] for s in setups]}); "
+               f"execution monitoring starts at {EXEC_START_ET[0]}:{EXEC_START_ET[1]:02d} ET "
+               f"(in {wait_s / 60:.0f} min).")
+        print(msg)
+        telegram(msg, high_priority=False)
+        await asyncio.sleep(wait_s)
     cfg = load_config()
     global TELEGRAM_TOKEN, TELEGRAM_CHAT
     TELEGRAM_TOKEN = cfg["telegram_token"]
@@ -498,6 +579,16 @@ async def run_daily_watch(setups, headers, last_message_id, alert_message_id=Non
                 raise
             print(f"IBKR connect failed, retrying: {exc}")
             await asyncio.sleep(15)
+
+    # Per-execution commission capture (added 2026-09-28). The 0DTE legs here
+    # are the account's most fee-heavy: ~$0.90 per leg on ~$120 of premium is
+    # roughly a 1.6% round-trip handicap, which only shows up if it is recorded.
+    try:
+        import commission_ledger
+        commission_ledger.attach(ib, strategy="ashley_0dte")
+        await commission_ledger.snapshot_async(ib, strategy="ashley_0dte")
+    except Exception as exc:
+        print(f"commission_ledger setup failed (non-fatal): {exc}")
 
     spy = Stock("SPY", "SMART", "USD")
     await ib.qualifyContractsAsync(spy)
@@ -763,7 +854,29 @@ async def run_daily_watch(setups, headers, last_message_id, alert_message_id=Non
                             if m.get("author", {}).get("username", "") != TARGET_USERNAME:
                                 continue
                             content = (m.get("content") or "").strip()
-                            if not content or not is_exit_signal(content):
+                            if not content:
+                                continue
+
+                            # RETIREMENT (2026-09-29 incident, see STRIKETHROUGH_RE):
+                            # she marks a finished level by striking it through in a
+                            # NEW message, not by editing the daily alert. Retire it
+                            # here so the entry monitor can never buy into a level she
+                            # has already closed. Only affects setups not yet entered;
+                            # an open position is still managed by the exit logic.
+                            retired = retired_setups_from(content, setups)
+                            if retired:
+                                newly = {n for n in retired if n not in fired}
+                                if newly:
+                                    fired.update(newly)
+                                    save_fired_today(fired)
+                                    txt = (f"Ashley retired {', '.join(sorted(newly))} "
+                                           f"(struck through in her message) -- will NOT be entered.")
+                                    print(txt)
+                                    telegram(txt)
+                                    oversight_log(txt, "Setup retired by strikethrough.",
+                                                  outcome="retired_by_strikethrough")
+
+                            if not is_exit_signal(content):
                                 continue
                             if not open_positions:
                                 # She's talking about a trade we never entered
@@ -823,6 +936,7 @@ async def run_daily_watch(setups, headers, last_message_id, alert_message_id=Non
                         if msg and msg.get("edited_timestamp") != alert_edited_ts:
                             alert_edited_ts = msg.get("edited_timestamp")
                             new_setups = setups_from_content(msg.get("content") or "")
+                            edit_changed_state = True
                             old_by_name = {s["name"]: s for s in setups}
                             new_by_name = {s["name"]: s for s in new_setups}
 
@@ -872,6 +986,25 @@ async def run_daily_watch(setups, headers, last_message_id, alert_message_id=Non
                                         print(txt); telegram(txt, high_priority=False)
                                         oversight_log(txt, "Detected via message edited_timestamp change.",
                                                       outcome="setup_removed")
+
+                            # PERSIST the reconciled setups (fix 2026-09-25).
+                            # Real gap found live: Ashley edited her alert to add
+                            # 771P, this loop added it in MEMORY and traded it,
+                            # but the state file still held only the original
+                            # three setups. TWS drops most nights and launchd
+                            # restarts this process; a restart reloads from that
+                            # file, so the 771P would have returned UNKNOWN --
+                            # no exit monitoring on her message and, worse, no
+                            # 15:55 force-close on a physically settled 0DTE.
+                            try:
+                                st_now = load_state()
+                                st_now["alert_setups"] = setups
+                                st_now["alert_edited_ts"] = alert_edited_ts
+                                save_state(st_now)
+                                print(f"state persisted after edit: {[x['name'] for x in setups]}")
+                            except Exception as exc:
+                                telegram(f"WARNING: could not persist edited setups ({exc}) -- a restart "
+                                         f"may lose track of them.", high_priority=True)
                     except Exception as exc:
                         print(f"Edit-check error: {exc}")
 
@@ -881,6 +1014,13 @@ async def run_daily_watch(setups, headers, last_message_id, alert_message_id=Non
             ib.cancelMktData(spy)
         except Exception:
             pass
+        # Final account-wide commission catch-up for the session. This runs
+        # after the 15:55 force-close, so the day's closing fees are included.
+        try:
+            import commission_ledger
+            await commission_ledger.snapshot_async(ib, strategy="ashley_0dte")
+        except Exception as exc:
+            print(f"commission_ledger snapshot failed (non-fatal): {exc}")
         ib.disconnect()
 
     return last_message_id
@@ -918,15 +1058,28 @@ async def main():
             await asyncio.sleep(DAY_POLL_S * 20)
             continue
 
-        if now < now.replace(hour=9, minute=30, second=0, microsecond=0):
+        if now < now.replace(hour=WATCH_START_ET[0], minute=WATCH_START_ET[1], second=0, microsecond=0):
             await asyncio.sleep(DAY_POLL_S)
             continue
 
         print(f"New trading day {today_iso} -- waiting for ashleyklieu's daily alert...")
-        setups, last_message_id, alert_edited_ts = wait_for_daily_setups(headers, state)
-        alert_message_id = last_message_id  # see wait_for_daily_setups docstring -- same ID
-        state["last_message_id"] = last_message_id
-        save_state(state)
+        recovered = recover_todays_alert(headers, state, today_iso)
+        if recovered:
+            setups, alert_edited_ts = recovered
+            alert_message_id = state["alert_message_id"]
+            last_message_id = state.get("last_message_id")
+            print(f"Restart recovery: today's alert ({alert_message_id}) already consumed earlier -- "
+                  f"resuming watch with setups {[s['name'] for s in setups]}.")
+        else:
+            setups, last_message_id, alert_edited_ts = wait_for_daily_setups(headers, state)
+            alert_message_id = last_message_id  # see wait_for_daily_setups docstring -- same ID
+            state["last_message_id"] = last_message_id
+            if setups:
+                # Persist what a restart needs to resume today's watch -- see
+                # recover_todays_alert().
+                state.update({"alert_date": today_iso, "alert_message_id": alert_message_id,
+                              "alert_setups": setups, "alert_edited_ts": alert_edited_ts})
+            save_state(state)
 
         if not setups:
             msg = f"Ashley-trigger daily watcher: no setups posted by {WAIT_CUTOFF_ET[0]}:{WAIT_CUTOFF_ET[1]:02d} ET today -- skipping {today_iso}."

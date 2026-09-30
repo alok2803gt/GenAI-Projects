@@ -146,3 +146,57 @@ produces the daily effect (overnight information processing, end-of-day
 positioning, multi-session mean reversion) is specific to the daily
 timeframe, not a fractal pattern that repeats at finer resolution. Do not
 build a 15-min version of harami_scanner.py off this data.
+
+## 2026-09-29 — DCA on IDR names: REPLICATED out of sample (the signal is worthless, the exit mechanics are not)
+
+`dca_sizing_study.py` + `dca_replication_407.py`. Market-adjusted (equal-weighted
+universe over the SAME holding window), date-clustered, and PAIRED on identical
+signals so the market cancels exactly.
+
+| | in-sample 112 tickers | REPLICATION 407 tickers |
+|---|---|---|
+| signals | 1,824 / 586 dates | **7,290 / 905 dates** |
+| single (excess, t) | +0.300, t 2.06 | **-0.010, t -0.11** |
+| dca_5 | +0.794, t 6.26 | +0.511, t 6.73 |
+| dca_5_10 | +0.930, t 7.84 | +0.619, t 8.65 |
+| **dca_5 minus single** | +0.494, t 9.91 | **+0.521, t 16.59** |
+| **dca_5_10 minus single** | +0.629, t 9.83 | **+0.630, t 16.28** |
+
+The 407-ticker panel had never been touched by any harami/IDR/DCA work (it was
+built for the Day Trader direction question, a different hypothesis).
+
+**The signal shrank to zero; the DCA advantage did not shrink at all.** `single`
+went +0.300 (t 2.06) -> -0.010 (t -0.11), textbook overfit collapse. The paired
+DCA differences are +0.629 -> +0.630, i.e. unchanged to three decimals on 4x the
+signals. That is the signature of a STRUCTURAL effect, not a fitted one:
+lowering the average cost makes the "first close above average cost" exit
+reachable more often (86.7% vs 83.0%) and sooner (3.3 vs 3.5 days).
+
+So the honest description of this strategy is: **the Inside Day Reversal signal
+has no edge, and the accumulation structure does.** Any capital here is being
+paid for by the exit mechanics, not by the pattern.
+
+**Tail, in % of capital deployed** (the right denominator for sizing, since the
+risk budget is against money actually at risk -- note dca_backtest.py normalised
+by the FIRST unit's price and therefore reported DCA's tail as WORSE):
+
+| variant | p1 | worst |
+|---|---|---|
+| single | -13.44% | -34.75% |
+| dca_5 | -9.22% | -28.38% |
+| dca_5_10 | -7.28% | -22.06% |
+
+**SIZING.** `TARGET_DOLLARS_OVERRIDE = 420` per name (CEO, 2026-09-29) implies,
+for dca_5_10 on a ~$1,400 account: -$34 at the 1st percentile (2.4% of the
+account) and -$65 at the worst five-year outcome (4.6%). Defensible. Inverting a
+budget instead: 1% -> $172/name, 2% -> $345, 5% -> $862.
+
+**LIMITATION.** The valuation gate is NOT in this backtest -- testing it needs
+point-in-time fundamentals, and using today's filings to judge a 2023 trade is
+look-ahead. These numbers describe the population the gate selects FROM. The
+gate can only help by excluding names; by how much is unmeasured.
+
+**A correction to an earlier claim the same day:** I described DCA as "a modest
+improvement layered on a strategy with no proven edge". The first half was wrong
+-- paired and market-adjusted it is +0.52 to +0.63pp at t 16 on fresh data. The
+second half stands.

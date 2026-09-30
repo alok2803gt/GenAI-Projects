@@ -177,3 +177,12 @@ ibkr_trader/backend/scanner_config.json
 # OS
 .DS_Store
 Thumbs.db
+
+# SPY 0DTE research: keep the code, pre-registrations and conclusions; exclude
+# the regenerable market-data corpus (893MB of option/minute bars) and the
+# frozen reproduction archives. Added 2026-09-30 before the first commit of
+# spy_0dte/ -- without these the directory is ~1.4GB.
+spy_0dte/data/
+spy_0dte/archive/
+spy_0dte/dist/
+spy_0dte/__pycache__/

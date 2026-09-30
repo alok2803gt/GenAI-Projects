@@ -33,6 +33,24 @@ def _parse_utc(s: str) -> datetime:
     dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
+import resource
+
+# Raise the per-process open-file limit. launchd's default soft limit for a
+# LaunchAgent is 256, and this process leaks file handles: found 2026-09-20 --
+# 112 open handles on yfinance's ~/Library/Caches/py-yfinance/tkr-tz.db (one per
+# distinct ticker looked up) plus 25 on its -wal file. Over a trading day that
+# reached 256 and produced "[Errno 24] Too many open files" -- failed IBKR
+# reconnects ("API connection failed: OSError(24)") and failed launchctl/
+# subprocess calls -- until the 5pm restart cleared it. Raising the limit
+# turns a crash-adjacent failure into a non-event; it does not fix the leak.
+try:
+    _soft, _hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    _want = 10240 if _hard == resource.RLIM_INFINITY else min(10240, _hard)
+    if _soft < _want:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (_want, _hard))
+except Exception:
+    pass
+
 import numpy as np
 import pandas as pd
 import requests
@@ -1186,7 +1204,7 @@ def _check_harami_1m(ticker: str, bars_list: list) -> None:
         state["harami_1m_alerted"][ticker] = current["time"]
 
     text = (
-        f"\U0001F56F️ 1-min Bullish Harami: {ticker} at {current['time']}\n"
+        f"\U0001F56F️ 1-min Inside Bar Reversal: {ticker} at {current['time']}\n"
         f"Prior candle: {prior['open']:.2f} -> {prior['close']:.2f} (bearish)\n"
         f"This candle: {current['open']:.2f} -> {current['close']:.2f} (bullish, inside prior body)\n"
         f"NOTE: this is the bare pattern on a 1-min candle, NOT the validated daily "
@@ -1630,11 +1648,39 @@ async def _ibkr_news_setup(ib: IB) -> None:
     log.info("IBKR news: tick-292 active for %d tickers: %s", len(subs), ", ".join(sorted(subs)))
 
 
+TAPE_ALERT_LOOKBACK_DAYS = 7
+
+
+def _recent_alert_tickers(days: int = TAPE_ALERT_LOOKBACK_DAYS) -> list:
+    """Tickers that actually fired breakout alerts in the last `days` days, most
+    frequent first (ties -> most recent). Used to choose who gets the scarce
+    tape-sentiment slots. Added 2026-09-21: the old order (index ETFs ->
+    positions -> watchlist in saved order -> universe) left the 20 slots on
+    tickers that rarely alert -- over 7 days only 8 of the 41 tickers that
+    alerted had tape data, covering 24% of the 92 alerts. Returns [] on any
+    error so a DB problem can never block slot filling."""
+    try:
+        con = sqlite3.connect(TAPE_DB_PATH, check_same_thread=False)
+        try:
+            rows = con.execute(
+                "SELECT ticker, COUNT(*) AS n, MAX(session_date) AS last FROM alert_history "
+                "WHERE session_date >= date('now', ?) GROUP BY ticker ORDER BY n DESC, last DESC",
+                (f"-{int(days)} day",),
+            ).fetchall()
+        finally:
+            con.close()
+        return [r[0] for r in rows if r[0]]
+    except Exception as exc:
+        log.warning("Tape pre-seed: could not read recent alert history (%s)", exc)
+        return []
+
+
 async def _tape_preseed(ib: IB) -> None:
     """Fill remaining tape subscription slots from a priority-ordered candidate list:
 
       0. Index ETFs (SPY, QQQ, DIA, IWM) — always subscribed first for the banner
       1. Active auto-trader positions     — tickers with live trades
+      1b. Tickers that alerted in the last 7 days, most frequent first
       2. Breakout scanner watchlist       — recently alerted candidates
       3. Top-ranked universe tickers      — sorted by XGBoost score
 
@@ -1662,6 +1708,10 @@ async def _tape_preseed(ib: IB) -> None:
     # 1 — active positions (money on the line — always monitor these)
     for info in state["autotrader"].get("positions", {}).values():
         _enqueue(info.get("ticker", ""))
+
+    # 1b — tickers that really alert, by 7-day frequency (see _recent_alert_tickers)
+    for t in _recent_alert_tickers():
+        _enqueue(t)
 
     # 2 — breakout watchlist (dict keyed by ticker string)
     for tk in state.get("watchlist", {}).keys():
@@ -3212,38 +3262,69 @@ def _liquidity_score(oi: int, vol: int, spread_pct: float) -> float:
 
 async def _screen_universe(top_n: int = 25) -> Optional[List[str]]:
     """
-    Screen CANDIDATE_POOL (~155 tickers) with yfinance bulk download.
+    Screen CANDIDATE_POOL (~311 tickers) via IBKR historical data.
     Criteria: price $20-$800, 30-day ADV >500K shares, above SMA-50,
               RSI-14 in 40-65 range, IV rank >25% (real iv_history or HV proxy).
     Returns top_n tickers by composite score, or None on failure.
+
+    Switched from yfinance bulk download to IBKR 2026-09-17: yfinance requires
+    curl_cffi>=0.15 for its supported request path, and that package's
+    compiled wheel cannot dlopen on this Mac (macOS 12.7.6's
+    SystemConfiguration.framework is missing the SCDynamicStoreCopyProxies
+    symbol the wheel expects -- confirmed directly via `nm`, no pip-version
+    fix exists, unlike a similar Playwright/macOS12 issue this session where
+    an older release did work). yfinance falls back gracefully to plain
+    `requests` rather than crashing, but that degraded path is what Yahoo
+    rate-limits/blocks -- this 311-ticker bulk call was the real driver of a
+    96%+ CPU spike that cascaded into SQLite "unable to open database file"
+    errors and dropped 1m-bar subscriptions (the "Independent Traders
+    unavailable" incident). IBKR's reqHistoricalData has been the reliable,
+    rate-limit-free data source for every other bulk-universe job built this
+    session (GEX/VEX and IV archivers, both 100+ tickers, zero issues) --
+    this brings the last major yfinance dependency in line with that.
+    Deployed via the scheduled 17:00 ET market-close restart, not a live
+    mid-day restart, per CEO instruction to avoid any restart during market
+    hours today.
     """
-    log.info("Universe screen: scoring %d candidates → top %d", len(CANDIDATE_POOL), top_n)
+    log.info("Universe screen: scoring %d candidates → top %d (via IBKR)", len(CANDIDATE_POOL), top_n)
     try:
-        def _bulk_dl():
-            return yf.download(
-                CANDIDATE_POOL,
-                period="1y",
-                interval="1d",
-                group_by="ticker",
-                auto_adjust=True,
-                progress=False,
-                threads=True,
-            )
-        loop = asyncio.get_event_loop()
-        df = await loop.run_in_executor(None, _bulk_dl)
+        from ib_insync import Stock as IbStock
+        ib = state.get("ib")
+        if ib is None or not ib.isConnected():
+            log.warning("Universe screen: no live IBKR connection — keeping existing universe")
+            return None
+
+        sem = asyncio.Semaphore(10)  # bounded concurrency -- this connection is shared with every live strategy
+
+        async def _fetch_one(ticker: str):
+            async with sem:
+                try:
+                    contract = IbStock(ticker, "SMART", "USD")
+                    await ib.qualifyContractsAsync(contract)
+                    bars = await asyncio.wait_for(
+                        ib.reqHistoricalDataAsync(
+                            contract, endDateTime="", durationStr="1 Y",
+                            barSizeSetting="1 day", whatToShow="TRADES", useRTH=True,
+                        ),
+                        timeout=20,
+                    )
+                    return ticker, bars
+                except Exception as exc:
+                    log.debug("Universe screen fetch [%s]: %s", ticker, exc)
+                    return ticker, None
+
+        results = await asyncio.gather(*(_fetch_one(t) for t in CANDIDATE_POOL))
+        bars_by_ticker = {t: b for t, b in results if b}
+        log.info("Universe screen: got real bars for %d/%d candidates", len(bars_by_ticker), len(CANDIDATE_POOL))
 
         scored = []
         for ticker in CANDIDATE_POOL:
             try:
-                # Extract close & volume series for this ticker
-                if isinstance(df.columns, pd.MultiIndex):
-                    if ticker not in df.columns.get_level_values(0):
-                        continue
-                    closes = df[ticker]["Close"].dropna()
-                    vol_series = df[ticker].get("Volume", pd.Series(dtype=float)).dropna()
-                else:
-                    closes = df["Close"].dropna()
-                    vol_series = df.get("Volume", pd.Series(dtype=float)).dropna()
+                bars = bars_by_ticker.get(ticker)
+                if not bars:
+                    continue
+                closes = pd.Series([b.close for b in bars], dtype=float).dropna()
+                vol_series = pd.Series([b.volume for b in bars], dtype=float).dropna()
 
                 if len(closes) < 21:
                     continue
@@ -9346,8 +9427,36 @@ async def lifespan(app: FastAPI):
     log.info("IBKR reconciliation tasks started (startup + 5-min alert-only + 60s auto-correct engine)")
     asyncio.create_task(_telegram_poll_commands_coro())
 
-    # Run initial universe screen in background (non-blocking)
+    # Run initial universe screen in background (non-blocking) -- but ONLY if
+    # the cache _universe_load() just restored (a few lines up) is stale.
+    # Found 2026-09-17: this used to fire unconditionally on EVERY startup,
+    # meaning every backend restart re-triggered a 311-ticker yfinance bulk
+    # download regardless of whether one had run minutes earlier. Confirmed
+    # in the log two restarts 30s apart each re-ran the full scan. Combined
+    # with yfinance running in degraded mode on this Mac (curl_cffi's
+    # compiled wheel can't dlopen here -- SCDynamicStoreCopyProxies missing
+    # from this macOS 12.7.6 SystemConfiguration.framework, confirmed via
+    # `nm`, no working pip fix exists), Yahoo rate-limiting turned this into
+    # real, repeated CPU spikes (96%+) that cascaded into SQLite "unable to
+    # open database file" errors and dropped 1m-bar subscriptions -- the
+    # root cause of an "Independent Traders unavailable" incident. A cache
+    # under FRESH_HOURS old is left alone; _universe_load() already
+    # populated CSP_UNIVERSE from it a few lines above.
+    FRESH_HOURS = 6
+
     async def _initial_screen():
+        saved_at_raw = state.get("universe_last_screened")
+        if saved_at_raw:
+            try:
+                age_hours = (_utcnow() - _parse_utc(saved_at_raw)).total_seconds() / 3600
+                if age_hours < FRESH_HOURS:
+                    log.info("Universe cache is %.1fh old (< %dh) -- skipping startup rescan, "
+                             "using the %d tickers _universe_load() already restored",
+                             age_hours, FRESH_HOURS, len(CSP_UNIVERSE))
+                    return
+            except Exception as e:
+                log.warning("Could not parse universe cache age (%s) -- rescanning to be safe", e)
+
         tickers = await _screen_universe()
         if tickers:
             CSP_UNIVERSE.clear()
@@ -9375,11 +9484,13 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-if _technicals_router_ok and technicals_router is not None:
-    app.include_router(technicals_router)   # GET /technicals/{ticker}
-else:
-    import logging as _lg
-    _lg.getLogger("main").warning("ibkr_technicals router failed to load — /technicals/{ticker} unavailable")
+# NOT mounted (found 2026-09-16): the real /technicals/{ticker} handler
+# lives below at line ~9928, a superset of this router's logic ("ported from
+# ibkr_technicals._overall") that also adds IV rank -- but since routes match
+# in registration order and this router was mounted first, it was silently
+# shadowing the newer handler this whole time, serving the old IV-rank-less
+# response to every /technicals/{ticker} call. Left ibkr_technicals.py itself
+# alone (unused now, not deleted) in case anything else imports its helpers.
 
 
 @app.get("/options-flow/unusual")
@@ -11208,39 +11319,56 @@ def watchlist_add_alert(req: WatchlistAlertRequest):
 _watchlist_price_cache: dict = {"prices": {}, "ts": 0.0}
 
 
-async def _watchlist_price_refresh_loop() -> None:
-    """Background task: refresh watchlist prices via yfinance every 30 s.
+async def _watchlist_ibkr_prices(tickers: list) -> dict:
+    """Last price per ticker from IBKR (the already-connected live `ib`), in small
+    batches so the brief market-data lines never crowd the streaming subscriptions.
+    Tickers IBKR can't price are simply omitted (the cache keeps their last value)."""
+    ib = state.get("ib")
+    if not ib or not ib.isConnected():
+        return {}
+    prices: dict = {}
+    for i in range(0, len(tickers), 10):
+        batch = tickers[i:i + 10]
+        contracts = [Stock(t, "SMART", "USD") for t in batch]
+        try:
+            await asyncio.wait_for(ib.qualifyContractsAsync(*contracts), timeout=15)
+            good = [c for c in contracts if c.conId]
+            tks = await asyncio.wait_for(ib.reqTickersAsync(*good), timeout=15)
+        except Exception:
+            continue
+        for tk in tks:
+            for v in (tk.last, tk.close, tk.marketPrice()):
+                if v is not None and math.isfinite(v) and v > 0:
+                    prices[tk.contract.symbol] = float(v)
+                    break
+    return prices
 
-    Running yfinance outside the request handler means /watchlist always returns
-    instantly from the in-memory cache (~1 ms) instead of blocking for 4-6 s.
+
+async def _watchlist_price_refresh_loop() -> None:
+    """Background task: refresh watchlist prices every 60 s so /watchlist always
+    returns instantly from the in-memory cache instead of blocking on a fetch.
+
+    Rewritten 2026-09-21: this used to yf.download() the WHOLE watchlist (55
+    tickers) with threads=True every 30 s, around the clock. On this Mac
+    yfinance runs in its degraded no-curl_cffi mode and gets rate-limited, so
+    the loop spun the backend to ~96% CPU until the API stopped answering
+    (found 08:15 ET -- the same failure class as the universe-screener CPU
+    incidents of 2026-09-17). Now: IBKR quotes only, and idle outside
+    04:00-20:00 ET on weekdays (nothing moves; the cache keeps the last prices).
     """
     import time as _time
-
-    def _fetch(tickers: list) -> dict:
-        if not tickers:
-            return {}
-        try:
-            data = yf.download(tickers, period="1d", interval="5m",
-                               group_by="ticker", progress=False,
-                               auto_adjust=True, threads=True)
-            prices = {}
-            for tk in tickers:
-                try:
-                    col = (data["Close"] if len(tickers) == 1
-                           else data[tk]["Close"] if tk in data else None)
-                    prices[tk] = float(col.dropna().iloc[-1]) if col is not None and not col.dropna().empty else None
-                except Exception:
-                    prices[tk] = None
-            return prices
-        except Exception:
-            return {}
+    from zoneinfo import ZoneInfo
 
     while True:
         try:
-            await asyncio.sleep(30)
+            await asyncio.sleep(60)
+            now = datetime.now(ZoneInfo("America/New_York"))
+            if now.weekday() >= 5 or not (4 <= now.hour < 20):
+                await asyncio.sleep(240)
+                continue
             tickers = [e["ticker"] for e in state["watchlist"].values()]
             if tickers:
-                prices = await asyncio.get_event_loop().run_in_executor(None, _fetch, tickers)
+                prices = await _watchlist_ibkr_prices(tickers)
                 if prices:
                     _watchlist_price_cache["prices"].update(prices)
                     _watchlist_price_cache["ts"] = _time.monotonic()
@@ -13545,7 +13673,15 @@ def pnl_dashboard():
     if ib_connected:
         # Build a lookup: (ticker, str(strike), right, expiry[:6]) → journal row
         def _jkey(ticker, strike, right, expiry):
-            return (ticker, str(strike or ""), right or "", (expiry or "")[:6])
+            # IBKR reports STOCKS with right='0' and strike=0.0; the journal stores
+            # them as NULL. Without normalizing, no stock position ever matched its
+            # journal row -- so every journaled stock trade (Harami, Day Trader, ...)
+            # was auto-marked 'orphaned' on the very next dashboard load, and open
+            # stock positions showed no strategy or entry price. Found 2026-09-21:
+            # SOFI/TFC/UAL were closed 3s after they opened, with no P&L.
+            r = "" if right in (None, "", "0") else right
+            s = "" if not strike else str(strike)
+            return (ticker, s, r, (expiry or "")[:6])
 
         jlookup = {}
         for t in open_trades:

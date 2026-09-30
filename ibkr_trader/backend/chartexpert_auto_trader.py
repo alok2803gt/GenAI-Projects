@@ -1,7 +1,7 @@
 """
 Chartexpert auto-trader -- SHADOW MODE. One-shot task, weekday 9:35 AM ET.
 
-Pipeline (per CEO instruction, 2026-09-10/11): generate the live 1-min
+Pipeline (per CEO instruction, 2026-09-10/11): generate the live 10-min
 charts already built on the frontend's Charts tab -> screenshot each panel
 -> read each chart with the chartexpert skill's exact format (a real vision
 call, since "read this chart" is a judgment call, not a formula) -> send
@@ -37,6 +37,7 @@ stdout-capture wrapper catches it) rather than silently skipping the day.
 
 Usage: python chartexpert_auto_trader.py
 """
+import argparse
 import base64
 import json
 import re
@@ -69,7 +70,13 @@ CLIENT_ID = 1850
 ET = ZoneInfo("America/New_York")
 SYMBOLS = ["SPY", "QQQ", "MNQ"]          # charted + Telegrammed every run
 TRADEABLE = ["SPY", "QQQ"]                # only these can fire a shadow signal
-SIGNAL_THRESHOLD_PCT = 70                 # CEO instruction: up% > 70
+SIGNAL_THRESHOLD_PCT = 70                 # CEO instruction: up% > 70 -- gates the SPY/QQQ shadow-trade entry
+TELEGRAM_UP_THRESHOLD_PCT = 60            # CEO instruction 2026-09-17: gates whether a chart+read gets
+                                           # Telegrammed at all. Separate, lower threshold than
+                                           # SIGNAL_THRESHOLD_PCT -- this fires more often (every "leaning
+                                           # up" read, not just ones that clear the shadow-trade bar).
+                                           # Deliberately UP-only, matching this whole pipeline's existing
+                                           # one-directional design (shadow trades only ever consider calls).
 TRAILING_STOP_PCT = 0.005                 # 0.5%, on the UNDERLYING price
 EOD_CUTOFF = "15:50"                      # hard close for any open shadow position
 POLL_SECONDS = 30
@@ -144,20 +151,34 @@ def telegram_text(cfg, text):
         print(f"Telegram text send failed: {e}")
 
 
-def telegram_photo(cfg, path, caption):
+def telegram_photo(cfg, path, caption) -> bool:
+    """Returns True if the image actually reached Telegram.
+
+    Retries added 2026-09-21: a single 20s attempt timed out on the 11:08 QQQ
+    alert and the caller sent the analysis text anyway, so the read arrived with
+    no chart to read it against. api.telegram.org has been intermittently
+    timing out/resetting across every script on this machine, so one attempt is
+    not enough. The return value lets the caller say so when it still fails."""
     try:
         from telegram_alert_gate import alert_enabled
         if not alert_enabled("chartexpert"):
-            return
+            return False
     except Exception:
         pass
-    try:
-        with open(path, "rb") as f:
-            requests.post(f"https://api.telegram.org/bot{cfg['telegram_token']}/sendPhoto",
-                          data={"chat_id": cfg["telegram_chat_id"], "caption": caption},
-                          files={"photo": f}, timeout=20)
-    except Exception as e:
-        print(f"Telegram photo send failed: {e}")
+    for attempt in range(1, 4):
+        try:
+            with open(path, "rb") as f:
+                r = requests.post(f"https://api.telegram.org/bot{cfg['telegram_token']}/sendPhoto",
+                                  data={"chat_id": cfg["telegram_chat_id"], "caption": caption},
+                                  files={"photo": f}, timeout=45)
+            if r.ok:
+                return True
+            print(f"Telegram photo attempt {attempt}: HTTP {r.status_code} {r.text[:120]}")
+        except Exception as e:
+            print(f"Telegram photo attempt {attempt} failed: {e}")
+        if attempt < 3:
+            time.sleep(3 * attempt)
+    return False
 
 
 def oversight_log(actor, category, summary, rationale="", outcome=None, pnl_impact=None):
@@ -223,8 +244,21 @@ def ensure_subscribed_and_shoot():
         browser = p.chromium.launch()
         page = browser.new_page(viewport={"width": 1200, "height": 900}, device_scale_factor=2)
         page.goto(FRONTEND_URL, wait_until="networkidle", timeout=30000)
-        page.wait_for_timeout(1200)
-        page.get_by_text("Market Data", exact=True).click()
+        # Found 2026-09-18 (first real overnight run of the Asia/EU MNQ
+        # schedule): the frontend shows a "CONNECTING..." badge while its own
+        # WebSocket to the backend establishes, and took >15s to clear under
+        # real conditions -- well past the old flat 1200ms wait, which then
+        # made the "Market Data" click fail (30s timeout exceeded) rather
+        # than just fire a bit late. This isn't actually an EU/overnight-only
+        # issue -- reproduced it live mid-morning too -- just surfaced there
+        # first. Wait for the real signal (CONNECTING gone) instead of a
+        # guessed delay, same lesson as the canvas-wait fix from 2026-09-16.
+        try:
+            page.locator("text=CONNECTING").wait_for(state="detached", timeout=45000)
+        except Exception:
+            print("  [WARN] frontend still shows CONNECTING after 45s -- proceeding anyway, nav click may fail")
+        page.wait_for_timeout(500)
+        page.get_by_text("Market Data", exact=True).click(timeout=45000)
         page.wait_for_timeout(300)
         page.get_by_text("Charts", exact=True).click()
         for t in SYMBOLS:
@@ -261,7 +295,12 @@ def read_chart(client, ticker, png_path):
         model="claude-sonnet-5", max_tokens=1000, system=CHARTEXPERT_SYSTEM,
         messages=[{"role": "user", "content": [
             {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": img_b64}},
-            {"type": "text", "text": f"Analyze this {ticker} 1-minute chart."},
+            # Must match the frontend's real CHART_TAB_BAR_MINUTES aggregation.
+            # Was still saying "1-minute" after the 2026-09-17 switch to 10-min bars
+            # (caught 2026-09-21 from a Telegram read that described 1-min candles):
+            # the model was judging how long a move had been building, and how far
+            # out a target sat, on a timeframe 10x off from what the chart showed.
+            {"type": "text", "text": f"Analyze this {ticker} 10-minute chart."},
         ]}],
     )
     # claude-sonnet-5 can emit a ThinkingBlock before the actual TextBlock,
@@ -403,13 +442,62 @@ def journal_shadow_trade(pos, exit_price, pnl, reason):
         print(f"  journal_shadow_trade failed: {e}")
 
 
+LOCK_PATH = HERE / "chartexpert_auto_trader.lock"
+
+
+def _acquire_run_lock():
+    """Scheduled every 30 min (2026-09-16) instead of once at 9:35 AM -- but a
+    run that gets a >70% signal blocks for hours in the trailing-stop monitor
+    loop below (until EOD_CUTOFF or a stop-out), so without this guard the
+    next 30-min-interval launchd fire would start a SECOND process polling/
+    closing the SAME shadow position concurrently: duplicate Telegram alerts,
+    a race on shadow_state.json writes, possibly a double-close. If a prior
+    PID in the lock file is still alive, this run exits immediately (quiet,
+    no Telegram) instead of piling up. A stale lock (process died without
+    cleanup -- kill -9, machine sleep, etc.) is detected via os.kill(pid, 0)
+    and overwritten rather than blocking forever.
+    """
+    import os
+    if LOCK_PATH.exists():
+        try:
+            old_pid = int(LOCK_PATH.read_text().strip())
+            os.kill(old_pid, 0)  # raises if that PID is dead/not ours
+            print(f"Another chartexpert_auto_trader run (pid {old_pid}) is still active -- skipping this 30-min slot.")
+            sys.exit(0)
+        except (ValueError, ProcessLookupError, PermissionError):
+            pass  # stale/foreign lock -- fall through and take it
+    LOCK_PATH.write_text(str(os.getpid()))
+    import atexit
+    atexit.register(lambda: LOCK_PATH.unlink(missing_ok=True))
+
+
 def main():
+    global SYMBOLS
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--symbols", default=None,
+                     help="Comma-separated override, e.g. 'MNQ' for the Asia/EU-session-only runs "
+                          "(CEO instruction 2026-09-17: MNQ is a CME Globex future and genuinely trades "
+                          "through Asia/EU hours, unlike SPY/QQQ which are US-listed ETFs with no real "
+                          "liquidity then). Default = the full SPY,QQQ,MNQ regular-US-hours run.")
+    args = ap.parse_args()
+    if args.symbols:
+        SYMBOLS = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+
+    _acquire_run_lock()
     cfg = load_cfg()
     et = now_et()
-    print(f"[{et.isoformat()}] chartexpert_auto_trader starting (SHADOW_MODE={SHADOW_MODE})")
+    print(f"[{et.isoformat()}] chartexpert_auto_trader starting (SHADOW_MODE={SHADOW_MODE}, SYMBOLS={SYMBOLS})")
 
-    if et.weekday() >= 5:
-        print("Weekend, nothing to do.")
+    # Saturday only -- CME Globex is genuinely closed Fri 17:00 ET to Sun 18:00
+    # ET, but everything BETWEEN those is real trading (Sunday evening is the
+    # start of Monday's Asia session). Blocking all of weekday()>=5 used to
+    # also block Sunday, which was fine while every run covered SPY/QQQ (US-
+    # only, correctly dark all weekend) but would incorrectly block the new
+    # MNQ-only Asia-session runs, which start Sunday evening. No separate
+    # launchd entry exists for the full SPY/QQQ/MNQ run on a weekend day, so
+    # this relaxation only ever actually matters for --symbols MNQ invocations.
+    if et.weekday() == 5:
+        print("Saturday, nothing to do.")
         return
 
     client = anthropic.Anthropic(api_key=cfg["anthropic_api_key"])
@@ -421,10 +509,10 @@ def main():
     if stale:
         stale_desc = ", ".join(f"{t} ({age:.0f}s old)" if age is not None else f"{t} (no bars)"
                                for t, age in stale.items())
-        telegram_text(cfg, f"⚠️ <b>chartexpert_auto_trader: stale data</b> for {stale_desc} -- "
-                            f"last bar older than {MAX_BAR_AGE_SECONDS}s at 9:35 AM ET means the 1m "
-                            f"subscription likely stalled. Reading the chart anyway (marked below), but "
-                            f"any signal on these tickers is SKIPPED, not traded on stale data.")
+        telegram_text(cfg, f"⚠️ <b>chartexpert_auto_trader: stale data</b> for {stale_desc} at "
+                            f"{et.strftime('%-I:%M %p')} ET -- last bar older than {MAX_BAR_AGE_SECONDS}s "
+                            f"means the 1m subscription likely stalled. Reading the chart anyway (marked "
+                            f"below), but any signal on these tickers is SKIPPED, not traded on stale data.")
         oversight_log("programmer", "chartexpert_stale_data",
                       f"Stale 1m bars at run start: {stale_desc}.",
                       outcome="chart still read + Telegrammed with a stale warning; trading signal suppressed for these tickers")
@@ -447,16 +535,41 @@ def main():
             print(f"  [{t}] chartexpert read failed: {e}")
             telegram_text(cfg, f"chartexpert_auto_trader: {t} chart read failed ({e}).")
 
-    # Telegram every symbol's analysis + chart, every run, regardless of signal
+    # Telegram gated on signal strength (CEO instruction 2026-09-17) -- was
+    # "every symbol, every run, regardless of signal", which at the current
+    # every-30-min schedule (13 runs/day x 3 symbols) was too much noise.
+    # Now only a read that's UP and clears TELEGRAM_UP_THRESHOLD_PCT actually
+    # sends. Stale-data reads never send regardless of probability -- an
+    # alert built on an old chart isn't trustworthy at any confidence level.
     for t in SYMBOLS:
         if t not in analyses:
             continue
         a = analyses[t]
-        prob_line = f"{a['direction']} {a['up_pct'] if a['direction']=='UP' else 100-a['up_pct']}%" if a["direction"] else "?"
-        stale_tag = " [STALE DATA]" if t in stale else ""
-        telegram_photo(cfg, shots[t], f"{t} 1-min chart (9:35 AM chartexpert read) -- {prob_line}{stale_tag}")
-        telegram_text(cfg, (f"⚠️ <b>STALE DATA -- last bar {stale[t]:.0f}s old, this reflects an earlier "
-                            f"market moment, not right now:</b>\n\n" if t in stale and stale[t] is not None else "") + a["text"])
+        if t in stale:
+            # stale[t] is None when the ticker had no bars at all (see capture()),
+            # so it can't be blindly %-formatted as a number.
+            age = f"{stale[t]:.0f}s old" if stale[t] is not None else "no bars"
+            print(f"  [{t}] {a['direction']} {a['up_pct']}% -- STALE chart ({age}), not Telegrammed")
+            continue
+        if a["direction"] != "UP" or a["up_pct"] is None or a["up_pct"] < TELEGRAM_UP_THRESHOLD_PCT:
+            print(f"  [{t}] {a['direction']} {a['up_pct']}% -- below the {TELEGRAM_UP_THRESHOLD_PCT}% UP threshold, not Telegrammed")
+            continue
+        prob_line = f"UP {a['up_pct']}%"
+        sent = telegram_photo(cfg, shots[t],
+                              f"{t} 10-min chart ({et.strftime('%-I:%M %p')} ET chartexpert read) -- {prob_line}")
+        # Say it plainly rather than letting a read show up with no chart under it.
+        prefix = "" if sent else f"⚠️ {t} chart image failed to send (Telegram) -- analysis only:\n\n"
+        telegram_text(cfg, prefix + a["text"])
+        # Log the SENT ones too. Until 2026-09-21 only skipped reads were logged --
+        # the alerts that actually fired left no record of their probability
+        # anywhere but the Telegram caption, which is exactly backwards for
+        # auditing later (found when the 11:08 QQQ alert's own number couldn't be
+        # recovered from the log). oversight_log gives it a durable, queryable row.
+        print(f"  [{t}] UP {a['up_pct']}% -- SENT (photo {'ok' if sent else 'FAILED'}, shot {Path(shots[t]).name})")
+        oversight_log("trader", "chartexpert_alert_sent",
+                      f"{t}: UP {a['up_pct']}% (>= {TELEGRAM_UP_THRESHOLD_PCT}% threshold), Telegram sent.",
+                      rationale=f"10-min chart read at {et.strftime('%H:%M')} ET; screenshot {Path(shots[t]).name}.",
+                      outcome=f"photo_sent={sent}, text_sent=True")
 
     # ── Signal + shadow entry (SPY/QQQ only) ─────────────────────────────
     ib = IB(); ib.errorEvent += lambda *a: None

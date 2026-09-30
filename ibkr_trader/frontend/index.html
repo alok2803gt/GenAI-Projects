@@ -6912,6 +6912,66 @@ const CHART_TAB_SYMBOLS = [
   { ticker: "MNQ", label: "MNQ (Micro E-mini Nasdaq futures)" },
 ];
 
+// Switched from raw 1-min to aggregated 10-min bars 2026-09-17 (CEO
+// request) -- chartexpert's own read is "next directional move, next 1-3
+// hours", which 1-min noise was too granular for. Backend only streams
+// 1-min bars (ONE_MIN_TICKERS pipe), so this aggregates client-side rather
+// than adding a new server-side bar size.
+//
+// Bucket key is built by STRING-flooring the source bar's own ISO text
+// (date/hour/offset untouched, only the minute digits floored to the
+// bucket boundary) rather than round-tripping through epoch millis. Found
+// live 2026-09-17: an epoch-based bucketStart fed through
+// `new Date(...).toISOString()` produces a true-UTC, "Z"-suffixed string --
+// but etIsoToChartSeconds() (above) expects the ORIGINAL "-04:00"-style
+// offset text so its strip-and-reparse-as-UTC trick can echo back correct
+// ET digits. A genuinely-UTC "Z" string has nothing to strip, so it passed
+// through unconverted and displayed 4h ahead of real ET on the chart axis.
+// String-flooring keeps the same offset text the 1-min bars already carry,
+// so the existing trick keeps working unchanged.
+function _floorBarTime(isoString, bucketMinutes) {
+  const m = isoString.match(/^(\d{4}-\d{2}-\d{2}T\d{2}):(\d{2}):\d{2}(.*)$/);
+  if (!m) return isoString;
+  const [, dateHour, minute, offset] = m;
+  const flooredMin = Math.floor(parseInt(minute, 10) / bucketMinutes) * bucketMinutes;
+  return `${dateHour}:${String(flooredMin).padStart(2, "0")}:00${offset}`;
+}
+function aggregateBars(bars, bucketMinutes) {
+  if (!bars || !bars.length) return [];
+  const buckets = new Map();
+  for (const b of bars) {
+    const bucketKey = _floorBarTime(b.time, bucketMinutes);
+    const existing = buckets.get(bucketKey);
+    if (!existing) {
+      buckets.set(bucketKey, { time: bucketKey, open: b.open, high: b.high, low: b.low, close: b.close, volume: b.volume });
+    } else {
+      existing.high = Math.max(existing.high, b.high);
+      existing.low = Math.min(existing.low, b.low);
+      existing.close = b.close;   // bars arrive chronologically -- last one in the bucket wins
+      existing.volume += b.volume;
+    }
+  }
+  const sorted = Array.from(buckets.values()).sort((a, b) => new Date(a.time) - new Date(b.time));
+
+  // Trim to the current session only. Found live 2026-09-17: fetching enough
+  // 1-min history to build a meaningful number of 10-min bars means the raw
+  // fetch often spans TWO sessions (yesterday afternoon + today, across the
+  // overnight gap). Lightweight Charts renders its time axis continuously --
+  // an ~18h overnight gap next to ~5h of real trading data means the gap
+  // eats nearly the whole width, squishing every real candle into a sliver
+  // at the edge. The 1-min chart never hit this (its 240-bar/4h fetch always
+  // stayed inside one session). Fix: find the last gap bigger than a normal
+  // bucket has any business being, and keep only what's after it.
+  const GAP_MULTIPLE = 4;   // a real session break is way more than 4x a normal bucket
+  let sessionStart = 0;
+  for (let i = 1; i < sorted.length; i++) {
+    const gapMin = (new Date(sorted[i].time) - new Date(sorted[i - 1].time)) / 60000;
+    if (gapMin > bucketMinutes * GAP_MULTIPLE) sessionStart = i;
+  }
+  return sorted.slice(sessionStart);
+}
+const CHART_TAB_BAR_MINUTES = 10;
+
 function ChartsTab() {
   const [barsBySymbol, setBarsBySymbol] = useState({});
   const [loading, setLoading]           = useState({});
@@ -6931,8 +6991,10 @@ function ChartsTab() {
   const loadBars = useCallback(async (ticker) => {
     setLoading(prev => ({ ...prev, [ticker]: true }));
     try {
-      const b = await apiFetch(`/bars-1m/${ticker}?limit=240`);
-      setBarsBySymbol(prev => ({ ...prev, [ticker]: b || [] }));
+      // limit=1200 (the backend's own max for this endpoint) of raw 1-min bars,
+      // aggregated client-side to CHART_TAB_BAR_MINUTES -- see aggregateBars() above.
+      const b = await apiFetch(`/bars-1m/${ticker}?limit=1200`);
+      setBarsBySymbol(prev => ({ ...prev, [ticker]: aggregateBars(b, CHART_TAB_BAR_MINUTES) || [] }));
     } catch (_) {
       setBarsBySymbol(prev => ({ ...prev, [ticker]: prev[ticker] || [] }));
     } finally {
@@ -6990,7 +7052,7 @@ function ChartsTab() {
             ) : (
               <CandleChart
                 bars={bars}
-                windowSize={120}
+                windowSize={60}
                 showVolume={true}
                 indicators={{ sma20: true, ema9: true, rsi: true }}
               />

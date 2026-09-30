@@ -51,7 +51,7 @@ HORIZONS_MIN = [5, 15, 30, 60]
 MIN_N_FOR_CONCLUSION = 20  # below this, report the number but don't imply it means anything
 
 _SUMMARY_RE = re.compile(
-    r"1-min Bullish Harami: (?P<ticker>[A-Z]+) at (?P<time>\S+)\n"
+    r"1-min (?:Bullish Harami|Inside Bar Reversal): (?P<ticker>[A-Z]+) at (?P<time>\S+)\n"
     r"Prior candle: (?P<prior_open>[\d.]+) -> (?P<prior_close>[\d.]+) \(bearish\)\n"
     r"This candle: (?P<curr_open>[\d.]+) -> (?P<curr_close>[\d.]+) \(bullish"
 )

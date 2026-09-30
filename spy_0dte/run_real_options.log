@@ -1,0 +1,84 @@
+WARNING regime condition 'vrp_rich_realized' disabled: input data not supplied
+WARNING regime condition 'vrp_rich_implied' disabled: input data not supplied
+WARNING regime condition 'vol_stress' disabled: input data not supplied
+WARNING regime condition 'calm_vol' disabled: input data not supplied
+bars 487,256, sessions 1254 (2021-09-22 .. 2026-09-21)
+DEVELOPMENT period: sessions before 2025-09-22 (1003 sessions). Holdout (251 sessions) is locked.
+inputs: SPY OHLCV only -> realized-vol IV proxy; VRP and VIX regime conditions disabled
+
+1) REGIME AT 10:00 (development sessions): {'Neutral': 902, 'Chop': 69, 'Breakout': 32}
+
+2) 10:00 CALL vs REALIZED DAY TYPE (development sessions, ex-post)
+realized  chop day  mixed  trend day   All
+called                                    
+Breakout        10      9         13    32
+Chop            21     22         26    69
+Neutral        247    305        350   902
+All            278    336        389  1003
+
+3) MODELS (145s) -- direction: 42 folds, spread: 42 folds; median trees after early stopping: direction 83, spread 44; folds calibrated (>= 100/class): 40/42 and 17/42
+
+   DIRECTION model (30-min barriers, used for long options)  -- t < 0 means better than that baseline
+                     n  log_loss   brier  auc_magnitude  auc_direction  t_vs_base_rate  t_vs_logistic
+variant                                                                                              
+lgb_raw          11264    1.0320  0.6222         0.7040         0.5172        -10.4342         0.0274
+lgb_isotonic     11264    1.0394  0.6244         0.7030         0.5199         -6.7019         2.6789
+lgb_temperature  11264    1.0318  0.6221         0.7044         0.5158        -10.3995        -0.0414
+base_rate        11264    1.0658  0.6453         0.6134         0.4889             NaN         8.2264
+logistic         11264    1.0314  0.6219         0.7028         0.5118         -8.2264            NaN
+
+   SPREAD model (inside +/-0.524 implied move until 15:45, used for spreads)  -- t < 0 means better than that baseline
+                    n  log_loss   brier  auc_magnitude  auc_direction  t_vs_base_rate  t_vs_logistic
+variant                                                                                             
+lgb_raw          6067    1.0069  0.6155         0.6347         0.5093         -3.2218         1.1407
+lgb_isotonic     6067    1.0088  0.6159         0.6370         0.5122         -1.9510         1.5811
+lgb_temperature  6067    1.0065  0.6153         0.6350         0.5086         -3.3583         1.0438
+base_rate        6067    1.0158  0.6193         0.5864         0.4984             NaN         2.6942
+logistic         6067    1.0024  0.6139         0.6685         0.5038         -2.6942            NaN
+
+4) CALIBRATION ERROR BY SESSION PHASE (direction model, engine variant 'lgb_temperature'; phase 0=open 1=AM 2=lunch 3=PM 4=close)
+          n  ece_down  ece_chop  ece_up
+phase                                  
+0       870    0.0297    0.0904  0.0703
+1      2609    0.0091    0.0248  0.0133
+2      3473    0.0125    0.0133  0.0034
+3      2586    0.0046    0.0317  0.0221
+4      1726    0.0184    0.0437  0.0280
+
+   option bars: 9,518,757 rows over 661 sessions -> engine limited to those sessions
+
+5) ENGINE -- EV rule, REAL traded option prices (VWAP mid, modeled bid/ask)
+   real_bars     lambda 0.0: {'eligible': 4608, 'traded': 70, 'abstain_ev': 4538, 'no_quote': 0, 'no_credit': 0}
+   real_bars     lambda 0.25: {'eligible': 5706, 'traded': 57, 'abstain_ev': 5649, 'no_quote': 0, 'no_credit': 0}
+   real_bars     lambda 0.5: {'eligible': 6594, 'traded': 46, 'abstain_ev': 6548, 'no_quote': 0, 'no_credit': 0}
+   black_scholes lambda 0.0: {'eligible': 5480, 'traded': 61, 'abstain_ev': 5419, 'no_quote': 0, 'no_credit': 0}
+   black_scholes lambda 0.25: {'eligible': 7241, 'traded': 42, 'abstain_ev': 7199, 'no_quote': 0, 'no_credit': 0}
+   black_scholes lambda 0.5: {'eligible': 7662, 'traded': 34, 'abstain_ev': 7628, 'no_quote': 0, 'no_credit': 0}
+       pricer  lam              kind  n  win  avg_usd  total_usd  avg_ev_usd  worst_usd
+    real_bars 0.00         long_call 19 0.47     2.88      54.76        6.40     -83.17
+    real_bars 0.00          long_put 18 0.28   -20.84    -375.06        6.66    -146.93
+    real_bars 0.00 short_call_spread 19 0.68     3.26      61.93       26.65    -162.51
+    real_bars 0.00  short_put_spread 14 0.86    12.68     177.51       22.45    -138.99
+    real_bars 0.25         long_call 13 0.46    -2.87     -37.34        5.89    -100.28
+    real_bars 0.25          long_put 11 0.36   -15.63    -171.88        5.76     -95.98
+    real_bars 0.25 short_call_spread 20 0.65    -1.48     -29.61       25.11    -171.64
+    real_bars 0.25  short_put_spread 13 0.85     9.02     117.25       21.52    -141.74
+    real_bars 0.50         long_call  7 0.14   -37.27    -260.91        5.87     -80.36
+    real_bars 0.50          long_put  6 0.33   -11.02     -66.12        6.85     -68.99
+    real_bars 0.50 short_call_spread 20 0.65    -3.60     -72.04       23.93    -180.77
+    real_bars 0.50  short_put_spread 13 0.85     7.25      94.21       20.42    -144.48
+black_scholes 0.00         long_call 17 0.53    13.05     221.89        6.07     -89.48
+black_scholes 0.00          long_put 11 0.45    -6.62     -72.81        6.39     -75.60
+black_scholes 0.00 short_call_spread 11 0.82    17.39     191.33       26.55     -61.33
+black_scholes 0.00  short_put_spread 22 0.82    15.35     337.68       24.79    -135.69
+black_scholes 0.25         long_call  7 0.14   -51.96    -363.74        6.00     -93.73
+black_scholes 0.25          long_put  2 0.50   -23.74     -47.47        6.11     -58.84
+black_scholes 0.25 short_call_spread 12 0.75    10.90     130.78       25.04     -63.30
+black_scholes 0.25  short_put_spread 21 0.76    12.95     271.93       23.93    -138.43
+black_scholes 0.50         long_call  1 0.00   -71.43     -71.43        5.19     -71.43
+black_scholes 0.50 short_call_spread 12 0.75     9.70     116.37       24.01     -64.92
+black_scholes 0.50  short_put_spread 21 0.76    11.75     246.83       22.90    -141.17
+   engine invariants (lambda 0.25): ALL PASS
+   per-trade audit records: data/trades_audit_real_bars_lambda025.csv
+
+done in 448s
