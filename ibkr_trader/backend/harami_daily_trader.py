@@ -443,6 +443,28 @@ def run_entry(ib, cfg):
                                     f"headroom=${budget['headroom']:.2f}")
             continue
 
+        # EARNINGS GATE (added 2026-09-30). This is MARKET-ON-OPEN, so anything
+        # reporting before that open fills straight into the gap. The IDR
+        # pipeline had NO earnings awareness until today, while the breakout and
+        # daytrader scanners both had blackouts -- backwards, since IDR is the
+        # strategy that HOLDS for days. Found on the day it mattered: MU reports
+        # 2026-09-30 postmarket with a 6.5pct expected move and MU is in the IDR
+        # panel. Fails CLOSED -- an unavailable earnings feed blocks the entry
+        # rather than buying blind into a binary event.
+        try:
+            from earnings_guard import reports_before_next_open
+            _blocked, _ewhy = reports_before_next_open(sig["ticker"])
+        except Exception as _exc:
+            _blocked, _ewhy = True, f"earnings guard failed ({type(_exc).__name__})"
+        if _blocked:
+            print(f"  SKIP {sig['ticker']}: {_ewhy}")
+            telegram_text(cfg, f"IDR entry skipped: <b>{sig['ticker']}</b> -- {_ewhy}")
+            oversight_log("trader", "harami_live_skipped_earnings",
+                          f"{sig['ticker']}: entry skipped -- {_ewhy}.",
+                          rationale="MOO fills at the next open; a report before then is "
+                                    "an unhedged overnight bet on a binary event.")
+            continue
+
         order = Order(action="BUY", totalQuantity=QTY, orderType="MKT", tif="OPG", transmit=True)
         trade = ib.placeOrder(contract, order)
         ib.sleep(2)
@@ -662,6 +684,28 @@ def run_morning(ib, cfg):
             save_state(state)
             telegram_text(cfg, f"harami_daily_trader: {pos['ticker']} entry order was lost and could not be re-placed ({why}) -- dropped.")
             oversight_log("trader", "harami_live_entry_abandoned", f"{pos['ticker']}: re-place blocked: {why}.")
+            continue
+
+        # EARNINGS GATE (added 2026-09-30). This is MARKET-ON-OPEN, so anything
+        # reporting before that open fills straight into the gap. The IDR
+        # pipeline had NO earnings awareness until today, while the breakout and
+        # daytrader scanners both had blackouts -- backwards, since IDR is the
+        # strategy that HOLDS for days. Found on the day it mattered: MU reports
+        # 2026-09-30 postmarket with a 6.5pct expected move and MU is in the IDR
+        # panel. Fails CLOSED -- an unavailable earnings feed blocks the entry
+        # rather than buying blind into a binary event.
+        try:
+            from earnings_guard import reports_before_next_open
+            _blocked, _ewhy = reports_before_next_open(pos["ticker"])
+        except Exception as _exc:
+            _blocked, _ewhy = True, f"earnings guard failed ({type(_exc).__name__})"
+        if _blocked:
+            print(f"  SKIP {pos['ticker']}: {_ewhy}")
+            telegram_text(cfg, f"IDR entry skipped: <b>{pos['ticker']}</b> -- {_ewhy}")
+            oversight_log("trader", "harami_live_skipped_earnings",
+                          f"{pos['ticker']}: entry skipped -- {_ewhy}.",
+                          rationale="MOO fills at the next open; a report before then is "
+                                    "an unhedged overnight bet on a binary event.")
             continue
 
         order = Order(action="BUY", totalQuantity=QTY, orderType="MKT", tif="OPG", transmit=True)

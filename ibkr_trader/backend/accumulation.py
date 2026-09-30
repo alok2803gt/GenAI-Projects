@@ -209,6 +209,24 @@ def recent_signal(ticker, days=3):
     return hit
 
 
+def _tranche_filled(ticker, tranche) -> bool:
+    """Did this recorded tranche actually fill? Checked against the commission
+    ledger, which is populated from IBKR's own execution reports."""
+    import sqlite3
+    db = HERE / "trade_journal.db"
+    if not db.exists():
+        return False
+    try:
+        con = sqlite3.connect(db)
+        n = con.execute(
+            "SELECT COUNT(*) FROM executions WHERE symbol=? AND side='BOT' "
+            "AND trade_date >= ?", (ticker, str(tranche.get("date")))).fetchone()[0]
+        con.close()
+        return n > 0
+    except Exception:
+        return False
+
+
 def plan_for(ticker, o, net_liq, price, st, held_value=0.0):
     """What the next action is for one qualifying name.
 
@@ -230,8 +248,26 @@ def plan_for(ticker, o, net_liq, price, st, held_value=0.0):
          passed in and the remaining room to target is respected.
     """
     held = st["names"].get(ticker, {"tranches": []})
-    # Only FILLED tranches count -- see bug 2 above.
-    done = [t for t in held["tranches"] if str(t.get("status", "")).lower() == "filled"]
+    # Only FILLED tranches count -- see bug 2 above. But a market-on-open order
+    # is recorded as "Submitted" and fills at the NEXT open, and nothing used to
+    # go back and mark it Filled. Counting only "filled" then made the tranche
+    # invisible forever, so this would BUY AGAIN every run until the cash or the
+    # target ran out (bug 4, found 2026-09-30 immediately after the first
+    # successful placement). A Submitted tranche from a PREVIOUS day whose fill
+    # is confirmed in the commission ledger is therefore counted, and the record
+    # is corrected in place.
+    done = []
+    for t in held["tranches"]:
+        stt = str(t.get("status", "")).lower()
+        if stt == "filled":
+            done.append(t)
+            continue
+        if stt in ("submitted", "presubmitted", "pendingsubmit"):
+            if str(t.get("date")) == str(date.today()):
+                done.append(t)          # queued today; treat as committed
+            elif _tranche_filled(ticker, t):
+                t["status"] = "Filled"  # corrected in place; caller saves state
+                done.append(t)
     target_dollars = (TARGET_DOLLARS_OVERRIDE if TARGET_DOLLARS_OVERRIDE
                       else net_liq * TARGET_WEIGHT)
     tranche_dollars = target_dollars / TRANCHES
