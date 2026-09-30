@@ -52,8 +52,22 @@ FIELDS = {
     "cash": ["CashAndCashEquivalentsAtCarryingValue",
              "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents"],
     "sti": ["ShortTermInvestments", "AvailableForSaleSecuritiesDebtSecuritiesCurrent"],
-    "debt_lt": ["LongTermDebtNoncurrent", "LongTermDebt"],
-    "debt_cur": ["LongTermDebtCurrent", "DebtCurrent", "ShortTermBorrowings"],
+    # REAL BUG found 2026-09-30. These lists missed the concept several issuers
+    # actually file under, and `A["debt_lt"].get(fy) or 0` then silently treated
+    # "no value for the latest fiscal year" as ZERO DEBT:
+    #   RTX files LongTermDebtAndCapitalLeaseObligations ($34.29B FY2025); its
+    #     LongTermDebt series STOPS at FY2024, so debt resolved to 0 and RTX was
+    #     valued as though it held $7.2B NET CASH instead of ~$38B net debt.
+    #   RCL files the same concept ($18.16B FY2025); its LongTermDebt series
+    #     stops at FY2011.
+    # Understating debt understates EV, which understates the implied growth the
+    # price requires -- i.e. it makes companies look CHEAPER than they are and
+    # biases the screen toward ACCEPTING. See also the debt_found guard below:
+    # a missing debt figure is now a hard failure, never an implied zero.
+    "debt_lt": ["LongTermDebtNoncurrent", "LongTermDebtAndCapitalLeaseObligations",
+                "DebtLongtermAndShorttermCombinedAmount", "LongTermDebt"],
+    "debt_cur": ["LongTermDebtCurrent", "LongTermDebtAndCapitalLeaseObligationsCurrent",
+                 "DebtCurrent", "ShortTermBorrowings"],
     "equity": ["StockholdersEquity", "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"],
     # net income to COMMON is the right numerator for a bank ROE (TFC has
     # preferred stock, and files under ProfitLoss rather than NetIncomeLoss);
@@ -233,8 +247,15 @@ def analyse(t, cik):
     fcf_now = ocf - (capex_now or 0)
     fcf_norm = (ocf - cap_ratio * rev) if (cap_ratio and rev) else None
     cash = (A["cash"].get(fy) or 0) + (A["sti"].get(fy) or 0)
-    debt = (A["debt_lt"].get(fy) or 0) + (A["debt_cur"].get(fy) or 0)
+    _dlt, _dcur = A["debt_lt"].get(fy), A["debt_cur"].get(fy)
+    debt = (_dlt or 0) + (_dcur or 0)
     nd = debt - cash
+    # A company with a real balance sheet does not have zero debt. If NEITHER
+    # debt concept produced a value for this fiscal year, the alias list has
+    # missed whatever this issuer files under, and proceeding would value the
+    # business as debt-free -- the exact failure that made RTX look like it held
+    # net cash. Fail loudly instead of quietly flattering the valuation.
+    debt_found = (_dlt is not None) or (_dcur is not None)
     mcap = market_cap(t)
     beta = beta_vs_spy(t)
     r, coe = wacc(beta, mcap, debt)
@@ -257,6 +278,10 @@ def analyse(t, cik):
                net_debt=nd, mcap=mcap, ev=ev, beta=beta, wacc=r, coe=coe, fcf_cagr=g_hist,
                fcf_window=g_window,
                book=A["equity"].get(fy), net_income=A["net_income"].get(fy))
+    if not debt_found and t not in BANKS:
+        out["error"] = ("no debt figure for FY" + str(fy)[:4] +
+                        " -- balance-sheet concepts not recognised, cannot value")
+        return out
     if t in BANKS:
         # MEDIAN of up to 5 years, not the mean of 3: TFC's 2023 goodwill
         # impairment (-$1.45B) dragged a 3-year mean ROE to 4.7% when the bank
