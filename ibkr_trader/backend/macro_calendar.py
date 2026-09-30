@@ -270,6 +270,58 @@ def _spx_macro_skip_dates(year: int | None = None) -> dict[str, str]:
     return result
 
 
+# HIGH-IMPACT events from the Unusual Whales economic calendar. Added
+# 2026-09-30 after finding the guard BLIND on the biggest rates print of the
+# month: every original source had failed silently --
+#   FOMC:      "parsed 0 dates for 2026 -- HTML structure may have changed"
+#   NFP/CPI/PPI: 403 Forbidden from www.bls.gov
+# -- and PCE, the Fed's preferred inflation gauge, was never on the list at all.
+# So on 2026-09-30 (Core PCE + quarter end) is_macro_day() would have returned
+# False and both the Ashley executor and the Day Trader would have traded it as
+# an ordinary Wednesday.
+#
+# UW is an API with a key rather than a scraped HTML page, so it does not break
+# when a government site is redesigned or starts refusing robots. Matching is on
+# substrings of the event name, deliberately narrow: only prints that actually
+# move the rates curve.
+_UW_HIGH_IMPACT = (
+    "PCE Price Idx", "PCE Core Price Idx",          # the Fed's preferred gauge
+    "Consumer Price Index", "CPI",
+    "Producer Price Index", "PPI",
+    "Employment Situation", "Nonfarm", "ADP National Employment",
+    "FOMC", "Federal Open Market Committee",
+    "ISM Report On Business Manufacturing", "ISM Report On Business Services",
+    "Gross Domestic Product", "GDP",
+)
+
+
+def _uw_macro_dates() -> dict[str, str]:
+    """{iso date: reason} for high-impact events, from the UW calendar.
+
+    Returns {} on any failure -- a dead data source must degrade to the existing
+    fallbacks, never to an exception inside a live entry gate.
+    """
+    try:
+        import unusual_whales_client as uw
+        c = uw.UnusualWhalesClient()
+        r = c._get("/api/market/economic-calendar", {})
+        rows = r.get("data", r) if isinstance(r, dict) else r
+    except Exception as exc:
+        log.warning("UW economic calendar unavailable: %s: %s", type(exc).__name__, exc)
+        return {}
+    out: dict[str, set] = {}
+    for x in rows or []:
+        try:
+            ts, ev = str(x.get("time") or ""), str(x.get("event") or "")
+        except Exception:
+            continue
+        if len(ts) < 10 or not ev:
+            continue
+        if any(k.lower() in ev.lower() for k in _UW_HIGH_IMPACT):
+            out.setdefault(ts[:10], set()).add(ev.split(",")[0][:48])
+    return {d: "UW: " + "; ".join(sorted(v)[:3]) for d, v in out.items()}
+
+
 def is_macro_day(d: date | None = None) -> tuple[bool, str]:
     """Convenience wrapper for callers that just want a yes/no + reason for
     ONE date (default: today) -- e.g. an entry gate in a standalone script
@@ -279,4 +331,8 @@ def is_macro_day(d: date | None = None) -> tuple[bool, str]:
     d = d or date.today()
     days = _spx_macro_skip_dates(d.year)
     reason = days.get(d.isoformat())
+    if reason is None:
+        # UW is consulted as well as (not instead of) the existing sources, so a
+        # gap in either one cannot hide a macro day.
+        reason = _uw_macro_dates().get(d.isoformat())
     return (reason is not None, reason or "")
