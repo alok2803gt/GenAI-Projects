@@ -37,6 +37,17 @@ import requests
 HERE = Path(__file__).resolve().parent
 CFG = json.loads((HERE / "scanner_config.json").read_text())
 UA = {"User-Agent": "Research Tool admin@example.com", "Accept-Encoding": "gzip, deflate"}
+# Bump this whenever the model or its inputs change, so every logged decision
+# is attributable to the logic that produced it. Rows written before a bump
+# cannot be compared with rows written after one.
+#   r1  original
+#   r2  smoothed_cagr (COVID base effect), merge=False for bank definitional
+#       fields, median-5yr bank ROE
+#   r3  2026-09-30: debt alias fix (LongTermDebtAndCapitalLeaseObligations etc.)
+#       + debt_found guard. Every r1/r2 row for a leveraged issuer understates
+#       net debt and therefore OVERSTATES how cheap the company looked.
+VALUATION_LOGIC_REV = "r3"
+
 RISK_FREE, EQUITY_PREMIUM, COST_OF_DEBT, TAX = 0.042, 0.050, 0.055, 0.21
 TERMINAL_G, YEARS = 0.025, 10
 WACC_FLOOR, WACC_CAP = 0.06, 0.14

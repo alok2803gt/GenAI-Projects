@@ -387,6 +387,51 @@ def check_ledger(ib) -> None:
              f"correct but intraday ordering is not.")
 
 
+def check_valuation_plausibility() -> None:
+    """Catch the failure mode found on 2026-09-30 automatically.
+
+    The debt alias list had missed what several issuers file under, so a missing
+    debt figure silently became ZERO and RTX was valued as holding net CASH when
+    it carries ~$30B of net debt -- understating enterprise value and making the
+    company look cheaper than it is. Two tells are checkable without re-deriving
+    anything: a non-bank showing net CASH, and an accumulate-track position whose
+    stored valuation predates the current model revision.
+    """
+    log = HERE / "valuation_decisions.jsonl"
+    if not log.exists():
+        note("valuation_no_audit_trail", "FLAG",
+             "valuation_decisions.jsonl is missing -- accumulate/technical calls "
+             "are not being recorded anywhere that survives a cache refresh.")
+        return
+    try:
+        import valuation as V
+        rev = getattr(V, "VALUATION_LOGIC_REV", "?")
+    except Exception:
+        rev = "?"
+    rows = []
+    for ln in log.read_text().splitlines():
+        try:
+            rows.append(json.loads(ln))
+        except Exception:
+            continue
+    latest: dict[str, dict] = {}
+    for r in rows:
+        latest[r.get("ticker")] = r
+    BANKS = {"TFC", "SOFI", "JPM", "BAC", "WFC", "C"}
+    for t, r in latest.items():
+        if r.get("eligible") and r.get("logic_rev") != rev:
+            note("valuation_stale_logic", "FLAG",
+                 f"{t} is eligible on logic {r.get('logic_rev')} but the model is now "
+                 f"{rev} -- re-screen before adding to it.")
+        nd = r.get("net_debt")
+        if t not in BANKS and isinstance(nd, (int, float)) and nd < 0 \
+                and r.get("model") == "reverse DCF":
+            note("valuation_net_cash", "FLAG",
+                 f"{t} is valued with NET CASH (net_debt ${nd/1e9:.2f}B). Genuine for "
+                 f"some issuers, but it is also exactly what a missed debt concept "
+                 f"looks like -- verify against the filing before trusting it.")
+
+
 def check_duplicate_processes() -> None:
     import subprocess
     for name in ("ashleyklieu_trigger_executor", "day_trader_agent",
@@ -513,6 +558,7 @@ def main() -> int:
         check_phantom_tranches()
         check_ashley_state(bs)
         check_ledger(ib)
+        check_valuation_plausibility()
         check_duplicate_processes()
     finally:
         ib.disconnect()

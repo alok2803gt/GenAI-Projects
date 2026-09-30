@@ -95,7 +95,30 @@ def eligibility(o):
 
 
 CACHE = HERE / "valuation_cache.json"
+# APPEND-ONLY audit trail. valuation_cache.json is OVERWRITTEN on every refresh,
+# so after a refresh there is no way to reconstruct the numbers that justified a
+# past decision -- a gap made concrete on 2026-09-30, when force-refreshing the
+# cache destroyed the (buggy, debt-understating) figures that had justified RTX
+# and TFC eligibility for the previous five days. Every evaluation is now also
+# appended here with the logic revision that produced it, and nothing is ever
+# rewritten.
+DECISION_LOG = HERE / "valuation_decisions.jsonl"
 CACHE_DAYS = 7          # fundamentals move quarterly; refetching per run is wasteful and rate-limited
+
+
+def log_decision(ticker, eligible, reason, summary, cached):
+    """Append one immutable row. Never raises -- an audit-trail failure must not
+    stop a trade being screened."""
+    try:
+        row = {"ts": datetime.now(ET).isoformat(), "ticker": ticker,
+               "eligible": bool(eligible), "reason": reason,
+               "logic_rev": getattr(V, "VALUATION_LOGIC_REV", "?"),
+               "cached": bool(cached)}
+        row.update({k: v for k, v in (summary or {}).items()})
+        with open(DECISION_LOG, "a") as f:
+            f.write(json.dumps(row, default=str) + "\n")
+    except Exception as exc:
+        print(f"  (valuation decision log failed: {type(exc).__name__}: {exc})")
 
 
 def screen(ticker, force=False):
@@ -111,7 +134,9 @@ def screen(ticker, force=False):
     if hit and not force:
         age = (date.today() - date.fromisoformat(hit["as_of"])).days
         if age <= CACHE_DAYS:
-            return hit["eligible"], hit["reason"] + f" (cached {age}d)", hit.get("summary", {})
+            r = hit["reason"] + f" (cached {age}d)"
+            log_decision(ticker, hit["eligible"], r, hit.get("summary", {}), cached=True)
+            return hit["eligible"], r, hit.get("summary", {})
     try:
         ciks = {v["ticker"]: str(v["cik_str"]).zfill(10)
                 for v in requests.get("https://www.sec.gov/files/company_tickers.json",
@@ -124,9 +149,12 @@ def screen(ticker, force=False):
                                          "roe", "coe", "price_to_fair", "net_debt", "ev")}
         cache[ticker] = {"as_of": str(date.today()), "eligible": bool(ok), "reason": why, "summary": summary}
         CACHE.write_text(json.dumps(cache, indent=1, default=str))
+        log_decision(ticker, ok, why, summary, cached=False)
         return bool(ok), why, summary
     except Exception as exc:
-        return False, f"screen failed ({type(exc).__name__}) -- defaulting to technical track", {}
+        why = f"screen failed ({type(exc).__name__}) -- defaulting to technical track"
+        log_decision(ticker, False, why, {}, cached=False)
+        return False, why, {}
 
 
 def load_state():

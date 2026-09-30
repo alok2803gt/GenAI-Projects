@@ -222,9 +222,18 @@ def get_spot(ib, ticker):
         return None, None
 
 
-def journal_insert_open(ticker, entry_price, opened_at):
+def journal_insert_open(ticker, entry_price, opened_at, valuation=None, track=None):
+    """valuation/track are recorded on the PERMANENT row, not just in the state
+    file: trade_journal is the only record that outlives a state reset, and
+    without them there is no way to audit why a name was put on the accumulate
+    track months later (gap found 2026-09-30)."""
     try:
         con = sqlite3.connect(JOURNAL_DB_PATH)
+        cols = {r[1] for r in con.execute("PRAGMA table_info(trade_journal)")}
+        if "valuation_json" not in cols:
+            con.execute("ALTER TABLE trade_journal ADD COLUMN valuation_json TEXT")
+        if "track" not in cols:
+            con.execute("ALTER TABLE trade_journal ADD COLUMN track TEXT")
         con.execute("""INSERT INTO trade_journal
             (opened_at, ticker, action, qty, entry_price, strategy_type, is_paper, notes)
             VALUES (?, ?, 'BUY', ?, ?, 'HARAMI_DAILY', 0, ?)""",
@@ -232,6 +241,11 @@ def journal_insert_open(ticker, entry_price, opened_at):
              "IDR daily live entry -- the original p=0.00007 was an artefact of "
              "treating same-day signals as independent; date-clustered and "
              "market-adjusted it is +0.088pp, t=0.48 (i.e. no proven edge)"))
+        if valuation is not None or track is not None:
+            con.execute(
+                "UPDATE trade_journal SET valuation_json=?, track=? WHERE id=?",
+                (json.dumps(valuation, default=str) if valuation else None, track,
+                 con.execute("SELECT MAX(id) FROM trade_journal").fetchone()[0]))
         con.commit()
         con.close()
     except Exception as e:
@@ -368,7 +382,8 @@ def run_entry(ib, cfg):
             why = f"screen error: {type(exc).__name__}"
         pos.update({"phase": "open", "entry_price": entry_price, "entry_fill_date": fill_date_str,
                     "exit_date": exit_date.isoformat(), "track": track, "track_reason": why})
-        journal_insert_open(pos["ticker"], entry_price, et.isoformat())
+        journal_insert_open(pos["ticker"], entry_price, et.isoformat(),
+                            valuation=pos.get("valuation"), track=track)
         telegram_text(cfg, f"✅ <b>IDR LIVE ENTRY FILLED: {pos['ticker']}</b>\n"
                             f"Bought {QTY}x @ ${entry_price:.2f} (MOO).\n"
                             f"Track: <b>{track.upper()}</b> -- {why}\n"
