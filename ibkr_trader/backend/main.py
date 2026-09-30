@@ -13722,6 +13722,31 @@ def pnl_dashboard():
             and _jkey(t.get("ticker",""), t.get("strike"), t.get("right",""), t.get("expiry",""))
             not in active_order_jkeys
         ]
+        # PERSISTENCE GUARD (added 2026-09-30 after a real corruption).
+        # The old guard was `if orphan_ids and portfolio_items:` -- it required the
+        # portfolio feed to be NON-EMPTY but not COMPLETE. At 23:49 ET on
+        # 2026-09-29, during TWS's nightly restart, ib.portfolio() came back
+        # PARTIALLY populated: non-empty, so the guard passed, and five still-held
+        # IDR stock positions (SOFI, TFC, NKE, RIVN, RTX) were marked
+        # exit_reason='orphaned' one second apart on two consecutive dashboard
+        # loads. BA survived only because it happened to be in that partial
+        # snapshot. Nothing traded wrongly -- harami_daily_trader controls exits
+        # from its own state file and uses the journal only for reporting -- but
+        # the journal was wrong until repaired by hand.
+        #
+        # A row must now be CONTINUOUSLY missing for ORPHAN_MIN_ABSENT_S across at
+        # least two observations before it is closed. A transient reconnect window
+        # (both 23:49 calls were one second apart) can no longer reach the UPDATE.
+        ORPHAN_MIN_ABSENT_S = 300
+        _pend = state.setdefault("_orphan_absent_since", {})
+        _now_ts = _utcnow().timestamp()
+        for _oid in orphan_ids:
+            _pend.setdefault(str(_oid), _now_ts)
+        for _k in [k for k in _pend if int(k) not in orphan_ids]:
+            _pend.pop(_k, None)          # reappeared -> reset its clock
+        orphan_ids = [o for o in orphan_ids
+                      if _now_ts - _pend.get(str(o), _now_ts) >= ORPHAN_MIN_ABSENT_S]
+
         if orphan_ids and portfolio_items:
             try:
                 _con = sqlite3.connect(JOURNAL_DB_PATH, check_same_thread=False)
