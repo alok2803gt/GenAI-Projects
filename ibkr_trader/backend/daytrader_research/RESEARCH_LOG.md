@@ -634,3 +634,134 @@ options flow. The single most robust directional FACT found is that options flow
 is coincident, not predictive (corr +0.29 with the contemporaneous move, -0.013
 with the forward move) -- i.e. at this frequency direction is already in the
 price by the time any of these inputs is observable.
+
+### 2026-09-30 — EXHAUSTIVE direction search, phases 1/4/5 complete
+
+CEO instruction: try every remaining option for the Day Trader's missing
+direction. All work on the EXPLORATION set only (< 2025-09-16); the flow holdout
+stays sealed. Fee hurdle 0.473pp (Tiered, $148 position).
+
+**Phase 1 -- INTRADAY MICROSTRUCTURE** (`micro_features.py`). Eleven features from
+the first 15 minutes of 5-minute bars: opening-range position and width, first-5m
+and 15m return, acceleration, up-bar fraction, volume tilt, distance from VWAP,
+close-within-bar, higher-high sequencing, volume front-loading. Nothing clears
+the fee with t>2; Bonferroni bar was 2.84, max |t| 2.09.
+
+  A consistent PATTERN though: EIGHT of the eleven point the same way, and it is
+  the opposite of momentum -- opening STRENGTH predicts forward WEAKNESS
+  (or_pos -0.318 t-1.79, up_bar_frac -0.738 t-2.02, vs_vwap -0.347 t-1.98,
+  close_in_bar -0.341 t-1.80, accel, open15_ret, first5_ret, vol_tilt all
+  negative). The composite "fade the opening move" score is monotonic across
+  quintiles (-0.037, -0.174, -0.151, +0.079, +0.282) with the weakest openers at
+  +0.282pp, t=1.77 -- still short of the fee. The only positive single feature is
+  or_width_pct (+0.409pp, t=2.09), which is a VOLATILITY measure, consistent with
+  everything else found: magnitude works, direction does not.
+
+**Phase 2a -- DEALER POSITIONING** (`gex_direction_study.py`). UW greek-exposure,
+net gamma/delta/vanna/charm plus 1-day changes, each scaled by the ticker's own
+trailing 60-session mean |value| and shifted to the prior session. This had the
+best theoretical case of anything tested, because dealer hedging is mechanical
+rather than predictive. Result: every |t| <= 0.83 against a 2.64 bar. Flat.
+  LIMITATION: greek-exposure history starts ~2025-10-01 (a 2024-11-15 request
+  returns zero rows), so it needed its own split (explore < 2026-04-01) and the
+  exploration set is only 609 rows / 125 sessions. Power is enough to detect
+  ~0.8pp, NOT enough to exclude something near the 0.473pp fee.
+
+**Phase 4 -- MARKET TIMING** (raw, not demeaned). Does the day's own state say
+whether to trade at all? Strongest is the market's 15-minute open (hi tercile
++0.383pp vs lo -0.246pp, spread t=1.51). Baseline across all 250 sessions is
++0.108pp (t=0.72), i.e. -0.365pp net of fee. No.
+
+**Phase 5 -- FEATURE INTERACTIONS** (`ml_combination_study.py`). The one thing
+never tried: that direction lives in a combination. Gradient boosting and ridge
+over all 11 microstructure features, contiguous-date-block expanding-window CV,
+every number out-of-fold, plus a SHUFFLED-LABEL control run through the identical
+pipeline.
+
+| model | OOF top-tercile | t | OOF IC | in-sample IC |
+|---|---|---|---|---|
+| gradient boosting | +0.035pp | 0.29 | 0.090 | **0.693** |
+| **shuffled control** | **+0.184pp** | **1.39** | 0.057 | 0.683 |
+| ridge | -0.098pp | -0.85 | 0.027 | - |
+| ridge shuffled | +0.047pp | 0.32 | -0.013 | - |
+
+**The shuffled control BEAT the real model.** In-sample IC 0.693 against
+out-of-fold 0.090 is the size of the overfit. This also CALIBRATES every marginal
+result in this project: if randomised labels yield +0.184pp at t=1.39 through
+this pipeline, then the Phase 1 fade composite (+0.282pp, t=1.77) is barely
+distinguishable from noise. Worth remembering the next time a t near 1.8 looks
+like something.
+
+Phases 2b (NOPE) and 2c (dark pool) in progress -- data still downloading.
+
+### 2026-09-30 — EXHAUSTIVE direction search COMPLETE: no directional signal exists in any accessible source
+
+Nine independent data sources, ~57 features. Exploration set only
+(< 2025-09-16, 1,195 ticker-days / 250 sessions). Window 09:30-09:45, entry at
+the close of the 09:45 bar (a real tradeable price), exit at the session close,
+long only, market-adjusted, date-clustered. Fee hurdle 0.473pp.
+
+| source | features | strongest \|t\| | Bonferroni bar | verdict |
+|---|---|---|---|---|
+| Daily-bar features | 11 | 1.96 | 3.40 | null |
+| Intraday microstructure (5m bars) | 11 | 2.09 | 2.84 | null |
+| Options flow (net delta / premium / imbalance x 3 windows) | 9 | 1.44 | — | null; COINCIDENT |
+| Dealer positioning (greek-exposure) | 6 | 0.83 | 2.64 | null (under-powered) |
+| NOPE (hedging pressure / stock volume) | 5 | 0.90 | 2.73 | null |
+| Dark pool print lean vs NBBO mid | 3 | 0.76 | 2.73 | null |
+| Market-state timing (raw, not demeaned) | 4 | 1.51 | — | null |
+| Prior-session option volume by price level | 4 | 1.62 | 2.69 | null |
+| Unusual options activity (whale alerts) | 3 | 0.84 | 2.69 | null |
+| Feature interactions (GBM + ridge, OOF) | 2 models | — | — | shuffled control WON |
+
+**Nothing cleared the 0.473pp fee with t>2 in any source.** The pre-registered
+holdout (PREREG_uw_flow_direction.md, 67c5d03a, 1,274 rows) was NEVER SPENT --
+nothing earned a confirmatory test.
+
+**THE NOISE FLOOR, which is the most useful output of the whole exercise.** The
+shuffled-label control in Phase 5 produced **+0.184pp at t=1.39** from randomly
+permuted targets through the identical pipeline. Every marginal result in this
+project sits at or below that: the fade composite (+0.282pp, t 1.77), opening-
+range width (+0.409pp, t 2.09), market timing (t 1.51). None is meaningfully
+distinguishable from a random relabelling of the same data. Any future t below
+~2.5 here should be assumed to be this.
+
+**TWO ARTEFACTS CAUGHT, opposite failure modes, both mine.**
+  1. TOO GOOD. Same-day option volume by price level scored +2.840pp at
+     **t=17.38**. The file is WHOLE-DAY, so splitting it at the 09:45 price
+     encodes where price subsequently went: corr +0.6714 with the forward
+     return, and the two halves correlated -0.9269 with each other -- an
+     identity, not a signal. The legitimate prior-session version scores
+     **+0.349pp, t=1.62**. The contamination was worth ~11 t-points.
+  2. TOO EARLY. net_delta_pressure looked like the best lead in the search at
+     +0.767pp (t 1.73) on a third of the sample; on the full sample it was
+     **+0.048pp, t 0.22** -- a 94% collapse. Reporting a partial-data lead would
+     have handed the CEO a discovery that did not exist.
+
+**Notable specific nulls.** Unusual options activity -- UW's flagship product and
+the basis of the retail "follow the whales" thesis -- is completely flat
+(max t 0.84). Dealer gamma positioning, which had the best theoretical case of
+anything tested because hedging is mechanical rather than predictive, is flat
+(max t 0.83), though that test is under-powered (609 rows; can detect ~0.8pp, so
+it cannot exclude something at the 0.47pp fee).
+
+**THE STRUCTURAL FINDING.** Options flow correlates **+0.29 with the
+contemporaneous move and -0.013 with the forward move**. Direction is already in
+the price by the time any of these inputs is observable. The available prize is
+large -- mean |excess| on these candidates is 1.726pp, so perfect sign would pay
+enormously -- and the best any source achieves is ~5% of its sign, against the
+~27% needed to clear the fee at a $148 position. That gap is not a tuning
+problem and it is not a data-access problem we can fix with this account.
+
+**WHAT REMAINS GENUINELY UNTESTED**, and it is only what we cannot obtain:
+order-book depth and queue position, tick-by-tick prints with aggressor flags,
+and news/sentiment with sub-second timestamps. All are latency-sensitive and
+competed by firms with structural advantages we do not have.
+
+**CONCLUSION.** The Day Trader's premise -- pick which high-magnitude name will
+rise today -- cannot be met from any data available to this operation. Stays
+disabled. The two things that DO work, both replicated out of sample, are the
+MAGNITUDE signal (>=0.5% move rate 36.5% -> 42.7%, needing a non-directional
+instrument this account cannot hold) and the IDR ACCUMULATION structure
+(+0.630pp, t 16.28 on 7,290 unseen signals). Effort belongs there, and on
+capital, not here.
