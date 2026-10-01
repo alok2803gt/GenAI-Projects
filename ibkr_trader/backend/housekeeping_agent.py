@@ -293,15 +293,44 @@ def check_phantom_tranches() -> None:
     except Exception as exc:
         note("state_unreadable", "FLAG", f"{p.name} will not parse: {exc}")
         return
+    # REAL INCIDENT 2026-10-01, caused by this very check. It used to treat ANY
+    # status other than "filled" as phantom and DELETE the tranche. A
+    # market-on-open tranche is recorded "Submitted" and fills at the NEXT open,
+    # so on 2026-09-30 it deleted the RTX and TFC tranches that had ACTUALLY
+    # FILLED (the commission ledger proves it: TFC BOT 2 @ 46.50, RTX BOT @
+    # 185.83). accumulation then saw zero tranches, called it "first tranche"
+    # again, and bought 3 more TFC at the 10-01 open -- bypassing the -5% add
+    # trigger the whole design rests on.
+    #
+    # The detector was written BEFORE the reconciler in plan_for() and the two
+    # were never checked against each other. They now agree on one authority:
+    # the commission ledger. A Submitted tranche whose fill is confirmed is
+    # CORRECTED to Filled, never deleted; only an order the broker actually
+    # rejected is dropped.
     for name, rec in (st.get("names") or {}).items():
-        bad = [t for t in rec.get("tranches", [])
-               if str(t.get("status", "")).lower() not in ("filled", "")]
-        if bad:
+        confirmed, rejected = [], []
+        for t in rec.get("tranches", []):
+            stt = str(t.get("status", "")).lower()
+            if stt in ("filled", ""):
+                continue
+            if stt in ("cancelled", "inactive", "apicancelled", "rejected"):
+                rejected.append(t)
+            elif _ledger_buy_after(name, str(t.get("date"))):
+                confirmed.append(t)
+            # Submitted with no fill yet and not rejected = still working; leave it.
+        if confirmed:
+            note("tranche_status_stale", "SAFE_FIX",
+                 f"{p.name}: {name} has {len(confirmed)} tranche(s) still marked "
+                 f"'Submitted' whose fill IS confirmed in the commission ledger -- "
+                 f"correcting to Filled so accumulation counts them and does not "
+                 f"re-place a first tranche",
+                 fix=("mark_tranches_filled", name))
+        if rejected:
             note("phantom_tranche", "SAFE_FIX",
-                 f"{p.name}: {name} has {len(bad)} tranche(s) recorded from orders "
-                 f"that never filled (status "
-                 f"{', '.join(sorted({str(t.get('status')) for t in bad}))}) -- these "
-                 f"wedge the add trigger against a price nothing was bought at",
+                 f"{p.name}: {name} has {len(rejected)} tranche(s) from orders the "
+                 f"broker REJECTED (status "
+                 f"{', '.join(sorted({str(t.get('status')) for t in rejected}))}) -- "
+                 f"these wedge the add trigger against a price nothing was bought at",
                  fix=("drop_phantom_tranches", name))
 
 
@@ -515,14 +544,30 @@ def apply_fix(kind: str, arg) -> str:
         con.commit()
         con.close()
         return f"reopened journal id {arg}"
+    if kind == "mark_tranches_filled":
+        pth = STATE_FILES["accumulation"]
+        backup(pth)
+        stt = json.loads(pth.read_text())
+        rec = stt["names"][arg]
+        n = 0
+        for t in rec["tranches"]:
+            if str(t.get("status", "")).lower() not in ("filled", "") \
+                    and _ledger_buy_after(arg, str(t.get("date"))):
+                t["status"] = "Filled"
+                t["confirmed_by"] = "housekeeping_agent (commission ledger)"
+                n += 1
+        pth.write_text(json.dumps(stt, indent=1))
+        return f"marked {n} {arg} tranche(s) Filled from ledger confirmation"
     if kind == "drop_phantom_tranches":
         p = STATE_FILES["accumulation"]
         backup(p)
         st = json.loads(p.read_text())
         rec = st["names"][arg]
         before = len(rec["tranches"])
-        rec["tranches"] = [t for t in rec["tranches"]
-                           if str(t.get("status", "")).lower() == "filled"]
+        rec["tranches"] = [
+            t for t in rec["tranches"]
+            if str(t.get("status", "")).lower() not in
+               ("cancelled", "inactive", "apicancelled", "rejected")]
         p.write_text(json.dumps(st, indent=1))
         return f"dropped {before - len(rec['tranches'])} unfilled tranche(s) for {arg}"
     if kind == "backfill_outcome":
