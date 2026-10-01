@@ -387,6 +387,63 @@ def check_ledger(ib) -> None:
              f"correct but intraday ordering is not.")
 
 
+def check_doomed_roundtrips() -> None:
+    """Round trips so short they could never have worked.
+
+    On 2026-09-30 the Ashley executor bought the 764C at 15:54:44 and the 15:55
+    forced close sold it at 15:55:05 -- a 21-second hold, -$24.78, of which
+    $1.78 was commission. There was no path to a profit at entry. A
+    MIN_MINUTES_BEFORE_FORCE_CLOSE guard now prevents that specific case, but
+    the CLASS is worth detecting generically: any entry whose exit was forced
+    by a clock rather than by the thesis.
+
+    FLAG only -- nothing to repair after the fact. The value is noticing the
+    pattern early rather than finding it in a monthly P&L review.
+    """
+    if not JOURNAL.exists():
+        return
+    con = sqlite3.connect(JOURNAL)
+    try:
+        rows = con.execute(
+            "SELECT local_symbol, trade_date, side, price, ts_utc, realized_pnl "
+            "FROM executions WHERE trade_date >= date('now','-7 day') "
+            "ORDER BY local_symbol, rowid").fetchall()
+    except sqlite3.OperationalError:
+        con.close()
+        return
+    con.close()
+    legs: dict[str, list] = {}
+    for ls, td, side, px, ts, rp in rows:
+        legs.setdefault((ls, td), []).append((side, px, ts, rp))
+    for (ls, td), v in legs.items():
+        buys = [x for x in v if x[0] == "BOT"]
+        sells = [x for x in v if x[0] == "SLD"]
+        if not buys or not sells:
+            continue
+        try:
+            t0 = datetime.fromisoformat(buys[0][2])
+            t1 = datetime.fromisoformat(sells[-1][2])
+            mins = abs((t1 - t0).total_seconds()) / 60
+        except Exception:
+            continue
+        pnl = sells[-1][3] or 0
+        # A SHORT hold is not itself the problem -- the 768C on 2026-09-28 was
+        # held 2.7 minutes and made +$28.91, a successful scalp. The signature of
+        # a DOOMED entry is short AND losing: the position was closed by a clock
+        # before the thesis could resolve. Filtering on the sign avoids flagging
+        # every fast winner.
+        #
+        # Duration is used rather than time-of-day deliberately: live_event rows
+        # carry a known local-offset bug in ts_utc, so absolute times are not
+        # trustworthy while DIFFERENCES between two rows still are.
+        if mins <= 5 and pnl < 0:
+            note("doomed_roundtrip", "FLAG",
+                 f"{ls} on {td} was opened and closed within {mins:.1f} minute(s) for "
+                 f"{pnl:+.2f}. Short AND losing is the signature of an entry closed by a "
+                 f"clock rather than by the thesis -- check which strategy placed it and "
+                 f"whether its late-entry guard is active.")
+
+
 def check_valuation_plausibility() -> None:
     """Catch the failure mode found on 2026-09-30 automatically.
 
@@ -558,6 +615,7 @@ def main() -> int:
         check_phantom_tranches()
         check_ashley_state(bs)
         check_ledger(ib)
+        check_doomed_roundtrips()
         check_valuation_plausibility()
         check_duplicate_processes()
     finally:

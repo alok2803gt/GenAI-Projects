@@ -1,0 +1,18 @@
+{
+ "names": {
+  "RTX": {
+   "tranches": []
+  },
+  "TFC": {
+   "tranches": [
+    {
+     "date": "2026-09-30",
+     "price": 46.7,
+     "shares": 2,
+     "order_id": 28,
+     "status": "Submitted"
+    }
+   ]
+  }
+ }
+}

@@ -99,6 +99,19 @@ FORCE_CLOSE_ET = (15, 55)        # real safety mechanism added 2026-09-07 (IBKR 
                                   # past close risks real auto-exercise (Monday SPY shares), not
                                   # just "expiring worthless" the way the old alert text implied.
 
+# LATE-ENTRY GUARD (added 2026-10-01 after a real loss). A new position opened
+# minutes before FORCE_CLOSE_ET has no time for the thesis to work -- it only
+# pays the spread twice plus two commissions. On 2026-09-30 the executor bought
+# the 764C at 15:54:44 and the forced close sold it at 15:55:05: a TWENTY-ONE
+# SECOND hold, 0.89 -> 0.66, -$24.78 realised, of which $1.78 was commission.
+# There was never a path to a profit.
+#
+# Expressed as minutes BEFORE the force close rather than an absolute clock
+# time, so changing FORCE_CLOSE_ET cannot leave this guard stranded at a stale
+# hour. 25 minutes is the CEO's call (2026-10-01), i.e. no new entries after
+# 15:30 while the force close is 15:55.
+MIN_MINUTES_BEFORE_FORCE_CLOSE = 25
+
 # Same pattern as ashleyklieu_alert_monitor.py -- reused verbatim so both
 # scripts parse her messages identically.
 ENTRY_PATTERN = re.compile(
@@ -623,6 +636,10 @@ async def run_daily_watch(setups, headers, last_message_id, alert_message_id=Non
     # it with its real qty/avg cost so exit monitoring resumes correctly.
     fired = load_fired_today()
     open_positions = reconcile_open_positions(ib, setups, contracts)
+    # names already reported as too-late-to-enter, so the Telegram fires once
+    # per setup rather than on every 5-second tick (see
+    # MIN_MINUTES_BEFORE_FORCE_CLOSE).
+    _late_skips: set = set()
     fired |= set(open_positions.keys())  # a real open position is definitely "fired"
     if fired or open_positions:
         save_fired_today(fired)
@@ -750,6 +767,27 @@ async def run_daily_watch(setups, headers, last_message_id, alert_message_id=Non
                     if s["name"] in fired:
                         continue
                     if s["lo"] <= spot <= s["hi"]:
+                        # Too late to open anything new? See
+                        # MIN_MINUTES_BEFORE_FORCE_CLOSE above.
+                        _fc = now.replace(hour=FORCE_CLOSE_ET[0], minute=FORCE_CLOSE_ET[1],
+                                          second=0, microsecond=0)
+                        _mins_left = (_fc - now).total_seconds() / 60
+                        if _mins_left < MIN_MINUTES_BEFORE_FORCE_CLOSE:
+                            if s["name"] not in _late_skips:
+                                _late_skips.add(s["name"])
+                                txt = (f"Ashley {s['name']}: zone hit at {now:%H:%M} ET but only "
+                                       f"{_mins_left:.0f} min to the {FORCE_CLOSE_ET[0]}:"
+                                       f"{FORCE_CLOSE_ET[1]:02d} forced close "
+                                       f"(need {MIN_MINUTES_BEFORE_FORCE_CLOSE}) -- NOT entering.")
+                                print(txt)
+                                telegram(txt)
+                                oversight_log(txt,
+                                              "A position opened this close to the forced close "
+                                              "cannot work; it only pays the spread and two "
+                                              "commissions (real case 2026-09-30: 21-second hold, "
+                                              "-$24.78).",
+                                              outcome="skipped_late_entry")
+                            continue
                         print(f"TRIGGER: {s['name']} -- SPY {spot} in zone [{s['lo']}, {s['hi']}]")
                         c = contracts[s["name"]]
                         td = ib.reqMktData(c, "", False, False)
