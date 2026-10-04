@@ -49,7 +49,9 @@ $weekdays = @('Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday')
 # skipped rather than launching a second, overlapping instance. This
 # matters most for SPY0DTEAutoFire, which can legitimately run for up to
 # ~6 hours.
-$settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -StartWhenAvailable -DontStopOnIdleEnd -ExecutionTimeLimit (New-TimeSpan -Hours 7)
+# Battery flags: Windows' defaults silently stop/skip tasks on battery (2026-10-02 outage: every
+# watchdog went quiet from ~11:00 when the laptop was unplugged). IBKR-BatteryWatch alerts instead.
+$settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -StartWhenAvailable -DontStopOnIdleEnd -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Hours 7)
 
 Write-Host "Creating IBKR-PortfolioOversight (hourly around the clock; script itself skips Sat/Sun)..."
 $action1 = New-ScheduledTaskAction -Execute $py -Argument "portfolio_oversight_check.py" -WorkingDirectory $backendDir
@@ -218,7 +220,7 @@ Write-Host "future logons/reboots; it does NOT touch whatever is currently runni
 # No ExecutionTimeLimit -- these are meant to run forever (the watchdog's own
 # while(true) loop is the thing that never exits), unlike every other task in
 # this file which either completes quickly or is capped at 7 hours.
-$alwaysOnSettings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -StartWhenAvailable -DontStopOnIdleEnd -ExecutionTimeLimit ([TimeSpan]::Zero)
+$alwaysOnSettings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -StartWhenAvailable -DontStopOnIdleEnd -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero)
 $currentUser = "$env:USERDOMAIN\$env:USERNAME"
 
 $alwaysOn = @(

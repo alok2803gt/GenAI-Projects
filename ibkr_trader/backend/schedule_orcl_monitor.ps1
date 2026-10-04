@@ -55,7 +55,7 @@ if ($LASTEXITCODE -eq 0) {
     try {
         $action   = New-ScheduledTaskAction -Execute $py -Argument "`"$script`"" -WorkingDirectory $wd
         $trigger  = New-ScheduledTaskTrigger -Once -At "2026-07-27T09:25:00"
-        $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 30) -StartWhenAvailable
+        $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 30) -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
         $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
         $task = Register-ScheduledTask -TaskName "ORCL_Monday_Monitor" `
             -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force

@@ -97,6 +97,7 @@ ibkr_trader/backend/chartexpert_shots/
 ibkr_trader/backend/chartexpert_shadow_trades.jsonl
 ibkr_trader/backend/harami_trader_trades.jsonl
 ibkr_trader/backend/ashley_signal_trades.json
+ibkr_trader/backend/battery_watch.log
 condor_v2/config.json
 condor_v2/qqq/
 condor_v2/monitor_state.json
