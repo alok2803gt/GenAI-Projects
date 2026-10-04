@@ -97,6 +97,15 @@ ibkr_trader/backend/chartexpert_shots/
 ibkr_trader/backend/chartexpert_shadow_trades.jsonl
 ibkr_trader/backend/harami_trader_trades.jsonl
 ibkr_trader/backend/ashley_signal_trades.json
+condor_v2/config.json
+condor_v2/qqq/
+condor_v2/monitor_state.json
+condor_v2/monitor_log.jsonl
+condor_v2/state.json
+condor_v2/condor_v2_log.jsonl
+condor_v2/PAUSED.flag
+condor_v2/safe_start_log.jsonl
+condor_v2/condor_v2_console.log
 ibkr_trader/backend/ashleyklieu_contracts_override.json
 ibkr_trader/backend/ashleyklieu_fired_today.json
 ibkr_trader/backend/total_risk_budget_override.json
