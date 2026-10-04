@@ -48,6 +48,7 @@ ALERT_CATEGORIES: dict[str, tuple[str, str]] = {
     "chartexpert":         ("ChartExpert auto-trader", "Signal Feeds & Scanners"),
     # Research desk
     "research_desk":       ("Darkpool / sector-catalyst / NFLX / shadow-filter research monitors", "Research Desk"),
+    "macro_watch":         ("Daily macro watch report (rates, credit, breadth, UW flows)", "Research Desk"),
     # Oversight & risk
     "risk_gate":           ("Risk Monitor violations", "Oversight & Risk"),
     "news_monitor":        ("News Monitor verdicts", "Oversight & Risk"),

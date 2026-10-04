@@ -1,0 +1,6 @@
+{
+  "_comment": "Verified key dates macro_watch shows ahead of time (the BLS calendar blocks scripts, and UW's calendar only looks ~1 week out). Add entries with a source.",
+  "key_dates": [
+    {"date": "2026-10-14", "label": "CPI (Sep) 8:30 ET", "source": "fxstreet/litefinance calendars, checked 2026-10-02"}
+  ]
+}
