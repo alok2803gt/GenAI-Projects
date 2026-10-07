@@ -109,6 +109,7 @@ condor_v2/condor_v2_log.jsonl
 condor_v2/PAUSED.flag
 condor_v2/safe_start_log.jsonl
 condor_v2/condor_v2_console.log
+condor_v2/golive_scorecard.jsonl
 ibkr_trader/backend/ashleyklieu_contracts_override.json
 ibkr_trader/backend/ashleyklieu_fired_today.json
 ibkr_trader/backend/total_risk_budget_override.json

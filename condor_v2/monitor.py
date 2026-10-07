@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """Watchdog for the condor_v2 instances (SPY in ./, QQQ in ./qqq).
 
-Task Scheduler runs this every 5 minutes; it does nothing outside 09:50-16:10 ET on weekdays.
-Each run:
+Task Scheduler runs this every 5 minutes; it does nothing outside 09:30-16:10 ET on weekdays.
+From 09:30 every run sells/covers SPY/QQQ shares left by an assignment or exercise (user ask
+2026-10-06: sell assigned shares at the open); until 09:50 that is all it does.
+From 09:50 each run also:
   - restarts an instance that died for an infrastructure reason (TWS disconnect) or never
     started, at most 3x/day, only on a paper account with no untracked short legs;
   - never restarts after a partial fill / partial close -- alerts with the details instead;
   - alerts on any SPY/QQQ 0DTE option leg that no running trader is tracking;
   - alerts on entry slots (10:01..14:31) that passed without being attempted;
   - 15:50: closes untracked legs that could be assigned/exercised (shorts; longs near/in the money);
-  - 16:05: sends a per-instance day summary.
+  - 16:05: sends a per-instance day summary;
+  - first run of a day: closes the previous session's go-live scorecard row (golive_scorecard.jsonl).
+An instance whose SafeStart task is disabled is switched off: no restarts, no missed-slot alerts.
 Deterministic, no LLM. Alerts go to the Telegram chat in ./config.json.
 
     python monitor.py           # normal run
@@ -31,12 +35,21 @@ ET = ZoneInfo("America/New_York")
 HERE = Path(__file__).resolve().parent
 PY = HERE / ".venv" / "Scripts" / "python.exe"
 INSTANCES = {"SPY": HERE, "QQQ": HERE / "qqq"}
+TASKS = {"SPY": "CondorV2-SafeStart", "QQQ": "CondorV2-QQQ-SafeStart"}
+# Go-live rehearsal (CEO 2026-10-06): the go-live plan -- SPY alone, about $15,000 -- run on paper
+# for 20 sessions; the gate is cumulative net profit after commissions. QQQ is disabled and the
+# Ashley paper test stopped, so the paper account's NetLiq change is SPY condor P&L only.
+GOLIVE_START = "2026-10-06"
+GOLIVE_SESSIONS = 20
+GOLIVE_CAPITAL = 15000
+SCORECARD = HERE / "golive_scorecard.jsonl"
 SLOTS = ["10:01", "10:31", "11:01", "11:31", "12:01", "12:31", "13:01", "13:31", "14:01", "14:31"]
 MON_STATE = HERE / "monitor_state.json"
 MON_LOG = HERE / "monitor_log.jsonl"
 MAX_RESTARTS = 3
 INFRA_ERRORS = ("ConnectionError", "Socket disconnect", "TimeoutError", "ConnectionRefused", "WinError")
-ACTIVE = (dtime(9, 50), dtime(16, 10))
+ACTIVE = (dtime(9, 30), dtime(16, 10))
+FULL_FROM = dtime(9, 50)  # before this, only the assigned-share clean-up runs
 RESTART_WINDOW = (dtime(10, 0), dtime(15, 55))
 FLATTEN_AT = dtime(15, 50)
 SUMMARY_AT = dtime(16, 5)
@@ -49,12 +62,16 @@ EXPIRY = NOW.strftime("%Y%m%d")
 
 # ----------------------------------------------------------------- plumbing
 def load_mon():
+    prev = None
     if MON_STATE.exists():
         s = json.loads(MON_STATE.read_text())
         if s.get("day") == TODAY:
             return s
+        # what the go-live scorecard needs from the previous session
+        prev = {k: s.get(k) for k in ("day", "start_netliq", "start_late", "peak_margin")}
     return {"day": TODAY, "alerted": [], "restarts": {k: 0 for k in INSTANCES},
-            "start_netliq": None, "flattened": False, "summary_sent": False}
+            "start_netliq": None, "start_late": False, "peak_margin": 0.0,
+            "flattened": False, "summary_sent": False, "prev": prev}
 
 
 def save_mon(s):
@@ -117,7 +134,7 @@ def read_state(base):
     return {"open": [], "closed": [], "realized": 0.0}
 
 
-def events_today(base):
+def events_today(base, day=TODAY):
     p = base / "condor_v2_log.jsonl"
     if not p.exists():
         return []
@@ -127,9 +144,23 @@ def events_today(base):
             e = json.loads(line)
         except ValueError:
             continue
-        if e.get("time", "").startswith(TODAY):
+        if e.get("time", "").startswith(day):
             evs.append(e)
     return evs
+
+
+def enabled_instances():
+    """Instances whose SafeStart task is enabled. Disabling the task switches an instance off: no
+    auto-start, no monitor restart, no missed-slot alerts. A failed lookup means all enabled."""
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "Get-ScheduledTask -TaskName 'CondorV2-*' | ForEach-Object { $_.TaskName + '=' + $_.State }"],
+            capture_output=True, text=True, timeout=60).stdout
+        states = dict(line.strip().split("=", 1) for line in out.splitlines() if "=" in line)
+    except Exception:
+        return set(INSTANCES)
+    return {sym for sym, task in TASKS.items() if states.get(task) != "Disabled"}
 
 
 def pause_reason(base):
@@ -243,7 +274,16 @@ def flatten(ib, acct, mon, running):
         spots[sym] = t.marketPrice()
         ib.cancelMktData(s)
     done = []
+    held = actual_legs(ib, acct)
     for (sym, k, r), q in sorted(legs.items()):
+        # Never trade more than the account really holds: on 2026-10-06 IBKR had bought back 6 of 7
+        # short 779P, the traders' records still said short 7, and this read the gap as "+6 long"
+        # and tried to SELL 6 -- which would have reopened six naked shorts.
+        a = held.get((sym, k, r), 0)
+        q = min(q, max(a, 0)) if q > 0 else -min(-q, max(-a, 0))
+        if not q:
+            done.append(f"left {sym} {k:g}{r}: account holds {a:+g}, nothing of ours to close")
+            continue
         spot = spots.get(sym)
         itm_or_near = spot is not None and (spot - k if r == "C" else k - spot) > -NEAR_MONEY
         if q < 0 or itm_or_near:
@@ -261,9 +301,96 @@ def flatten(ib, acct, mon, running):
              high=bool(shorts_left))
 
 
-def summary(ib, acct, mon):
+def finalize_scorecard(mon):
+    """First run of a day: close the previous session's go-live row with this morning's NetLiq.
+    The account holds nothing overnight (0DTE), so the NetLiq change from one morning to the next
+    is that session's P&L after commissions -- valid while SPY condors are the account's only
+    trading."""
+    prev = mon.get("prev") or {}
+    day, start = prev.get("day"), prev.get("start_netliq")
+    if not day or day < GOLIVE_START or start is None or mon["start_netliq"] is None:
+        return
+    rows = [json.loads(l) for l in SCORECARD.read_text().splitlines() if l.strip()] if SCORECARD.exists() else []
+    if any(r["date"] == day for r in rows):
+        return
+    acts = [e["action"] for e in events_today(INSTANCES["SPY"], day)]
+    entered, stopped = acts.count("entered"), acts.count("closed")
+    if not entered:
+        return  # SPY didn't trade (holiday, outage): not a session
+    net = round(mon["start_netliq"] - start, 2)
+    row = {"date": day, "net": net, "entered": entered, "stopped": stopped, "start_netliq": start,
+           "end_netliq": mon["start_netliq"], "peak_margin": prev.get("peak_margin"),
+           "inexact": bool(prev.get("start_late") or mon.get("start_late"))}
+    rows.append(row)
+    if not CHECK_ONLY:
+        with open(SCORECARD, "a") as f:
+            f.write(json.dumps(row) + "\n")
+    n, cum = len(rows), sum(r["net"] for r in rows)
+    stop_rate = sum(r["stopped"] for r in rows) / sum(r["entered"] for r in rows)
+    verdict = ("GATE PASSED -- review go-live" if n >= GOLIVE_SESSIONS and cum > 0 else
+               "GATE FAILED -- net not positive after 20 sessions" if n >= GOLIVE_SESSIONS else
+               f"{GOLIVE_SESSIONS - n} sessions to go")
+    msg = (f"GO-LIVE SCORECARD (SPY alone, ${GOLIVE_CAPITAL:,} plan) -- session {n}/{GOLIVE_SESSIONS}, {day}: "
+           f"net ${net:+,.0f} after commissions ({net / GOLIVE_CAPITAL:+.2%}), {entered} entered, "
+           f"{stopped} stopped, peak margin ${row['peak_margin'] or 0:,.0f}"
+           f"{' (start measured late: inexact)' if row['inexact'] else ''} | cumulative ${cum:+,.0f} "
+           f"({cum / GOLIVE_CAPITAL:+.2%}), stop rate {stop_rate:.0%} (backtest ~42%) | {verdict}")
+    log(msg)
+    telegram(msg)
+
+
+def flatten_stock(ib, acct, mon):
+    """Sell (or cover) SPY/QQQ shares an assignment or exercise left in the account: these traders
+    never hold stock, so any share position is expiration fallout (2026-10-06: a short 780P was
+    assigned overnight). Marketable limit 5 cents through the quote; alerts if it doesn't fill."""
+    for p in ib.positions(acct):
+        c = p.contract
+        if c.secType != "STK" or c.symbol not in INSTANCES or not p.position:
+            continue
+        action, qty = ("SELL" if p.position > 0 else "BUY"), abs(p.position)
+        s = Stock(c.symbol, "SMART", "USD")
+        ib.qualifyContracts(s)
+        t = ib.reqMktData(s, "", False, False)
+        ib.sleep(3)
+        bid, ask = t.bid, t.ask
+        ib.cancelMktData(s)
+        quote = bid if action == "SELL" else ask
+        if not (quote == quote and quote and quote > 0):
+            alert_once(mon, f"stock_noquote:{c.symbol}", f"{qty:g} {c.symbol} shares from an assignment "
+                       f"in the account but no quote to {action.lower()} them -- will retry next run", True)
+            continue
+        px = round(quote - 0.05 if action == "SELL" else quote + 0.05, 2)
+        if CHECK_ONLY:
+            print(f"[would {action}] {qty:g} {c.symbol} @ {px} (assigned shares)")
+            continue
+        log(f"assigned shares: {action} {qty:g} {c.symbol} @ {px}")
+        trade = ib.placeOrder(s, LimitOrder(action, qty, px, tif="DAY"))
+        for _ in range(30):
+            ib.sleep(1)
+            if trade.orderStatus.status == "Filled":
+                break
+        if trade.orderStatus.status == "Filled":
+            msg = f"assigned shares: {action.lower()} {qty:g} {c.symbol} @ {trade.orderStatus.avgFillPrice:.2f}"
+            log(msg)
+            telegram(msg)
+            continue
+        ib.cancelOrder(trade.order)
+        for _ in range(30):
+            ib.sleep(1)
+            if trade.orderStatus.status in ("Filled", "Cancelled", "ApiCancelled", "Inactive"):
+                break
+        filled = trade.orderStatus.filled
+        msg = (f"assigned shares: {action.lower()} {qty:g} {c.symbol} did not fully fill "
+               f"({filled:g} done, status {trade.orderStatus.status}) -- next run retries; check TWS")
+        log(msg)
+        telegram(msg, high=True)
+
+
+def summary(ib, acct, mon, active):
     parts = []
     for sym, base in INSTANCES.items():
+        if sym not in active:
+            continue
         evs = events_today(base)
         acts = [e["action"] for e in evs]
         st = read_state(base)
@@ -275,7 +402,9 @@ def summary(ib, acct, mon):
                      f"{len(st['open'])} held to expiry, trader-booked ${st['realized']:+.0f}")
     netliq = next((float(r.value) for r in ib.accountSummary(acct) if r.tag == "NetLiquidation"), None)
     if netliq and mon["start_netliq"]:
-        parts.append(f"account NetLiq {netliq:,.0f} ({netliq - mon['start_netliq']:+,.0f} today)")
+        parts.append(f"account NetLiq {netliq:,.0f} ({netliq - mon['start_netliq']:+,.0f} today; "
+                     f"go-live scorecard finalizes it at tomorrow's first run)")
+    parts.append(f"peak margin ${mon.get('peak_margin') or 0:,.0f} of the ${GOLIVE_CAPITAL:,} plan")
     parts.append(f"0DTE legs left in account (incl. condors held to expiry): {fmt(actual_legs(ib, acct))}")
     msg = "DAY SUMMARY -- " + " | ".join(parts)
     log(msg)
@@ -288,6 +417,7 @@ def main():
         return
     mon = load_mon()
     t = NOW.time()
+    full = t >= FULL_FROM
 
     last = mon.get("last_run")
     if last and NOW - datetime.fromisoformat(last) > timedelta(minutes=15):
@@ -301,7 +431,8 @@ def main():
     try:
         ib.connect("127.0.0.1", 7497, clientId=random.randint(9000, 9999), timeout=15)
     except Exception as e:
-        alert_once(mon, f"tws_down:{NOW.hour}", f"cannot reach TWS on 7497 ({type(e).__name__}) -- traders are blind", True)
+        if full:  # before 09:50 TWS may simply not be logged in yet
+            alert_once(mon, f"tws_down:{NOW.hour}", f"cannot reach TWS on 7497 ({type(e).__name__}) -- traders are blind", True)
         save_mon(mon)
         return
     try:
@@ -310,14 +441,23 @@ def main():
             alert_once(mon, f"not_paper:{NOW.hour}",
                        f"TWS on 7497 is logged into {acct}, not paper -- monitor took no action", True)
             return
+        acct_vals = {r.tag: r.value for r in ib.accountSummary(acct)}
         if mon["start_netliq"] is None:
-            mon["start_netliq"] = next((float(r.value) for r in ib.accountSummary(acct)
-                                        if r.tag == "NetLiquidation"), None)
+            mon["start_netliq"] = float(acct_vals["NetLiquidation"]) if "NetLiquidation" in acct_vals else None
+            mon["start_late"] = t > dtime(10, 0)  # trading already under way: the day's start is inexact
+            finalize_scorecard(mon)
+        flatten_stock(ib, acct, mon)
+        if not full:
+            return
+        mon["peak_margin"] = max(mon.get("peak_margin") or 0.0, float(acct_vals.get("InitMarginReq") or 0))
 
         running = running_instances()
-        log(f"running instances: {sorted(running) or 'none'}")
+        enabled = enabled_instances()
+        log(f"running instances: {sorted(running) or 'none'}; enabled: {sorted(enabled) or 'none'}")
 
         for sym, base in INSTANCES.items():
+            if sym not in enabled and sym not in running:
+                continue  # switched off: its SafeStart task is disabled
             reason = pause_reason(base)
             evs = events_today(base)
             if sym in running:
@@ -363,7 +503,7 @@ def main():
             flatten(ib, acct, mon, running)
         if t >= SUMMARY_AT and not mon["summary_sent"]:
             mon["summary_sent"] = True
-            summary(ib, acct, mon)
+            summary(ib, acct, mon, enabled | running)
     except Exception as e:
         alert_once(mon, f"monitor_error:{type(e).__name__}:{NOW.hour}", f"monitor itself failed: {type(e).__name__}: {e}", True)
         raise

@@ -173,6 +173,87 @@ def test_entry_requotes_each_leg():
     C.get_quotes = fake_quotes
 
 
+def recording_ladder(calls):
+    return lambda ib, cfg, c, action, label, qty, b, a, m, **kw: calls.append((action, label, qty)) or (True, m)
+
+
+def test_near_money_closes_itm_short_beyond_dist():
+    # 2026-10-06: a short put $0.79 in the money was skipped by the old |spot - strike| rule and assigned
+    setup()
+    calls = []
+    C.place_leg_ladder = recording_ladder(calls)
+    pos = {"id": "x", "qty": 1, "strikes": {"short_put": 661, "long_put": 656, "short_call": 663, "long_call": 668}}
+    C.close_near_money_side(FakeIB(), CFG, "20260923", pos, 660.21, {"open": []}, False)
+    assert [(a, l) for a, l, _ in calls] == [("BUY", "close short put"), ("SELL", "close long put")], calls
+    assert pos["legs_closed"] == ["put"], "the call side ($2.79 out of the money) must stay open"
+
+
+def test_near_money_does_not_rebuy_shorts_ibkr_closed():
+    # 2026-10-06 15:42: IBKR bought back 6 of 7 short 779P; the 15:58 close then re-bought four,
+    # leaving the account long. Orders must be capped at what the account really holds.
+    setup()
+    calls = []
+    C.place_leg_ladder = recording_ladder(calls)
+    held = {(660.0, "P"): -1, (655.0, "P"): 7, (665.0, "C"): -7, (670.0, "C"): 7}
+    state = {"open": [], "closed": [], "realized": 0.0}
+    for i in range(7):
+        pos = {"id": f"p{i}", "qty": 1, "credit": 0.80,
+               "strikes": {"short_put": 660, "long_put": 655, "short_call": 665, "long_call": 670}}
+        state["open"].append(pos)
+        C.close_near_money_side(FakeIB(), CFG, "20260923", pos, 660.10, state, False, 0.25, held)
+    buys = [c for c in calls if c[0] == "BUY"]
+    sells = [c for c in calls if c[0] == "SELL"]
+    assert len(buys) == 1, f"only the one short IBKR left should be bought back: {calls}"
+    assert len(sells) == 7, f"every condor's put wing is still held and must be sold: {calls}"
+    assert held[(660.0, "P")] == 0 and held[(655.0, "P")] == 0, held
+    assert all(p["legs_closed"] == ["put"] for p in state["open"])
+
+
+def test_early_pass_closes_both_sides_and_books_position():
+    setup()
+    calls = []
+    C.place_leg_ladder = recording_ladder(calls)
+    pos = {"id": "n", "qty": 1, "credit": 0.90,
+           "strikes": {"short_put": 660, "long_put": 655, "short_call": 661, "long_call": 666}}
+    state = {"open": [pos], "closed": [], "realized": 0.0}
+    held = {(660.0, "P"): -1, (655.0, "P"): 1, (661.0, "C"): -1, (666.0, "C"): 1}
+    C.close_near_money_side(FakeIB(), CFG, "20260923", pos, 660.5, state, False, 1.0, held)
+    assert len(calls) == 4 and not state["open"], f"both shorts within $1: whole condor closes ({calls})"
+    assert state["closed"][0]["close_reason"] == "near-money close"
+    assert abs(state["realized"] - (0.90 - pos["closed_cost"]) * 100) < 1e-6
+
+
+def test_stop_after_early_pass_closes_only_remaining_side():
+    setup()
+    calls = []
+    C.close_condor_legs = REAL["close_condor_legs"]
+    C.condor_value = REAL["condor_value"]
+    C.place_leg_ladder = lambda ib, cfg, c, action, label, qty, b, a, m, **kw: calls.append(label) or (True, 0.50)
+    pos = {"id": "s", "qty": 1, "credit": 1.00, "stop_loss_usd": 50, "legs_closed": ["put"], "closed_cost": 0.30,
+           "strikes": {"short_put": 655, "long_put": 650, "short_call": 665, "long_call": 670}}
+    state = {"session": "t", "open": [pos], "closed": [], "realized": 0.0}
+    C.close_condor(FakeIB(), CFG, "20260923", pos, state, "stop 0.5x", False)
+    assert sorted(calls) == ["close long call", "close short call"], f"the closed put side must be left alone: {calls}"
+    # call side: bought at 0.50, sold at 0.50 -> 0.00; plus 0.30 already paid on the put side
+    assert not state["open"] and abs(state["closed"][0]["pnl"] - (1.00 - 0.30) * 100) < 1e-6
+
+
+def test_held_options_reads_the_account():
+    class P:
+        def __init__(self, sym, k, r, q, exp="20260923", sec="OPT"):
+            self.contract = type("Ct", (), {"secType": sec, "symbol": sym, "strike": k, "right": r,
+                                            "lastTradeDateOrContractMonth": exp})()
+            self.position = q
+
+    class IBP(FakeIB):
+        def positions(self):
+            return [P("SPY", 779, "P", -1), P("SPY", 779, "P", 4), P("SPY", 774, "P", 3),
+                    P("QQQ", 750, "P", -2), P("SPY", 779, "P", 9, exp="20260924"), P("SPY", 0, "", 100, sec="STK")]
+
+    held = C.held_options(IBP(), CFG, "20260923")
+    assert held == {(779.0, "P"): 3, (774.0, "P"): 3}, held
+
+
 def test_config_defaults_are_paper():
     cfg = C.DEFAULTS
     assert cfg["tws_port"] == 7497, "default port must be TWS PAPER"
