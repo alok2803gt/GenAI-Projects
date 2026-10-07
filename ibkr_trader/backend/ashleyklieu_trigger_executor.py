@@ -52,11 +52,12 @@ import asyncio
 import json
 import re
 import sys
+import time
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import requests
-from ib_insync import IB, Option, Stock
+from ib_insync import IB, ExecutionFilter, Index, Option, Stock
 
 sys.path.insert(0, ".")
 from alpaca_0dte_common import (
@@ -66,6 +67,7 @@ from alpaca_0dte_common import (
 )
 from ibkr_0dte_common import (
     ibkr_place_leg_with_ladder_async, ibkr_has_open_position, ibkr_get_last_closing_fill,
+    ibkr_place_leg_async, ibkr_price_ladder,
 )
 from macro_calendar import is_macro_day
 
@@ -75,6 +77,11 @@ ET = ZoneInfo("America/New_York")
 CHANNEL_ID = "1540614267152371752"
 TARGET_USERNAME = "ashleyklieu"
 DISCORD_POLL_EVERY_N_TICKS = 3   # entry loop ticks at 5s -> Discord checked ~every 15s
+WATCH_START_ET = (9, 0)          # start WATCHING Discord for her post at 9:00 ET (CEO, 2026-09-23:
+                                 # she posts "sometime before 9:30", so the watcher must be up before
+                                 # the open; parsing a post is harmless pre-market)
+EXEC_START_ET = (9, 30)          # but place NO orders before the real open -- options do not trade
+                                 # pre-market, so the entry/exit watch waits here until 9:30 ET
 WAIT_CUTOFF_ET = (13, 0)         # give up waiting for today's alert past 1:00 PM ET -- loosened
                                   # from 11:00 (CEO instruction 2026-08-27) after she posted her
                                   # daily setups at 12:20 PM ET that day, past the old cutoff,
@@ -93,12 +100,88 @@ FORCE_CLOSE_ET = (15, 55)        # real safety mechanism added 2026-09-07 (IBKR 
                                   # past close risks real auto-exercise (Monday SPY shares), not
                                   # just "expiring worthless" the way the old alert text implied.
 
+# Paper mode (CEO ask 2026-10-05, Windows laptop): the live account's TWS runs on the iMac,
+# so port 7496 is closed on the laptop. With PAPER_MODE_FILE present this connects to the
+# local paper TWS instead, and refuses to trade unless every managed account is paper
+# (DU...) -- the port alone says nothing about which login is behind it (2026-09-29: a live
+# login sat on 7497). That paper account also runs condor_v2, whose monitor sells legs it
+# doesn't track at 15:50, so paper mode force-closes at 15:45. Read once at start: restart
+# the process to switch modes. Without the file nothing changes (live, port 7496).
+PAPER_MODE_FILE = "ashleyklieu_paper_mode.json"
+
+
+def trading_mode() -> dict:
+    try:
+        with open(PAPER_MODE_FILE) as f:
+            cfg = json.load(f)
+        return {"paper": True, "port": int(cfg.get("port", 7497)),
+                "spx_mirror": bool(cfg.get("spx_mirror", False)), "spx_qty": int(cfg.get("spx_qty", 1))}
+    except FileNotFoundError:
+        return {"paper": False, "port": 7496, "spx_mirror": False, "spx_qty": 0}
+    except (json.JSONDecodeError, ValueError, TypeError, AttributeError):
+        # a garbled flag file still means paper, without the SPX mirror
+        return {"paper": True, "port": 7497, "spx_mirror": False, "spx_qty": 0}
+
+
+MODE = trading_mode()
+TAG = "[PAPER] " if MODE["paper"] else ""
+if MODE["paper"]:
+    FORCE_CLOSE_ET = (15, 45)
+
+# SPX mirror (CEO ask 2026-10-05, paper only, "spx_mirror": true in PAPER_MODE_FILE): every SPY
+# setup that triggers is also bought as its SPXW 0DTE twin -- same signal, same moment, same
+# exits. SPX is ~10x SPY but not exactly (10.037 on 2026-10-05, SPY's dividend drag), so the
+# twin's strike is the SPY strike x the live SPX/SPY ratio on SPX's 5-point grid. One SPXW
+# contract carries ~10x the exposure of one SPY contract. SPXW is cash-settled (no exercise
+# risk at the close) and the condor monitor ignores it (it manages SPY/QQQ only). Open twins
+# persist in SPX_MIRROR_FILE so a restart keeps managing them.
+SPX_MIRROR_FILE = "ashleyklieu_spx_mirror_today.json"
+
+# LATE-ENTRY GUARD (added 2026-10-01 after a real loss). A new position opened
+# minutes before FORCE_CLOSE_ET has no time for the thesis to work -- it only
+# pays the spread twice plus two commissions. On 2026-09-30 the executor bought
+# the 764C at 15:54:44 and the forced close sold it at 15:55:05: a TWENTY-ONE
+# SECOND hold, 0.89 -> 0.66, -$24.78 realised, of which $1.78 was commission.
+# There was never a path to a profit.
+#
+# Expressed as minutes BEFORE the force close rather than an absolute clock
+# time, so changing FORCE_CLOSE_ET cannot leave this guard stranded at a stale
+# hour. 25 minutes is the CEO's call (2026-10-01), i.e. no new entries after
+# 15:30 while the force close is 15:55.
+MIN_MINUTES_BEFORE_FORCE_CLOSE = 25
+
 # Same pattern as ashleyklieu_alert_monitor.py -- reused verbatim so both
 # scripts parse her messages identically.
 ENTRY_PATTERN = re.compile(
     r"(\d+(?:\.\d+)?)\s*([CP])\b[^0-9]{0,15}Entry:?\s*(\d+(?:\.\d+)?)\s*(?:to|-)\s*(\d+(?:\.\d+)?)",
     re.IGNORECASE,
 )
+
+# REAL INCIDENT 2026-09-29: she took profit on 765C at 10:51 ("765 TP"), then
+# at 10:52 marked the level done by STRIKING IT THROUGH in a NEW message
+# (~~765 C | Entry: 764.2 - 764.5 ~~), and at 11:06 posted "Next two levels in
+# play are here". This executor only re-parses EDITS to the original daily
+# alert, so it never learned the level was retired -- and at 11:00:52 it bought
+# the 765C into a setup she had closed nine minutes earlier. The exit logic
+# could not save it either: at 10:51 there was no open position, so her "765 TP"
+# was correctly ignored. Retirement has to be handled on the ENTRY side.
+#
+# Discord strikethrough is ~~text~~. Any setup named inside a struck-through
+# span is treated as retired for the rest of the day.
+STRIKETHROUGH_RE = re.compile(r"~~(.+?)~~", re.DOTALL)
+
+
+def retired_setups_from(content: str, setups: list[dict]) -> set:
+    """Names of setups Ashley has struck through in this message."""
+    out = set()
+    for span in STRIKETHROUGH_RE.findall(content or ""):
+        for m in ENTRY_PATTERN.finditer(span):
+            strike, right = m.group(1), m.group(2).upper()
+            for s in setups:
+                if abs(float(s["strike"]) - float(strike)) < 1e-6 and s["right"] == right:
+                    out.add(s["name"])
+    return out
+
 
 EXIT_PHRASES = [
     "took profit", "take profit", "tp hit", "closed my", "closed the",
@@ -213,7 +296,10 @@ def reconcile_open_positions(ib, setups: list[dict], contracts: dict) -> dict:
     specifically the first time it actually matters.
     """
     try:
-        real_positions = {p.contract.conId: p for p in ib.positions() if p.position != 0}
+        # Longs only: this script never sells to open, so a short on the same contract is never
+        # ours (2026-10-05: a condor's short 772P on the shared paper account was restored as
+        # ours, and the "close" sold another one).
+        real_positions = {p.contract.conId: p for p in ib.positions() if p.position > 0}
     except Exception as exc:
         print(f"reconcile_open_positions: could not fetch real IBKR positions: {exc}")
         return {}
@@ -243,7 +329,7 @@ def telegram(msg, high_priority=True):
         prefix = "\U0001F6A8 " if high_priority else "\U0001F4E1 "
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT, "text": prefix + msg, "parse_mode": "HTML"},
+            json={"chat_id": TELEGRAM_CHAT, "text": prefix + TAG + msg, "parse_mode": "HTML"},
             timeout=8,
         )
     except Exception as e:
@@ -255,7 +341,7 @@ def oversight_log(summary, rationale, outcome=None):
         "time": datetime.now(ET).isoformat(),
         "actor": "trader",
         "category": "ashleyklieu_trigger_executor",
-        "summary": summary,
+        "summary": TAG + summary,
         "rationale": rationale,
         "outcome": outcome,
         "pnl_impact": None,
@@ -318,6 +404,40 @@ def msg_date_et(m: dict):
         return None
 
 
+def msg_time_et(m: dict):
+    """Real Discord message time, in ET (see msg_date_et)."""
+    ts = m.get("timestamp")
+    try:
+        return datetime.fromisoformat(ts).astimezone(ET) if ts else None
+    except Exception:
+        return None
+
+
+def opened_before(positions: dict, msg_t) -> dict:
+    """The positions a message posted at msg_t can be an exit for: those opened before it.
+    A position with no known open time (or a message with no time) is kept."""
+    return {k: v for k, v in positions.items()
+            if not (msg_t and v.get("opened_at")) or msg_t >= datetime.fromisoformat(v["opened_at"])}
+
+
+async def own_net_longs(ib) -> dict:
+    """{conId: (contracts still held from this script's own fills today, last buy time)}, from
+    IBKR's executions for clientId 994 -- so another strategy's leg on the same contract can
+    never be mistaken for one of ours."""
+    out = {}
+    for f in await ib.reqExecutionsAsync(ExecutionFilter(clientId=994)):
+        t = f.time.astimezone(ET)
+        if t.date() != date.today():
+            continue
+        q, last = out.get(f.contract.conId, (0.0, None))
+        if f.execution.side == "BOT":
+            q, last = q + f.execution.shares, max(last, t) if last else t
+        else:
+            q -= f.execution.shares
+        out[f.contract.conId] = (q, last)
+    return out
+
+
 def match_open_setup(content: str, open_positions: dict, setups: list):
     numbers = re.findall(r"\d+(?:\.\d+)?", content)
     for name in open_positions:
@@ -358,6 +478,38 @@ def fetch_message(headers, message_id: str) -> dict | None:
     except Exception as exc:
         print(f"fetch_message error for {message_id}: {exc}")
         return None
+
+
+def recover_todays_alert(headers, state, today_iso):
+    """Restart recovery for a mid-day restart. Real bug found 2026-09-18/20:
+    state["last_message_id"] is the alert's OWN id while the day's watch is
+    running, and wait_for_daily_setups() polls `after=last_message_id` -- so it
+    can never see today's already-consumed alert again. A restart mid-day (with
+    a position open) would sit there waiting for a NEW alert, never reach
+    run_daily_watch(), and so never reach reconcile_open_positions() -- the open
+    position would go unmonitored. Fix: main() persists the alert's id + parsed
+    setups + date when it first consumes it; here we re-fetch that exact message
+    by id (picks up an edit made while we were down), falling back to the cached
+    setups if Discord is unreachable. Returns (setups, edited_ts) or None if
+    there is nothing to recover for today."""
+    if state.get("alert_date") != today_iso or not state.get("alert_message_id"):
+        return None
+    cached = state.get("alert_setups") or []
+    msg = None
+    for attempt in range(4):
+        msg = fetch_message(headers, state["alert_message_id"])
+        if msg:
+            break
+        import time as _t
+        _t.sleep(5)
+    if msg:
+        fresh = setups_from_content((msg.get("content") or "").strip())
+        if fresh:
+            return fresh, msg.get("edited_timestamp")
+    if cached:
+        print("Restart recovery: could not re-fetch today's alert from Discord -- using the cached setups.")
+        return cached, state.get("alert_edited_ts")
+    return None
 
 
 def wait_for_daily_setups(headers, state):
@@ -469,7 +621,136 @@ async def close_position(ib, name, pos, setups, reason_text):
     return ok
 
 
+def to_spx_tick(px: float) -> float:
+    """Round to SPXW's minimum tick: $0.05 below $3, $0.10 from $3 up."""
+    t = 0.05 if px < 3 else 0.10
+    return round(round(px / t) * t, 2)
+
+
+def spx_strike_for(spy_strike: float, ratio: float) -> float:
+    return float(5 * round(spy_strike * ratio / 5))
+
+
+def load_spx_mirror() -> dict:
+    """Today's open SPX twins, {setup name: {...}} -- self-scoped to today like FIRED_STATE_FILE."""
+    try:
+        with open(SPX_MIRROR_FILE) as f:
+            d = json.load(f)
+        if d.get("date") == date.today().isoformat():
+            return d.get("open", {})
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+    return {}
+
+
+def save_spx_mirror(spx_open: dict) -> None:
+    with open(SPX_MIRROR_FILE, "w") as f:
+        json.dump({"date": date.today().isoformat(), "open": spx_open}, f, indent=2)
+
+
+async def spx_ladder(ib, c, action, label, qty):
+    """The SPY ladder's favorable -> mid -> aggressive steps on SPXW ticks, but RE-QUOTED before
+    every step: one snapshot for all three steps is what let the 2026-10-05 SPY exit miss a
+    falling put entirely (bid $1.11 at her TP, sold at $0.70 after a restart)."""
+    for step in range(3):
+        td = ib.reqMktData(c, "", False, False)
+        await asyncio.sleep(3)
+        bid = td.bid if td.bid and td.bid > 0 else None
+        ask = td.ask if td.ask and td.ask > 0 else None
+        ib.cancelMktData(c)
+        mid = (bid + ask) / 2 if bid and ask else None
+        px = to_spx_tick(ibkr_price_ladder(action, bid, ask, mid)[step])
+        ok, fill_px = await ibkr_place_leg_async(ib, c, action, px, f"{label} step {step + 1}", qty)
+        if ok:
+            return True, fill_px
+    return False, None
+
+
+async def spx_mirror_enter(ib, s, spy_spot, spx_open):
+    """Buy the SPXW twin of SPY setup s. Never raises: the SPY trade must not depend on it."""
+    name = s["name"]
+    try:
+        idx = Index("SPX", "CBOE", "USD")
+        await ib.qualifyContractsAsync(idx)
+        td = ib.reqMktData(idx, "", False, False)
+        await asyncio.sleep(2)
+        spx_spot = td.last if td.last and td.last == td.last else td.close
+        ib.cancelMktData(idx)
+        if not (spx_spot and spx_spot == spx_spot and spy_spot):
+            raise RuntimeError("no SPX index quote")
+        ratio = spx_spot / spy_spot
+        strike = spx_strike_for(s["strike"], ratio)
+        c = Option("SPX", date.today().strftime("%Y%m%d"), strike, s["right"], "SMART", tradingClass="SPXW")
+        await ib.qualifyContractsAsync(c)
+        if not c.conId:
+            raise RuntimeError(f"SPXW {strike:g}{s['right']} did not qualify")
+        qty = MODE["spx_qty"]
+        ok, fill_px = await spx_ladder(ib, c, "BUY", f"spx twin {name}", qty)
+        if ok:
+            spx_open[name] = {"conId": c.conId, "strike": strike, "right": s["right"], "qty": qty,
+                              "fill_px": fill_px, "ratio": round(ratio, 4),
+                              "opened_at": datetime.now(ET).isoformat()}
+            save_spx_mirror(spx_open)
+            msg = (f"SPX twin FILLED: bought {qty}x SPXW {strike:g}{s['right']} @ ${fill_px} "
+                   f"(twin of SPY {name}; SPX {spx_spot:.2f} / SPY {spy_spot} = {ratio:.4f}).")
+        else:
+            msg = f"SPX twin of {name}: SPXW {strike:g}{s['right']} BUY did NOT fill -- no twin for this setup."
+        print(msg)
+        telegram(msg, high_priority=False)
+        oversight_log(msg, "SPX twin of an Ashley SPY trigger (paper).",
+                      outcome=f"filled @ {fill_px}" if ok else "not_filled")
+    except Exception as exc:
+        print(f"SPX twin of {name}: entry failed (SPY trade unaffected): {exc}")
+        telegram(f"SPX twin of {name}: entry failed (SPY trade unaffected): {exc}", high_priority=False)
+
+
+async def spx_mirror_exit(ib, name, spx_open, reason):
+    """Sell the SPX twin of setup `name`. A twin that doesn't fill stays in spx_open, so the next
+    exit trigger or the forced close tries again (the SPY path forgets a failed close)."""
+    pos = spx_open.get(name)
+    if not pos:
+        return
+    try:
+        c = Option("SPX", date.today().strftime("%Y%m%d"), pos["strike"], pos["right"], "SMART",
+                   tradingClass="SPXW")
+        await ib.qualifyContractsAsync(c)
+        ok, fill_px = await spx_ladder(ib, c, "SELL", f"spx twin {name} exit", pos["qty"])
+        if ok:
+            spx_open.pop(name, None)
+            save_spx_mirror(spx_open)
+            pnl = round((fill_px - pos["fill_px"]) * 100 * pos["qty"], 2)
+            msg = (f"SPX twin exit FILLED: sold {pos['qty']}x SPXW {pos['strike']:g}{pos['right']} @ ${fill_px} "
+                   f"(bought @ ${pos['fill_px']}, pnl=${pnl}). Trigger: {reason}")
+        else:
+            msg = (f"SPX twin {name}: SELL of SPXW {pos['strike']:g}{pos['right']} did NOT fill -- "
+                   f"still open, will retry at the next exit trigger or the forced close.")
+        print(msg)
+        telegram(msg, high_priority=not ok)
+        oversight_log(msg, "SPX twin exit (paper).", outcome=f"closed @ {fill_px}" if ok else "not_filled")
+    except Exception as exc:
+        print(f"SPX twin {name}: exit failed: {exc}")
+        telegram(f"SPX twin {name}: exit failed: {exc} -- still open.", high_priority=True)
+
+
+def seconds_until(hh, mm, now=None):
+    """Seconds from `now` until hh:mm ET today (0 if already past)."""
+    now = now or datetime.now(ET)
+    target = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    return max((target - now).total_seconds(), 0.0)
+
+
 async def run_daily_watch(setups, headers, last_message_id, alert_message_id=None, alert_edited_ts=None):
+    # Her post can land before the open (watcher starts at WATCH_START_ET), but
+    # nothing tradable exists until 9:30 -- hold the entry/exit machinery here
+    # rather than connecting to IBKR and pricing options pre-market.
+    wait_s = seconds_until(*EXEC_START_ET)
+    if wait_s > 0:
+        msg = (f"Ashley setups parsed pre-market ({[s['name'] for s in setups]}); "
+               f"execution monitoring starts at {EXEC_START_ET[0]}:{EXEC_START_ET[1]:02d} ET "
+               f"(in {wait_s / 60:.0f} min).")
+        print(msg)
+        telegram(msg, high_priority=False)
+        await asyncio.sleep(wait_s)
     cfg = load_config()
     global TELEGRAM_TOKEN, TELEGRAM_CHAT
     TELEGRAM_TOKEN = cfg["telegram_token"]
@@ -479,7 +760,39 @@ async def run_daily_watch(setups, headers, last_message_id, alert_message_id=Non
     today_yymmdd = date.today().strftime("%y%m%d")
 
     ib = IB()
-    await ib.connectAsync("127.0.0.1", 7496, clientId=994, timeout=15)
+    # Retry the initial connect for up to 10 min -- real failure mode seen
+    # 2026-09-15: Ashley's Discord alert was found fine right at 9:30, but
+    # TWS's API port wasn't listening yet for a few minutes after market
+    # open, and this was the one connect() in the whole live-trading fleet
+    # with no retry around it. Day Trader / SPY Weekly Condor both already
+    # retry their own connect and recovered on their own that same morning;
+    # this brings Ashley in line. Safe to retry freely here specifically --
+    # nothing below this point has run yet, so a retry can't double an order.
+    _connect_deadline = time.monotonic() + 600
+    while True:
+        try:
+            await ib.connectAsync("127.0.0.1", MODE["port"], clientId=994, timeout=15)
+            break
+        except Exception as exc:
+            if time.monotonic() >= _connect_deadline:
+                raise
+            print(f"IBKR connect failed, retrying: {exc}")
+            await asyncio.sleep(15)
+    accounts = ib.managedAccounts()
+    if MODE["paper"] and (not accounts or not all(a.startswith("DU") for a in accounts)):
+        ib.disconnect()
+        raise RuntimeError(f"paper mode, but port {MODE['port']} is logged into {accounts} -- "
+                           f"refusing to trade a non-paper account")
+
+    # Per-execution commission capture (added 2026-09-28). The 0DTE legs here
+    # are the account's most fee-heavy: ~$0.90 per leg on ~$120 of premium is
+    # roughly a 1.6% round-trip handicap, which only shows up if it is recorded.
+    try:
+        import commission_ledger
+        commission_ledger.attach(ib, strategy="ashley_0dte")
+        await commission_ledger.snapshot_async(ib, strategy="ashley_0dte")
+    except Exception as exc:
+        print(f"commission_ledger setup failed (non-fatal): {exc}")
 
     spy = Stock("SPY", "SMART", "USD")
     await ib.qualifyContractsAsync(spy)
@@ -494,7 +807,7 @@ async def run_daily_watch(setups, headers, last_message_id, alert_message_id=Non
     today_qty = contracts_for_today()
     print(f"Daily watch started {datetime.now(ET)}. Setups: {[s['name'] for s in setups]}. Qty/setup: {today_qty}")
     telegram(
-        "Ashley-trigger daily watcher LIVE: "
+        f"Ashley-trigger daily watcher {','.join(accounts) if MODE['paper'] else 'LIVE'}: "
         + ", ".join(f"{s['name']} @ SPY {s['lo']}-{s['hi']}" for s in setups)
         + f". Real IBKR orders (ladder-filled) on entry trigger AND on her exit messages. "
         + f"Qty/setup today: {today_qty}" + (" (one-day override)" if today_qty != 1 else ""),
@@ -514,11 +827,39 @@ async def run_daily_watch(setups, headers, last_message_id, alert_message_id=Non
     # it with its real qty/avg cost so exit monitoring resumes correctly.
     fired = load_fired_today()
     open_positions = reconcile_open_positions(ib, setups, contracts)
+    if MODE["paper"]:
+        # Shared paper account: condor legs sit on the same contracts, so restore only what this
+        # script's own fills say it still holds, stamped with when it bought (the stale-exit
+        # guard needs that). 2026-10-05: the earlier "setup fired today" filter restored a
+        # condor's short 772P as ours, and the replayed "770 TP" sold another one.
+        try:
+            own = await own_net_longs(ib)
+        except Exception as exc:
+            own = {}
+            telegram(f"Restart recovery could not read this script's own fills ({exc}) -- "
+                     f"restoring nothing; check the paper account for Ashley positions.")
+        kept = {}
+        for k, v in open_positions.items():
+            q, last = own.get(contracts[k].conId, (0.0, None))
+            if q > 0:
+                kept[k] = dict(v, qty=min(v["qty"], int(q)), opened_at=last.isoformat())
+        open_positions = kept
+    # SPX twins this script bought today, kept only if IBKR still really holds them.
+    spx_open = load_spx_mirror() if MODE["spx_mirror"] else {}
+    if spx_open:
+        held = {p.contract.conId for p in ib.positions() if p.position > 0}
+        spx_open = {k: v for k, v in spx_open.items() if v["conId"] in held}
+        save_spx_mirror(spx_open)
+    # names already reported as too-late-to-enter, so the Telegram fires once
+    # per setup rather than on every 5-second tick (see
+    # MIN_MINUTES_BEFORE_FORCE_CLOSE).
+    _late_skips: set = set()
     fired |= set(open_positions.keys())  # a real open position is definitely "fired"
     if fired or open_positions:
         save_fired_today(fired)
         txt = (f"Ashley-trigger restart recovery: already-fired today = {sorted(fired) or 'none'}, "
-               f"real open positions restored = {sorted(open_positions.keys()) or 'none'}.")
+               f"real open positions restored = {sorted(open_positions.keys()) or 'none'}."
+               + (f" SPX twins restored = {sorted(spx_open) or 'none'}." if MODE["spx_mirror"] else ""))
         print(txt)
         telegram(txt, high_priority=False)
         oversight_log(txt, "Restart recovery from persisted fired-state + real IBKR reconciliation.")
@@ -532,7 +873,7 @@ async def run_daily_watch(setups, headers, last_message_id, alert_message_id=Non
             # Real forced-close safety window (see FORCE_CLOSE_ET comment) --
             # runs once, while the market is still open, before the
             # alert-only post-close check below even has a chance to matter.
-            if (is_market_hours(now) and open_positions and not force_close_attempted
+            if (is_market_hours(now) and (open_positions or spx_open) and not force_close_attempted
                     and (now.hour, now.minute) >= FORCE_CLOSE_ET):
                 force_close_attempted = True
                 for name, pos in list(open_positions.items()):
@@ -569,6 +910,9 @@ async def run_daily_watch(setups, headers, last_message_id, alert_message_id=Non
                         print(msg)
                         telegram(msg, high_priority=True)
                         oversight_log(msg, "Forced pre-close safety exit failed to fill.", outcome="not_filled")
+                for name in list(spx_open):
+                    await spx_mirror_exit(ib, name, spx_open, f"no exit signal by {FORCE_CLOSE_ET[0]}:"
+                                                              f"{FORCE_CLOSE_ET[1]:02d} ET -- forced close")
 
             if not is_market_hours(now):
                 if open_positions:
@@ -629,9 +973,14 @@ async def run_daily_watch(setups, headers, last_message_id, alert_message_id=Non
                 else:
                     telegram("Ashley-trigger daily watcher stopping: market closed, no open positions.",
                               high_priority=False)
+                if spx_open:
+                    telegram("SPX twin(s) still OPEN at the close: "
+                             + ", ".join(f"SPXW {v['strike']:g}{v['right']}" for v in spx_open.values())
+                             + " -- cash-settled, they settle at intrinsic value (no exercise risk).",
+                             high_priority=False)
                 print("Outside market hours -- stopping today's watch.")
                 break
-            if len(fired) == len(setups) and not open_positions:
+            if len(fired) == len(setups) and not open_positions and not spx_open:
                 print("All setups fired and closed -- stopping today's watch early.")
                 break
 
@@ -641,6 +990,27 @@ async def run_daily_watch(setups, headers, last_message_id, alert_message_id=Non
                     if s["name"] in fired:
                         continue
                     if s["lo"] <= spot <= s["hi"]:
+                        # Too late to open anything new? See
+                        # MIN_MINUTES_BEFORE_FORCE_CLOSE above.
+                        _fc = now.replace(hour=FORCE_CLOSE_ET[0], minute=FORCE_CLOSE_ET[1],
+                                          second=0, microsecond=0)
+                        _mins_left = (_fc - now).total_seconds() / 60
+                        if _mins_left < MIN_MINUTES_BEFORE_FORCE_CLOSE:
+                            if s["name"] not in _late_skips:
+                                _late_skips.add(s["name"])
+                                txt = (f"Ashley {s['name']}: zone hit at {now:%H:%M} ET but only "
+                                       f"{_mins_left:.0f} min to the {FORCE_CLOSE_ET[0]}:"
+                                       f"{FORCE_CLOSE_ET[1]:02d} forced close "
+                                       f"(need {MIN_MINUTES_BEFORE_FORCE_CLOSE}) -- NOT entering.")
+                                print(txt)
+                                telegram(txt)
+                                oversight_log(txt,
+                                              "A position opened this close to the forced close "
+                                              "cannot work; it only pays the spread and two "
+                                              "commissions (real case 2026-09-30: 21-second hold, "
+                                              "-$24.78).",
+                                              outcome="skipped_late_entry")
+                            continue
                         print(f"TRIGGER: {s['name']} -- SPY {spot} in zone [{s['lo']}, {s['hi']}]")
                         c = contracts[s["name"]]
                         td = ib.reqMktData(c, "", False, False)
@@ -668,13 +1038,17 @@ async def run_daily_watch(setups, headers, last_message_id, alert_message_id=Non
                             continue
 
                         sym = occ_symbol(s["strike"], s["right"], today_yymmdd)
+                        # The SPX twin runs alongside the SPY ladder, never in its way.
+                        spx_task = (asyncio.create_task(spx_mirror_enter(ib, s, spot, spx_open))
+                                    if MODE["spx_mirror"] else None)
                         ok, fill_px = await ibkr_place_leg_with_ladder_async(
                             ib, c, "BUY", f"ashley {s['name']}", qty, bid, ask, mid)
 
                         fired.add(s["name"])
                         save_fired_today(fired)
                         if ok:
-                            pos_id = f"ASHLEY_{s['name']}_{now.strftime('%Y%m%d_%H%M%S')}"
+                            # Paper trades stay out of the live position registry.
+                            pos_id = None if MODE["paper"] else f"ASHLEY_{s['name']}_{now.strftime('%Y%m%d_%H%M%S')}"
                             open_positions[s["name"]] = {
                                 "symbol": sym, "fill_px": fill_px, "qty": qty,
                                 "opened_at": now.isoformat(), "pos_id": pos_id,
@@ -689,17 +1063,18 @@ async def run_daily_watch(setups, headers, last_message_id, alert_message_id=Non
                             # here it's just recorded, for context if this trade underperforms.
                             macro_skip, macro_reason = is_macro_day()
                             macro_note = f" CAUTION: real {macro_reason} day." if macro_skip else ""
-                            try:
-                                registry_register_position(
-                                    pos_id, "SPY", "ashley_signal",
-                                    [{"leg": "long", "strike": s["strike"], "symbol": sym,
-                                      "fill": fill_px, "qty": qty}],
-                                    -fill_px, qty, round(fill_px * 100 * qty, 2), None, "15:45",
-                                    now.isoformat(),
-                                    notes=f"Ashley signal-follow, zone [{s['lo']},{s['hi']}], SPY spot {spot} at entry.{macro_note}",
-                                )
-                            except Exception as exc:
-                                print(f"registry_register_position failed (non-fatal): {exc}")
+                            if pos_id:
+                                try:
+                                    registry_register_position(
+                                        pos_id, "SPY", "ashley_signal",
+                                        [{"leg": "long", "strike": s["strike"], "symbol": sym,
+                                          "fill": fill_px, "qty": qty}],
+                                        -fill_px, qty, round(fill_px * 100 * qty, 2), None, "15:45",
+                                        now.isoformat(),
+                                        notes=f"Ashley signal-follow, zone [{s['lo']},{s['hi']}], SPY spot {spot} at entry.{macro_note}",
+                                    )
+                                except Exception as exc:
+                                    print(f"registry_register_position failed (non-fatal): {exc}")
                             msg = (f"Ashley trigger FILLED: bought {qty}x {s['name']} @ ${fill_px} "
                                    f"(SPY {spot}, zone [{s['lo']},{s['hi']}]). Now watching her "
                                    f"messages for the exit.{macro_note}")
@@ -714,6 +1089,8 @@ async def run_daily_watch(setups, headers, last_message_id, alert_message_id=Non
                             telegram(msg, high_priority=True)
                             oversight_log(msg, "Order placement attempted but not confirmed filled.",
                                           outcome="not_filled")
+                        if spx_task:
+                            await spx_task
 
             tick += 1
             # Real bug found 2026-08-30 (2026-08-28 postmortem): this used to
@@ -745,9 +1122,36 @@ async def run_daily_watch(setups, headers, last_message_id, alert_message_id=Non
                             if m.get("author", {}).get("username", "") != TARGET_USERNAME:
                                 continue
                             content = (m.get("content") or "").strip()
-                            if not content or not is_exit_signal(content):
+                            if not content:
                                 continue
-                            if not open_positions:
+
+                            # RETIREMENT (2026-09-29 incident, see STRIKETHROUGH_RE):
+                            # she marks a finished level by striking it through in a
+                            # NEW message, not by editing the daily alert. Retire it
+                            # here so the entry monitor can never buy into a level she
+                            # has already closed. Only affects setups not yet entered;
+                            # an open position is still managed by the exit logic.
+                            retired = retired_setups_from(content, setups)
+                            if retired:
+                                newly = {n for n in retired if n not in fired}
+                                if newly:
+                                    fired.update(newly)
+                                    save_fired_today(fired)
+                                    txt = (f"Ashley retired {', '.join(sorted(newly))} "
+                                           f"(struck through in her message) -- will NOT be entered.")
+                                    print(txt)
+                                    telegram(txt)
+                                    oversight_log(txt, "Setup retired by strikethrough.",
+                                                  outcome="retired_by_strikethrough")
+
+                            if not is_exit_signal(content):
+                                continue
+                            # SPY positions first, then any SPX twin whose SPY leg is
+                            # already gone. Same setup names; exactly open_positions
+                            # when the mirror is off.
+                            live = {**open_positions,
+                                    **{k: v for k, v in spx_open.items() if k not in open_positions}}
+                            if not live:
                                 # She's talking about a trade we never entered
                                 # (or already closed) -- not actionable, and
                                 # not worth escalating either.
@@ -760,29 +1164,40 @@ async def run_daily_watch(setups, headers, last_message_id, alert_message_id=Non
                                 # today.
                                 print(f"Ignoring stale exit signal from {msg_date} (not today): {content!r}")
                                 continue
+                            # A message older than a position can't be its exit. A restart
+                            # replays everything since the alert, and on 2026-10-05 that
+                            # replayed "770 TP" against a position opened later. Positions
+                            # with no known open time keep the old behavior.
+                            live = opened_before(live, msg_time_et(m))
+                            if not live:
+                                print(f"Ignoring exit signal older than every open position: {content!r}")
+                                continue
 
                             print(f"EXIT SIGNAL from Ashley: {content}")
-                            if len(open_positions) == 1:
-                                name = next(iter(open_positions))
+                            if len(live) == 1:
+                                name = next(iter(live))
                             else:
-                                name = match_open_setup(content, open_positions, setups)
+                                name = match_open_setup(content, live, setups)
                             if name is None:
                                 telegram(
-                                    f"Ashley posted an exit signal (\"{content}\") but {len(open_positions)} "
-                                    f"positions are open ({', '.join(open_positions.keys())}) and I can't tell "
+                                    f"Ashley posted an exit signal (\"{content}\") but {len(live)} "
+                                    f"positions are open ({', '.join(live.keys())}) and I can't tell "
                                     f"which one from her message -- NOT guessing. Close manually.",
                                     high_priority=True,
                                 )
                                 oversight_log(
-                                    f"Ambiguous exit signal with {len(open_positions)} open positions: \"{content}\"",
+                                    f"Ambiguous exit signal with {len(live)} open positions: \"{content}\"",
                                     "Multiple positions open, message didn't clearly identify which -- "
                                     "escalated instead of guessing.",
                                     outcome="escalated_ambiguous",
                                 )
                                 continue
 
-                            pos = open_positions.pop(name)
-                            await close_position(ib, name, pos, setups, content)
+                            if name in open_positions:
+                                pos = open_positions.pop(name)
+                                await close_position(ib, name, pos, setups, content)
+                            if name in spx_open:
+                                await spx_mirror_exit(ib, name, spx_open, f"\"{content}\"")
                 except Exception as exc:
                     print(f"Discord poll error: {exc}")
 
@@ -805,6 +1220,7 @@ async def run_daily_watch(setups, headers, last_message_id, alert_message_id=Non
                         if msg and msg.get("edited_timestamp") != alert_edited_ts:
                             alert_edited_ts = msg.get("edited_timestamp")
                             new_setups = setups_from_content(msg.get("content") or "")
+                            edit_changed_state = True
                             old_by_name = {s["name"]: s for s in setups}
                             new_by_name = {s["name"]: s for s in new_setups}
 
@@ -854,6 +1270,25 @@ async def run_daily_watch(setups, headers, last_message_id, alert_message_id=Non
                                         print(txt); telegram(txt, high_priority=False)
                                         oversight_log(txt, "Detected via message edited_timestamp change.",
                                                       outcome="setup_removed")
+
+                            # PERSIST the reconciled setups (fix 2026-09-25).
+                            # Real gap found live: Ashley edited her alert to add
+                            # 771P, this loop added it in MEMORY and traded it,
+                            # but the state file still held only the original
+                            # three setups. TWS drops most nights and launchd
+                            # restarts this process; a restart reloads from that
+                            # file, so the 771P would have returned UNKNOWN --
+                            # no exit monitoring on her message and, worse, no
+                            # 15:55 force-close on a physically settled 0DTE.
+                            try:
+                                st_now = load_state()
+                                st_now["alert_setups"] = setups
+                                st_now["alert_edited_ts"] = alert_edited_ts
+                                save_state(st_now)
+                                print(f"state persisted after edit: {[x['name'] for x in setups]}")
+                            except Exception as exc:
+                                telegram(f"WARNING: could not persist edited setups ({exc}) -- a restart "
+                                         f"may lose track of them.", high_priority=True)
                     except Exception as exc:
                         print(f"Edit-check error: {exc}")
 
@@ -863,6 +1298,13 @@ async def run_daily_watch(setups, headers, last_message_id, alert_message_id=Non
             ib.cancelMktData(spy)
         except Exception:
             pass
+        # Final account-wide commission catch-up for the session. This runs
+        # after the 15:55 force-close, so the day's closing fees are included.
+        try:
+            import commission_ledger
+            await commission_ledger.snapshot_async(ib, strategy="ashley_0dte")
+        except Exception as exc:
+            print(f"commission_ledger snapshot failed (non-fatal): {exc}")
         ib.disconnect()
 
     return last_message_id
@@ -900,15 +1342,28 @@ async def main():
             await asyncio.sleep(DAY_POLL_S * 20)
             continue
 
-        if now < now.replace(hour=9, minute=30, second=0, microsecond=0):
+        if now < now.replace(hour=WATCH_START_ET[0], minute=WATCH_START_ET[1], second=0, microsecond=0):
             await asyncio.sleep(DAY_POLL_S)
             continue
 
         print(f"New trading day {today_iso} -- waiting for ashleyklieu's daily alert...")
-        setups, last_message_id, alert_edited_ts = wait_for_daily_setups(headers, state)
-        alert_message_id = last_message_id  # see wait_for_daily_setups docstring -- same ID
-        state["last_message_id"] = last_message_id
-        save_state(state)
+        recovered = recover_todays_alert(headers, state, today_iso)
+        if recovered:
+            setups, alert_edited_ts = recovered
+            alert_message_id = state["alert_message_id"]
+            last_message_id = state.get("last_message_id")
+            print(f"Restart recovery: today's alert ({alert_message_id}) already consumed earlier -- "
+                  f"resuming watch with setups {[s['name'] for s in setups]}.")
+        else:
+            setups, last_message_id, alert_edited_ts = wait_for_daily_setups(headers, state)
+            alert_message_id = last_message_id  # see wait_for_daily_setups docstring -- same ID
+            state["last_message_id"] = last_message_id
+            if setups:
+                # Persist what a restart needs to resume today's watch -- see
+                # recover_todays_alert().
+                state.update({"alert_date": today_iso, "alert_message_id": alert_message_id,
+                              "alert_setups": setups, "alert_edited_ts": alert_edited_ts})
+            save_state(state)
 
         if not setups:
             msg = f"Ashley-trigger daily watcher: no setups posted by {WAIT_CUTOFF_ET[0]}:{WAIT_CUTOFF_ET[1]:02d} ET today -- skipping {today_iso}."

@@ -112,6 +112,9 @@ condor_v2/condor_v2_console.log
 condor_v2/golive_scorecard.jsonl
 ibkr_trader/backend/ashleyklieu_contracts_override.json
 ibkr_trader/backend/ashleyklieu_fired_today.json
+# per-machine: the paper flag must never reach the iMac's live executor
+ibkr_trader/backend/ashleyklieu_paper_mode.json
+ibkr_trader/backend/ashleyklieu_spx_mirror_today.json
 ibkr_trader/backend/total_risk_budget_override.json
 ibkr_trader/backend/daytrader_premarket_shortlist.json
 ibkr_trader/backend/spy_0dte_gex_raw.json
