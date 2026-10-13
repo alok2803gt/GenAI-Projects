@@ -5,17 +5,35 @@ battery fast -- and when the laptop sleeps, all of them freeze with positions un
 (2026-10-02: unplugged ~11:00, slept 12:47-17:06, 0DTE condors expired unmonitored).
 
 So: alert the minute it goes on battery, then repeat -- every 5 min above 50%, every 2 min
-from 20-50%, every minute below 20% -- and confirm when AC power is back. Stdlib only.
+from 20-50%, every minute below 20% -- and confirm when AC power is back.
+
+It also reports sleep it could not prevent: a run more than GAP_MIN after the last one means the
+laptop was asleep or off, and if that overlapped market hours it says so once, on waking
+(2026-10-07: Modern Standby on AC from 15:15 to 21:53, nothing ran through the close). Stdlib only.
 """
 import ctypes
 import json
 import urllib.request
-from datetime import datetime
+from datetime import datetime, time as dtime, timedelta
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 STATE = HERE / "battery_watch_state.json"
 LOG = HERE / "battery_watch.log"
+GAP_MIN = 5  # the task runs every minute; a longer silence means asleep or off
+
+
+def market_minutes(start, end):
+    """Minutes of [start, end] inside US market hours (weekdays 09:30-16:00; this laptop runs on ET)."""
+    total, day = 0.0, start.date()
+    while day <= end.date():
+        if day.weekday() < 5:
+            lo = max(start, datetime.combine(day, dtime(9, 30)))
+            hi = min(end, datetime.combine(day, dtime(16, 0)))
+            if hi > lo:
+                total += (hi - lo).total_seconds() / 60
+        day += timedelta(days=1)
+    return total
 
 
 class SYSTEM_POWER_STATUS(ctypes.Structure):
@@ -54,6 +72,13 @@ def main():
     on_battery, pct = p
     now = datetime.now()
     prev = json.loads(STATE.read_text()) if STATE.exists() else {}
+    seen = datetime.fromisoformat(prev["seen"]) if prev.get("seen") else None
+    if seen and (now - seen).total_seconds() > GAP_MIN * 60:
+        lost = market_minutes(seen, now)
+        if lost > 0:
+            send(f"[HIGH] POWER: the laptop was asleep or off from {seen:%a %H:%M} to {now:%a %H:%M} -- "
+                 f"{lost:.0f} min of market hours with every trader, monitor and TWS frozen. "
+                 f"Check positions and the day's P&L.")
     if on_battery:
         since = datetime.fromisoformat(prev["since"]) if prev.get("on_battery") else now
         last = datetime.fromisoformat(prev["last_alert"]) if prev.get("on_battery") and prev.get("last_alert") else None
@@ -65,12 +90,12 @@ def main():
                  f"Repeating every {every} min until AC is back.")
             last = now
         STATE.write_text(json.dumps({"on_battery": True, "since": since.isoformat(),
-                                     "last_alert": last.isoformat(), "pct": pct}))
+                                     "last_alert": last.isoformat(), "pct": pct, "seen": now.isoformat()}))
     else:
         if prev.get("on_battery"):
             mins = int((now - datetime.fromisoformat(prev["since"])).total_seconds() // 60)
             send(f"POWER: back on AC ({pct}%) after {mins} min on battery.")
-        STATE.write_text(json.dumps({"on_battery": False, "pct": pct}))
+        STATE.write_text(json.dumps({"on_battery": False, "pct": pct, "seen": now.isoformat()}))
 
 
 if __name__ == "__main__":

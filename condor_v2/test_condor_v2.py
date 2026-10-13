@@ -87,7 +87,7 @@ def test_entry_records_slot_and_stop():
     C.enter(FakeIB(), CFG, "20260923", state, False, "10:01")
     pos = state["open"][0]
     assert pos["slot"] == "10:01", "scheduled slot must be stored for restart safety"
-    assert abs(pos["stop_loss_usd"] - 0.5 * pos["credit"] * 100) < 1e-9, "stop must be 0.5x credit"
+    assert abs(pos["stop_loss_usd"] - 1.0 * pos["credit"] * 100) < 1e-9, "stop must be 1x credit (2026-10-13)"
 
 
 def test_stop_closes_and_books_pnl():
@@ -185,28 +185,99 @@ def test_near_money_closes_itm_short_beyond_dist():
     pos = {"id": "x", "qty": 1, "strikes": {"short_put": 661, "long_put": 656, "short_call": 663, "long_call": 668}}
     C.close_near_money_side(FakeIB(), CFG, "20260923", pos, 660.21, {"open": []}, False)
     assert [(a, l) for a, l, _ in calls] == [("BUY", "close short put"), ("SELL", "close long put")], calls
-    assert pos["legs_closed"] == ["put"], "the call side ($2.79 out of the money) must stay open"
+    assert set(pos["legs_gone"]) == {"short_put", "long_put"}, "the call side ($2.79 out of the money) must stay open"
 
 
-def test_near_money_does_not_rebuy_shorts_ibkr_closed():
+def seven_condors():
+    return {"open": [{"id": f"p{i}", "qty": 1, "credit": 0.80,
+                      "strikes": {"short_put": 660, "long_put": 655, "short_call": 665, "long_call": 670}}
+                     for i in range(7)], "closed": [], "realized": 0.0}
+
+
+def test_reconcile_marks_shorts_ibkr_closed_and_pass_buys_only_the_rest():
     # 2026-10-06 15:42: IBKR bought back 6 of 7 short 779P; the 15:58 close then re-bought four,
-    # leaving the account long. Orders must be capped at what the account really holds.
+    # leaving the account long. Now the account is reconciled first and only the real short is bought.
+    setup()
+    calls, real_held = [], C.held_options
+    C.place_leg_ladder = recording_ladder(calls)
+    C.held_options = lambda ib, cfg, e: {(660.0, "P"): -1, (655.0, "P"): 7, (665.0, "C"): -7, (670.0, "C"): 7}
+    state = seven_condors()
+    C.reconcile_broker(FakeIB(), CFG, "20260923", state, False)
+    assert [a for a, _, _ in calls] == ["SELL"] * 6, f"no buys; six orphaned wings sold: {calls}"
+    assert sum("short_put" in p.get("legs_gone", []) for p in state["open"]) == 6
+    calls.clear()
+    for pos in list(state["open"]):
+        C.close_near_money_side(FakeIB(), CFG, "20260923", pos, 660.10, state, False, 0.25)
+    assert [a for a, _, _ in calls] == ["BUY", "SELL"], f"only the one real short is bought back: {calls}"
+    C.held_options = real_held
+
+
+def test_reconcile_ignores_a_wing_netting_another_short():
+    # condor B's put wing sits on condor A's short strike: the account nets them to zero there
+    setup()
+    calls, real_held = [], C.held_options
+    C.place_leg_ladder = recording_ladder(calls)
+    a = {"id": "a", "qty": 1, "credit": 0.8, "strikes": {"short_put": 660, "long_put": 655, "short_call": 668, "long_call": 673}}
+    b = {"id": "b", "qty": 1, "credit": 0.8, "strikes": {"short_put": 665, "long_put": 660, "short_call": 670, "long_call": 675}}
+    state = {"open": [a, b], "closed": [], "realized": 0.0}
+    C.held_options = lambda ib, cfg, e: {(655.0, "P"): 1, (665.0, "P"): -1, (668.0, "C"): -1, (673.0, "C"): 1,
+                                         (670.0, "C"): -1, (675.0, "C"): 1}  # 660P nets to 0: A short + B wing
+    C.reconcile_broker(FakeIB(), CFG, "20260923", state, False)
+    assert not calls and not any(p.get("legs_gone") for p in state["open"]), calls
+    C.held_options = real_held
+
+
+def test_reconcile_finishes_a_stop_close_ibkr_interrupted():
+    setup()
+    calls, real_held = [], C.held_options
+    C.close_condor_legs = REAL["close_condor_legs"]
+    C.condor_value = REAL["condor_value"]
+    C.place_leg_ladder = lambda ib, cfg, c, action, label, qty, b, a, m, **kw: calls.append((action, label)) or (True, 0.40)
+    pos = {"id": "s", "qty": 1, "credit": 1.0, "stop_loss_usd": 50, "close_reason": "stop 0.5x",
+           "close_fills": {"short_call": 0.9, "long_call": 0.1},
+           "strikes": {"short_put": 655, "long_put": 650, "short_call": 665, "long_call": 670}}
+    state = {"session": "t", "open": [pos], "closed": [], "realized": 0.0}
+    C.held_options = lambda ib, cfg, e: {(650.0, "P"): 1}  # IBKR bought the 655P back mid stop-close
+    C.reconcile_broker(FakeIB(), CFG, "20260923", state, False)
+    assert "short_put" in pos["close_fills"] and not calls
+    C.close_condor(FakeIB(), CFG, "20260923", pos, state, "stop 0.5x", False)
+    assert calls == [("SELL", "close long put")], f"the short must not be bought again: {calls}"
+    assert not state["open"] and state["closed"][0]["close_reason"] == "stop 0.5x"
+    C.held_options = real_held
+
+
+def test_stop_buys_the_threatened_short_first():
+    # 2026-10-08: the stop bought the cheap short call first while the short put ran away
     setup()
     calls = []
-    C.place_leg_ladder = recording_ladder(calls)
-    held = {(660.0, "P"): -1, (655.0, "P"): 7, (665.0, "C"): -7, (670.0, "C"): 7}
-    state = {"open": [], "closed": [], "realized": 0.0}
-    for i in range(7):
-        pos = {"id": f"p{i}", "qty": 1, "credit": 0.80,
-               "strikes": {"short_put": 660, "long_put": 655, "short_call": 665, "long_call": 670}}
-        state["open"].append(pos)
-        C.close_near_money_side(FakeIB(), CFG, "20260923", pos, 660.10, state, False, 0.25, held)
-    buys = [c for c in calls if c[0] == "BUY"]
-    sells = [c for c in calls if c[0] == "SELL"]
-    assert len(buys) == 1, f"only the one short IBKR left should be bought back: {calls}"
-    assert len(sells) == 7, f"every condor's put wing is still held and must be sold: {calls}"
-    assert held[(660.0, "P")] == 0 and held[(655.0, "P")] == 0, held
-    assert all(p["legs_closed"] == ["put"] for p in state["open"])
+    C.place_leg_ladder = lambda ib, cfg, c, action, label, qty, b, a, m, **kw: calls.append(label) or (True, m)
+    limits = {"short_call": (0.09, 0.11, 0.10), "short_put": (1.48, 1.52, 1.50),
+              "long_call": (0.01, 0.02, 0.015), "long_put": (0.20, 0.22, 0.21)}
+    REAL["close_condor_legs"](FakeIB(), CFG, {n: object() for n in limits}, limits, 1)
+    assert calls[0] == "close short put", f"the dearer (threatened) short goes first: {calls}"
+
+
+def test_urgent_ladder_requotes_every_step_with_short_waits():
+    setup()
+    asks, placed = iter([1.20, 1.40]), []
+    real_leg = C.place_leg
+    C.get_quotes = lambda ib, cs: {"leg": (lambda a: {"bid": a - 0.02, "ask": a, "mid": a - 0.01})(next(asks))}
+    C.place_leg = lambda ib, cfg, c, action, px, label, qty, wait=None: placed.append((px, wait)) or (False, None)
+    ok, _ = REAL["place_leg_ladder"](FakeIB(), CFG, object(), "BUY", "close short put", 1, 1.00, 1.02, 1.01, urgent=True)
+    assert not ok and [p for p, _ in placed] == [1.04, 1.25, 1.75], f"fresh ask each step, last crosses 25%: {placed}"
+    assert all(w == CFG["urgent_fill_wait_seconds"] for _, w in placed), placed
+    C.place_leg, C.get_quotes = real_leg, fake_quotes
+
+
+def test_urgent_last_step_crosses_at_least_25_percent():
+    assert C.price_ladder("BUY", 0.98, 1.00, 0.99, urgent=True)[-1] == 1.25
+    assert C.price_ladder("SELL", 1.00, 1.02, 1.01, urgent=True)[-1] == 0.75
+    assert C.price_ladder("BUY", 0.18, 0.20, 0.19, urgent=True)[-1] == 0.30, "cheap legs still cross $0.10"
+
+
+def test_early_pass_is_off_by_default():
+    assert not C.DEFAULTS["near_money_early"], "IBKR's liquidation is reconciled, not pre-empted (2026-10-08)"
+    assert C.DEFAULTS["reconcile_from"] == "14:45"
 
 
 def test_early_pass_closes_both_sides_and_books_position():
@@ -216,8 +287,7 @@ def test_early_pass_closes_both_sides_and_books_position():
     pos = {"id": "n", "qty": 1, "credit": 0.90,
            "strikes": {"short_put": 660, "long_put": 655, "short_call": 661, "long_call": 666}}
     state = {"open": [pos], "closed": [], "realized": 0.0}
-    held = {(660.0, "P"): -1, (655.0, "P"): 1, (661.0, "C"): -1, (666.0, "C"): 1}
-    C.close_near_money_side(FakeIB(), CFG, "20260923", pos, 660.5, state, False, 1.0, held)
+    C.close_near_money_side(FakeIB(), CFG, "20260923", pos, 660.5, state, False, 1.0)
     assert len(calls) == 4 and not state["open"], f"both shorts within $1: whole condor closes ({calls})"
     assert state["closed"][0]["close_reason"] == "near-money close"
     assert abs(state["realized"] - (0.90 - pos["closed_cost"]) * 100) < 1e-6
@@ -254,10 +324,18 @@ def test_held_options_reads_the_account():
     assert held == {(779.0, "P"): 3, (774.0, "P"): 3}, held
 
 
+def test_quote_recorder_band_and_cap():
+    import quote_recorder as Q
+    keys = Q.wanted(777.4, band=10)
+    assert len(keys) == 42 and (767.0, "P") in keys and (787.0, "C") in keys and (766.0, "C") not in keys
+    kept = Q.trim(keys | Q.wanted(790.2, band=10), 790.2, 40)
+    assert len(kept) == 40 and (790.0, "C") in kept and (767.0, "P") not in kept, "the cap drops the strikes farthest from spot"
+
+
 def test_config_defaults_are_paper():
     cfg = C.DEFAULTS
     assert cfg["tws_port"] == 7497, "default port must be TWS PAPER"
-    assert cfg["qty"] == 1 and len(cfg["entry_times"]) == 10
+    assert cfg["qty"] == 1 and len(cfg["entry_times"]) == 8 and cfg["entry_times"][0] == "11:01"
 
 
 if __name__ == "__main__":

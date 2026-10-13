@@ -43,22 +43,26 @@ DEFAULTS = {
     "tws_host": "127.0.0.1",
     "tws_port": 7497,                 # 7497 TWS paper / 7496 TWS live / 4002 gateway paper
     "client_id": 1580,
-    "entry_times": ["10:01", "10:31", "11:01", "11:31", "12:01",
-                    "12:31", "13:01", "13:31", "14:01", "14:31"],
+    # 2026-10-13 (user call, from the 258-day replay): the 10:01/10:31 entries lost in both
+    # half-years, and a 1x stop nearly doubled the year's net vs 0.5x (+$8.3k vs +$4.7k per lot).
+    "entry_times": ["11:01", "11:31", "12:01", "12:31", "13:01", "13:31", "14:01", "14:31"],
     "short_u": 0.5,
     "wing": 5.0,
-    "stop_mult": 0.5,
+    "stop_mult": 1.0,
     "min_credit": 0.10,
     "monitor_seconds": 45,
     # Near-money passes close the sides whose short is in the money or within `dist` of spot.
-    # The early pass runs before IBKR's own pre-expiry liquidation, which on 2026-10-06 bought
-    # back 6 of our 7 short 779P at 15:42 (assignment would have exceeded the account's equity).
-    "near_money_early": "15:35",
+    # IBKR's own pre-expiry liquidation (2026-10-06 15:42: 6 of our 7 short 779P) is met by
+    # reconcile_broker() every cycle from reconcile_from rather than pre-empted (user call
+    # 2026-10-08). The early pass stays available ("15:35") but is off.
+    "near_money_early": None,
     "near_money_dist_early": 1.0,
-    "near_money_close": "15:58",
+    "near_money_close": "15:57",       # was 15:58; on 2026-10-12 the pass only started at 15:59:23 (stop cycle ran first)
     "near_money_dist": 0.25,
+    "reconcile_from": "14:45",        # after the last entry window, so our own fills can't race it
     "daily_stop_usd": -1500.0,
     "fill_wait_seconds": 20,
+    "urgent_fill_wait_seconds": 6,    # stop/close steps: re-quoted each step, so short waits
     "entry_window_min": 10,
     "telegram_token": "",
     "telegram_chat_id": "",
@@ -89,6 +93,18 @@ def load_config(base=HERE):
     else:
         print(f"note: {p} not found -- using defaults (paper port {cfg['tws_port']})")
     return cfg
+
+
+def keep_awake(on=True):
+    """Hold off Windows idle sleep and screen-off while the trader runs. On 2026-10-07 at 15:15 the
+    laptop (Modern Standby) went to standby on AC once its 5-hour screen timeout passed with the
+    user away, and the trader, monitor and TWS froze through the close. Lid-close and the power
+    button still sleep it."""
+    if sys.platform != "win32":
+        return
+    import ctypes
+    es_continuous, es_system, es_display = 0x80000000, 0x00000001, 0x00000002
+    ctypes.windll.kernel32.SetThreadExecutionState(es_continuous | ((es_system | es_display) if on else 0))
 
 
 def telegram(cfg, text, high_priority=False):
@@ -223,7 +239,7 @@ def expected_move(ib, cfg, expiry, S):
 
 
 # ----------------------------------------------------------------- orders
-def place_leg(ib, cfg, contract, action, limit_price, label, qty):
+def place_leg(ib, cfg, contract, action, limit_price, label, qty, wait=None):
     px = round(limit_price, 2)
     print(f"  {label}: {action} {qty}x {contract.localSymbol or contract.symbol} @ ${px}...")
     trade = None
@@ -233,7 +249,7 @@ def place_leg(ib, cfg, contract, action, limit_price, label, qty):
     except Exception as exc:
         print(f"    SUBMIT FAILED: {exc}")
         return False, None
-    for _ in range(cfg["fill_wait_seconds"]):
+    for _ in range(wait or cfg["fill_wait_seconds"]):
         ib.sleep(1)
         s = trade.orderStatus.status
         if s == "Filled":
@@ -263,11 +279,14 @@ def price_ladder(action, bid, ask, mid, urgent=False):
     """[favorable, mid, aggressive]. The last step crosses the quote by CROSS so it actually fills:
     the backtest assumed every leg filled, and cheap wings often sit unfilled at the touch.
     urgent (stop exits): every step crosses the quote, because the backtest exits in the minute
-    the stop is hit and a patient ladder lets a fast-moving short run away (2026-10-01: -$78)."""
+    the stop is hit and a patient ladder lets a fast-moving short run away (2026-10-01: -$78).
+    The last urgent step crosses by the larger of $0.10 and 25% of the price: on 2026-10-08 a
+    short put being bought back in a falling market outran a $0.10 cross for 16 minutes (-$131
+    against -$36 in the replay)."""
     if urgent and bid is not None and ask is not None:
         if action == "BUY":
-            return [round(ask + d, 2) for d in (CROSS, 0.05, 0.10)]
-        return [round(max(bid - d, 0.01), 2) for d in (CROSS, 0.05, 0.10)]
+            return [round(ask + d, 2) for d in (CROSS, 0.05, max(0.10, 0.25 * ask))]
+        return [round(max(bid - d, 0.01), 2) for d in (CROSS, 0.05, max(0.10, 0.25 * bid))]
     if mid is None:
         fb = (ask if action == "SELL" else bid) or 0.01
         return [round(fb, 2)] * 3
@@ -279,9 +298,21 @@ def price_ladder(action, bid, ask, mid, urgent=False):
 
 
 def place_leg_ladder(ib, cfg, contract, action, label, qty, bid, ask, mid, urgent=False):
-    for i, px in enumerate(price_ladder(action, bid, ask, mid, urgent)):
+    """Up to three limit orders, each cancelled before the next. Urgent ladders (stops, closes,
+    unwinds) re-quote before every step after the first and wait only urgent_fill_wait_seconds:
+    one quote held for three 20-second steps chased a moving short for minutes on 2026-10-08."""
+    wait = cfg.get("urgent_fill_wait_seconds") if urgent else None
+    for i in range(3):
+        if urgent and i:
+            try:
+                fresh = get_quotes(ib, {"leg": contract})["leg"]
+                if fresh["bid"] is not None and fresh["ask"] is not None:
+                    bid, ask, mid = fresh["bid"], fresh["ask"], fresh["mid"]
+            except Exception as exc:
+                print(f"  [{label}] re-quote failed ({exc}) -- using the last quote")
+        px = price_ladder(action, bid, ask, mid, urgent)[i]
         print(f"  [{label}] step {i + 1}: {action} @ ${px}")
-        ok, fill = place_leg(ib, cfg, contract, action, px, label, qty)
+        ok, fill = place_leg(ib, cfg, contract, action, px, label, qty, wait)
         if ok:
             return True, fill
     return False, None
@@ -308,9 +339,12 @@ def close_condor_legs(ib, cfg, contracts, limits, qty, urgent=True):
     risk), then sell the longs. A wing is only sold once its short is gone -- otherwise it stays
     as cover. Returns (all_ok, {leg: fill price or None}) for the legs attempted."""
     fills, all_ok = {}, True
-    for name, label in (("short_call", "close short call"), ("short_put", "close short put")):
-        if name not in contracts:
-            continue
+    # The threatened short first: the dearer one is the one the market is running at. On 2026-10-08
+    # a stop bought the cheap short call first while the short put it was stopping out ran away.
+    shorts = sorted((n for n in ("short_call", "short_put") if n in contracts),
+                    key=lambda n: -(limits[n][2] or limits[n][1] or 0.0))
+    for name in shorts:
+        label = f"close {name.replace('_', ' ')}"
         b, a, m = limits[name]
         ok, px = place_leg_ladder(ib, cfg, contracts[name], "BUY", label, qty, b, a, m, urgent=urgent)
         fills[name] = px
@@ -362,9 +396,10 @@ def side_of(leg):
 
 
 def live_strikes(pos):
-    """The legs a position still holds: a side closed by a near-money pass is gone."""
-    gone = set(pos.get("legs_closed", []))
-    return {n: k for n, k in pos["strikes"].items() if side_of(n) not in gone}
+    """The legs a position still holds: not in a side closed by a near-money pass (legs_closed, the
+    2026-10-06 format) and not closed one by one since (legs_gone)."""
+    gone_sides, gone_legs = set(pos.get("legs_closed", [])), set(pos.get("legs_gone", []))
+    return {n: k for n, k in pos["strikes"].items() if side_of(n) not in gone_sides and n not in gone_legs}
 
 
 def condor_value(ib, cfg, expiry, strikes):
@@ -480,72 +515,135 @@ def held_options(ib, cfg, expiry):
     return out
 
 
-def close_near_money_side(ib, cfg, expiry, pos, S, state, dry, dist=None, held=None):
+SIDES = (("put", "short_put", "long_put", "P"), ("call", "short_call", "long_call", "C"))
+
+
+def mark_gone(pos, leg, px):
+    """Record a leg as no longer held, at what closing it cost (a short bought back adds, a wing sold
+    subtracts)."""
+    pos.setdefault("legs_gone", []).append(leg)
+    pos["closed_cost"] = pos.get("closed_cost", 0.0) + (px if leg.startswith("short") else -px)
+
+
+def sell_wing(ib, cfg, pos, lk, contract, quote):
+    """Sell a wing whose short is gone. One with no bid stays on the books and expires."""
+    if not quote["bid"]:
+        return
+    ok, px = place_leg_ladder(ib, cfg, contract, "SELL", f"close {lk.replace('_', ' ')}", pos["qty"],
+                              quote["bid"], quote["ask"], quote["mid"], urgent=True)
+    if ok:
+        mark_gone(pos, lk, px)
+
+
+def book_if_done(pos, state, reason):
+    """A position with no live legs left is booked at its credit minus what closing it cost."""
+    if live_strikes(pos) or pos not in state["open"]:
+        return
+    state["open"] = [p for p in state["open"] if p["id"] != pos["id"]]
+    realized = (pos["credit"] - pos.get("closed_cost", 0.0)) * 100 * pos["qty"]
+    state["closed"].append({**pos, "close_reason": reason, "pnl": realized})
+    state["realized"] += realized
+    save_state(state)
+    log("closed", pos=pos["id"], reason=reason, pnl=round(realized, 0))
+
+
+def booked_net(state):
+    """{(strike, right): net position} the books say this trader holds: the live legs of open positions,
+    minus legs a stop-close in progress has already closed."""
+    net = {}
+    for p in state["open"]:
+        done = p.get("close_fills", {})
+        for leg, k in live_strikes(p).items():
+            if leg not in done:
+                key = (float(k), "P" if "put" in leg else "C")
+                net[key] = net.get(key, 0) + p["qty"] * (-1 if leg.startswith("short") else 1)
+    return net
+
+
+def reconcile_broker(ib, cfg, expiry, state, dry):
+    """React to IBKR's own pre-expiry liquidation rather than pre-empting it (user call 2026-10-08).
+    On 2026-10-06 IBKR bought back 6 of our 7 short 779P at 15:42, because assignment would have
+    exceeded the account's equity. Wherever the account is less short than the books, the difference
+    was bought back for us. Totals are compared NET per strike, since one condor's wing can share a
+    strike with another's short. Those shorts are marked gone at mid (IBKR's fill isn't visible
+    here) and their wings sold, so stops and the 15:58 pass only ever trade legs that are really
+    there."""
+    held = held_options(ib, cfg, expiry)
+    for key, want in booked_net(state).items():
+        extra = held.get(key, 0) - want  # > 0: fewer shorts in the account than on the books
+        if extra <= 0:
+            continue
+        side = "put" if key[1] == "P" else "call"
+        sk, lk = f"short_{side}", f"long_{side}"
+        for pos in list(state["open"]):
+            if extra < pos["qty"]:
+                break
+            live = live_strikes(pos)
+            if sk not in live or float(live[sk]) != key[0] or sk in pos.get("close_fills", {}):
+                continue
+            extra -= pos["qty"]
+            wing_live = lk in live and lk not in pos.get("close_fills", {})
+            cons = {sk: option_contract(cfg["ticker"], expiry, key[0], key[1])}
+            if wing_live:
+                cons[lk] = option_contract(cfg["ticker"], expiry, live[lk], key[1])
+            q = get_quotes(ib, cons)
+            log("short_closed_by_broker", pos=pos["id"], side=side, strike=key[0])
+            if dry:
+                continue
+            mid = q[sk]["mid"] or 0.0
+            if "close_fills" in pos:
+                pos["close_fills"][sk] = mid  # a stop-close in progress: close_condor sells the wing
+            else:
+                mark_gone(pos, sk, mid)
+                if wing_live:
+                    sell_wing(ib, cfg, pos, lk, cons[lk], q[lk])
+            save_state(state)
+            telegram(cfg, f"{cfg['ticker']} {pos['id']}: IBKR bought back our short {key[0]:g}{key[1]} itself "
+                          f"(pre-expiry liquidation) -- booked at ~${mid:.2f}, wing sold if it had a bid")
+            if "close_fills" not in pos:
+                book_if_done(pos, state, "closed by IBKR")
+
+
+def close_near_money_side(ib, cfg, expiry, pos, S, state, dry, dist=None):
     """Close each side whose short is in the money or within `dist` of spot: buy the short back, then
     sell its wing. 2026-10-06: the old rule (|spot - strike| <= dist) skipped a short put $0.79 in the
-    money, which was then assigned. `held` (held_options(), shared across one pass) caps each order
-    at what the account really holds -- the same day the 15:58 close re-bought four 779P that IBKR
-    had already bought back, leaving the account long -- and is debited as legs close."""
+    money, which was then assigned. Run after reconcile_broker(), so a short IBKR already bought back
+    is no longer live here and is never bought twice."""
     dist = cfg["near_money_dist"] if dist is None else dist
-    for side, sk, lk, right in (("put", "short_put", "long_put", "P"), ("call", "short_call", "long_call", "C")):
-        if side in pos.get("legs_closed", []):
+    live = live_strikes(pos)
+    for side, sk, lk, right in SIDES:
+        if sk not in live:
             continue
-        k = pos["strikes"][sk]
+        k = live[sk]
         if (S - k if right == "P" else k - S) > dist:  # out of the money by more than dist
             continue
-        qty = pos["qty"]
-        short_key, long_key = (float(k), right), (float(pos["strikes"][lk]), right)
-        buy = qty if held is None else min(qty, max(-held.get(short_key, 0), 0))
-        cons = {n: option_contract(cfg["ticker"], expiry, pos["strikes"][n], right) for n in (sk, lk)}
+        cons = {n: option_contract(cfg["ticker"], expiry, live[n], right) for n in (sk, lk) if n in live}
         q = get_quotes(ib, cons)
-        log("near_money_close", pos=pos["id"], side=side, spot=round(S, 2), strike=k, dist=dist,
-            covered_by_broker=qty - buy)
+        log("near_money_close", pos=pos["id"], side=side, spot=round(S, 2), strike=k, dist=dist)
         if dry:
             continue
-        cost = 0.0
-        if buy:
-            ok, px = place_leg_ladder(ib, cfg, cons[sk], "BUY", f"close short {side}", buy,
-                                      q[sk]["bid"], q[sk]["ask"], q[sk]["mid"], urgent=True)
-            if not ok:
-                log("near_money_close_failed", pos=pos["id"], side=side, leg=sk)
-                telegram(cfg, f"{cfg['ticker']} {pos['id']}: could not buy back short {side} {k:g} "
-                              f"near the close -- assignment risk, close by hand", high_priority=True)
-                continue
-            cost += px * buy / qty
-            if held is not None:
-                held[short_key] = held.get(short_key, 0) + buy
-        if buy < qty:
-            # IBKR's pre-expiry liquidation got there first; its fill isn't visible here, so book it at mid.
-            cost += (q[sk]["mid"] or 0.0) * (qty - buy) / qty
-            log("near_money_short_gone", pos=pos["id"], side=side, strike=k, covered_by_broker=qty - buy)
-        sell = qty if held is None else min(qty, max(held.get(long_key, 0), 0))
-        if sell:
-            ok, px = place_leg_ladder(ib, cfg, cons[lk], "SELL", f"close long {side}", sell,
-                                      q[lk]["bid"], q[lk]["ask"], q[lk]["mid"], urgent=True)
-            if ok:
-                cost -= px * sell / qty
-                if held is not None:
-                    held[long_key] = held.get(long_key, 0) - sell
-        pos.setdefault("legs_closed", []).append(side)
-        pos["closed_cost"] = pos.get("closed_cost", 0.0) + cost
+        ok, px = place_leg_ladder(ib, cfg, cons[sk], "BUY", f"close short {side}", pos["qty"],
+                                  q[sk]["bid"], q[sk]["ask"], q[sk]["mid"], urgent=True)
+        if not ok:
+            log("near_money_close_failed", pos=pos["id"], side=side, leg=sk)
+            telegram(cfg, f"{cfg['ticker']} {pos['id']}: could not buy back short {side} {k:g} "
+                          f"near the close -- assignment risk, close by hand", high_priority=True)
+            continue
+        mark_gone(pos, sk, px)
+        if lk in cons:
+            sell_wing(ib, cfg, pos, lk, cons[lk], q[lk])
         save_state(state)
-    if {"put", "call"} <= set(pos.get("legs_closed", [])) and pos in state["open"]:
-        state["open"] = [p for p in state["open"] if p["id"] != pos["id"]]
-        realized = (pos["credit"] - pos.get("closed_cost", 0.0)) * 100 * pos["qty"]
-        state["closed"].append({**pos, "close_reason": "near-money close", "pnl": realized})
-        state["realized"] += realized
-        save_state(state)
-        log("closed", pos=pos["id"], reason="near-money close", pnl=round(realized, 0))
+    book_if_done(pos, state, "near-money close")
 
 
 def near_money_pass(ib, cfg, expiry, state, dry, dist):
     S = spot(ib, cfg["ticker"])
     if not S:
         return
-    held = held_options(ib, cfg, expiry)
+    reconcile_broker(ib, cfg, expiry, state, dry)  # anything IBKR closed since the last cycle
     for pos in list(state["open"]):
         if "close_fills" not in pos:
-            close_near_money_side(ib, cfg, expiry, pos, S, state, dry, dist, held)
+            close_near_money_side(ib, cfg, expiry, pos, S, state, dry, dist)
 
 
 # ----------------------------------------------------------------- main
@@ -579,6 +677,7 @@ def main():
     entry_times = [hhmm(s) for s in cfg["entry_times"]]
     near_close = hhmm(cfg["near_money_close"])
     near_early = hhmm(cfg["near_money_early"]) if cfg.get("near_money_early") else None
+    reconcile_from = hhmm(cfg["reconcile_from"])
 
     ib = IB()
     try:
@@ -597,6 +696,7 @@ def main():
         dry_run=dry, qty=cfg["qty"], expiry=expiry, accounts=ib.managedAccounts())
     telegram(cfg, f"started {cfg['ticker']} on port {cfg['tws_port']}"
                   f"{' DRY-RUN' if dry else ''}, {len(entry_times)} entries planned")
+    keep_awake(True)
     try:
         done = {p.get("slot") for p in state["open"] + state["closed"]
                 + state.get("unwound", []) + state.get("partial_legs", [])}
@@ -622,6 +722,8 @@ def main():
                 else:
                     enter(ib, cfg, expiry, state, dry, slot)
                 done.add(slot)
+            if t >= reconcile_from:
+                reconcile_broker(ib, cfg, expiry, state, dry)
             for pos in list(state["open"]):
                 if "close_fills" in pos:
                     close_condor(ib, cfg, expiry, pos, state, pos.get("close_reason", "stop"), dry)
@@ -647,6 +749,7 @@ def main():
         pause(cfg, f"unhandled error: {type(e).__name__} {e}")
         raise
     finally:
+        keep_awake(False)
         save_state(state)
         ib.disconnect()
 
