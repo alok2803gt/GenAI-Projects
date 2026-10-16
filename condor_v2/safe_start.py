@@ -31,11 +31,14 @@ def main():
         log("weekend -- not starting")
         return
 
+    # Keep trying until the last entry slot rather than giving up at once (2026-10-15: TWS was at its
+    # login screen at 09:55 and nothing alerted). The trader itself skips slots that have passed.
+    import condor_v2 as C
+    cfg = C.load_config(BASE)
     ib = IB()
-    try:
-        ib.connect("127.0.0.1", 7497, clientId=random.randint(9000, 9999), timeout=15)
-    except Exception as e:
-        log(f"ABORT: could not reach TWS on 127.0.0.1:7497 ({type(e).__name__}: {e})")
+    if not C.connect_retry(ib, 7497, random.randint(9000, 9999), C.hhmm(cfg["entry_times"][-1]), cfg,
+                           f"SafeStart {BASE.name}", say=log):
+        log("ABORT: could not reach TWS on 127.0.0.1:7497 before the last entry slot")
         return
 
     accounts = ib.managedAccounts()

@@ -197,3 +197,10 @@ ibkr_trader/backend/scanner_config.json
 # OS
 .DS_Store
 Thumbs.db
+condor_v2/spx_call_state.json
+condor_v2/spx_call_log.jsonl
+condor_v2/spx_put_state.json
+condor_v2/spx_put_log.jsonl
+condor_v2/spx_*_quotes.jsonl
+condor_v2/shadow_ledger.jsonl
+ibkr_trader/backend/ashleyklieu_spx_twin_trades.jsonl

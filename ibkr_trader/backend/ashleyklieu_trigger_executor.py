@@ -115,12 +115,13 @@ def trading_mode() -> dict:
         with open(PAPER_MODE_FILE) as f:
             cfg = json.load(f)
         return {"paper": True, "port": int(cfg.get("port", 7497)),
-                "spx_mirror": bool(cfg.get("spx_mirror", False)), "spx_qty": int(cfg.get("spx_qty", 1))}
+                "spx_mirror": bool(cfg.get("spx_mirror", False)), "spx_qty": int(cfg.get("spx_qty", 1)),
+                "spy_trade": bool(cfg.get("spy_trade", True))}
     except FileNotFoundError:
-        return {"paper": False, "port": 7496, "spx_mirror": False, "spx_qty": 0}
+        return {"paper": False, "port": 7496, "spx_mirror": False, "spx_qty": 0, "spy_trade": True}
     except (json.JSONDecodeError, ValueError, TypeError, AttributeError):
         # a garbled flag file still means paper, without the SPX mirror
-        return {"paper": True, "port": 7497, "spx_mirror": False, "spx_qty": 0}
+        return {"paper": True, "port": 7497, "spx_mirror": False, "spx_qty": 0, "spy_trade": True}
 
 
 MODE = trading_mode()
@@ -136,6 +137,22 @@ if MODE["paper"]:
 # risk at the close) and the condor monitor ignores it (it manages SPY/QQQ only). Open twins
 # persist in SPX_MIRROR_FILE so a restart keeps managing them.
 SPX_MIRROR_FILE = "ashleyklieu_spx_mirror_today.json"
+# SPX-only (CEO ask 2026-10-16, "spy_trade": false in PAPER_MODE_FILE): the paper account also
+# runs the SPY condor rehearsal, so Ashley's SPY options there muddle its P&L and the condor
+# monitor's view of SPY holdings. With the flag off a trigger buys only the SPXW twin; her
+# signals and exits work exactly as before. Live (no flag file) always trades SPY.
+# Every twin fill is appended to SPX_TWIN_LOG for condor_v2/shadow_ledger.py to re-score.
+SPX_TWIN_LOG = "ashleyklieu_spx_twin_trades.jsonl"
+
+
+def log_twin(action, name, pos, fill_px):
+    try:
+        with open(SPX_TWIN_LOG, "a") as f:
+            f.write(json.dumps({"time": datetime.now(ET).isoformat(), "action": action, "setup": name,
+                                "strike": pos["strike"], "right": pos["right"], "qty": pos["qty"],
+                                "fill": fill_px}) + "\n")
+    except OSError as exc:
+        print(f"twin log write failed (non-fatal): {exc}")
 
 # LATE-ENTRY GUARD (added 2026-10-01 after a real loss). A new position opened
 # minutes before FORCE_CLOSE_ET has no time for the thesis to work -- it only
@@ -691,6 +708,7 @@ async def spx_mirror_enter(ib, s, spy_spot, spx_open):
                               "fill_px": fill_px, "ratio": round(ratio, 4),
                               "opened_at": datetime.now(ET).isoformat()}
             save_spx_mirror(spx_open)
+            log_twin("entered", name, spx_open[name], fill_px)
             msg = (f"SPX twin FILLED: bought {qty}x SPXW {strike:g}{s['right']} @ ${fill_px} "
                    f"(twin of SPY {name}; SPX {spx_spot:.2f} / SPY {spy_spot} = {ratio:.4f}).")
         else:
@@ -718,6 +736,7 @@ async def spx_mirror_exit(ib, name, spx_open, reason):
         if ok:
             spx_open.pop(name, None)
             save_spx_mirror(spx_open)
+            log_twin("closed", name, pos, fill_px)
             pnl = round((fill_px - pos["fill_px"]) * 100 * pos["qty"], 2)
             msg = (f"SPX twin exit FILLED: sold {pos['qty']}x SPXW {pos['strike']:g}{pos['right']} @ ${fill_px} "
                    f"(bought @ ${pos['fill_px']}, pnl=${pnl}). Trigger: {reason}")
@@ -1012,6 +1031,13 @@ async def run_daily_watch(setups, headers, last_message_id, alert_message_id=Non
                                               outcome="skipped_late_entry")
                             continue
                         print(f"TRIGGER: {s['name']} -- SPY {spot} in zone [{s['lo']}, {s['hi']}]")
+                        if not MODE["spy_trade"]:  # SPX-only paper mode (see SPX_TWIN_LOG)
+                            fired.add(s["name"])
+                            save_fired_today(fired)
+                            print(f"{s['name']}: SPY leg off in this mode -- SPXW twin only")
+                            if MODE["spx_mirror"]:
+                                await spx_mirror_enter(ib, s, spot, spx_open)
+                            continue
                         c = contracts[s["name"]]
                         td = ib.reqMktData(c, "", False, False)
                         await asyncio.sleep(3)

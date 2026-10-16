@@ -1,4 +1,5 @@
 """Offline tests -- no IBKR, no orders, no network. Run: ./.venv/bin/python test_condor_v2.py"""
+import json
 import math
 import tempfile
 from pathlib import Path
@@ -87,7 +88,7 @@ def test_entry_records_slot_and_stop():
     C.enter(FakeIB(), CFG, "20260923", state, False, "10:01")
     pos = state["open"][0]
     assert pos["slot"] == "10:01", "scheduled slot must be stored for restart safety"
-    assert abs(pos["stop_loss_usd"] - 1.0 * pos["credit"] * 100) < 1e-9, "stop must be 1x credit (2026-10-13)"
+    assert abs(pos["stop_loss_usd"] - 0.5 * pos["credit"] * 100) < 1e-9, "stop must be 0.5x credit (2026-10-14)"
 
 
 def test_stop_closes_and_books_pnl():
@@ -330,6 +331,92 @@ def test_quote_recorder_band_and_cap():
     assert len(keys) == 42 and (767.0, "P") in keys and (787.0, "C") in keys and (766.0, "C") not in keys
     kept = Q.trim(keys | Q.wanted(790.2, band=10), 790.2, 40)
     assert len(kept) == 40 and (790.0, "C") in kept and (767.0, "P") not in kept, "the cap drops the strikes farthest from spot"
+
+
+def test_spx_call_target_stop_and_ticks():
+    import spx_call_trader as X
+    assert X.target_price(18.40) == 19.50, X.target_price(18.40)   # 18.40 + 1.026 -> up to the 0.10 tick
+    assert X.stop_price(18.40) == 16.40
+    assert X.round_up(2.91) == 2.95 and X.round_down(2.97) == 2.95 and X.round_up(3.01) == 3.10
+
+
+def test_shadow_ledger_condor_prices_and_bracket():
+    import shadow_ledger as S
+    lab = {"short_put": "760P", "long_put": "755P", "short_call": "770C", "long_call": "775C"}
+    s = {"o": {"760P": [0.50, 0.52], "755P": [0.10, 0.12], "770C": [0.40, 0.42], "775C": [0.05, 0.07]}}
+    assert abs(S.condor_credit(s, lab) - 0.71) < 1e-9, "open: shorts at the bid, wings at the ask"
+    assert abs(S.condor_cost(s, lab) - 0.79) < 1e-9, "close: shorts at the ask, wings at the bid"
+    mq = {"13:28": {"t": "13:28"}, "13:29": {"t": "13:29"}}
+    assert [x["t"] for x in S.bracket(mq, "2026-10-14T13:28:32-04:00")] == ["13:28", "13:29"]
+
+
+def test_shadow_ledger_spx_needs_bid_at_target_and_no_gaps():
+    import shadow_ledger as S
+    old = S.HERE
+    with tempfile.TemporaryDirectory() as d:
+        S.HERE = Path(d)
+        try:
+            day = "2026-10-15"
+            (S.HERE / "spx_call_log.jsonl").write_text("\n".join(json.dumps(r) for r in [
+                {"time": f"{day}T09:31:05", "action": "buy_step", "ask": 10.2},
+                {"time": f"{day}T09:31:20", "action": "entered", "strike": 7800, "fill": 10.0, "target": 11.1, "stop": 8.0},
+                {"time": f"{day}T09:40:00", "action": "closed", "exit": 11.1, "reason": "target +$100"}]) + "\n")
+            q = [{"ts": f"{day}T09:3{i}:00", "strike": 7800, "bid": b} for i, b in enumerate([None, None, 10.5, 11.0, 11.3])]
+            (S.HERE / "spx_call_quotes.jsonl").write_text("\n".join(json.dumps(r) for r in q) + "\n")
+            r = S.spx_trade("call", day, {})
+            # live target comes from the REAL entry (the 10.20 ask): 10.20 + 1.026 -> 11.30
+            assert r["realistic"] == round((11.3 - 10.2) * 100 - S.SPX_FEES, 2), r
+            assert r["whatif"]["150"]["pnl"] is None, "+$150 (11.80) never reached and the record ends early: unscored"
+            q[3]["ts"] = f"{day}T09:38:00"; del q[4]                                  # 09:32 -> 09:38 gap, never at target
+            (S.HERE / "spx_call_quotes.jsonl").write_text("\n".join(json.dumps(r) for r in q) + "\n")
+            assert S.spx_trade("call", day, {})["realistic"] is None, "a quote gap must not score"
+            path = [("09:32:00", 9.0), ("09:33:00", 8.1)]
+            assert S.walk(path, "09:31:20", 10.2, 100)["pnl"] == round((8.0 - 10.2) * 100 - S.SPX_FEES, 2), "stop: bid - 1 tick"
+        finally:
+            S.HERE = old
+
+
+def test_shadow_ledger_scores_ashley_twin_at_worse_side():
+    import shadow_ledger as S
+    old = S.ASHLEY_TWINS
+    with tempfile.TemporaryDirectory() as d:
+        S.ASHLEY_TWINS = Path(d) / "twins.jsonl"
+        try:
+            day = "2026-10-16"
+            S.ASHLEY_TWINS.write_text("\n".join(json.dumps(r) for r in [
+                {"time": f"{day}T10:05:20-04:00", "action": "entered", "setup": "773C", "strike": 7760.0, "right": "C", "qty": 1, "fill": 16.6},
+                {"time": f"{day}T10:11:40-04:00", "action": "closed", "setup": "773C", "strike": 7760.0, "right": "C", "qty": 1, "fill": 17.2}]) + "\n")
+            mq = {"10:05": {"x": {"7760C": [16.4, 16.7]}}, "10:06": {"x": {"7760C": [16.5, 16.8]}},
+                  "10:11": {"x": {"7760C": [17.0, 17.3]}}, "10:12": {"x": {"7760C": [17.1, 17.4]}}}
+            r = S.ashley_twins(day, mq)[0]
+            assert r["paper"] == 60.0 and r["realistic"] == 20.0, r   # bought 16.80 (worse ask), sold 17.00 (worse bid)
+        finally:
+            S.ASHLEY_TWINS = old
+
+
+def test_connect_retry_alerts_once_then_recovers_or_gives_up():
+    from datetime import time as dtime
+
+    class FakeIB:
+        def __init__(self, fails):
+            self.fails = fails
+        def connect(self, *a, **k):
+            if self.fails:
+                self.fails -= 1
+                raise TimeoutError()
+        def disconnect(self):
+            pass
+
+    sent, old = [], C.telegram
+    C.telegram = lambda cfg, text, high=False: sent.append((text, high))
+    try:
+        assert C.connect_retry(FakeIB(2), 7497, 1, dtime(23, 59), {}, "T", every=0, say=lambda m: None)
+        assert [h for _, h in sent] == [True, False], "one HIGH alert on the first failure, then a recovery note"
+        sent.clear()
+        assert not C.connect_retry(FakeIB(99), 7497, 1, dtime(0, 0), {}, "T", every=0, say=lambda m: None)
+        assert len(sent) == 2 and "gave up" in sent[1][0], sent
+    finally:
+        C.telegram = old
 
 
 def test_config_defaults_are_paper():

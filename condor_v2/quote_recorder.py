@@ -11,7 +11,8 @@ the trader and monitor keep their market-data lines. Reconnects if TWS drops. Ho
 Task CondorV2-QuoteRecorder starts it weekdays 09:25; it records 09:30-16:00 and exits.
 
 Output quotes/SPY_<date>.jsonl, one line per minute:
-    {"t": "09:31", "spy": [bid, ask, last], "o": {"779C": [bid, ask], "779P": [bid, ask], ...}}
+    {"t": "09:31", "spy": [bid, ask, last], "o": {"779C": [bid, ask], ...},
+     "spx": last, "x": {"7800C": [bid, ask], ...}}     (SPX/SPXW from 2026-10-14)
 
     python quote_recorder.py           # the day's recording
     python quote_recorder.py --once    # connect, take one sample, print it (no file)
@@ -23,7 +24,7 @@ from datetime import datetime, time as dtime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from ib_insync import IB, Option, Stock
+from ib_insync import IB, Index, Option, Stock
 
 import condor_v2 as C
 
@@ -31,8 +32,10 @@ ET = ZoneInfo("America/New_York")
 HERE = Path(__file__).resolve().parent
 OUT = HERE / "quotes"
 CLIENT_ID = 1590
-BAND = 10
-MAX_LINES = 80
+BAND = 8              # SPY strikes within +/- $8 of spot
+MAX_LINES = 36         # SPY option streams
+SPX_BAND = 30          # SPXW strikes within +/- 30 points (5-point grid), added 2026-10-14
+SPX_MAX = 28           # SPXW option streams; with SPY + SPX index ~66 lines, under IBKR's 100
 START, END = dtime(9, 30), dtime(16, 0)
 
 
@@ -40,10 +43,10 @@ def now():
     return datetime.now(ET)
 
 
-def wanted(spot, band=BAND):
-    """(strike, right) keys within `band` dollars of spot."""
-    k0 = round(spot)
-    return {(float(k), r) for k in range(k0 - band, k0 + band + 1) for r in ("C", "P")}
+def wanted(spot, band=BAND, step=1):
+    """(strike, right) keys within `band` of spot on a `step` strike grid."""
+    k0 = step * round(spot / step)
+    return {(float(k), r) for k in range(int(k0 - band), int(k0 + band) + 1, step) for r in ("C", "P")}
 
 
 def trim(keys, spot, limit):
@@ -62,6 +65,7 @@ def label(key):
 class Recorder:
     def __init__(self, expiry):
         self.ib, self.expiry, self.spy, self.opts = IB(), expiry, None, {}
+        self.spx, self.xopts = None, {}
 
     def connect(self):
         self.ib.connect("127.0.0.1", 7497, clientId=CLIENT_ID, readonly=True, timeout=15)
@@ -70,29 +74,44 @@ class Recorder:
         self.ib.qualifyContracts(stock)
         self.spy = self.ib.reqMktData(stock, "", False, False)
         self.opts = {}
+        index = Index("SPX", "CBOE", "USD")
+        self.ib.qualifyContracts(index)
+        self.spx = self.ib.reqMktData(index, "", False, False)
+        self.xopts = {}
 
     def spot(self):
         t = self.spy
         b, a = px(t.bid), px(t.ask)
         return (b + a) / 2 if b and a else px(t.last) or px(t.close)
 
-    def follow(self, spot):
-        """Stream the strikes around spot; drop the farthest when over the cap."""
-        keep = trim(wanted(spot) | set(self.opts), spot, MAX_LINES - 1)
-        for key in [k for k in self.opts if k not in keep]:
-            self.ib.cancelMktData(self.opts.pop(key).contract)
-        new = [k for k in keep if k not in self.opts]
+    def spx_spot(self):
+        return (px(self.spx.last) or px(self.spx.close)) if self.spx else None
+
+    def _follow(self, store, keys, spot, limit, symbol, tclass):
+        keep = trim(keys | set(store), spot, limit)
+        for key in [k for k in store if k not in keep]:
+            self.ib.cancelMktData(store.pop(key).contract)
+        new = [k for k in keep if k not in store]
         if new:
-            cons = [Option("SPY", self.expiry, k, r, "SMART", tradingClass="SPY") for k, r in new]
+            cons = [Option(symbol, self.expiry, k, r, "SMART", tradingClass=tclass) for k, r in new]
             self.ib.qualifyContracts(*cons)
             for key, c in zip(new, cons):
                 if c.conId:
-                    self.opts[key] = self.ib.reqMktData(c, "", False, False)
+                    store[key] = self.ib.reqMktData(c, "", False, False)
+
+    def follow(self, spot):
+        """Stream the strikes around spot; drop the farthest when over the cap."""
+        self._follow(self.opts, wanted(spot), spot, MAX_LINES, "SPY", "SPY")
+        x = self.spx_spot()
+        if x:
+            self._follow(self.xopts, wanted(x, SPX_BAND, 5), x, SPX_MAX, "SPX", "SPXW")
 
     def sample(self, hhmm):
         s = self.spy
         return {"t": hhmm, "spy": [px(s.bid), px(s.ask), px(s.last)],
-                "o": {label(k): [px(t.bid), px(t.ask)] for k, t in sorted(self.opts.items())}}
+                "o": {label(k): [px(t.bid), px(t.ask)] for k, t in sorted(self.opts.items())},
+                "spx": self.spx_spot(),
+                "x": {label(k): [px(t.bid), px(t.ask)] for k, t in sorted(self.xopts.items())}}
 
 
 def main():

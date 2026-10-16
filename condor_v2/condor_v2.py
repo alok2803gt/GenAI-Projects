@@ -28,6 +28,7 @@ import argparse
 import json
 import math
 import sys
+import time
 from datetime import datetime, time as dtime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -43,12 +44,13 @@ DEFAULTS = {
     "tws_host": "127.0.0.1",
     "tws_port": 7497,                 # 7497 TWS paper / 7496 TWS live / 4002 gateway paper
     "client_id": 1580,
-    # 2026-10-13 (user call, from the 258-day replay): the 10:01/10:31 entries lost in both
-    # half-years, and a 1x stop nearly doubled the year's net vs 0.5x (+$8.3k vs +$4.7k per lot).
+    # From the 258-day replay (user calls 2026-10-13/14): the 10:01/10:31 entries lost in both
+    # half-years. With them gone, the 0.5x stop earns about what 1x does (+$7.3k vs +$7.9k a year
+    # per lot) with a smaller drawdown (-$4.5k vs -$6.1k), so the original 0.5x stop stays.
     "entry_times": ["11:01", "11:31", "12:01", "12:31", "13:01", "13:31", "14:01", "14:31"],
     "short_u": 0.5,
     "wing": 5.0,
-    "stop_mult": 1.0,
+    "stop_mult": 0.5,
     "min_credit": 0.10,
     "monitor_seconds": 45,
     # Near-money passes close the sides whose short is in the money or within `dist` of spot.
@@ -117,6 +119,35 @@ def telegram(cfg, text, high_priority=False):
                             "text": ("[HIGH] " if high_priority else "") + "CONDOR V2: " + text}, timeout=10)
     except Exception as e:
         print(f"telegram send failed: {e}")
+
+
+def connect_retry(ib, port, client_id, until, cfg, who, every=30, say=print):
+    """Connect to TWS, retrying every `every` s until the ET time `until`. On 2026-10-15 TWS sat at its
+    login screen after the overnight restart: the SPX scalpers crashed at 09:25, SafeStart gave up at
+    09:55, and nothing told the user until they looked at 10:58. Now the first failure sends a
+    high-priority Telegram, recovery says so, and giving up says so. Returns True when connected."""
+    tries = 0
+    while True:
+        try:
+            ib.connect("127.0.0.1", port, clientId=client_id, timeout=15)
+            if tries:
+                say(f"connected to TWS after {tries} failed tries")
+                telegram(cfg, f"{who}: TWS is back -- connected after {tries} failed tries ({now_et():%H:%M} ET)")
+            return True
+        except Exception as e:
+            tries += 1
+            try:
+                ib.disconnect()
+            except Exception:
+                pass
+            say(f"TWS not reachable on {port} (try {tries}: {type(e).__name__}) -- retrying until {until:%H:%M}")
+            if tries == 1:
+                telegram(cfg, f"{who}: TWS paper on {port} is NOT answering ({now_et():%H:%M} ET). Log into TWS -- "
+                              f"retrying every {every}s until {until:%H:%M} ET, then giving up for today.", True)
+        if now_et().time() >= until:
+            telegram(cfg, f"{who}: gave up -- TWS still not answering at {until:%H:%M} ET. No trades from it today.", True)
+            return False
+        time.sleep(every)
 
 
 def log(action, **detail):

@@ -39,7 +39,7 @@ TASKS = {"SPY": "CondorV2-SafeStart", "QQQ": "CondorV2-QQQ-SafeStart"}
 # Go-live rehearsal (CEO 2026-10-06): the go-live plan -- SPY alone, about $15,000 -- run on paper
 # for 20 sessions; the gate is cumulative net profit after commissions. QQQ is disabled and the
 # Ashley paper test stopped, so the paper account's NetLiq change is SPY condor P&L only.
-GOLIVE_START = "2026-10-13"  # rehearsal restarted with the revised rules (1x stop, 11:01-14:31)
+GOLIVE_START = "2026-10-14"  # rehearsal of the final rules: 0.5x stop, entries 11:01-14:31
 GOLIVE_SESSIONS = 20
 GOLIVE_CAPITAL = 15000
 SCORECARD = HERE / "golive_scorecard.jsonl"
