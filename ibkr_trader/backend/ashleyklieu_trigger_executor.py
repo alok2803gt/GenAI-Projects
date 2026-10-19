@@ -13,10 +13,13 @@ Each trading day:
      WAIT_CUTOFF_ET.
   2. ENTRY: watches SPY spot via IBKR; the moment spot enters one of her
      stated zones for an unfired setup, places a real BUY limit order (1
-     contract) for the corresponding 0DTE SPY option, via the
-     favorable->mid->aggressive ladder (ibkr_place_leg_with_ladder_async,
-     ibkr_0dte_common.py) proven 2026-08-26 on Alpaca -- no flat, no-retry
-     price.
+     contract) via the favorable->mid->aggressive ladder
+     (ibkr_place_leg_with_ladder_async, ibkr_0dte_common.py) proven
+     2026-08-26 on Alpaca -- no flat, no-retry price. WHICH contract depends
+     on when the zone triggers (CEO relayed 2026-10-14, direct from Ashley):
+     before noon ET, same-day 0DTE; at/after noon, the 3rd real trading day
+     out (dte_kind_for(), AFTERNOON_CUTOFF_HOUR_ET) -- she only plays 0DTE in
+     the morning, and an afternoon trade is always 3DTE on her side too.
   3. EXIT: polls the same Discord channel for her follow-up messages. A
      clear, past-tense exit phrase ("took profit", "stopped out", "closed",
      "i'm out", etc.) on a setup this run currently holds triggers a real
@@ -24,12 +27,17 @@ Each trading day:
      conditional/hypothetical phrasing ("if stopped...") is never treated
      as a fill trigger, and an exit signal with >1 position open and no
      clear match escalates via Telegram instead of guessing.
-  4. FORCE-CLOSE SAFETY WINDOW at 15:55 ET: any position still open with no
-     exit signal seen gets a real forced close attempted here, before
-     market close. Self-terminates for the day right after (0DTE, nothing
-     carries overnight); if the forced close somehow still didn't clear a
-     position, flags it HIGH PRIORITY, then loops back to wait for the
-     NEXT trading day.
+  4. FORCE-CLOSE SAFETY WINDOW at 15:55 ET: any OPEN POSITION WHOSE CONTRACT
+     ACTUALLY EXPIRES TODAY (today's 0DTE, or a 3DTE position whose 3rd
+     trading day has arrived) with no exit signal seen gets a real forced
+     close attempted here, before market close; if it somehow still didn't
+     clear, flags it HIGH PRIORITY. A 3DTE position NOT yet at its expiry is
+     deliberately left alone here -- it is expected to carry past today's
+     close, persisted in OPEN_POSITIONS_FILE (not day-scoped) and picked back
+     up by reconcile_all_open_positions() on the next run, same day or a
+     later one, until she signals an exit or its own expiry day arrives.
+     Either way the day's loop then ends and goes back to wait for the NEXT
+     trading day.
 
 CEO decision 2026-08-27 (asked directly, not assumed): keep running fully
 autonomously at 1 contract per setup, no day-count cap -- flag anomalies
@@ -87,6 +95,9 @@ WAIT_CUTOFF_ET = (13, 0)         # give up waiting for today's alert past 1:00 P
                                   # and the run skipped a real, tradeable day for it. 1:00 PM still
                                   # leaves ~3 hours before the 4:00 PM close for a 0DTE entry+exit.
 DAY_POLL_S = 30                  # how often the outer daily loop checks in
+CRASH_RETRY_LIMIT = 3           # same-day budget for auto-retrying after run_daily_watch() throws
+                                 # (e.g. a transient TWS-relogin race) before giving up on today --
+                                 # see the crash handler in main(), real incident 2026-10-12
 STATE_FILE = "ashleyklieu_trigger_executor_state.json"
 FORCE_CLOSE_ET = (15, 55)        # real safety mechanism added 2026-09-07 (IBKR migration): Alpaca
                                   # used to auto-close any still-open 0DTE position at 15:45 ET on
@@ -111,6 +122,61 @@ FORCE_CLOSE_ET = (15, 55)        # real safety mechanism added 2026-09-07 (IBKR 
 # hour. 25 minutes is the CEO's call (2026-10-01), i.e. no new entries after
 # 15:30 while the force close is 15:55.
 MIN_MINUTES_BEFORE_FORCE_CLOSE = 25
+
+# Trailing stop on Ashley's entries (decided 2026-10-06). Sell when the live bid
+# falls this far below the highest bid seen since entry. Replayed on her 11 logged
+# closed trades (09-14..10-02): 20% turned -$268 into -$28 but stopped out two
+# winners; 30% gave -$56 with one winner cut. In-sample, n=11 -- verify forward.
+TRAIL_STOP_PCT = 0.30
+
+# Morning/afternoon DTE rule (CEO relayed 2026-10-14, direct from Ashley herself):
+# she only plays 0DTE during morning hours; an afternoon trade is always the 3rd
+# trading day out. Noon ET is the CEO's chosen cutoff. This is about WHEN A ZONE
+# ACTUALLY TRIGGERS, not a separate afternoon alert -- she posts one setup list
+# pre-market and the bot watches it all day, so the same zone list can produce a
+# 0DTE fill at 9:40 and a 3DTE fill at 1pm depending purely on when SPY gets there.
+AFTERNOON_CUTOFF_HOUR_ET = 12
+
+
+def dte_kind_for(now_et: datetime) -> str:
+    """"0dte" before noon ET, "3dte" at/after -- see AFTERNOON_CUTOFF_HOUR_ET."""
+    return "0dte" if now_et.hour < AFTERNOON_CUTOFF_HOUR_ET else "3dte"
+
+
+# Full-day NYSE closures (2026-2027; weekend holidays use the exchange's observed
+# date -- Sat -> prior Fri, Sun -> next Mon). Copied verbatim from the same table
+# in harami_daily_trader.py rather than imported -- this script's own convention
+# (see its other state files) is to stay a self-contained single file with no
+# cross-strategy imports, so a change to harami's trading calendar can never
+# silently affect Ashley's. Keep both copies in sync by hand; extend before 2028.
+NYSE_HOLIDAYS = {date.fromisoformat(s) for s in (
+    "2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03", "2026-05-25",
+    "2026-06-19", "2026-07-03", "2026-09-07", "2026-11-26", "2026-12-25",
+    "2027-01-01", "2027-01-18", "2027-02-15", "2027-03-26", "2027-05-31",
+    "2027-06-18", "2027-07-05", "2027-09-06", "2027-11-25", "2027-12-24",
+)}
+HOLIDAY_LIST_LAST_YEAR = 2027
+
+
+def _is_trading_day(d: date) -> bool:
+    return d.weekday() < 5 and d not in NYSE_HOLIDAYS
+
+
+def _add_trading_days(d: date, n: int) -> date:
+    """Skips weekends and NYSE_HOLIDAYS, so the result is always a real trading
+    day (within the years that table covers -- see HOLIDAY_LIST_LAST_YEAR)."""
+    cur = d
+    added = 0
+    while added < n:
+        cur += timedelta(days=1)
+        if _is_trading_day(cur):
+            added += 1
+    return cur
+
+
+def trail_stop_hit(peak_bid: float, bid: float | None, pct: float = TRAIL_STOP_PCT) -> bool:
+    """True when the live bid has fallen pct below the highest bid since entry."""
+    return bid is not None and bid > 0 and bid <= (1 - pct) * peak_bid
 
 # Same pattern as ashleyklieu_alert_monitor.py -- reused verbatim so both
 # scripts parse her messages identically.
@@ -143,6 +209,23 @@ def retired_setups_from(content: str, setups: list[dict]) -> set:
                 if abs(float(s["strike"]) - float(strike)) < 1e-6 and s["right"] == right:
                     out.add(s["name"])
     return out
+
+
+def retired_names_needing_exit(retired: set, open_positions: dict) -> list:
+    """Of the names she struck through in THIS message, which ones are
+    currently open positions that need a real close -- not just a "don't
+    enter" flag? Real incident 2026-09-29 (765C): 5 minutes after the fill
+    she posted new setups with 765C struck through, right next to "Next
+    two levels in play are here" -- as clear an "I'm done with this one"
+    as the strikethrough convention gets. The retirement handling at the
+    call site only ever updates `fired` for names NOT already fired (its
+    whole job is stopping a dead level from being entered), so an already-
+    open position's strikethrough was silently doing nothing. Strikethrough
+    on an open position is unconditionally treated as her exit, same as
+    the not-yet-fired case is unconditionally treated as retirement -- no
+    extra phrase-matching gate, since striking through a level you still
+    want to hold would defeat the whole point of the convention."""
+    return [n for n in retired if n in open_positions]
 
 
 EXIT_PHRASES = [
@@ -178,6 +261,52 @@ CONDITIONAL_PREFIXES = ("if ", "when ", "should ", "would ", "in case")
 AMBIGUOUS_EXIT_PHRASES = ("take profit", "took profit")
 HYPOTHETICAL_MARKERS = ("i'd", "i would")  # she only ever describes her own trades in first person
 TP_WORD = re.compile(r"\btp\b", re.IGNORECASE)
+
+# REAL INCIDENT 2026-10-01: she posted "2nd Play invalid, I wasn't in this trade
+# and this happened too fast. SPY dumping to 760" FOUR MINUTES after our fill on
+# the 762C. is_exit_signal() returned False -- it only ever recognised
+# profit-taking and stop language -- so the executor logged "watching her
+# messages for the exit" and waited for a signal that was never coming. The
+# position rode to the 15:55 clock and had to be closed by hand.
+#
+# This is the single biggest money leak in the strategy. Of 15 round trips to
+# 2026-10-01, the ones she actually called an exit on net +$31.80, while the six
+# closed only by the 15:55 clock net -$286.18. Four of those six were positions
+# she had effectively walked away from.
+#
+# ABANDONMENT means "she is not in this trade": there will never be a TP or a
+# stop, so the only question is how long we hold an unmanaged 0DTE. Treated as
+# an exit, with its own kind so the log says why we closed.
+ABANDON_PHRASES = (
+    "invalid", "no longer valid", "wasn't in this trade", "wasnt in this trade",
+    "not in this trade", "wasn't in that trade", "wasnt in that trade",
+    "didn't take this", "didnt take this", "didn't take that", "didnt take that",
+    "scratch that", "disregard", "cancel that", "nvm", "never mind",
+)
+# Her completion notices. "First play is done ✅" (2026-10-01 09:34) is her
+# saying the trade is finished -- if we hold it, we should be flat too.
+DONE_PHRASES = ("play is done", "plays are done", "trade is done", "that's it for",
+                "thats it for", "done for the day", "wrapping up")
+
+# REAL BUG found 2026-10-02: at 09:52:31 she posted "I got small limit filled at
+# 772.10, TP 771.3" -- an ENTRY announcement carrying the target she intends to
+# exit at. TP_WORD matched, so is_exit_signal() returned True. No position was
+# open so it was harmlessly ignored, but with a position open that message would
+# have closed it 15 seconds after she opened hers. The mirror image of the
+# abandonment bug: this one invents exits that were never called.
+#
+# So in a message where she is describing GETTING IN, a bare "TP" is a stated
+# plan, not a fill, and only explicit past-tense exit language counts.
+ENTRY_MARKERS = (
+    "got filled", "limit filled", "got in at", "got in @", "i'm in", "im in",
+    "entered at", "entered @", "adding", "starter", "i got small", "i got a small",
+    "bought", "buying", "scaling in", "size in", "sized in",
+)
+# Unambiguously past-tense: safe even inside an entry announcement.
+HARD_EXIT_PHRASES = (
+    "tp hit", "took profit", "stopped out", "i'm out", "im out", "flat now",
+    "out now", "banked", "closed my", "closed the", "locked in profit",
+)
 
 TELEGRAM_TOKEN = None
 TELEGRAM_CHAT = None
@@ -238,43 +367,91 @@ def save_fired_today(fired: set) -> None:
         json.dump({"date": date.today().isoformat(), "fired": sorted(fired)}, f)
 
 
-def reconcile_open_positions(ib, setups: list[dict], contracts: dict) -> dict:
-    """Real IBKR position check for each of today's setups at startup --
-    NOT trusting local bookkeeping, which is exactly what a restart loses.
-    A genuinely still-open real position (e.g. the process crashed mid-day
-    while holding one) gets restored into open_positions with its REAL qty
-    and avg cost, so exit-signal monitoring resumes correctly. A setup with
-    no matching real position (already closed, manually or otherwise, or
-    never filled) is correctly left alone -- callers combine this with
-    load_fired_today() to also mark it as "already done."
+OPEN_POSITIONS_FILE = "ashleyklieu_open_positions.json"
+# Deliberately NOT day-scoped (unlike FIRED_STATE_FILE/the old per-day trail-peak
+# file it replaces) -- an afternoon (3DTE) position bought today must still be
+# found here tomorrow and the day after. Holds every currently-open Ashley
+# position, 0DTE or 3DTE alike, keyed by setup name, each record carrying its
+# own frozen "expiry" (YYYYMMDD) so a position is always closed against the
+# SAME contract it was bought on, never today's date. Built 2026-10-14 for the
+# 3DTE-afternoon-trade feature; replaces the old TRAIL_STATE_FILE (peak_bid now
+# just lives on each record here) and the old reconcile_open_positions(), which
+# only ever checked today's 0DTE contracts and so could never find -- or even
+# correctly re-close -- a position still open from a prior afternoon.
 
-    contracts: dict of setup name -> already-qualified Option contract
-    (built in run_daily_watch before this is called). IBKR's avgCost for
-    an option position is the total cost PER CONTRACT (price x multiplier,
-    i.e. already x100) -- divided back down here to the per-share premium
-    price this script stores everywhere else. Migrated from Alpaca
-    2026-09-07 -- not yet live-verified against a real restart-with-open-
-    position scenario (market closed at build time); verify this
-    specifically the first time it actually matters.
+
+def load_open_positions() -> dict:
+    try:
+        with open(OPEN_POSITIONS_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_open_positions(open_positions: dict) -> None:
+    try:
+        with open(OPEN_POSITIONS_FILE, "w") as f:
+            json.dump(open_positions, f, indent=2)
+    except OSError as exc:
+        print(f"save_open_positions failed (non-fatal): {exc}")
+
+
+async def reconcile_all_open_positions(ib, setups: list[dict], fired: set) -> dict:
+    """Real IBKR position check against EVERY persisted open position -- today's
+    0DTE ones AND any 3DTE position carried over from a prior afternoon -- not
+    trusting local bookkeeping, which is exactly what a restart (or a new day)
+    loses. For each record in OPEN_POSITIONS_FILE, rebuilds its own frozen-expiry
+    contract, qualifies it, and checks real ib.positions(): a genuinely still-open
+    one is restored with its REAL qty (never guessed) but this script's OWN
+    fill_px/pos_id/opened_at/trail/peak_bid (more precise than re-deriving from
+    IBKR's avgCost, since we wrote those ourselves at the moment of entry). One
+    that's gone (closed some other way -- manually, exercised, expired) is
+    dropped silently here: its real economics were already captured by
+    commission_ledger's own snapshot, and no P&L is guessed.
+
+    Mutates `setups` (adds a pseudo-setup for any restored name not already in
+    today's fresh list, so every strike/right lookup elsewhere keeps working)
+    and `fired` (so the entry loop never tries to re-enter something already
+    open). Returns the restored open_positions dict, with "contract" NOT
+    included (callers must re-derive/qualify as needed via each record's own
+    strike/right/expiry) -- actually returns alongside a parallel contracts
+    dict; see call site.
     """
+    persisted = load_open_positions()
+    if not persisted:
+        return {}, {}
+    to_qualify = {}
+    for name, rec in persisted.items():
+        to_qualify[name] = Option("SPY", rec["expiry"], rec["strike"], rec["right"],
+                                   "SMART", tradingClass="SPY")
+    try:
+        await ib.qualifyContractsAsync(*to_qualify.values())
+    except Exception as exc:
+        print(f"reconcile_all_open_positions: could not qualify persisted contracts: {exc}")
+        return {}, {}
     try:
         real_positions = {p.contract.conId: p for p in ib.positions() if p.position != 0}
     except Exception as exc:
-        print(f"reconcile_open_positions: could not fetch real IBKR positions: {exc}")
-        return {}
-    restored = {}
-    for s in setups:
-        c = contracts.get(s["name"])
-        if c is None:
+        print(f"reconcile_all_open_positions: could not fetch real IBKR positions: {exc}")
+        return {}, {}
+
+    restored, restored_contracts = {}, {}
+    existing_names = {s["name"] for s in setups}
+    for name, rec in persisted.items():
+        c = to_qualify[name]
+        rp = real_positions.get(c.conId)
+        if rp is None:
+            print(f"reconcile_all_open_positions: {name} (exp {rec['expiry']}) no longer a real "
+                  f"IBKR position -- dropping from {OPEN_POSITIONS_FILE}, not carrying forward.")
             continue
-        p = real_positions.get(c.conId)
-        if p:
-            restored[s["name"]] = {
-                "symbol": occ_symbol(s["strike"], s["right"], date.today().strftime("%y%m%d")),
-                "fill_px": abs(float(p.avgCost)) / 100,
-                "qty": int(abs(p.position)), "opened_at": None,
-            }
-    return restored
+        restored[name] = {**rec, "qty": int(abs(rp.position))}
+        restored_contracts[name] = c
+        if name not in existing_names:
+            setups.append({"name": name, "strike": rec["strike"], "right": rec["right"],
+                           "lo": rec["strike"], "hi": rec["strike"]})
+            existing_names.add(name)
+        fired.add(name)
+    return restored, restored_contracts
 
 
 def telegram(msg, high_priority=True):
@@ -330,23 +507,71 @@ def is_market_hours(now):
     return open_t <= now <= close_t
 
 
-def is_exit_signal(content: str) -> bool:
+def exit_signal_kind(content: str) -> str | None:
+    """Why we should close, or None to keep holding.
+
+    Returns one of:
+      "tp"        -- she took profit / hit her target
+      "stop"      -- she was stopped out
+      "abandoned" -- she is NOT in this trade (invalid, never filled, scratched)
+      "done"      -- she has declared the play finished
+
+    "abandoned" exists because of the 2026-10-01 762C: silence from her is
+    indistinguishable from an unmanaged position, and waiting for a TP that will
+    never come is how the forced-close bucket lost $286.18 across six trades.
+    """
     lower = content.strip().lower()
     if lower.startswith(CONDITIONAL_PREFIXES) or " if " in lower[:40]:
-        return False
-    # Her own explicit, deliberate alert convention (confirmed directly by
-    # her, 2026-08-31) -- always real when present, regardless of anything
-    # else in the message.
+        return None
+
+    hypothetical = any(h in lower for h in HYPOTHETICAL_MARKERS)
+
+    # Abandonment is checked FIRST and is not subject to the entry-marker
+    # suppression below: "2nd Play invalid, I wasn't in this trade" is itself a
+    # statement about not being filled, so an entry word appearing in it must
+    # not mute it.
+    #
+    # Nor is it subject to the hypothetical-marker suppression -- fixed
+    # 2026-10-19 after real incident 2026-10-15 (770P): she posted "Not in
+    # this trade, I'd take profit now", and "i'd" tripped `hypothetical`,
+    # which silently swallowed the clearly-stated, non-hypothetical
+    # abandonment clause ("Not in this trade") earlier in the SAME message.
+    # The hypothetical gate exists for AMBIGUOUS_EXIT_PHRASES ("take profit"/
+    # "took profit"), which really do double as her casual commentary style
+    # (the 2026-08-30 incident this gate was built for). Abandonment
+    # language is never that -- she doesn't muse hypothetically about not
+    # being in a trade -- so it is checked ungated, same as it already is
+    # against the entry-marker suppression just above.
+    if any(p in lower for p in ABANDON_PHRASES):
+        return "abandoned"
+    if any(p in lower for p in DONE_PHRASES) and not hypothetical:
+        return "done"
+
+    # She often announces an ENTRY together with the target she will exit at
+    # ("I got small limit filled at 772.10, TP 771.3"). That TP is a plan, not a
+    # fill, so inside an entry announcement only past-tense exit language counts.
+    if any(k in lower for k in ENTRY_MARKERS):
+        if any(p in lower for p in HARD_EXIT_PHRASES) and not hypothetical:
+            return "stop" if "stopped" in lower else "tp"
+        return None
+
+    # Her own explicit, deliberate alert convention (confirmed directly by her,
+    # 2026-08-31): sharing "TP" IS the take-profit alert.
     if TP_WORD.search(lower):
-        return True
-    # "take profit"/"took profit" specifically overlap with her casual,
-    # non-actionable commentary about profit-taking philosophy -- a
-    # hypothetical marker anywhere in the message (not just at the very
-    # start, which CONDITIONAL_PREFIXES already covers) means it's her
-    # opinion, not a real trade she's making.
+        return "tp"
+    # "take profit"/"took profit" overlap with her casual commentary about
+    # profit-taking philosophy -- a hypothetical marker anywhere in the message
+    # means it's her opinion, not a trade she's making.
     if any(p in lower for p in AMBIGUOUS_EXIT_PHRASES):
-        return not any(h in lower for h in HYPOTHETICAL_MARKERS)
-    return any(p in lower for p in EXIT_PHRASES if p not in AMBIGUOUS_EXIT_PHRASES)
+        return None if hypothetical else "tp"
+    if any(p in lower for p in EXIT_PHRASES if p not in AMBIGUOUS_EXIT_PHRASES):
+        return "stop" if "stopped" in lower else "tp"
+    return None
+
+
+def is_exit_signal(content: str) -> bool:
+    """Back-compat wrapper -- any kind of close signal."""
+    return exit_signal_kind(content) is not None
 
 
 def msg_date_et(m: dict):
@@ -509,8 +734,14 @@ def wait_for_daily_setups(headers, state):
 async def close_position(ib, name, pos, setups, reason_text):
     strike = next(s["strike"] for s in setups if s["name"] == name)
     right  = next(s["right"] for s in setups if s["name"] == name)
-    today_ibkr = date.today().strftime("%Y%m%d")
-    c = Option("SPY", today_ibkr, strike, right, "SMART", tradingClass="SPY")
+    # The position's OWN actual expiry -- never date.today(). Real bug fixed
+    # 2026-10-14 alongside the 3DTE-afternoon feature: this used to always
+    # rebuild today's 0DTE contract here, which happened to be correct only
+    # because nothing but same-day 0DTE existed yet. A 3DTE (or carried-over)
+    # position closed this way would have silently tried to sell the WRONG
+    # contract (today's unrelated 0DTE strike) instead of the one actually held.
+    expiry = pos.get("expiry") or date.today().strftime("%Y%m%d")
+    c = Option("SPY", expiry, strike, right, "SMART", tradingClass="SPY")
     await ib.qualifyContractsAsync(c)
     td = ib.reqMktData(c, "", False, False)
     await asyncio.sleep(3)
@@ -572,6 +803,11 @@ async def run_daily_watch(setups, headers, last_message_id, alert_message_id=Non
 
     today_ibkr  = date.today().strftime("%Y%m%d")
     today_yymmdd = date.today().strftime("%y%m%d")
+    # The 3rd real trading day out, computed once from TODAY's date -- DTE counts
+    # in days, not hours, so this is the same value regardless of what time this
+    # afternoon a zone actually triggers (CEO/Ashley rule, 2026-10-14).
+    third_ibkr   = _add_trading_days(date.today(), 3).strftime("%Y%m%d")
+    third_yymmdd = _add_trading_days(date.today(), 3).strftime("%y%m%d")
 
     ib = IB()
     # Retry the initial connect for up to 10 min -- real failure mode seen
@@ -607,11 +843,36 @@ async def run_daily_watch(setups, headers, last_message_id, alert_message_id=Non
     await ib.qualifyContractsAsync(spy)
     spy_td = ib.reqMktData(spy, "", False, False)
 
-    contracts = {}
+    # Two candidate contracts per not-yet-fired setup -- which one actually gets
+    # bought is decided at trigger time by dte_kind_for(now), since a zone from
+    # the SAME pre-market alert can trigger at 9:40 (0DTE) or 2pm (3DTE). Both
+    # are qualified upfront here so the hot entry path never has to await a
+    # qualify call. `contracts` (singular) holds the ONE real contract for any
+    # name that's already open (today's reconciled 0DTE, a carried 3DTE, or one
+    # that fires during this run) -- everything downstream of entry (force-close,
+    # trailing stop, exits) looks it up there, never in contracts0/contracts3.
+    contracts0, contracts3 = {}, {}
     for s in setups:
-        c = Option("SPY", today_ibkr, s["strike"], s["right"], "SMART", tradingClass="SPY")
-        contracts[s["name"]] = c
-    await ib.qualifyContractsAsync(*contracts.values())
+        contracts0[s["name"]] = Option("SPY", today_ibkr, s["strike"], s["right"],
+                                        "SMART", tradingClass="SPY")
+        contracts3[s["name"]] = Option("SPY", third_ibkr, s["strike"], s["right"],
+                                        "SMART", tradingClass="SPY")
+    try:
+        await ib.qualifyContractsAsync(*contracts0.values(), *contracts3.values())
+    except Exception as exc:
+        # A single bad contract in the batch can fail the whole qualify call --
+        # fall back to qualifying 0DTE and 3DTE separately so a problem with the
+        # (less certain to be listed) 3rd-trading-day expiry can't also take
+        # down today's ordinary 0DTE setups.
+        print(f"Batch contract qualification failed ({exc}); retrying 0DTE and 3DTE separately.")
+        await ib.qualifyContractsAsync(*contracts0.values())
+        try:
+            await ib.qualifyContractsAsync(*contracts3.values())
+        except Exception as exc3:
+            print(f"3DTE contract qualification failed: {exc3} -- afternoon entries today will be "
+                  f"SKIPPED (not silently bought as 0DTE) until this resolves.")
+            contracts3.clear()
+    contracts = dict(contracts0)  # today's 0DTE is the default "real" contract for a fresh setup
 
     today_qty = contracts_for_today()
     print(f"Daily watch started {datetime.now(ET)}. Setups: {[s['name'] for s in setups]}. Qty/setup: {today_qty}")
@@ -627,24 +888,37 @@ async def run_daily_watch(setups, headers, last_message_id, alert_message_id=Non
         f"Scheduled daily run (CEO instruction 2026-08-27) -- {today_qty} contract(s) per setup, autonomous.",
     )
 
-    # Restart recovery, built 2026-08-31: never start these blank without
-    # checking. load_fired_today() carries forward anything already acted on
-    # today (including a setup the CEO manually closed -- with no real
-    # position left to find, it just stays correctly "done, don't re-enter").
-    # reconcile_open_positions() independently checks REAL IBKR state for
-    # anything still genuinely open (e.g. a crash mid-position) and restores
-    # it with its real qty/avg cost so exit monitoring resumes correctly.
+    # Restart recovery, built 2026-08-31, generalized 2026-10-14 for 3DTE.
+    # load_fired_today() carries forward anything already acted on today
+    # (including a setup the CEO manually closed -- with no real position left
+    # to find, it just stays correctly "done, don't re-enter"). It is day-scoped
+    # on purpose (yesterday's 0DTE strikes don't exist today) and is ONLY about
+    # "don't re-enter" -- it is not where position identity lives any more.
+    #
+    # reconcile_all_open_positions() independently checks REAL IBKR state
+    # against OPEN_POSITIONS_FILE (NOT day-scoped) for anything still
+    # genuinely open -- today's 0DTE reconciled after a same-day crash, OR a
+    # 3DTE position carried over from a prior afternoon -- and restores each
+    # with its real qty (from IBKR) plus this script's own fill_px/pos_id/
+    # opened_at/trail/peak_bid (from the file), so exit-signal monitoring,
+    # the trailing stop, and eventual force-close on its real expiry day all
+    # resume correctly regardless of which day it was actually opened on.
     fired = load_fired_today()
-    open_positions = reconcile_open_positions(ib, setups, contracts)
-    # names already reported as too-late-to-enter, so the Telegram fires once
-    # per setup rather than on every 5-second tick (see
-    # MIN_MINUTES_BEFORE_FORCE_CLOSE).
+    open_positions, restored_contracts = await reconcile_all_open_positions(ib, setups, fired)
+    contracts.update(restored_contracts)
     _late_skips: set = set()
+    trail_tickers: dict = {}  # live market-data tickers for trailing-stop positions
+    last_open_positions_snapshot: dict | None = None  # last state written to OPEN_POSITIONS_FILE
     fired |= set(open_positions.keys())  # a real open position is definitely "fired"
     if fired or open_positions:
         save_fired_today(fired)
+        save_open_positions(open_positions)
+        last_open_positions_snapshot = dict(open_positions)
         txt = (f"Ashley-trigger restart recovery: already-fired today = {sorted(fired) or 'none'}, "
-               f"real open positions restored = {sorted(open_positions.keys()) or 'none'}.")
+               f"real open positions restored = {sorted(open_positions.keys()) or 'none'}"
+               + (f" (carried from a prior day: "
+                  f"{sorted(n for n in open_positions if open_positions[n].get('expiry') != today_ibkr)})"
+                  if any(p.get("expiry") != today_ibkr for p in open_positions.values()) else "") + ".")
         print(txt)
         telegram(txt, high_priority=False)
         oversight_log(txt, "Restart recovery from persisted fired-state + real IBKR reconciliation.")
@@ -655,13 +929,65 @@ async def run_daily_watch(setups, headers, last_message_id, alert_message_id=Non
         while True:
             now = datetime.now(ET)
 
+            # Trailing stop (see TRAIL_STOP_PCT). Only positions opened after this change
+            # carry "trail": True, so anything already open keeps following her exit.
+            for name in list(trail_tickers):
+                if name not in open_positions:
+                    ib.cancelMktData(contracts[name])
+                    trail_tickers.pop(name, None)
+            if is_market_hours(now):
+                for name, pos in list(open_positions.items()):
+                    if not pos.get("trail"):
+                        continue
+                    if name not in trail_tickers:
+                        trail_tickers[name] = ib.reqMktData(contracts[name], "", False, False)
+                        continue
+                    tk = trail_tickers[name]
+                    bid = tk.bid if tk.bid and tk.bid > 0 else None
+                    if bid is not None and bid > pos["peak_bid"]:
+                        pos["peak_bid"] = bid
+                    if trail_stop_hit(pos["peak_bid"], bid):
+                        ib.cancelMktData(contracts[name])
+                        trail_tickers.pop(name, None)
+                        msg = (f"Ashley {name}: trailing stop hit -- bid ${bid} is "
+                               f"{TRAIL_STOP_PCT:.0%} below peak bid ${pos['peak_bid']}. Selling.")
+                        print(msg)
+                        telegram(msg, high_priority=True)
+                        # Real bug fixed 2026-10-16: this used to pop() the position
+                        # out of open_positions UNCONDITIONALLY, before even checking
+                        # whether close_position() actually got a fill. A failed sell
+                        # (real incident 2026-10-15, 770P: 3 ladder steps, none filled)
+                        # would then silently vanish from tracking -- no force-close
+                        # at 15:55, no EOD alarm -- while the real IBKR position sat
+                        # open and unmanaged. Only drop it from tracking on a
+                        # CONFIRMED fill; an unfilled attempt leaves it in
+                        # open_positions so force-close/the EOD check still see it.
+                        ok = await close_position(ib, name, pos, setups,
+                                                   f"trailing stop {TRAIL_STOP_PCT:.0%} from peak ${pos['peak_bid']}")
+                        if ok:
+                            open_positions.pop(name, None)
+
+            # Persist open positions (incl. trailing peaks) whenever anything
+            # changes (a peak moves, a trailed position closes), so a restart
+            # resumes correctly instead of dropping state. Replaces the old
+            # day-scoped TRAIL_STATE_FILE -- peak_bid now lives on each
+            # OPEN_POSITIONS_FILE record, which survives across days too.
+            if open_positions != last_open_positions_snapshot:
+                save_open_positions(open_positions)
+                last_open_positions_snapshot = dict(open_positions)
+
             # Real forced-close safety window (see FORCE_CLOSE_ET comment) --
             # runs once, while the market is still open, before the
             # alert-only post-close check below even has a chance to matter.
-            if (is_market_hours(now) and open_positions and not force_close_attempted
+            # Scoped to positions whose expiry is ACTUALLY TODAY -- a 3DTE
+            # position bought this afternoon, or one carried in from a prior
+            # afternoon that isn't expiring today, must NOT be force-closed
+            # here; it keeps right on being watched for her exit signal.
+            expiring_today = {n: p for n, p in open_positions.items() if p.get("expiry", today_ibkr) == today_ibkr}
+            if (is_market_hours(now) and expiring_today and not force_close_attempted
                     and (now.hour, now.minute) >= FORCE_CLOSE_ET):
                 force_close_attempted = True
-                for name, pos in list(open_positions.items()):
+                for name, pos in list(expiring_today.items()):
                     c = contracts[name]
                     txt = (f"Ashley {name}: no exit signal seen by {FORCE_CLOSE_ET[0]}:{FORCE_CLOSE_ET[1]:02d} ET -- "
                            f"attempting a real forced close now (IBKR has no broker-side auto-close).")
@@ -697,7 +1023,18 @@ async def run_daily_watch(setups, headers, last_message_id, alert_message_id=Non
                         oversight_log(msg, "Forced pre-close safety exit failed to fill.", outcome="not_filled")
 
             if not is_market_hours(now):
-                if open_positions:
+                # Split by whether this position's contract actually expires TODAY
+                # (today's 0DTE, or a carried-in position whose 3rd-trading-day
+                # expiry happens to BE today) vs genuinely carrying past today's
+                # close (a fresh or still-carried 3DTE position with real life
+                # left). Only the former is subject to the auto-exercise alarm
+                # below -- the latter is exactly the point of the 3DTE feature
+                # and is expected to still be open here.
+                expiring_today_open = {n: p for n, p in open_positions.items()
+                                       if p.get("expiry", today_ibkr) == today_ibkr}
+                carried_forward = {n: p for n, p in open_positions.items()
+                                   if p.get("expiry", today_ibkr) != today_ibkr}
+                if expiring_today_open:
                     # REAL bug found 2026-09-03: her "stopped" exit message wasn't recognized
                     # (EXIT_PHRASES gap, since fixed), leaving a position this script thought
                     # was still open for 2+ hours after the broker had already force-closed it
@@ -710,7 +1047,7 @@ async def run_daily_watch(setups, headers, last_message_id, alert_message_id=Non
                     # had, so a still-open 0DTE at this point is a real, unclosed position, not
                     # an expected broker action to reconcile against.
                     still_genuinely_open = []
-                    for name, pos in list(open_positions.items()):
+                    for name, pos in list(expiring_today_open.items()):
                         try:
                             c = contracts[name]
                             if ibkr_has_open_position(ib, c):
@@ -733,6 +1070,7 @@ async def run_daily_watch(setups, headers, last_message_id, alert_message_id=Non
                                 oversight_log(msg, "EOD reconciliation found a real close this "
                                               "script's own exit logic missed.",
                                               outcome=f"recovered @ {exit_px}, pnl={pnl}")
+                                open_positions.pop(name, None)
                             else:
                                 still_genuinely_open.append(name)
                         except Exception as exc:
@@ -752,9 +1090,19 @@ async def run_daily_watch(setups, headers, last_message_id, alert_message_id=Non
                                       "Forced-close attempt at 15:55 ET did not clear these -- "
                                       "physically-settled 0DTE options risk auto-exercise if ITM.",
                                       outcome="left_open_at_close")
-                else:
+                if carried_forward:
+                    txt = ("Ashley-trigger daily watcher stopping for today: carrying "
+                           + ", ".join(f"{n} (exp {p['expiry']})" for n, p in carried_forward.items())
+                           + " past today's close -- these are 3DTE, not expiring today, and will keep "
+                             "being watched for her exit signal on a later day.")
+                    print(txt)
+                    telegram(txt, high_priority=False)
+                    oversight_log(txt, "3DTE afternoon position(s) correctly carried past close, not alarmed.",
+                                  outcome="carried_forward")
+                if not expiring_today_open and not carried_forward:
                     telegram("Ashley-trigger daily watcher stopping: market closed, no open positions.",
                               high_priority=False)
+                save_open_positions(open_positions)
                 print("Outside market hours -- stopping today's watch.")
                 break
             if len(fired) == len(setups) and not open_positions:
@@ -767,29 +1115,58 @@ async def run_daily_watch(setups, headers, last_message_id, alert_message_id=Non
                     if s["name"] in fired:
                         continue
                     if s["lo"] <= spot <= s["hi"]:
-                        # Too late to open anything new? See
-                        # MIN_MINUTES_BEFORE_FORCE_CLOSE above.
-                        _fc = now.replace(hour=FORCE_CLOSE_ET[0], minute=FORCE_CLOSE_ET[1],
-                                          second=0, microsecond=0)
-                        _mins_left = (_fc - now).total_seconds() / 60
-                        if _mins_left < MIN_MINUTES_BEFORE_FORCE_CLOSE:
+                        dte_kind = dte_kind_for(now)
+                        # MIN_MINUTES_BEFORE_FORCE_CLOSE only matters for a 0DTE
+                        # entry (real case 2026-09-30: 21-second hold, -$24.78,
+                        # from a 0DTE bought 6 seconds before the force close).
+                        # An afternoon trigger buys the 3DTE contract instead,
+                        # which isn't expiring today at all, so this guard
+                        # (and the whole concept of "too close to force-close")
+                        # simply doesn't apply to it.
+                        if dte_kind == "0dte":
+                            _fc = now.replace(hour=FORCE_CLOSE_ET[0], minute=FORCE_CLOSE_ET[1],
+                                              second=0, microsecond=0)
+                            _mins_left = (_fc - now).total_seconds() / 60
+                            if _mins_left < MIN_MINUTES_BEFORE_FORCE_CLOSE:
+                                if s["name"] not in _late_skips:
+                                    _late_skips.add(s["name"])
+                                    txt = (f"Ashley {s['name']}: zone hit at {now:%H:%M} ET but only "
+                                           f"{_mins_left:.0f} min to the {FORCE_CLOSE_ET[0]}:"
+                                           f"{FORCE_CLOSE_ET[1]:02d} forced close "
+                                           f"(need {MIN_MINUTES_BEFORE_FORCE_CLOSE}) -- NOT entering.")
+                                    print(txt)
+                                    telegram(txt)
+                                    oversight_log(txt,
+                                                  "A position opened this close to the forced close "
+                                                  "cannot work; it only pays the spread and two "
+                                                  "commissions (real case 2026-09-30: 21-second hold, "
+                                                  "-$24.78).",
+                                                  outcome="skipped_late_entry")
+                                continue
+
+                        if dte_kind == "3dte" and s["name"] not in contracts3:
+                            # 3DTE contract failed to qualify earlier -- see the
+                            # qualify try/except above. Never silently fall back
+                            # to buying 0DTE instead; that would be exactly the
+                            # wrong-instrument mistake this whole feature exists
+                            # to prevent. Skip and escalate instead.
                             if s["name"] not in _late_skips:
                                 _late_skips.add(s["name"])
-                                txt = (f"Ashley {s['name']}: zone hit at {now:%H:%M} ET but only "
-                                       f"{_mins_left:.0f} min to the {FORCE_CLOSE_ET[0]}:"
-                                       f"{FORCE_CLOSE_ET[1]:02d} forced close "
-                                       f"(need {MIN_MINUTES_BEFORE_FORCE_CLOSE}) -- NOT entering.")
+                                txt = (f"Ashley {s['name']}: afternoon zone hit at {now:%H:%M} ET but the "
+                                       f"3DTE contract (exp {third_ibkr}) never qualified -- NOT entering "
+                                       f"as 0DTE instead (that would be the wrong instrument). Check manually.")
                                 print(txt)
-                                telegram(txt)
-                                oversight_log(txt,
-                                              "A position opened this close to the forced close "
-                                              "cannot work; it only pays the spread and two "
-                                              "commissions (real case 2026-09-30: 21-second hold, "
-                                              "-$24.78).",
-                                              outcome="skipped_late_entry")
+                                telegram(txt, high_priority=True)
+                                oversight_log(txt, "3DTE contract qualification failure blocked an afternoon entry.",
+                                              outcome="skipped_no_3dte_contract")
                             continue
-                        print(f"TRIGGER: {s['name']} -- SPY {spot} in zone [{s['lo']}, {s['hi']}]")
-                        c = contracts[s["name"]]
+
+                        expiry = today_ibkr if dte_kind == "0dte" else third_ibkr
+                        yymmdd = today_yymmdd if dte_kind == "0dte" else third_yymmdd
+                        c = contracts0[s["name"]] if dte_kind == "0dte" else contracts3[s["name"]]
+                        contracts[s["name"]] = c
+                        print(f"TRIGGER: {s['name']} -- SPY {spot} in zone [{s['lo']}, {s['hi']}] "
+                              f"({dte_kind}, exp {expiry})")
                         td = ib.reqMktData(c, "", False, False)
                         await asyncio.sleep(3)
                         bid = td.bid if td.bid and td.bid > 0 else None
@@ -814,7 +1191,7 @@ async def run_daily_watch(setups, headers, last_message_id, alert_message_id=Non
                             save_fired_today(fired)
                             continue
 
-                        sym = occ_symbol(s["strike"], s["right"], today_yymmdd)
+                        sym = occ_symbol(s["strike"], s["right"], yymmdd)
                         ok, fill_px = await ibkr_place_leg_with_ladder_async(
                             ib, c, "BUY", f"ashley {s['name']}", qty, bid, ask, mid)
 
@@ -825,7 +1202,12 @@ async def run_daily_watch(setups, headers, last_message_id, alert_message_id=Non
                             open_positions[s["name"]] = {
                                 "symbol": sym, "fill_px": fill_px, "qty": qty,
                                 "opened_at": now.isoformat(), "pos_id": pos_id,
+                                "trail": True, "peak_bid": fill_px,
+                                "expiry": expiry, "dte_kind": dte_kind,
+                                "strike": s["strike"], "right": s["right"],
                             }
+                            save_open_positions(open_positions)
+                            last_open_positions_snapshot = dict(open_positions)
                             # Macro calendar CAUTION only (added 2026-09-04, CEO-requested) --
                             # real motivating example was this exact position type (SPY 770C)
                             # stumbling on the real August-jobs-report morning. Deliberately
@@ -847,8 +1229,9 @@ async def run_daily_watch(setups, headers, last_message_id, alert_message_id=Non
                                 )
                             except Exception as exc:
                                 print(f"registry_register_position failed (non-fatal): {exc}")
-                            msg = (f"Ashley trigger FILLED: bought {qty}x {s['name']} @ ${fill_px} "
-                                   f"(SPY {spot}, zone [{s['lo']},{s['hi']}]). Now watching her "
+                            dte_note = " [3DTE -- afternoon rule]" if dte_kind == "3dte" else ""
+                            msg = (f"Ashley trigger FILLED: bought {qty}x {s['name']} @ ${fill_px}"
+                                   f"{dte_note} (SPY {spot}, zone [{s['lo']},{s['hi']}]). Now watching her "
                                    f"messages for the exit.{macro_note}")
                             print(msg)
                             telegram(msg, high_priority=True)
@@ -899,8 +1282,7 @@ async def run_daily_watch(setups, headers, last_message_id, alert_message_id=Non
                             # she marks a finished level by striking it through in a
                             # NEW message, not by editing the daily alert. Retire it
                             # here so the entry monitor can never buy into a level she
-                            # has already closed. Only affects setups not yet entered;
-                            # an open position is still managed by the exit logic.
+                            # has already closed.
                             retired = retired_setups_from(content, setups)
                             if retired:
                                 newly = {n for n in retired if n not in fired}
@@ -913,9 +1295,44 @@ async def run_daily_watch(setups, headers, last_message_id, alert_message_id=Non
                                     telegram(txt)
                                     oversight_log(txt, "Setup retired by strikethrough.",
                                                   outcome="retired_by_strikethrough")
+                                # Fixed 2026-10-19: real incident 2026-09-29 (765C) --
+                                # she struck through an ALREADY-OPEN position's listing
+                                # 5 minutes after the fill, and the retirement handling
+                                # above (which only ever updates `fired` for NOT-yet-
+                                # entered names) silently did nothing with it. A struck-
+                                # through OPEN position is her exit, just as unconditionally
+                                # as a struck-through pending one is her "don't enter."
+                                for _name in retired_names_needing_exit(retired, open_positions):
+                                    _pos = open_positions[_name]
+                                    _txt = (f"Ashley struck through {_name} while it was an open "
+                                            f"position -- treating as her exit, closing now.")
+                                    print(_txt)
+                                    telegram(_txt, high_priority=True)
+                                    _ok = await close_position(
+                                        ib, _name, _pos, setups,
+                                        f"struck through (retired) in her message: {content!r}")
+                                    if _ok:
+                                        open_positions.pop(_name, None)
 
-                            if not is_exit_signal(content):
+                            kind = exit_signal_kind(content)
+                            if kind is None:
                                 continue
+                            # An abandoned or finished play must never be entered
+                            # later in the day either -- she has told us the level
+                            # is off. This is the exit-side twin of the
+                            # strikethrough retirement above, and it matters even
+                            # when we hold nothing right now, because the entry
+                            # monitor is still watching that zone.
+                            if kind in ("abandoned", "done"):
+                                hint = match_open_setup(content, open_positions, setups) \
+                                       if open_positions else None
+                                stale = {hint} if hint else set()
+                                if not stale and len(open_positions) == 1:
+                                    stale = set(open_positions)
+                                newly = {n for n in stale if n not in fired}
+                                if newly:
+                                    fired.update(newly)
+                                    save_fired_today(fired)
                             if not open_positions:
                                 # She's talking about a trade we never entered
                                 # (or already closed) -- not actionable, and
@@ -930,7 +1347,11 @@ async def run_daily_watch(setups, headers, last_message_id, alert_message_id=Non
                                 print(f"Ignoring stale exit signal from {msg_date} (not today): {content!r}")
                                 continue
 
-                            print(f"EXIT SIGNAL from Ashley: {content}")
+                            print(f"EXIT SIGNAL from Ashley [{kind}]: {content}")
+                            if kind == "abandoned":
+                                telegram(f"Ashley ABANDONED the setup (\"{content}\") -- "
+                                         f"closing now rather than waiting for a TP that "
+                                         f"will never come.", high_priority=True)
                             if len(open_positions) == 1:
                                 name = next(iter(open_positions))
                             else:
@@ -950,8 +1371,16 @@ async def run_daily_watch(setups, headers, last_message_id, alert_message_id=Non
                                 )
                                 continue
 
-                            pos = open_positions.pop(name)
-                            await close_position(ib, name, pos, setups, content)
+                            # Real incident 2026-10-15 (770P): popped here
+                            # unconditionally before, so a sell that failed to
+                            # fill (3 ladder steps, none filled) silently
+                            # vanished from tracking anyway -- no force-close,
+                            # no EOD alarm, while the real position sat open.
+                            # Only drop it on a CONFIRMED fill.
+                            pos = open_positions[name]
+                            ok = await close_position(ib, name, pos, setups, content)
+                            if ok:
+                                open_positions.pop(name, None)
                 except Exception as exc:
                     print(f"Discord poll error: {exc}")
 
@@ -982,10 +1411,23 @@ async def run_daily_watch(setups, headers, last_message_id, alert_message_id=Non
                                 old_s = old_by_name.get(name)
                                 if old_s is None:
                                     setups.append(new_s)
-                                    c = Option("SPY", today_ibkr, new_s["strike"], new_s["right"],
-                                               "SMART", tradingClass="SPY")
-                                    await ib.qualifyContractsAsync(c)
-                                    contracts[name] = c
+                                    # Build both DTE variants, same as the upfront setups --
+                                    # an edit posted mid-morning could still trigger this
+                                    # afternoon, so it needs the 3DTE option ready too.
+                                    c0 = Option("SPY", today_ibkr, new_s["strike"], new_s["right"],
+                                                "SMART", tradingClass="SPY")
+                                    c3 = Option("SPY", third_ibkr, new_s["strike"], new_s["right"],
+                                                "SMART", tradingClass="SPY")
+                                    try:
+                                        await ib.qualifyContractsAsync(c0, c3)
+                                        contracts3[name] = c3
+                                    except Exception as exc:
+                                        print(f"Edit-added setup {name}: 3DTE qualify failed ({exc}), "
+                                              f"0DTE only -- an afternoon trigger on it will be skipped, "
+                                              f"not bought as 0DTE.")
+                                        await ib.qualifyContractsAsync(c0)
+                                    contracts0[name] = c0
+                                    contracts[name] = c0
                                     txt = (f"Ashley EDITED her alert -- added new setup {name} @ "
                                            f"SPY {new_s['lo']}-{new_s['hi']}. Now watching it too.")
                                     print(txt); telegram(txt, high_priority=True)
@@ -1064,6 +1506,34 @@ async def run_daily_watch(setups, headers, last_message_id, alert_message_id=Non
     return last_message_id
 
 
+def _update_crash_state(state: dict, today_iso: str, now_after_crash) -> bool:
+    """Bumps today's same-day crash counter (resetting it on a new day) and
+    returns True iff main() should give up on today entirely -- past the
+    16:00 close, or the crash budget (CRASH_RETRY_LIMIT) is exhausted --
+    vs False to retry via the next loop iteration's recover_todays_alert()
+    path. A pure-ish mutate-and-decide helper so this is unit-testable in
+    isolation, the way trail_stop_hit() already is for the trailing stop.
+
+    Real incident 2026-10-12: run_daily_watch() crashed ~9:23-9:40 ET on a
+    ConnectionRefusedError while TWS was mid-relogin. The old code
+    unconditionally set state["last_processed_date"] = today_iso right after
+    ANY crash, so every restart for the rest of the day saw "already
+    processed today" and silently idled -- never watching again. SPY sat
+    inside the day's 778C zone [777.7,778.0] for ~25 straight minutes right
+    before the close and nothing ever checked for it.
+
+    Deliberately NOT is_market_hours() for the close check -- that requires
+    now >= 9:30, but the real crash above first fired ~9:23, pre-open. The
+    question here is only "is there still time left today to retry", i.e.
+    are we before the close -- not whether official hours have begun."""
+    if state.get("crash_date") != today_iso:
+        state["crash_date"] = today_iso
+        state["crash_count"] = 0
+    state["crash_count"] += 1
+    past_close = now_after_crash >= now_after_crash.replace(hour=16, minute=0, second=0, microsecond=0)
+    return past_close or state["crash_count"] >= CRASH_RETRY_LIMIT
+
+
 async def main():
     print(f"Ashley-trigger DAILY executor started {datetime.now(ET)}")
     cfg = load_config()
@@ -1140,14 +1610,40 @@ async def main():
             last_message_id = await run_daily_watch(
                 setups, headers, state.get("last_message_id"), alert_message_id, alert_edited_ts)
             state["last_message_id"] = last_message_id
+            state["last_processed_date"] = today_iso
+            save_state(state)
         except Exception as exc:
+            # Real incident 2026-10-12: run_daily_watch() crashed ~9:23-9:40 ET
+            # on a ConnectionRefusedError while TWS was mid-relogin. The old code
+            # unconditionally set last_processed_date = today_iso right after this
+            # except block, so every restart for the REST OF THE DAY saw "already
+            # processed today" at the top-of-loop check and silently idled --
+            # never calling recover_todays_alert()/run_daily_watch() again. SPY
+            # sat inside the day's 778C zone [777.7,778.0] for ~25 straight minutes
+            # right before the 16:00 close and nothing ever checked for it.
+            # Fix: only give up for the day (set last_processed_date) once we're
+            # past close or have exhausted a small same-day crash budget; otherwise
+            # leave last_processed_date unset so the next loop iteration re-enters
+            # via recover_todays_alert() (the same mid-day-restart path that already
+            # works correctly, per the 2026-10-06 10:22 restart log) and keeps trying.
             print(f"Daily watch crashed: {exc}")
-            telegram(f"Ashley-trigger daily watcher crashed today: {exc} -- check manually, no more entries today.",
-                      high_priority=True)
-            oversight_log(f"Daily watch crashed: {exc}", "Unhandled exception mid-day.", outcome="crashed")
-
-        state["last_processed_date"] = today_iso
-        save_state(state)
+            give_up = _update_crash_state(state, today_iso, datetime.now(ET))
+            if give_up:
+                telegram(f"Ashley-trigger daily watcher crashed today: {exc} -- check manually, no more entries today.",
+                          high_priority=True)
+                oversight_log(f"Daily watch crashed: {exc}", "Unhandled exception mid-day; crash budget "
+                              f"exhausted or past market close -- giving up for today.", outcome="crashed")
+                state["last_processed_date"] = today_iso
+                save_state(state)
+            else:
+                telegram(f"Ashley-trigger daily watcher crashed today: {exc} -- retrying automatically "
+                          f"(attempt {state['crash_count']}/{CRASH_RETRY_LIMIT}), market still open.",
+                          high_priority=True)
+                oversight_log(f"Daily watch crashed: {exc}", "Unhandled exception mid-day; market still open "
+                              f"and crash budget remains -- auto-retrying via recover_todays_alert().",
+                              outcome="crashed_retrying")
+                save_state(state)
+                await asyncio.sleep(DAY_POLL_S)
 
 
 if __name__ == "__main__":

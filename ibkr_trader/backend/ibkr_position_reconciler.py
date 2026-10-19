@@ -39,11 +39,11 @@ every other standalone trader in this repo.
 import argparse
 import json
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from ib_insync import IB, ExecutionFilter
+from ib_insync import IB, ExecutionFilter, Stock
 
 sys.path.insert(0, str(Path(__file__).parent))
 from alpaca_0dte_common import load_registry, save_registry  # noqa: E402
@@ -126,6 +126,65 @@ def find_closing_execution(ib, occ_symbol_str):
     return latest.execution.avgPrice, latest.execution.time.astimezone(ET)
 
 
+def worthless_expiry_pnl(ib, ticker, expiry_yyyymmdd, strike, right, entry_fill, qty):
+    """Real incident 2026-10-15 (and, found while fixing it, also
+    2026-10-05): a single-leg long option goes flat with no closing
+    execution to be found -- because nothing traded; it expired. The old
+    code left close_pnl=None forever, which is right for a genuinely
+    unverifiable case (MLEG combo pricing, the 2026-09-03 case this
+    function's caller was built for) but wrong here: once the contract's
+    own expiry date is in the past, its real outcome is just a historical
+    fact -- fetch the underlying's REAL official close that day and check
+    if the option finished out of the money. If so, the full premium was
+    lost and nothing was recovered -- a confident number, not a guess.
+
+    Returns the loss (a negative number) if expiry has passed and the
+    close confirms OTM. Returns None (deliberately, not a fallback to
+    guessing) if expiry hasn't happened yet, the close can't be fetched,
+    or -- the important case -- the option actually finished ITM: that
+    means real assignment/exercise economics (SPY shares delivered,
+    possibly at a gain or a smaller loss than the full premium), which
+    this function will not estimate. That stays close_pnl=None for a
+    human to resolve, same as before.
+    """
+    try:
+        exp_date = datetime.strptime(expiry_yyyymmdd, "%Y%m%d").date()
+    except ValueError:
+        return None
+    if exp_date >= now_et().date():
+        return None
+    try:
+        stock = Stock(ticker, "SMART", "USD")
+        ib.qualifyContracts(stock)
+        # Bare "yyyymmdd HH:mm:ss", no named-timezone suffix -- a suffix like
+        # "US/Eastern" was found 2026-10-08 (data_access.py, a different
+        # script) to fail SILENTLY for a daily/minute bar request: no
+        # exception, just an empty list. This exact bare-format + +1-day-end
+        # + filter-by-date pattern is the one already verified live today
+        # (checking SPY's real 2026-10-05 close) -- reused verbatim rather
+        # than risking a second silent-failure variant.
+        end_dt = exp_date + timedelta(days=1)
+        bars = ib.reqHistoricalData(
+            stock, endDateTime=f"{end_dt.strftime('%Y%m%d')} 00:00:00",
+            durationStr="5 D", barSizeSetting="1 day", whatToShow="TRADES", useRTH=True, formatDate=1)
+    except Exception:
+        return None
+    matching = [b for b in bars if str(b.date) == expiry_yyyymmdd or
+                str(b.date)[:10].replace("-", "") == expiry_yyyymmdd]
+    if not matching:
+        return None
+    close = matching[-1].close
+    # A put is OTM when the close is ABOVE the strike (the right to sell at
+    # strike is worthless when the market is already higher); a call is OTM
+    # when the close is BELOW the strike. Caught backward on first write by
+    # test_worthless_expiry_pnl.py -- glad it was a test that found this and
+    # not a live run guessing the wrong sign on a real trade.
+    otm = (close > strike) if right == "P" else (close < strike)
+    if not otm:
+        return None
+    return round(-float(entry_fill) * 100 * qty, 2)
+
+
 def reconcile_alpaca_registry(ib, live, cfg, dry_run):
     """alpaca_0dte_positions.json -- shared by Ashley, the three SPY/QQQ/IWM
     0DTE butterflies, and the GOOG weekly condor."""
@@ -153,14 +212,29 @@ def reconcile_alpaca_registry(ib, live, cfg, dry_run):
         # weighting, so those get flagged with pnl=None instead of guessed).
         pnl = None
         closed_at = now_et().isoformat()
+        reason = "auto_reconciled_ibkr_flat_pnl_unknown"
         if len(legs) == 1:
             price, ts = find_closing_execution(ib, legs[0]["symbol"])
+            entry_fill = legs[0].get("fill") or 0.0
+            qty = legs[0].get("qty", 1)
             if price is not None:
-                entry_fill = legs[0].get("fill") or 0.0
-                qty = legs[0].get("qty", 1)
                 pnl = round((price - entry_fill) * qty * 100, 2)
                 closed_at = ts.isoformat()
-        reason = "auto_reconciled_ibkr_flat" if pnl is not None else "auto_reconciled_ibkr_flat_pnl_unknown"
+                reason = "auto_reconciled_ibkr_flat"
+            else:
+                # No closing execution exists because nothing traded -- it
+                # expired. Real incidents 2026-10-05 and 2026-10-15 (SPY
+                # 770P, both times): this used to leave pnl=None forever,
+                # which silently excluded a REAL, confidently-knowable loss
+                # from every pnl stat downstream. See worthless_expiry_pnl().
+                try:
+                    ticker, expiry, strike, right = parse_occ_symbol(legs[0]["symbol"])
+                    worthless_pnl = worthless_expiry_pnl(ib, ticker, expiry, strike, right, entry_fill, qty)
+                except (KeyError, ValueError, TypeError):
+                    worthless_pnl = None
+                if worthless_pnl is not None:
+                    pnl = worthless_pnl
+                    reason = "auto_reconciled_worthless_expiry"
         corrections.append((pos_id, pos["ticker"], reason, pnl, closed_at))
         if not dry_run:
             # Build the closed record directly (rather than close_position() +
