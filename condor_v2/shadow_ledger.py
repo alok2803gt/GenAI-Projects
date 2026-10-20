@@ -145,8 +145,12 @@ def ashley_twins(day, mq):
             continue
         label, qty = f"{e['strike']:g}{e['right']}", e["qty"]
         paper = round((r["fill"] - e["fill"]) * 100 * qty, 2)
-        asks = [q[1] for s in bracket(mq, e["time"]) if (q := s.get("x", {}).get(label)) and q[1]]
-        bids = [q[0] for s in bracket(mq, r["time"]) if (q := s.get("x", {}).get(label)) and q[0] is not None]
+        # The executor's own quote at the signal (from 2026-10-17) beats 1-minute samples, which put a
+        # $0.70 SPXW move between them on 2026-10-16. Older records fall back to the samples.
+        asks = [e["ask"]] if e.get("ask") else \
+            [q[1] for s in bracket(mq, e["time"]) if (q := s.get("x", {}).get(label)) and q[1]]
+        bids = [r["bid"]] if r.get("bid") is not None else \
+            [q[0] for s in bracket(mq, r["time"]) if (q := s.get("x", {}).get(label)) and q[0] is not None]
         name = f"Ashley SPX {label}"
         if not asks or not bids:
             rows.append({"trade": name, "paper": paper, "realistic": None,
@@ -261,6 +265,41 @@ def condor_trades(day, mq):
         else:
             note += f", {c['reason']}" if c else ", held"
         rows.append({"trade": name, "paper": round(paper, 2), "realistic": round(real, 2), "note": note})
+    rows += unwound_entries(log, mq)
+    return rows
+
+
+def unwound_entries(log, mq):
+    """Entries that filled only some legs and were sold back (2026-10-16: two cost $29 the ledger
+    never saw). Real cost of each filled leg: a long bought at the ask and sold at the bid, a short
+    sold at the bid and bought back at the ask -- around the entry and unwind times."""
+    plans = {r["slot"]: r for r in log if r["action"] == "entry_plan"}
+    partial = {r["slot"]: r for r in log if r["action"] == "entry_partial"}
+    rows = []
+    for u in (r for r in log if r["action"] == "entry_unwound"):
+        slot, paper = u["slot"], u["pnl"]
+        plan, part = plans.get(slot), partial.get(slot)
+        real, note = paper, "unwound -- no leg quotes, paper cost kept"
+        if plan and part:
+            k = plan["strikes"]
+            total, ok = 0.0, True
+            for leg in part.get("filled", {}):
+                lab = f"{k[leg]:g}{'P' if 'put' in leg else 'C'}"
+                ins = [ba(s, lab) for s in bracket(mq, part["time"])]
+                outs = [ba(s, lab) for s in bracket(mq, u["time"])]
+                ins, outs = [q for q in ins if q[1] is not None], [q for q in outs if q[1] is not None]
+                if not ins or not outs:
+                    ok = False
+                    break
+                if leg.startswith("long"):
+                    total += min(b for b, _ in outs) - max(a for _, a in ins)
+                else:
+                    total += min(b for b, _ in ins) - max(a for _, a in outs)
+            if ok:
+                real = min(paper, total * 100)
+                note = f"unwound ({u.get('status', '')}): filled {', '.join(part.get('filled', {}))}"
+        rows.append({"trade": f"condor {slot} (unwound)", "paper": round(paper, 2), "realistic": round(real, 2),
+                     "note": note})
     return rows
 
 

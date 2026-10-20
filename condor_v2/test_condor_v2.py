@@ -390,8 +390,25 @@ def test_shadow_ledger_scores_ashley_twin_at_worse_side():
                   "10:11": {"x": {"7760C": [17.0, 17.3]}}, "10:12": {"x": {"7760C": [17.1, 17.4]}}}
             r = S.ashley_twins(day, mq)[0]
             assert r["paper"] == 60.0 and r["realistic"] == 20.0, r   # bought 16.80 (worse ask), sold 17.00 (worse bid)
+            S.ASHLEY_TWINS.write_text("\n".join(json.dumps(r) for r in [
+                {"time": f"{day}T10:05:20-04:00", "action": "entered", "setup": "773C", "strike": 7760.0, "right": "C", "qty": 1, "fill": 16.6, "bid": 16.5, "ask": 16.7},
+                {"time": f"{day}T10:11:40-04:00", "action": "closed", "setup": "773C", "strike": 7760.0, "right": "C", "qty": 1, "fill": 17.2, "bid": 17.1, "ask": 17.3}]) + "\n")
+            r = S.ashley_twins(day, mq)[0]
+            assert r["realistic"] == 40.0, r   # the executor's own quotes: 16.70 ask in, 17.10 bid out
         finally:
             S.ASHLEY_TWINS = old
+
+
+def test_shadow_ledger_scores_unwound_entries():
+    import shadow_ledger as S
+    t0, t1 = "2026-10-16T12:03:30-04:00", "2026-10-16T12:03:48-04:00"
+    log = [{"action": "entry_plan", "slot": "12:01", "strikes": {"short_put": 765, "short_call": 769, "long_put": 760.0, "long_call": 774.0}},
+           {"action": "entry_partial", "slot": "12:01", "time": t0, "filled": {"long_put": 0.09, "short_put": 0.55}},
+           {"action": "entry_unwound", "slot": "12:01", "time": t1, "status": "short_call_failed", "pnl": -4.0}]
+    mq = {"12:03": {"o": {"760P": [0.08, 0.10], "765P": [0.54, 0.56]}}, "12:04": {"o": {"760P": [0.07, 0.09], "765P": [0.55, 0.57]}}}
+    r = S.unwound_entries(log, mq)[0]
+    # long 760P: in at 0.10 ask, out at 0.07 bid = -0.03; short 765P: in at 0.54 bid, out at 0.57 ask = -0.03
+    assert r["paper"] == -4.0 and r["realistic"] == -6.0, r
 
 
 def test_connect_retry_alerts_once_then_recovers_or_gives_up():
