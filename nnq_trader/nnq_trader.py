@@ -46,7 +46,7 @@ CHARTS.mkdir(exist_ok=True)
 ET = ZoneInfo("America/New_York")
 SYMBOL, EXCHANGE, TICK, MULT = "NNQ", "CME", 0.5, 0.2
 CLIENT_ID, PORT = 1660, 7497
-THRESHOLD = 60            # strictly greater than this
+THRESHOLD = 60            # at or above this (>=), same rule as the channel posts (user, 2026-10-20)
 QTY = 1
 ROLL_DAYS = 7
 BAR_SECONDS = 600
@@ -86,6 +86,15 @@ Rules: extract the current price exactly as shown. The two probabilities must ad
 Be objective and based only on what is visible on the chart -- never invent levels, patterns,
 or labels that aren't actually there. When the chart gives no real edge, say so with probabilities
 near 50/50 rather than forcing a direction."""
+
+# Channel broadcast (user ask 2026-10-19): the chartexpert read of the Dec 2026 NNQ and MNQ 10-minute
+# charts goes to the "BreakOut- Futures" channel whenever either direction is >= 60%. Posted by the
+# alert bot, which must be an admin of the channel. Broadcast only -- it never affects trading.
+BROADCAST_CHAT = "-1004232108698"
+BROADCAST_MONTH = "202612"           # Dec 2026 (NNQZ6 / MNQZ6, last trade 2026-12-18)
+BROADCAST_SYMBOLS = ("NNQ", "MNQ")
+BROADCAST_MIN = 60                   # >= this, either direction
+NAMES = {"NNQ": "Nano Nasdaq-100 futures", "MNQ": "Micro E-mini Nasdaq-100 futures"}
 
 PROB_RE = re.compile(r"(UP|DOWN)\s*-\s*Probability\s*(\d+)%\s*\|\s*(?:Up|Down)\s*(\d+)%", re.I)
 
@@ -213,7 +222,7 @@ def rsi(vals, n=14):
     return out
 
 
-def draw(bars, path, n=120):
+def draw(bars, path, n=120, sym=SYMBOL, local=None):
     closes = [b.close for b in bars]
     e9, e21, e50, r = ema(closes, 9), ema(closes, 21), ema(closes, 50), rsi(closes)
     bars, e9, e21, e50, r = bars[-n:], e9[-n:], e21[-n:], e50[-n:], r[-n:]
@@ -234,7 +243,7 @@ def draw(bars, path, n=120):
     ax.axhline(last.close, color="#555", lw=0.6, ls="--")
     ax.text(len(bars) - 0.5, last.close, f" {last.close:,.2f}", va="center", fontsize=9,
             bbox=dict(boxstyle="round", fc="white", ec="#555"))
-    ax.set_title(f"NNQ (Nano Nasdaq-100 futures) - 10-minute - last bar {last.date:%Y-%m-%d %H:%M} ET",
+    ax.set_title(f"{local or sym} ({NAMES.get(sym, sym)}) - 10-minute - last bar {last.date:%Y-%m-%d %H:%M} ET",
                  fontsize=11)
     ax.legend(loc="upper left", fontsize=8)
     ax.grid(alpha=0.25)
@@ -253,7 +262,7 @@ def draw(bars, path, n=120):
 
 
 # ----------------------------------------------------------------- read
-def read_chart(client, png):
+def read_chart(client, png, sym=SYMBOL):
     data = base64.standard_b64encode(Path(png).read_bytes()).decode()
     resp = client.beta.messages.create(
         model=MODEL, max_tokens=16000, system=SYSTEM,
@@ -261,7 +270,7 @@ def read_chart(client, png):
         betas=["server-side-fallback-2026-07-01"], fallbacks="default",
         messages=[{"role": "user", "content": [
             {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": data}},
-            {"type": "text", "text": "Analyze this NNQ 10-minute chart."}]}],
+            {"type": "text", "text": f"Analyze this {sym} 10-minute chart."}]}],
     )
     if resp.stop_reason == "refusal":
         raise ValueError(f"read refused: {getattr(resp.stop_details, 'category', None)}")
@@ -275,10 +284,10 @@ def read_chart(client, png):
 
 
 def target_position(read, current):
-    """Hold until the opposite signal (user rule): only a >THRESHOLD read moves the position."""
-    if read["up"] > THRESHOLD and read["up"] > read["down"]:
+    """Hold until the opposite signal (user rule): only a >=THRESHOLD read moves the position."""
+    if read["up"] >= THRESHOLD and read["up"] > read["down"]:
         return QTY
-    if read["down"] > THRESHOLD and read["down"] > read["up"]:
+    if read["down"] >= THRESHOLD and read["down"] > read["up"]:
         return -QTY
     return current
 
@@ -346,16 +355,79 @@ def realized(fills):
 
 
 # ----------------------------------------------------------------- loop
-async def cycle(ib, client, st, dry):
-    c, sessions = await front_contract(ib)
-    if not is_open(sessions):
-        return "closed"
+async def closed_bars(ib, c):
     # formatDate=2 -> tz-aware UTC bar times. With 1 they come back naive in TWS's own zone (US/Central
     # here), which read as ET put every bar an hour off (caught in the 2026-10-19 dry run).
     bars = await ib.reqHistoricalDataAsync(c, "", "5 D", "10 mins", "TRADES", useRTH=False, formatDate=2)
     for b in bars:
         b.date = b.date.astimezone(ET)
-    bars = [b for b in bars if b.date + timedelta(seconds=BAR_SECONDS) <= now()]  # closed bars only
+    return [b for b in bars if b.date + timedelta(seconds=BAR_SECONDS) <= now()]  # closed bars only
+
+
+def to_html(text):
+    """Chartexpert markdown -> Telegram HTML (escape first, then **bold**)."""
+    text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
+
+
+def post_channel(st, png, caption, text):
+    """Chart + analysis to the BreakOut- Futures channel via the alert bot. Returns True if posted."""
+    c = cfg()
+    base = f"https://api.telegram.org/bot{c['telegram_token']}"
+    try:
+        with open(png, "rb") as f:
+            r = requests.post(f"{base}/sendPhoto", data={"chat_id": BROADCAST_CHAT, "caption": caption[:1000]},
+                              files={"photo": f}, timeout=30)
+        if r.ok:
+            r = requests.post(f"{base}/sendMessage", json={"chat_id": BROADCAST_CHAT, "text": to_html(text)[:4000],
+                                                          "parse_mode": "HTML"}, timeout=15)
+        if not r.ok:
+            raise RuntimeError(r.json().get("description", r.status_code))
+        return True
+    except Exception as e:
+        log("broadcast_failed", error=str(e)[:150])
+        alert_once(st, "broadcast", f"could not post to the BreakOut- Futures channel ({e}). Add @ad2803_bot "
+                                    f"to the channel as an admin with 'Post messages'.", 3600)
+        return False
+
+
+async def broadcast(ib, client, st, nnq):
+    """Dec 2026 NNQ + MNQ reads to the channel when UP or DOWN is >= BROADCAST_MIN. `nnq` is the trading
+    cycle's (contract, png, read) -- reused when it is the Dec 2026 contract, so NNQ isn't read twice."""
+    for sym in BROADCAST_SYMBOLS:
+        try:
+            if sym == SYMBOL and nnq and nnq[0].lastTradeDateOrContractMonth.startswith(BROADCAST_MONTH):
+                c, png, rd = nnq
+            else:
+                c = Future(sym, BROADCAST_MONTH, EXCHANGE)
+                await ib.qualifyContractsAsync(c)
+                if not c.conId:
+                    log("broadcast_skip", sym=sym, reason=f"{BROADCAST_MONTH} contract not found (expired?)")
+                    continue
+                bars = await closed_bars(ib, c)
+                if len(bars) < 60:
+                    continue
+                png = CHARTS / f"{sym}_{now():%Y%m%d_%H%M}.png"
+                draw(bars, png, sym=sym, local=c.localSymbol)
+                rd = read_chart(client, png, sym)
+            hit = rd["up"] >= BROADCAST_MIN or rd["down"] >= BROADCAST_MIN
+            log("broadcast_read", sym=sym, contract=c.localSymbol, up=rd["up"], down=rd["down"], posted=hit,
+                chart=png.name, text=None if sym == SYMBOL else rd["text"])  # NNQ text is on its "read" line
+            if hit:
+                lead = "UP" if rd["up"] >= rd["down"] else "DOWN"
+                cap = f"{c.localSymbol} 10-min | {lead} {max(rd['up'], rd['down'])}% | {now():%Y-%m-%d %H:%M} ET"
+                post_channel(st, png, cap, rd["text"])
+        except anthropic.APIError as e:
+            log("broadcast_failed", sym=sym, error=f"{type(e).__name__}: {str(e)[:120]}")
+        except Exception as e:
+            log("broadcast_failed", sym=sym, error=f"{type(e).__name__}: {str(e)[:120]}")
+
+
+async def cycle(ib, client, st, dry):
+    c, sessions = await front_contract(ib)
+    if not is_open(sessions):
+        return "closed"
+    bars = await closed_bars(ib, c)
     if len(bars) < 60:
         log("skip", reason=f"only {len(bars)} closed bars")
         return "no bars"
@@ -365,9 +437,10 @@ async def cycle(ib, client, st, dry):
         log("skip", reason=f"stale bars ({age:.0f}s)")
         return "stale"
     png = CHARTS / f"NNQ_{now():%Y%m%d_%H%M}.png"
-    draw(bars, png)
-    for old in sorted(CHARTS.glob("NNQ_*.png"))[:-300]:
-        old.unlink(missing_ok=True)
+    draw(bars, png, sym=SYMBOL, local=c.localSymbol)
+    for pat in ("NNQ_*.png", "MNQ_*.png"):  # keep the last 300 charts of each
+        for old in sorted(CHARTS.glob(pat))[:-300]:
+            old.unlink(missing_ok=True)
     try:
         rd = read_chart(client, png)
     except anthropic.AuthenticationError:
@@ -389,13 +462,14 @@ async def cycle(ib, client, st, dry):
     pos = sum(q for cc, q in (await held(ib)).values())
     tgt = target_position(rd, pos)
     log("read", up=rd["up"], down=rd["down"], lead=rd["lead"], price=bars[-1].close, position=pos, target=tgt,
-        chart=png.name, model=rd["model"])
+        chart=png.name, model=rd["model"], text=rd["text"])  # full analysis kept for later review
+    st["_last_nnq"] = (c, png, rd)  # handed to broadcast() after any trade, so trading isn't delayed
     if abs(tgt) > QTY:
         raise RuntimeError(f"target {tgt} exceeds max position {QTY}")
     if tgt == pos:
         return "hold"
     delta = tgt - pos
-    why = (f"{'UP' if tgt > 0 else 'DOWN'} {max(rd['up'], rd['down'])}% > {THRESHOLD}%"
+    why = (f"{'UP' if tgt > 0 else 'DOWN'} {max(rd['up'], rd['down'])}% >= {THRESHOLD}%"
            + (" (flip)" if pos and abs(delta) == 2 else ""))
     if dry:
         log("dry_run", would=("BUY" if delta > 0 else "SELL"), qty=abs(delta), why=why)
@@ -465,6 +539,9 @@ async def main():
                 log("cycle_error", error=f"{type(e).__name__}: {str(e)[:200]}")
                 alert_once(st, "cycle", f"cycle error {type(e).__name__}: {str(e)[:120]}", 1800)
                 result = "error"
+            nnq = st.pop("_last_nnq", None)
+            if result not in ("closed", "auth") and "--no-broadcast" not in sys.argv:
+                await broadcast(ib, client, st, nnq)
             save_state(st)
             if once:
                 print("result:", result)

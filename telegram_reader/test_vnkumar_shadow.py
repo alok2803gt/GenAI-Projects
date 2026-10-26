@@ -44,6 +44,20 @@ def test_exit_matching():
     assert V.match_exit("Closing 770p for $3", two, REF)[0] == [], "two 770p and no expiry: don't guess"
 
 
+def test_exit_bugs_of_oct_21_to_23():
+    opens = dict([pos("3", "SPCX", [(162.5, "C", 1)], "2026-10-23", 1),
+                  pos("4", "SPCX", [(135.0, "P", 1)], "2026-10-23", 2),
+                  pos("5", "SPY", [(762.0, "P", 1)], "2026-10-23", 3)])
+    ids, how = V.match_exit("Closed $SPcX STRANGLE for $3.75", opens, REF)
+    assert sorted(ids) == ["3", "4"], (ids, how)  # both SPCX legs -- never the SPY 762P
+    two = dict([pos("7", "SPY", [(775.0, "C", 1)], "2026-10-23", 1),
+                pos("8", "AMD", [(570.0, "C", 1), (580.0, "C", -1)], "2026-10-23", 2)])
+    assert sorted(V.match_exit("Closing $SPY and $AMD near open", two, REF)[0]) == ["7", "8"]
+    nb = dict([pos("9", "NBIS", [(180.0, "C", 1)], "2026-10-30", 1)])
+    assert V.match_exit("Closing NVDA", nb, REF)[0] == [], "NVDA isn't held: never close NBIS"
+    assert V.named_tickers("Closed $SPcX STRANGLE for $3.75") == {"SPCX"}
+
+
 def test_plans_are_not_exits():
     for msg in ("Will try to hold this week\nIf it doesn’t work will close on Thursday. \nDon’t average",
                 "Will close half $BABA 108p near open",

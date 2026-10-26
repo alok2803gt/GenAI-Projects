@@ -65,7 +65,10 @@ def bars(ticker, day):
         if r.status_code == 429:
             time.sleep(15)
             continue
-        r.raise_for_status()
+        if not r.ok:
+            # Never raise_for_status(): its message carries the full URL, apiKey included -- it leaked
+            # the key into tool output twice (2026-10-13, 2026-10-23). Report the status only.
+            raise RuntimeError(f"Polygon {r.status_code} for {ticker} {day} (same-day bars aren't served)")
         break
     out = {}
     for b in r.json().get("results") or []:

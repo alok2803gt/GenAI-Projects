@@ -12,7 +12,11 @@ def rd(up):
 def test_hold_until_opposite_signal():
     assert N.target_position(rd(61), 0) == 1
     assert N.target_position(rd(39), 0) == -1          # DOWN 61%
-    assert N.target_position(rd(60), 0) == 0, "exactly 60 is not above 60"
+    assert N.target_position(rd(60), 0) == 1, "exactly 60 trades (>=), same as the channel rule"
+    assert N.target_position(rd(40), 0) == -1, "DOWN exactly 60 shorts"
+    assert N.target_position(rd(59), 0) == 0
+    assert N.target_position(rd(50), 1) == 1, "50/50 never moves the position"
+    assert N.THRESHOLD == N.BROADCAST_MIN, "trading and channel thresholds must stay the same"
     assert N.target_position(rd(55), 1) == 1, "a weak read keeps the long"
     assert N.target_position(rd(45), -1) == -1, "a weak read keeps the short"
     assert N.target_position(rd(30), 1) == -1, "DOWN 70% flips a long to short"
@@ -33,6 +37,11 @@ def test_trading_hours_and_break():
     assert N.is_open(s, datetime(2026, 10, 19, 10, 0, tzinfo=et))
     assert not N.is_open(s, datetime(2026, 10, 19, 17, 30, tzinfo=et)), "17:00-18:00 ET daily break"
     assert N.is_open(s, datetime(2026, 10, 19, 18, 30, tzinfo=et))
+
+
+def test_channel_html_escapes_then_bolds():
+    out = N.to_html("**Bias:** Bullish (RSI < 30 & rising) -> **UP**")
+    assert out == "<b>Bias:</b> Bullish (RSI &lt; 30 &amp; rising) -&gt; <b>UP</b>", out
 
 
 def test_tick_rounding_is_marketable():

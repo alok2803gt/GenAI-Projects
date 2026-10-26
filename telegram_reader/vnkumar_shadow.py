@@ -27,6 +27,7 @@ posts is forwarded to the user's Telegram immediately, day or night; trade alert
 import asyncio
 import json
 import re
+from collections import defaultdict
 import sys
 from datetime import date, datetime, time as dtime, timedelta
 from pathlib import Path
@@ -135,11 +136,28 @@ def label(p):
     return f"{p['ticker']} {s} {p['expiry'][5:]}"
 
 
+# All-caps words that are commentary, not tickers ("Closing NVDA" names a ticker; "ER", "FOMC" don't).
+NOT_TICKERS = {"ER", "FOMC", "CPI", "PPI", "NFP", "ATH", "EMA", "SMA", "VWAP", "TP", "SL", "ITM", "OTM", "ATM",
+               "DTE", "EOD", "AM", "PM", "OK", "ET", "EST", "PT", "STRANGLE", "STRADDLE", "CALL", "PUT", "OPEX",
+               "GDP", "PCE", "RSI", "IV", "USA", "US", "I", "A"}
+
+
+def named_tickers(text):
+    """Every ticker a message names: $-prefixed in any case ("$SPcX" -> SPCX, 2026-10-21) plus bare
+    all-caps words that aren't commentary ("Closing NVDA", 2026-10-23)."""
+    out = {t.upper() for t in re.findall(r"\$([A-Za-z]{1,5})\b", text)}
+    out |= {w for w in re.findall(r"\b([A-Z]{2,5})\b", text) if w not in NOT_TICKERS}
+    return out
+
+
 def match_exit(text, opens, ref):
     """(position ids to close, how matched). Filters by every identifier the message names."""
     cands = dict(opens)
     named = False
-    tickers = {p["ticker"] for p in opens.values() if re.search(r"(?<![A-Za-z])\$?" + p["ticker"] + r"\b", text)}
+    said = named_tickers(text)
+    tickers = {p["ticker"] for p in opens.values() if p["ticker"] in said}
+    if said and not tickers:
+        return [], f"names {sorted(said)}, none of which is open"  # never guess another position
     if tickers:
         named = True
         cands = {k: p for k, p in cands.items() if p["ticker"] in tickers}
@@ -164,6 +182,17 @@ def match_exit(text, opens, ref):
         return [last], "inferred: most recently mentioned"
     if len(cands) == 1:
         return list(cands), "named"
+    # "Closed $SPcX STRANGLE for $3.75" (2026-10-21): one ticker, both legs -> close every leg of it
+    if (len(tickers) == 1 and not pairs and not strikes
+            and re.search(r"\b(strangle|straddle|both|all legs)\b", text, re.I)):
+        return list(cands), "named ticker, all legs"
+    # "Closing $SPY and $AMD near open" (2026-10-22): several tickers, one open position each -> all of them
+    if len(tickers) > 1 and not pairs and not strikes:
+        per = defaultdict(list)
+        for k, p in cands.items():
+            per[p["ticker"]].append(k)
+        if all(len(v) == 1 for v in per.values()):
+            return [v[0] for v in per.values()], f"named {len(per)} tickers"
     return [], f"ambiguous ({len(cands)} candidates)" if cands else "names nothing open"
 
 
@@ -209,6 +238,10 @@ def sell_value(p, q):
 
 # ---------------------------------------------------------------- actions
 async def open_pos(ib, st, e, msg):
+    if e["expiry"] < msg["date"][:10]:  # "$SPY 768c 10/20" posted 10/23: a typo, not a real contract
+        log("entry_bad_expiry", pos=label(e), msg=msg["text"][:120])
+        tg(f"Skipped {label(e)}: expiry is before the post date (typo in his alert?) -- not tracked.")
+        return
     key = (e["ticker"], tuple(map(tuple, e["legs"])), e["expiry"])
     for p in st["open"].values():
         if (p["ticker"], tuple(map(tuple, p["legs"])), p["expiry"]) == key:
