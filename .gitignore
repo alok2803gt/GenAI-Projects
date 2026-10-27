@@ -12,6 +12,10 @@ venv/
 .venv/
 env/
 
+# Visa bulletin tracker runtime files
+visa_bulletin_tracker/monitor.log
+visa_bulletin_tracker/run_logs/
+
 # Runtime / auto-generated data files
 ibkr_trader/backend/autotrader_state.json
 ibkr_trader/backend/iv_history.json
@@ -211,15 +215,27 @@ telegram_reader/vnkumar_console.log
 telegram_reader/vnkumar_watchdog.log
 condor_v2/opex_results.json
 condor_v2/opex_backtest.log
-condor_v2/opex_backtest.err
 condor_v2/iv_study.json
 nnq_trader/.venv/
 nnq_trader/nnq_log.jsonl
 nnq_trader/nnq_state.json
 nnq_trader/nnq_charts/
 nnq_trader/nnq_*.log
+condor_v2/opex_backtest.err
 ibkr_trader/backend/*.pre_merge_*
 ibkr_trader/backend/startup_disabled/
 condor_v2/replay_cache/spx_vix_5y.json
 condor_v2/replay_cache/spx_15m_5y.json
 condor_v2/condor_daily_tracker.csv
+telegram_reader/replay_bars/
+
+# C2 shadow tracker state (2026-10-26)
+c2_shadow/c2_shadow_state.json
+c2_shadow/c2_shadow_log.jsonl
+c2_shadow/c2_shadow_task.log
+c2_shadow/research/data/
+c2_shadow/ae_clone_state.json
+c2_shadow/ae_clone_log.jsonl
+c2_shadow/ae_clone_task.log
+c2_shadow/*.bak
+c2_shadow/*.tmp
