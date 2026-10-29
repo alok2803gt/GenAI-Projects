@@ -239,3 +239,4 @@ c2_shadow/ae_clone_log.jsonl
 c2_shadow/ae_clone_task.log
 c2_shadow/*.bak
 c2_shadow/*.tmp
+condor_v2/gateway_watchdog_log.jsonl

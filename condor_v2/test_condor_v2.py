@@ -441,6 +441,250 @@ def test_config_defaults_are_paper():
     assert cfg["tws_port"] == 7497, "default port must be TWS PAPER"
     assert cfg["qty"] == 1 and len(cfg["entry_times"]) == 8 and cfg["entry_times"][0] == "11:01"
 
+# ---- gateway_watchdog escalation (2026-10-28)
+def test_gateway_escalation_ladder():
+    import gateway_watchdog as G
+    e = G.Escalator()
+    p = ["Gateway lost its link to IBKR (1100)"]
+    seen = {}
+    for s in range(0, 2500, 30):
+        for name, _ in e.step(1000 + s, p, True):
+            seen.setdefault(name, []).append(s)
+    assert seen["alert"] == [60] and seen["reconnect"] == [180] and seen["restart"] == [480]
+    assert seen["hard_restart"] == [900, 2100], seen  # then every 20 min
+    assert "start" not in seen
+    assert e.step(1000 + 2500, [], True) == [("recovered", 2500)]
+    assert e.step(1000 + 2530, [], True) == []
+
+
+def test_gateway_blip_and_not_running():
+    import gateway_watchdog as G
+    e = G.Escalator()
+    assert e.step(0, ["API session down"], True) == []
+    assert e.step(30, [], True) == [], "a 30 s blip never alerts or announces recovery"
+    e = G.Escalator()
+    acts = [a for s in range(0, 200, 30) for a in e.step(s, ["Gateway is not running"], False)]
+    assert [a[0] for a in acts] == ["start", "alert"], acts  # nothing to send IBC commands to
+    e = G.Escalator()
+    assert [a for s in range(0, 900, 30) for a in e.step(s, ["port 7497 refuses connections"], True, nightly=True)] == []
+
+
+def test_gateway_problems():
+    import gateway_watchdog as G
+    ok = {"process": True, "port": True, "api": True, "link": True, "data": None}
+    assert G.problems(ok) == []
+    assert G.problems({**ok, "link": False}) == ["Gateway lost its link to IBKR (1100)"]
+    assert G.problems({**ok, "port": False, "api": False}) == ["port 7497 refuses connections"]
+    assert G.problems({**ok, "data": False}) == ["SPY quotes stale > 3 min"]
+
+
+# ---- connection trouble (2026-10-28): socket drops, IBKR link loss, stray shares, untracked legs
+from types import SimpleNamespace as _NS
+
+
+def _opt(strike, right, qty, expiry="20261028"):
+    return _NS(contract=_NS(secType="OPT", symbol="SPY", lastTradeDateOrContractMonth=expiry, strike=float(strike),
+                            right=right), position=qty)
+
+
+_CONDOR = {"id": "1", "slot": "11:01", "qty": 1, "credit": 0.6, "stop_loss_usd": 30.0,
+           "strikes": {"short_put": 768, "short_call": 771, "long_put": 763.0, "long_call": 776.0}}
+_LEGS = [_opt(768, "P", -1), _opt(763, "P", 1), _opt(771, "C", -1), _opt(776, "C", 1)]
+
+
+def test_link_tracking_1100_pairs_only():
+    C.LINK.update(ok=True, since=None)
+    C.on_ib_error(-1, 2110, "TWS-server broken")
+    assert C.LINK["ok"], "2110 has no guaranteed 'restored' pair: ignore it"
+    C.on_ib_error(-1, 1100, "lost")
+    assert not C.LINK["ok"]
+    C.on_ib_error(-1, 1102, "restored")
+    assert C.LINK["ok"]
+
+
+def test_untracked_legs_and_stray_stock():
+    sent, old = [], C.telegram
+    C.telegram = lambda cfg, text, high_priority=False: sent.append((text, high_priority))
+    try:
+        state = {"open": [dict(_CONDOR)]}
+        ib = _NS(positions=lambda: list(_LEGS))
+        assert C.untracked_legs(ib, CFG, "20261028", state) == {} and not sent
+        ib = _NS(positions=lambda: _LEGS + [_opt(770, "P", -1), _opt(765, "P", 1)])
+        assert C.untracked_legs(ib, CFG, "20261028", state) == {"770P": -1, "765P": 1}
+        assert sent and sent[-1][1], "HIGH alert"
+        sent.clear()
+        ib = _NS(positions=lambda: [_opt(763, "P", 1), _opt(771, "C", -1), _opt(776, "C", 1)])
+        assert C.untracked_legs(ib, CFG, "20261028", state) == {}, "IBKR bought back our short: not 'untracked'"
+        stock = _NS(contract=_NS(secType="STK", symbol="SPY"), position=100.0)
+        assert C.stray_stock(_NS(positions=lambda: [stock]), CFG) == [("SPY", 100.0)] and sent[-1][1]
+    finally:
+        C.telegram = old
+
+
+def _run_main_with(fake_sleep_hook, start="15:50"):
+    """Run condor_v2.main() against a fake IB and a fake clock (each sleep advances it)."""
+    import sys
+    from datetime import datetime
+    tmp = Path(tempfile.mkdtemp())
+    (tmp / "config.json").write_text(json.dumps({"telegram_token": ""}))
+    h, m = map(int, start.split(":"))
+    clock = {"t": datetime(2026, 10, 28, h, m, tzinfo=C.ET)}
+    (tmp / "state.json").write_text(json.dumps({"session": "2026-10-28", "open": [dict(_CONDOR)], "closed": [],
+                                                "realized": 0.0}))
+    calls = {"near": 0, "value": 0, "connects": 0, "sleeps": 0}
+    sent = []
+
+    class Ev:
+        def __iadd__(self, f):
+            return self
+
+    class FakeIB:
+        RequestTimeout = 0
+
+        def __init__(self):
+            self.connected, self.errorEvent = False, Ev()
+
+        def connect(self, *a, **k):
+            calls["connects"] += 1
+            self.connected = True
+
+        def disconnect(self):
+            self.connected = False
+
+        def isConnected(self):
+            return self.connected
+
+        def managedAccounts(self):
+            return ["DUT155508"]
+
+        def positions(self):
+            return list(_LEGS)
+
+        def sleep(self, s):
+            calls["sleeps"] += 1
+            clock["t"] += timedelta(seconds=s)
+            fake_sleep_hook(self, calls["sleeps"])
+
+    from datetime import timedelta
+    saved = {n: getattr(C, n) for n in ("IB", "now_et", "telegram", "keep_awake", "reconcile_broker",
+                                        "near_money_pass", "condor_value")}
+    argv = sys.argv
+    try:
+        C.IB = FakeIB
+        C.now_et = lambda: clock["t"]
+        C.telegram = lambda cfg, text, high_priority=False: sent.append((text, high_priority))
+        C.keep_awake = lambda on=True: None
+        C.reconcile_broker = lambda *a, **k: None
+        C.near_money_pass = lambda *a, **k: calls.__setitem__("near", calls["near"] + 1)
+
+        def value(*a, **k):
+            calls["value"] += 1
+            return 0.10, {}, {}
+        C.condor_value = value
+        C.LINK.update(ok=True, since=None)
+        sys.argv = ["condor_v2.py", "--dir", str(tmp)]
+        C.main()
+    finally:
+        for n, v in saved.items():
+            setattr(C, n, v)
+        sys.argv = argv
+    return calls, sent, tmp
+
+
+def test_main_survives_a_socket_drop_and_still_runs_the_near_money_pass():
+    def hook(ib, n):
+        if n == 2:  # Gateway restarted under us
+            ib.connected = False
+            raise ConnectionError("Socket disconnect")
+    calls, sent, tmp = _run_main_with(hook)
+    assert calls["connects"] == 2, calls
+    assert calls["near"] == 1, "the 15:57 pass must still run after the reconnect"
+    assert not (tmp / "PAUSED.flag").exists(), "a dropped socket must not pause the bot"
+    assert any("lost contact" in t and h for t, h in sent) and any("back in contact" in t for t, h in sent), sent
+
+
+def test_main_holds_fire_while_ibkr_link_is_down_and_flags_the_missed_pass():
+    def hook(ib, n):
+        if n == 1:
+            C.on_ib_error(-1, 1100, "Connectivity between IBKR and Trader Workstation has been lost.")
+    calls, sent, tmp = _run_main_with(hook)
+    assert calls["near"] == 0 and calls["value"] == 1, "no stop checks on frozen quotes after the first cycle"
+    assert any("link lost" in t and h for t, h in sent), sent
+    assert any("near-money pass did NOT run" in t and h for t, h in sent), sent
+
+
+def test_main_resumes_when_the_link_comes_back():
+    def hook(ib, n):
+        if n == 1:
+            C.on_ib_error(-1, 1100, "lost")
+        if n == 3:
+            C.on_ib_error(-1, 1102, "restored")
+    calls, sent, tmp = _run_main_with(hook)
+    assert calls["near"] == 1 and any("link back" in t for t, h in sent), sent
+
+
+def test_spx_scalper_reconnects_and_books_an_exit_that_filled_while_away():
+    import sys
+    from datetime import datetime
+    argv = sys.argv
+    sys.argv = ["spx_call_trader.py"]
+    import importlib
+    import spx_call_trader as S
+    importlib.reload(S)
+    sys.argv = argv
+    tmp = Path(tempfile.mkdtemp())
+    S.STATE, S.LOG = tmp / "state.json", tmp / "log.jsonl"
+    clock = datetime(2026, 10, 28, 10, 0, tzinfo=C.ET)
+    S.now = lambda: clock
+    S.save_state({"day": "2026-10-28", "status": "open", "strike": 7700, "conId": 42, "fill": 13.9})
+    sent = []
+    saved = {n: getattr(C, n) for n in ("telegram", "connect_retry", "keep_awake", "load_config")}
+
+    class FakeIB:
+        RequestTimeout = 0
+
+        def managedAccounts(self):
+            return ["DUT155508"]
+
+        def qualifyContracts(self, c):
+            c.conId = 42
+
+        def positions(self):
+            return []
+
+        def reqExecutions(self):
+            return [_NS(contract=_NS(conId=42), execution=_NS(side="BOT", price=13.9, shares=1)),
+                    _NS(contract=_NS(conId=42), execution=_NS(side="SLD", price=15.0, shares=1))]
+
+        def disconnect(self):
+            pass
+
+    runs = {"n": 0}
+    real_main = S.main
+
+    def flaky_main():
+        runs["n"] += 1
+        if runs["n"] == 1:
+            raise ConnectionError("Socket disconnect")
+        real_main()
+    try:
+        C.telegram = lambda cfg, text, high_priority=False: sent.append((text, high_priority))
+        C.connect_retry = lambda *a, **k: True
+        C.keep_awake = lambda on=True: None
+        C.load_config = lambda base=None: {}
+        S.IB = FakeIB
+        S.main = flaky_main
+        real_sleep, S.time = S.time, _NS(sleep=lambda s: None)
+        S.main_with_reconnect()
+    finally:
+        for n, v in saved.items():
+            setattr(C, n, v)
+        S.main = real_main
+        S.time = real_sleep
+    st = S.load_state()
+    assert runs["n"] == 2 and st["status"] == "done" and st["exit"] == 15.0, st
+    assert "target +$100 (filled while disconnected)" == st["exit_reason"], st
+    assert sum(1 for t, h in sent if h) == 1, "one HIGH alert for the drop"
 
 if __name__ == "__main__":
     for name, fn in list(globals().items()):

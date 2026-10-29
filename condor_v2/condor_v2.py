@@ -677,6 +677,99 @@ def near_money_pass(ib, cfg, expiry, state, dry, dist):
             close_near_money_side(ib, cfg, expiry, pos, S, state, dry, dist)
 
 
+# ----------------------------------------------------------------- connection trouble (2026-10-28)
+# 2026-10-27: TWS lost its IBKR link (error 1100) at 14:34. A request with no timeout then waited
+# until the link came back at 16:48, so no stop check and no 15:58 near-money pass ran, and a
+# short 770P was assigned. Now requests time out (RequestTimeout); a lost link stops trading
+# decisions on frozen quotes and says so; a dropped socket (Gateway restart) reconnects instead of
+# crashing into PAUSED.flag.
+LINK = {"ok": True, "since": None}
+
+
+def on_ib_error(req_id, code, msg, contract=None):
+    if code == 1100:  # always followed by 1101/1102 when it's back (2110 has no such pair)
+        if LINK["ok"]:
+            LINK.update(ok=False, since=now_et())
+            log("link_lost", code=code)
+    elif code in (1101, 1102) and not LINK["ok"]:
+        log("link_restored", code=code, down_s=int((now_et() - LINK["since"]).total_seconds()))
+        LINK.update(ok=True, since=None)
+
+
+def nap(ib, secs):
+    """ib.sleep that never raises: it throws ConnectionError the moment the socket drops."""
+    try:
+        if ib.isConnected():
+            ib.sleep(secs)
+            return
+    except Exception:
+        pass
+    time.sleep(secs)
+
+
+def stray_stock(ib, cfg):
+    """Shares of the underlying in the account: an assigned short (2026-10-27 770P -> 100 SPY)."""
+    out = [(p.contract.symbol, p.position) for p in ib.positions()
+           if p.contract.secType == "STK" and p.contract.symbol == cfg["ticker"].upper() and p.position]
+    if out:
+        log("stray_stock", positions=out)
+        telegram(cfg, f"{cfg['ticker']}: the account holds {out[0][1]:g} {out[0][0]} shares, most likely from an "
+                      f"assignment. Flatten them by hand (or ask Claude).", high_priority=True)
+    return out
+
+
+def untracked_legs(ib, cfg, expiry, state):
+    """Option legs the account holds beyond the books (e.g. an entry cut off by a lost connection).
+    Alert only: reconcile_broker already handles the opposite case (account less short than books)."""
+    books = {}
+    for pos in state["open"]:
+        for n, k in live_strikes(pos).items():
+            key = (float(k), "P" if "put" in n else "C")
+            books[key] = books.get(key, 0) + (-1 if n.startswith("short") else 1) * pos["qty"]
+    acct = {}
+    for p in ib.positions():
+        c = p.contract
+        if c.secType == "OPT" and c.symbol == cfg["ticker"].upper() and c.lastTradeDateOrContractMonth == expiry:
+            key = (float(c.strike), c.right)
+            acct[key] = acct.get(key, 0) + p.position
+    extra = {}
+    for key in set(acct) | set(books):
+        a, b = acct.get(key, 0), books.get(key, 0)
+        if abs(a - b) > 1e-9 and abs(a) > abs(b):
+            extra[f"{key[0]:g}{key[1]}"] = round(a - b, 2)
+    if extra:
+        log("untracked_legs", extra=extra)
+        telegram(cfg, f"{cfg['ticker']}: legs in the account that no condor owns: {extra}. Check them by hand.",
+                 high_priority=True)
+    return extra
+
+
+def recover_connection(ib, cfg, expiry, state, dry, err, alerted):
+    """After a socket drop or an unanswered request: reconnect (until 16:00), then re-sync with IBKR."""
+    log("connection_trouble", err=f"{type(err).__name__}: {str(err)[:150]}", connected=ib.isConnected())
+    if not alerted:
+        telegram(cfg, f"{cfg['ticker']}: lost contact with IBKR ({type(err).__name__}) at {now_et():%H:%M} ET -- "
+                      f"no stop checks until it's back. Reconnecting.", high_priority=True)
+    if not ib.isConnected():
+        try:
+            ib.disconnect()
+        except Exception:
+            pass
+        if not connect_retry(ib, cfg["tws_port"], cfg["client_id"], dtime(16, 0), cfg, "CONDOR", every=15):
+            return False
+        LINK.update(ok=True, since=None)
+    try:
+        reconcile_broker(ib, cfg, expiry, state, dry)
+        untracked_legs(ib, cfg, expiry, state)
+        save_state(state)
+    except OSError as e:
+        log("resync_failed", err=f"{type(e).__name__}: {str(e)[:150]}")
+        return False
+    log("connection_recovered")
+    telegram(cfg, f"{cfg['ticker']}: back in contact with IBKR at {now_et():%H:%M} ET, positions re-synced.")
+    return True
+
+
 # ----------------------------------------------------------------- main
 def main():
     ap = argparse.ArgumentParser(description="0DTE iron condor V2 (IBKR)")
@@ -722,57 +815,88 @@ def main():
               "  3. 127.0.0.1 in Trusted IPs, and 'Read-Only API' unticked.\n"
               f"  4. client_id {cfg['client_id']} not already used by another script.\n")
         sys.exit(2)
+    ib.RequestTimeout = cfg.get("request_timeout_s", 30)
+    ib.errorEvent += on_ib_error
     live_port = cfg["tws_port"] in (7496, 4001)
     log("start", ticker=cfg["ticker"], port=cfg["tws_port"], account="LIVE" if live_port else "paper",
         dry_run=dry, qty=cfg["qty"], expiry=expiry, accounts=ib.managedAccounts())
     telegram(cfg, f"started {cfg['ticker']} on port {cfg['tws_port']}"
                   f"{' DRY-RUN' if dry else ''}, {len(entry_times)} entries planned")
     keep_awake(True)
+    stray_stock(ib, cfg)
     try:
         done = {p.get("slot") for p in state["open"] + state["closed"]
                 + state.get("unwound", []) + state.get("partial_legs", [])}
-        early_done = False
+        early_done = near_done = False
+        trouble = None  # when contact with IBKR was lost, while it lasts
         while now_et().time() < dtime(16, 0):
-            t = now_et().time()
-            for et in entry_times:
-                slot = f"{et:%H:%M}"
-                end = (datetime.combine(now_et().date(), et) + timedelta(minutes=cfg["entry_window_min"])).time()
-                if slot in done or not (et <= t < end):
+            try:
+                if not LINK["ok"]:  # quotes are frozen: no entries, stops or closes on them
+                    if trouble is None:
+                        trouble = now_et()
+                        telegram(cfg, f"{cfg['ticker']}: IBKR link lost at {trouble:%H:%M} ET (1100) -- quotes "
+                                      f"frozen, no stop checks or entries until it's back.", high_priority=True)
+                    ib.sleep(cfg["monitor_seconds"])
                     continue
-                if PAUSE_FLAG.exists():
-                    log("entry_blocked", slot=slot, reason="paused mid-session -- no new entries")
+                if trouble is not None:
+                    telegram(cfg, f"{cfg['ticker']}: IBKR link back at {now_et():%H:%M} ET "
+                                  f"(down {int((now_et() - trouble).total_seconds() // 60)} min), resuming.")
+                    trouble = None
+                    reconcile_broker(ib, cfg, expiry, state, dry)
+                    untracked_legs(ib, cfg, expiry, state)
+                t = now_et().time()
+                for et in entry_times:
+                    slot = f"{et:%H:%M}"
+                    end = (datetime.combine(now_et().date(), et) + timedelta(minutes=cfg["entry_window_min"])).time()
+                    if slot in done or not (et <= t < end):
+                        continue
+                    if PAUSE_FLAG.exists():
+                        log("entry_blocked", slot=slot, reason="paused mid-session -- no new entries")
+                        done.add(slot)
+                        continue
+                    open_pnl = 0.0
+                    for p in state["open"]:
+                        v = condor_value(ib, cfg, expiry, live_strikes(p))[0] if live_strikes(p) else 0.0
+                        if v is not None:
+                            open_pnl += (p["credit"] - v - p.get("closed_cost", 0.0)) * 100 * p["qty"]
+                    if state["realized"] + open_pnl <= cfg["daily_stop_usd"]:
+                        log("entry_blocked", slot=slot, reason="daily stop", day_pnl=round(state["realized"] + open_pnl, 0))
+                    else:
+                        done.add(slot)  # before entering: a connection cut mid-entry must not re-enter the slot
+                        enter(ib, cfg, expiry, state, dry, slot)
                     done.add(slot)
-                    continue
-                open_pnl = 0.0
-                for p in state["open"]:
-                    v = condor_value(ib, cfg, expiry, live_strikes(p))[0] if live_strikes(p) else 0.0
-                    if v is not None:
-                        open_pnl += (p["credit"] - v - p.get("closed_cost", 0.0)) * 100 * p["qty"]
-                if state["realized"] + open_pnl <= cfg["daily_stop_usd"]:
-                    log("entry_blocked", slot=slot, reason="daily stop", day_pnl=round(state["realized"] + open_pnl, 0))
+                if t >= reconcile_from:
+                    reconcile_broker(ib, cfg, expiry, state, dry)
+                for pos in list(state["open"]):
+                    if "close_fills" in pos:
+                        close_condor(ib, cfg, expiry, pos, state, pos.get("close_reason", "stop"), dry)
+                        continue
+                    if not live_strikes(pos):
+                        continue
+                    # a side closed by the 15:35 pass counts at what it cost to close
+                    val = condor_value(ib, cfg, expiry, live_strikes(pos))[0]
+                    if val is not None and (val + pos.get("closed_cost", 0.0) - pos["credit"]) * 100 * pos["qty"] \
+                            >= pos["stop_loss_usd"]:
+                        close_condor(ib, cfg, expiry, pos, state, f"stop {cfg['stop_mult']:g}x", dry)
+                if near_early and not early_done and near_early <= t < near_close:
+                    early_done = True
+                    near_money_pass(ib, cfg, expiry, state, dry, cfg["near_money_dist_early"])
+                if t >= near_close:
+                    near_money_pass(ib, cfg, expiry, state, dry, cfg["near_money_dist"])
+                    near_done = True
+                    break
+                ib.sleep(cfg["monitor_seconds"])
+            except OSError as e:  # ConnectionError (socket dropped) or TimeoutError (request unanswered)
+                alerted = trouble is not None
+                trouble = trouble or now_et()
+                if recover_connection(ib, cfg, expiry, state, dry, e, alerted):
+                    trouble = None
                 else:
-                    enter(ib, cfg, expiry, state, dry, slot)
-                done.add(slot)
-            if t >= reconcile_from:
-                reconcile_broker(ib, cfg, expiry, state, dry)
-            for pos in list(state["open"]):
-                if "close_fills" in pos:
-                    close_condor(ib, cfg, expiry, pos, state, pos.get("close_reason", "stop"), dry)
-                    continue
-                if not live_strikes(pos):
-                    continue
-                # a side closed by the 15:35 pass counts at what it cost to close
-                val = condor_value(ib, cfg, expiry, live_strikes(pos))[0]
-                if val is not None and (val + pos.get("closed_cost", 0.0) - pos["credit"]) * 100 * pos["qty"] \
-                        >= pos["stop_loss_usd"]:
-                    close_condor(ib, cfg, expiry, pos, state, f"stop {cfg['stop_mult']:g}x", dry)
-            if near_early and not early_done and near_early <= t < near_close:
-                early_done = True
-                near_money_pass(ib, cfg, expiry, state, dry, cfg["near_money_dist_early"])
-            if t >= near_close:
-                near_money_pass(ib, cfg, expiry, state, dry, cfg["near_money_dist"])
-                break
-            ib.sleep(cfg["monitor_seconds"])
+                    nap(ib, 5)
+        if not near_done and any(live_strikes(p) for p in state["open"]):
+            log("near_money_missed", open=len(state["open"]))
+            telegram(cfg, f"{cfg['ticker']}: the 15:58 near-money pass did NOT run (lost contact with IBKR). "
+                          f"Held condors may be assigned -- check for shares after the close.", high_priority=True)
         log("day_end", closed=len(state["closed"]), realized=round(state["realized"], 0), held=len(state["open"]))
         telegram(cfg, f"day done: {len(state['closed'])} closed (${state['realized']:+.0f}), "
                       f"{len(state['open'])} held to expiry")

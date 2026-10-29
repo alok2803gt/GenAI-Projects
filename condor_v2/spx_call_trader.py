@@ -18,6 +18,7 @@ state and log; the condor trader, monitor and recorder ignore SPX.
     python spx_call_trader.py --put      # the put trader (state spx_put_*, client 1601)
 """
 import json
+import time
 import math
 import sys
 from datetime import datetime, time as dtime
@@ -185,6 +186,7 @@ def main():
         C.telegram(cfg, f"{NAME}: refusing to trade -- TWS on 7497 is logged into {accts}, not paper", True)
         ib.disconnect()
         return
+    ib.RequestTimeout = 30  # an unanswered request raises instead of hanging (2026-10-27)
     C.keep_awake(True)
     try:
         expiry = n.strftime("%Y%m%d")
@@ -208,6 +210,8 @@ def main():
                 b, a = quote(ib, c)
                 log("dry_run", bid=b, ask=a, target=target_price(a or 0), stop=stop_price(a or 0))
                 return
+            state.update(status="buying", strike=strike, conId=c.conId)  # a restart must not buy twice
+            save_state(state)
             fill = buy(ib, c)
             if fill is None:
                 state.update(status="done", exit_reason="entry not filled")
@@ -224,6 +228,29 @@ def main():
             c = Option("SPX", expiry, state["strike"], RIGHT, "SMART", tradingClass="SPXW")
             ib.qualifyContracts(c)
             held = sum(p.position for p in ib.positions() if p.contract.conId == c.conId)
+            fills = [f for f in ib.reqExecutions() if f.contract.conId == c.conId]
+            if state["status"] == "buying":  # the connection dropped during the entry
+                buys = [f for f in fills if f.execution.side == "BOT"]
+                if held <= 0 or not buys:
+                    log("restart", note="entry was cut off before anything filled")
+                    state.update(status="done", exit_reason="entry interrupted, no fill")
+                    save_state(state)
+                    C.telegram(cfg, f"{NAME}: the entry was cut off by a lost connection and nothing filled -- "
+                                    f"no trade today")
+                    return
+                fill = round(sum(f.execution.price * f.execution.shares for f in buys)
+                             / sum(f.execution.shares for f in buys), 2)
+                state.update(status="open", fill=fill)
+                save_state(state)
+                log("entered", strike=state["strike"], fill=fill, target=target_price(fill), stop=stop_price(fill),
+                    note="adopted after reconnect")
+                C.telegram(cfg, f"{NAME}: entry filled @ ${fill} while the connection was down -- placing exits now")
+            sells = [f for f in fills if f.execution.side == "SLD"]
+            if held <= 0 and sells:  # a resting exit filled while we were away
+                px = sells[-1].execution.price
+                why = "target +$100" if px >= target_price(state["fill"]) - 1e-9 else "stop -$200"
+                finish(state, cfg, why + " (filled while disconnected)", px)
+                return
             if held <= 0:
                 log("restart", note="position already gone -- treating as closed at unknown price")
                 state.update(status="done", exit_reason="gone on restart")
@@ -285,5 +312,24 @@ def main():
         ib.disconnect()
 
 
+def main_with_reconnect():
+    """The exits rest at IBKR, so a dropped connection (Gateway restart, 2026-10-28) only needs a
+    reconnect and a re-run: main() picks the trade back up from its state file."""
+    for attempt in range(1, 41):
+        try:
+            main()
+            return
+        except OSError as e:  # ConnectionError (socket dropped) or TimeoutError (request unanswered)
+            st = load_state()
+            log("connection_lost", err=f"{type(e).__name__}: {str(e)[:120]}", status=st["status"], attempt=attempt)
+            if st["status"] == "done":
+                return
+            if attempt == 1:
+                C.telegram(C.load_config(), f"{NAME}: lost the IBKR connection ({type(e).__name__}) with the trade "
+                                            f"'{st['status']}' -- reconnecting; resting exits stay at IBKR", True)
+            time.sleep(15)
+    C.telegram(C.load_config(), f"{NAME}: gave up reconnecting after 40 tries -- check the position by hand", True)
+
+
 if __name__ == "__main__":
-    main()
+    main_with_reconnect()

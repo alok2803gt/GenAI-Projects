@@ -175,7 +175,7 @@ def backfill():
         if not parts or not parts[0].startswith("2026-"):
             continue
         day = parts[0]
-        if day in rows and rows[day]["source"] == "ibkr fills":
+        if day in rows and rows[day]["source"].startswith("ibkr fills"):
             continue  # never overwrite a fill-based day with the rebuild
         nums = parts[-7:]  # entered stopped held gross real net cum
         ent, stp, held, gross, real, net = nums[0], nums[1], nums[2], float(nums[3]), nums[4], float(nums[5])
