@@ -2,6 +2,8 @@
 
 Self-contained. Needs only Python 3.10+ and a TWS or IB Gateway login. Nothing else from the original project is required.
 
+**Track record:** the full paper history (30 sessions on IBKR) and the backtests behind the current rules are in [TRACK_RECORD.md](TRACK_RECORD.md). Read it before judging a losing streak.
+
 ## What it trades
 
 | | |
