@@ -19,6 +19,7 @@ Deterministic, no LLM. Alerts go to the Telegram chat in ./config.json.
     python monitor.py           # normal run
     python monitor.py --check   # print status only: no restarts, orders, or alerts
 """
+import csv
 import json
 import random
 import re
@@ -37,12 +38,13 @@ PY = HERE / ".venv" / "Scripts" / "python.exe"
 INSTANCES = {"SPY": HERE, "QQQ": HERE / "qqq"}
 TASKS = {"SPY": "CondorV2-SafeStart", "QQQ": "CondorV2-QQQ-SafeStart"}
 # Go-live rehearsal (CEO 2026-10-06): the go-live plan -- SPY alone, about $15,000 -- run on paper
-# for 20 sessions; the gate is cumulative net profit after commissions. QQQ is disabled and the
-# Ashley paper test stopped, so the paper account's NetLiq change is SPY condor P&L only.
+# for 20 sessions; the gate is cumulative net profit after commissions. Other bots share this paper
+# account, so each session's net comes from the condor tracker, never from the NetLiq change.
 GOLIVE_START = "2026-10-14"  # rehearsal of the final rules: 0.5x stop, entries 11:01-14:31
 GOLIVE_SESSIONS = 20
 GOLIVE_CAPITAL = 15000
 SCORECARD = HERE / "golive_scorecard.jsonl"
+TRACKER = HERE / "condor_daily_tracker.csv"
 SLOTS = ["11:01", "11:31", "12:01", "12:31", "13:01", "13:31", "14:01", "14:31"]
 MON_STATE = HERE / "monitor_state.json"
 MON_LOG = HERE / "monitor_log.jsonl"
@@ -68,9 +70,9 @@ def load_mon():
         if s.get("day") == TODAY:
             return s
         # what the go-live scorecard needs from the previous session
-        prev = {k: s.get(k) for k in ("day", "start_netliq", "start_late", "peak_margin")}
+        prev = {k: s.get(k) for k in ("day", "peak_margin")}
     return {"day": TODAY, "alerted": [], "restarts": {k: 0 for k in INSTANCES},
-            "start_netliq": None, "start_late": False, "peak_margin": 0.0,
+            "start_netliq": None, "peak_margin": 0.0,
             "flattened": False, "summary_sent": False, "prev": prev}
 
 
@@ -301,14 +303,20 @@ def flatten(ib, acct, mon, running):
              high=bool(shorts_left))
 
 
+def tracker_row(day):
+    if not TRACKER.exists():
+        return None
+    with open(TRACKER, newline="", encoding="utf-8") as f:
+        return next((r for r in csv.DictReader(f) if r["date"] == day), None)
+
+
 def finalize_scorecard(mon):
-    """First run of a day: close the previous session's go-live row with this morning's NetLiq.
-    The account holds nothing overnight (0DTE), so the NetLiq change from one morning to the next
-    is that session's P&L after commissions -- valid while SPY condors are the account's only
-    trading."""
+    """First run of a day: close the previous session's go-live row with its condor tracker net
+    (condor_eod_tracker.py, 16:20), which counts the condor trader's own fills only. Days not built
+    from IBKR fills are marked inexact."""
     prev = mon.get("prev") or {}
-    day, start = prev.get("day"), prev.get("start_netliq")
-    if not day or day < GOLIVE_START or start is None or mon["start_netliq"] is None:
+    day = prev.get("day")
+    if not day or day < GOLIVE_START:
         return
     rows = [json.loads(l) for l in SCORECARD.read_text().splitlines() if l.strip()] if SCORECARD.exists() else []
     if any(r["date"] == day for r in rows):
@@ -317,10 +325,14 @@ def finalize_scorecard(mon):
     entered, stopped = acts.count("entered"), acts.count("closed")
     if not entered:
         return  # SPY didn't trade (holiday, outage): not a session
-    net = round(mon["start_netliq"] - start, 2)
-    row = {"date": day, "net": net, "entered": entered, "stopped": stopped, "start_netliq": start,
-           "end_netliq": mon["start_netliq"], "peak_margin": prev.get("peak_margin"),
-           "inexact": bool(prev.get("start_late") or mon.get("start_late"))}
+    tracked = tracker_row(day)
+    if tracked is None:
+        alert_once(mon, f"scorecard_no_tracker:{day}", f"go-live scorecard: no condor tracker row for {day} "
+                   f"(check task CondorV2-EODTracker) -- that session was NOT scored", True)
+        return
+    net = round(float(tracked["net"]), 2)
+    row = {"date": day, "net": net, "entered": entered, "stopped": stopped, "peak_margin": prev.get("peak_margin"),
+           "inexact": not tracked["source"].startswith("ibkr fills")}
     rows.append(row)
     if not CHECK_ONLY:
         with open(SCORECARD, "a") as f:
@@ -333,7 +345,7 @@ def finalize_scorecard(mon):
     msg = (f"GO-LIVE SCORECARD (SPY alone, ${GOLIVE_CAPITAL:,} plan) -- session {n}/{GOLIVE_SESSIONS}, {day}: "
            f"net ${net:+,.0f} after commissions ({net / GOLIVE_CAPITAL:+.2%}), {entered} entered, "
            f"{stopped} stopped, peak margin ${row['peak_margin'] or 0:,.0f}"
-           f"{' (start measured late: inexact)' if row['inexact'] else ''} | cumulative ${cum:+,.0f} "
+           f"{' (tracker rebuilt from logs: inexact)' if row['inexact'] else ''} | cumulative ${cum:+,.0f} "
            f"({cum / GOLIVE_CAPITAL:+.2%}), stop rate {stop_rate:.0%} (backtest ~42%) | {verdict}")
     log(msg)
     telegram(msg)
@@ -402,8 +414,8 @@ def summary(ib, acct, mon, active):
                      f"{len(st['open'])} held to expiry, trader-booked ${st['realized']:+.0f}")
     netliq = next((float(r.value) for r in ib.accountSummary(acct) if r.tag == "NetLiquidation"), None)
     if netliq and mon["start_netliq"]:
-        parts.append(f"account NetLiq {netliq:,.0f} ({netliq - mon['start_netliq']:+,.0f} today; "
-                     f"go-live scorecard finalizes it at tomorrow's first run)")
+        parts.append(f"account NetLiq {netliq:,.0f} ({netliq - mon['start_netliq']:+,.0f} today, all bots; "
+                     f"go-live scorecard uses the condor tracker)")
     parts.append(f"peak margin ${mon.get('peak_margin') or 0:,.0f} of the ${GOLIVE_CAPITAL:,} plan")
     parts.append(f"0DTE legs left in account (incl. condors held to expiry): {fmt(actual_legs(ib, acct))}")
     msg = "DAY SUMMARY -- " + " | ".join(parts)
@@ -444,7 +456,6 @@ def main():
         acct_vals = {r.tag: r.value for r in ib.accountSummary(acct)}
         if mon["start_netliq"] is None:
             mon["start_netliq"] = float(acct_vals["NetLiquidation"]) if "NetLiquidation" in acct_vals else None
-            mon["start_late"] = t > dtime(10, 0)  # trading already under way: the day's start is inexact
             finalize_scorecard(mon)
         flatten_stock(ib, acct, mon)
         if not full:

@@ -2,6 +2,7 @@
 import json
 import math
 import tempfile
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import condor_v2 as C
@@ -27,6 +28,7 @@ def fake_quotes(ib, contracts):
 def setup():
     C.get_quotes = fake_quotes
     C.spot = lambda ib, t: SPOT
+    C.vix_rise = lambda ib, now=None: None
     tmp = Path(tempfile.mkdtemp())
     C.STATE_FILE, C.LOG_FILE, C.PAUSE_FLAG = tmp / "state.json", tmp / "log.jsonl", tmp / "PAUSED.flag"
 
@@ -521,17 +523,19 @@ def test_untracked_legs_and_stray_stock():
         C.telegram = old
 
 
-def _run_main_with(fake_sleep_hook, start="15:50"):
-    """Run condor_v2.main() against a fake IB and a fake clock (each sleep advances it)."""
+def _run_main_with(fake_sleep_hook, start="15:50", stop_retry_s=None, accounts=("DUT155508",)):
+    """Run condor_v2.main() against a fake IB and a fake clock (each sleep advances it). With stop_retry_s
+    the condor is mid stop-close and each retry takes that long."""
     import sys
     from datetime import datetime
     tmp = Path(tempfile.mkdtemp())
     (tmp / "config.json").write_text(json.dumps({"telegram_token": ""}))
     h, m = map(int, start.split(":"))
     clock = {"t": datetime(2026, 10, 28, h, m, tzinfo=C.ET)}
-    (tmp / "state.json").write_text(json.dumps({"session": "2026-10-28", "open": [dict(_CONDOR)], "closed": [],
+    condor = dict(_CONDOR, close_fills={"short_put": 1.0}, close_reason="stop 0.5x") if stop_retry_s else dict(_CONDOR)
+    (tmp / "state.json").write_text(json.dumps({"session": "2026-10-28", "open": [condor], "closed": [],
                                                 "realized": 0.0}))
-    calls = {"near": 0, "value": 0, "connects": 0, "sleeps": 0}
+    calls = {"near": 0, "value": 0, "connects": 0, "sleeps": 0, "retries": 0, "near_at": None}
     sent = []
 
     class Ev:
@@ -555,7 +559,7 @@ def _run_main_with(fake_sleep_hook, start="15:50"):
             return self.connected
 
         def managedAccounts(self):
-            return ["DUT155508"]
+            return list(accounts)
 
         def positions(self):
             return list(_LEGS)
@@ -567,7 +571,7 @@ def _run_main_with(fake_sleep_hook, start="15:50"):
 
     from datetime import timedelta
     saved = {n: getattr(C, n) for n in ("IB", "now_et", "telegram", "keep_awake", "reconcile_broker",
-                                        "near_money_pass", "condor_value")}
+                                        "near_money_pass", "condor_value", "close_condor")}
     argv = sys.argv
     try:
         C.IB = FakeIB
@@ -575,7 +579,16 @@ def _run_main_with(fake_sleep_hook, start="15:50"):
         C.telegram = lambda cfg, text, high_priority=False: sent.append((text, high_priority))
         C.keep_awake = lambda on=True: None
         C.reconcile_broker = lambda *a, **k: None
-        C.near_money_pass = lambda *a, **k: calls.__setitem__("near", calls["near"] + 1)
+
+        def near_pass(*a, **k):
+            calls["near"] += 1
+            calls["near_at"] = clock["t"]
+        C.near_money_pass = near_pass
+
+        def retry(*a, **k):
+            calls["retries"] += 1
+            clock["t"] += timedelta(seconds=stop_retry_s)
+        C.close_condor = retry
 
         def value(*a, **k):
             calls["value"] += 1
@@ -621,6 +634,38 @@ def test_main_resumes_when_the_link_comes_back():
             C.on_ib_error(-1, 1102, "restored")
     calls, sent, tmp = _run_main_with(hook)
     assert calls["near"] == 1 and any("link back" in t for t, h in sent), sent
+
+
+def test_near_money_pass_outranks_slow_stop_retries():
+    """2026-11-04: a stop-close retry ran 15:57:30-16:00:15, so the pass only started after the bell."""
+    calls, sent, _ = _run_main_with(lambda ib, n: None, start="15:56", stop_retry_s=170)
+    assert calls["near"] == 1 and calls["retries"] == 1, calls
+    assert calls["near_at"].hour == 15, f"pass ran at {calls['near_at']}"
+    # already past 15:57 when a cycle begins: the pass goes first, no retry at all
+    calls, _, _ = _run_main_with(lambda ib, n: None, start="15:57", stop_retry_s=170)
+    assert calls["near"] == 1 and calls["retries"] == 0, calls
+
+
+def test_account_problem():
+    paper, live = {"tws_port": 7497}, {"tws_port": 4001}
+    assert C.account_problem(paper, ["DUT155508"]) is None
+    assert C.account_problem({**paper, "account": "DUT155508"}, ["DUT155508"]) is None
+    assert "no account" in C.account_problem(paper, [])
+    assert "does not match" in C.account_problem(paper, ["U29056581"]), "live login on the paper port"
+    assert "does not match" in C.account_problem({"tws_port": 7496}, ["DUT155508"]), "paper login on a live port"
+    assert "config allows only" in C.account_problem({**paper, "account": "DUT155508"}, ["DUX000001"])
+    assert "not named" in C.account_problem(live, ["U29056581"]), "live must be named in config"
+    assert "config allows only" in C.account_problem({**live, "account": "U29056581"}, ["U17469343"]), "wrong live account"
+    assert C.account_problem({**live, "account": "U29056581"}, ["U29056581"]) is None
+
+
+def test_main_refuses_a_wrong_account_before_doing_anything():
+    try:
+        _run_main_with(lambda ib, n: None, accounts=("U17469343",))
+    except SystemExit as e:
+        assert e.code == 3
+    else:
+        raise AssertionError("main must exit on a live login on the paper port")
 
 
 def test_spx_scalper_reconnects_and_books_an_exit_that_filled_while_away():
@@ -685,6 +730,183 @@ def test_spx_scalper_reconnects_and_books_an_exit_that_filled_while_away():
     assert runs["n"] == 2 and st["status"] == "done" and st["exit"] == 15.0, st
     assert "target +$100 (filled while disconnected)" == st["exit_reason"], st
     assert sum(1 for t, h in sent if h) == 1, "one HIGH alert for the drop"
+
+
+# ---- an order stuck in PendingCancel (2026-10-30 15:53) must not crash the bot or be ordered twice
+def _stuck_ib():
+    placed = []
+
+    class FakeIB:
+        execs = []
+
+        def placeOrder(self, contract, order):
+            order.orderId = 100 + len(placed)
+            t = _NS(order=order, orderStatus=_NS(status="Submitted", avgFillPrice=0.0))
+            placed.append(t)
+            return t
+
+        def cancelOrder(self, order):
+            placed[-1].orderStatus.status = "PendingCancel"
+
+        def sleep(self, s):
+            pass
+
+        def reqExecutions(self):
+            return self.execs
+    return FakeIB(), placed
+
+
+def _with_quiet_alerts(fn):
+    sent, old_t, old_l = [], C.telegram, C.log
+    C.telegram = lambda cfg, text, high_priority=False: sent.append((text, high_priority))
+    C.log = lambda *a, **k: None
+    C.STUCK_ORDERS.clear()
+    try:
+        return fn(sent)
+    finally:
+        C.telegram, C.log = old_t, old_l
+        C.STUCK_ORDERS.clear()
+
+
+_LEG = _NS(symbol="SPY", lastTradeDateOrContractMonth="20261102", strike=750.0, right="P", localSymbol="SPY P750")
+
+
+def test_stuck_cancel_alerts_and_sends_nothing_more_on_that_contract():
+    def run(sent):
+        ib, placed = _stuck_ib()
+        ok, fill = C.place_leg(ib, CFG, _LEG, "SELL", 0.33, "close long put", 1, 6)
+        assert (ok, fill) == (False, None) and C.STUCK_ORDERS
+        assert sent and sent[-1][1], "HIGH alert"
+        assert C.place_leg(ib, CFG, _LEG, "SELL", 0.30, "close long put", 1, 6) == (False, None)
+        assert len(placed) == 1, "a retry sends nothing while it is unsettled"
+    _with_quiet_alerts(run)
+
+
+def test_ladder_stops_at_a_stuck_order():
+    def run(sent):
+        ib, placed = _stuck_ib()
+        old = C.get_quotes
+        C.get_quotes = lambda ib, cs: {"leg": {"bid": 0.30, "ask": 0.35, "mid": 0.32}}
+        try:
+            ok, _ = REAL["place_leg_ladder"](ib, CFG, _LEG, "SELL", "close long put", 1, 0.30, 0.35, 0.32, urgent=True)
+        finally:
+            C.get_quotes = old
+        assert not ok and len(placed) == 1
+    _with_quiet_alerts(run)
+
+
+def test_stuck_cancel_that_really_filled_counts_as_the_fill():
+    def run(sent):
+        ib, placed = _stuck_ib()
+        ib.execs = [_NS(execution=_NS(orderId=100, shares=1.0, price=0.31))]
+        assert C.place_leg(ib, CFG, _LEG, "SELL", 0.33, "close long put", 1, 6) == (True, 0.31)
+        assert not C.STUCK_ORDERS and not sent
+    _with_quiet_alerts(run)
+
+
+def test_retry_after_the_stuck_order_filled_uses_that_fill_and_orders_nothing():
+    def run(sent):
+        ib, placed = _stuck_ib()
+        C.place_leg(ib, CFG, _LEG, "SELL", 0.33, "close long put", 1, 6)
+        assert C.STUCK_ORDERS
+        ib.execs = [_NS(execution=_NS(orderId=100, shares=1.0, price=0.29))]
+        assert C.place_leg(ib, CFG, _LEG, "SELL", 0.30, "close long put", 1, 6) == (True, 0.29)
+        assert len(placed) == 1 and not C.STUCK_ORDERS
+    _with_quiet_alerts(run)
+
+
+def test_retry_after_the_stuck_order_cancelled_sends_a_new_order():
+    def run(sent):
+        ib, placed = _stuck_ib()
+        C.place_leg(ib, CFG, _LEG, "SELL", 0.33, "close long put", 1, 6)
+        placed[0].orderStatus.status = "Cancelled"
+        C.place_leg(ib, CFG, _LEG, "SELL", 0.30, "close long put", 1, 6)
+        assert len(placed) == 2, "the first order settled, so a new one may go"
+    _with_quiet_alerts(run)
+
+
+
+# ---- the near-money close keeps trying until 15:59 (2026-11-02: one failed pass, short 753P assigned)
+def _final_with(passes, clock_times):
+    calls, sent = {"n": 0, "sleeps": 0}, []
+    times = iter(clock_times)
+    saved = {n: getattr(C, n) for n in ("near_money_pass", "now_et", "telegram", "log")}
+
+    def fake_pass(*a, **k):
+        calls["n"] += 1
+        return passes[min(calls["n"], len(passes)) - 1]
+
+    def sleep(s):
+        calls["sleeps"] += 1
+    try:
+        C.near_money_pass, C.now_et = fake_pass, lambda: _NS(time=lambda: C.hhmm(next(times)))
+        C.telegram = lambda cfg, text, high_priority=False: sent.append((text, high_priority))
+        C.log = lambda *a, **k: None
+        C.near_money_final(_NS(sleep=sleep), CFG, "20261102", {"open": []}, False)
+    finally:
+        for n, v in saved.items():
+            setattr(C, n, v)
+    return calls, sent
+
+
+def test_final_pass_stops_once_nothing_is_exposed():
+    calls, sent = _final_with([[]], ["15:57"])
+    assert calls["n"] == 1 and not sent
+
+
+def test_final_pass_retries_until_the_short_is_gone():
+    calls, sent = _final_with([["1 753P"], ["1 753P"], []], ["15:57", "15:58"])
+    assert calls["n"] == 3 and calls["sleeps"] == 2 and not sent
+
+
+def test_final_pass_gives_up_at_the_last_try_with_a_high_alert():
+    calls, sent = _final_with([["1 753P"]], ["15:58", "15:59"])
+    assert calls["n"] == 2 and sent and sent[-1][1] and "assignment likely" in sent[-1][0]
+
+
+def test_exposed_shorts_ignores_far_and_already_bought_legs():
+    pos = dict(_CONDOR)
+    assert C.exposed_shorts({"open": [pos]}, 769.5, 0.25) == []
+    assert C.exposed_shorts({"open": [pos]}, 767.9, 0.25) == ["1 768P"], "in the money"
+    assert C.exposed_shorts({"open": [pos]}, 770.9, 0.25) == ["1 771C"], "within dist"
+    assert C.exposed_shorts({"open": [dict(pos, close_fills={"short_put": 1.0})]}, 767.9, 0.25) == []
+
+
+def _vix_bars(*closes):
+    """Today's 30-min VIX bars from 09:30, opening at 20.0."""
+    start = datetime(2026, 11, 12, 9, 30, tzinfo=C.ET)
+    return [(start + timedelta(minutes=30 * i), 20.0 if i == 0 else closes[i - 1], c) for i, c in enumerate(closes)]
+
+
+def test_vix_rise_uses_only_completed_bars():
+    bars = _vix_bars(20.2, 20.6, 21.4)  # bars starting 09:30, 10:00, 10:30
+    o, last, rise = C.vix_rise_from_bars(bars, datetime(2026, 11, 12, 10, 45, tzinfo=C.ET))
+    assert (o, last) == (20.0, 20.6), "the 10:30 bar hasn't finished at 10:45"
+    assert abs(rise - 0.03) < 1e-9
+    assert C.vix_rise_from_bars(bars, datetime(2026, 11, 12, 9, 45, tzinfo=C.ET)) is None
+    assert C.vix_rise_from_bars([], datetime(2026, 11, 12, 11, 1, tzinfo=C.ET)) is None
+
+
+def test_vix_spike_skips_the_slot_and_calm_vix_enters():
+    setup()
+    keep = C.vix_rise
+    try:
+        state = {"open": [], "closed": [], "realized": 0.0}
+        C.place_condor = lambda ib, cfg, cs, lim, qty: (True, {n: lim[n][2] for n in cs}, "all_4_filled")
+        C.vix_rise = lambda ib, now=None: (20.0, 21.0, 0.05)
+        C.enter(FakeIB(), CFG, "20260923", state, False, "11:01")
+        assert state["open"] == [], "VIX +5% from its open holds the entry"
+        assert '"vix_hold"' in C.LOG_FILE.read_text().splitlines()[-1]
+        C.vix_rise = lambda ib, now=None: (20.0, 20.9, 0.045)
+        C.enter(FakeIB(), CFG, "20260923", state, False, "11:31")
+        assert len(state["open"]) == 1
+        C.vix_rise = lambda ib, now=None: (_ for _ in ()).throw(TimeoutError("no VIX"))
+        C.enter(FakeIB(), CFG, "20260923", state, False, "12:01")
+        assert len(state["open"]) == 2, "no VIX data means no hold"
+        assert C.vix_hold(FakeIB(), dict(CFG, vix_hold_pct=None), "12:31") is False
+    finally:
+        C.vix_rise = keep
+
 
 if __name__ == "__main__":
     for name, fn in list(globals().items()):

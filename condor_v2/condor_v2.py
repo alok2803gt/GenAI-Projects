@@ -10,6 +10,8 @@ pre-registered test; see README):
   entries  every 30 min, 10:01 .. 14:31 ET -- 10 condors per session
   strikes  short legs nearest spot +/- 0.5u, wings $5 further out, where
            u = spot * ATM implied vol * sqrt(minutes_to_1600 / 98280)
+  hold     skip a slot while VIX's last completed 30-min bar is >= 5% above
+           today's VIX open (vix_hold_pct, added 2026-11-12)
   stop     close the whole condor the first time its mark-to-market loss
            reaches 0.5 x the credit received
   exit     otherwise HOLD TO EXPIRY -- this is where the edge lives. A broker
@@ -33,7 +35,7 @@ from datetime import datetime, time as dtime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from ib_insync import IB, LimitOrder, Option, Stock
+from ib_insync import IB, Index, LimitOrder, Option, Stock
 
 ET = ZoneInfo("America/New_York")
 MIN_PER_YEAR = 390 * 252
@@ -43,6 +45,7 @@ DEFAULTS = {
     "qty": 1,
     "tws_host": "127.0.0.1",
     "tws_port": 7497,                 # 7497 TWS paper / 7496 TWS live / 4002 gateway paper
+    "account": "",                    # the one account this instance may trade; required for live
     "client_id": 1580,
     # From the 258-day replay (user calls 2026-10-13/14): the 10:01/10:31 entries lost in both
     # half-years. With them gone, the 0.5x stop earns about what 1x does (+$7.3k vs +$7.9k a year
@@ -52,6 +55,10 @@ DEFAULTS = {
     "wing": 5.0,
     "stop_mult": 0.5,
     "min_credit": 0.10,
+    # VIX hold (user call 2026-11-12): skip a slot while VIX's last completed 30-min bar closes this far
+    # above today's VIX open. 262-day replay, entries 11:01+: +$33.6 -> +$49.0/day, max drawdown -$4.5k
+    # -> -$2.8k, better in both half-years; the skipped condors averaged -$12.47. None turns it off.
+    "vix_hold_pct": 0.05,
     "monitor_seconds": 45,
     # Near-money passes close the sides whose short is in the money or within `dist` of spot.
     # IBKR's own pre-expiry liquidation (2026-10-06 15:42: 6 of our 7 short 779P) is met by
@@ -61,6 +68,8 @@ DEFAULTS = {
     "near_money_dist_early": 1.0,
     "near_money_close": "15:57",       # was 15:58; on 2026-10-12 the pass only started at 15:59:23 (stop cycle ran first)
     "near_money_dist": 0.25,
+    "near_money_last_try": "15:59",    # 2026-11-02: one failed pass at 15:57 left a short 753P to be assigned
+    "near_money_retry_seconds": 5,
     "reconcile_from": "14:45",        # after the last entry window, so our own fills can't race it
     "daily_stop_usd": -1500.0,
     "fill_wait_seconds": 20,
@@ -270,7 +279,54 @@ def expected_move(ib, cfg, expiry, S):
 
 
 # ----------------------------------------------------------------- orders
+# 2026-10-30 15:53: a cancel stayed PendingCancel for 60s. Raising there crashed the bot into PAUSED.flag,
+# so the 15:57 near-money pass never ran and a short call finished in the money. Now the order is remembered
+# per contract: nothing more is sent on that contract until it settles, and everything else keeps running.
+STUCK_ORDERS = {}
+
+
+def stuck_key(c):
+    """Contract objects are rebuilt every cycle, so key on what the contract is, not on the object."""
+    return tuple(getattr(c, a, None) for a in ("symbol", "lastTradeDateOrContractMonth", "strike", "right"))
+
+
+def reported_fill(ib, trade):
+    """The average fill IBKR reports for this order, or None. An order stuck in PendingCancel can have
+    filled without the status ever changing."""
+    fills = [f for f in ib.reqExecutions() if f.execution.orderId == trade.order.orderId]
+    shares = sum(f.execution.shares for f in fills)
+    if not shares or shares < trade.order.totalQuantity:
+        return None
+    return sum(f.execution.price * f.execution.shares for f in fills) / shares
+
+
+def settle_stuck(ib, contract):
+    """(blocked, fill) for an earlier order on this contract whose cancel was never confirmed.
+    A fill counts as this leg's fill, so it is never ordered twice."""
+    key = stuck_key(contract)
+    trade = STUCK_ORDERS.get(key)
+    if trade is None:
+        return False, None
+    fill = reported_fill(ib, trade)
+    if trade.orderStatus.status == "Filled" and fill is None:
+        fill = float(trade.orderStatus.avgFillPrice)
+    if fill is not None:
+        del STUCK_ORDERS[key]
+        return False, fill
+    if trade.orderStatus.status in IB_DONE_NOT_FILLED:
+        del STUCK_ORDERS[key]
+        return False, None
+    return True, None
+
+
 def place_leg(ib, cfg, contract, action, limit_price, label, qty, wait=None):
+    blocked, earlier = settle_stuck(ib, contract)
+    if earlier is not None:
+        print(f"    earlier order FILLED @ ${earlier} while its cancel was pending")
+        return True, earlier
+    if blocked:
+        print(f"    {label}: an earlier order's cancel is still unconfirmed -- not sending another")
+        return False, None
     px = round(limit_price, 2)
     print(f"  {label}: {action} {qty}x {contract.localSymbol or contract.symbol} @ ${px}...")
     trade = None
@@ -303,7 +359,15 @@ def place_leg(ib, cfg, contract, action, limit_price, label, qty, wait=None):
         if trade.orderStatus.status in IB_DONE_NOT_FILLED:
             print("    did not fill in time -- cancelled")
             return False, None
-    raise RuntimeError(f"{label}: cancel never confirmed (status {trade.orderStatus.status}) -- fill state unknown")
+    fill = reported_fill(ib, trade)
+    if fill is not None:
+        print(f"    FILLED @ ${fill} per IBKR's executions (status stuck at {trade.orderStatus.status})")
+        return True, fill
+    STUCK_ORDERS[stuck_key(contract)] = trade
+    log("cancel_unconfirmed", label=label, order_id=trade.order.orderId, status=trade.orderStatus.status)
+    telegram(cfg, f"{cfg['ticker']} {label}: cancel not confirmed after 60s (status {trade.orderStatus.status}) -- "
+                  f"holding further orders on this contract until it settles", high_priority=True)
+    return False, None
 
 
 def price_ladder(action, bid, ask, mid, urgent=False):
@@ -346,6 +410,8 @@ def place_leg_ladder(ib, cfg, contract, action, label, qty, bid, ask, mid, urgen
         ok, fill = place_leg(ib, cfg, contract, action, px, label, qty, wait)
         if ok:
             return True, fill
+        if stuck_key(contract) in STUCK_ORDERS:
+            return False, None
     return False, None
 
 
@@ -443,7 +509,50 @@ def condor_value(ib, cfg, expiry, strikes):
     return val, contracts, q
 
 
+def vix_rise_from_bars(bars, now):
+    """(today's open, last completed close, rise) from today's 30-min VIX bars [(start, open, close)], or
+    None. Only bars that have finished by `now` count, as in the replay."""
+    done = [b for b in bars if b[0] + timedelta(minutes=30) <= now]
+    if not bars or not done or not bars[0][1]:
+        return None
+    o, last = bars[0][1], done[-1][2]
+    return o, last, last / o - 1
+
+
+def vix_rise(ib, now=None):
+    now = now or now_et()
+    v = Index("VIX", "CBOE")
+    ib.qualifyContracts(v)
+    bs = ib.reqHistoricalData(v, "", "1 D", "30 mins", "TRADES", useRTH=True, formatDate=2)
+    bars = [(b.date.astimezone(ET), b.open, b.close) for b in bs if b.date.astimezone(ET).date() == now.date()]
+    return vix_rise_from_bars(bars, now)
+
+
+def vix_hold(ib, cfg, slot):
+    """True if this slot is skipped because VIX is spiking. No VIX data means no hold: the backtest edge
+    doesn't depend on it, and a data outage shouldn't stop the strategy."""
+    lim = cfg.get("vix_hold_pct")
+    if lim is None:
+        return False
+    try:
+        r = vix_rise(ib)
+    except Exception as e:
+        r = None
+        log("vix_unavailable", slot=slot, error=f"{type(e).__name__} {e}")
+    if r is None:
+        return False
+    o, last, rise = r
+    if rise < lim:
+        return False
+    log("entry_skipped", slot=slot, reason="vix_hold", vix_open=round(o, 2), vix=round(last, 2), rise=round(rise, 4))
+    telegram(cfg, f"{cfg['ticker']} {slot}: no entry -- VIX {last:.2f} is {rise:+.1%} from today's open {o:.2f} "
+                  f"(hold at +{lim:.0%})")
+    return True
+
+
 def enter(ib, cfg, expiry, state, dry, slot):
+    if vix_hold(ib, cfg, slot):
+        return
     S = spot(ib, cfg["ticker"])
     if not S:
         log("entry_skipped", slot=slot, reason="no spot")
@@ -657,8 +766,10 @@ def close_near_money_side(ib, cfg, expiry, pos, S, state, dry, dist=None):
                                   q[sk]["bid"], q[sk]["ask"], q[sk]["mid"], urgent=True)
         if not ok:
             log("near_money_close_failed", pos=pos["id"], side=side, leg=sk)
-            telegram(cfg, f"{cfg['ticker']} {pos['id']}: could not buy back short {side} {k:g} "
-                          f"near the close -- assignment risk, close by hand", high_priority=True)
+            if not pos.get("near_fail_alerted"):  # the pass repeats until near_money_last_try
+                pos["near_fail_alerted"] = True
+                telegram(cfg, f"{cfg['ticker']} {pos['id']}: could not buy back short {side} {k:g} "
+                              f"near the close -- retrying until {cfg['near_money_last_try']}", high_priority=True)
             continue
         mark_gone(pos, sk, px)
         if lk in cons:
@@ -667,14 +778,47 @@ def close_near_money_side(ib, cfg, expiry, pos, S, state, dry, dist=None):
     book_if_done(pos, state, "near-money close")
 
 
+def exposed_shorts(state, S, dist):
+    """Shorts still open that are in the money or within `dist` of spot, including a stop-close in progress."""
+    out = []
+    for pos in state["open"]:
+        live = live_strikes(pos)
+        for _, sk, _, right in SIDES:
+            if sk in live and sk not in pos.get("close_fills", {}) \
+                    and (S - live[sk] if right == "P" else live[sk] - S) <= dist:
+                out.append(f"{pos['id']} {live[sk]:g}{right}")
+    return out
+
+
 def near_money_pass(ib, cfg, expiry, state, dry, dist):
+    """Returns the shorts still exposed afterwards (True if spot is unknown), so a caller can try again."""
     S = spot(ib, cfg["ticker"])
     if not S:
-        return
+        return True
     reconcile_broker(ib, cfg, expiry, state, dry)  # anything IBKR closed since the last cycle
     for pos in list(state["open"]):
         if "close_fills" not in pos:
             close_near_money_side(ib, cfg, expiry, pos, S, state, dry, dist)
+    return [] if dry else exposed_shorts(state, S, dist)
+
+
+def near_money_final(ib, cfg, expiry, state, dry):
+    """The last line of defence against assignment: repeat the pass until nothing is exposed or time is
+    up. A pass re-reads spot, so a short the market has moved away from stops being chased."""
+    last = hhmm(cfg["near_money_last_try"])
+    while True:
+        exposed = near_money_pass(ib, cfg, expiry, state, dry, cfg["near_money_dist"])
+        if not exposed:
+            return
+        if now_et().time() >= last:
+            log("near_money_gave_up", exposed=exposed)
+            telegram(cfg, f"{cfg['ticker']}: still exposed at the close: {exposed} -- assignment likely, "
+                          f"check for shares in the morning", high_priority=True)
+            return
+        ib.sleep(cfg["near_money_retry_seconds"])
+        for pos in list(state["open"]):
+            if "close_fills" in pos:
+                close_condor(ib, cfg, expiry, pos, state, pos.get("close_reason", "stop"), dry)
 
 
 # ----------------------------------------------------------------- connection trouble (2026-10-28)
@@ -770,6 +914,22 @@ def recover_connection(ib, cfg, expiry, state, dry, err, alerted):
     return True
 
 
+def account_problem(cfg, accounts):
+    """Why this session must not trade, judged by the account actually logged in (the port only says
+    which login to expect), or None. A live account must also be named in config "account"."""
+    if not accounts:
+        return "IBKR reported no account"
+    acct, wanted = accounts[0], cfg.get("account")
+    paper = acct.startswith("DU")
+    if (cfg["tws_port"] in (7496, 4001)) == paper:
+        return f"port {cfg['tws_port']} does not match account {acct}"
+    if wanted and acct != wanted:
+        return f"logged into {acct}, config allows only {wanted}"
+    if not paper and not wanted:
+        return f"live account {acct} is not named in config \"account\""
+    return None
+
+
 # ----------------------------------------------------------------- main
 def main():
     ap = argparse.ArgumentParser(description="0DTE iron condor V2 (IBKR)")
@@ -817,6 +977,13 @@ def main():
         sys.exit(2)
     ib.RequestTimeout = cfg.get("request_timeout_s", 30)
     ib.errorEvent += on_ib_error
+    problem = account_problem(cfg, ib.managedAccounts())
+    if problem:
+        log("start_refused", reason=problem)
+        telegram(cfg, f"{cfg['ticker']}: refused to start, wrong account logged in on port {cfg['tws_port']} "
+                      f"-- see condor_v2_log.jsonl", high_priority=True)
+        ib.disconnect()
+        sys.exit(3)
     live_port = cfg["tws_port"] in (7496, 4001)
     log("start", ticker=cfg["ticker"], port=cfg["tws_port"], account="LIVE" if live_port else "paper",
         dry_run=dry, qty=cfg["qty"], expiry=expiry, accounts=ib.managedAccounts())
@@ -868,6 +1035,8 @@ def main():
                 if t >= reconcile_from:
                     reconcile_broker(ib, cfg, expiry, state, dry)
                 for pos in list(state["open"]):
+                    if now_et().time() >= near_close:  # 2026-11-04: stop retries held the pass until 16:00:29
+                        break
                     if "close_fills" in pos:
                         close_condor(ib, cfg, expiry, pos, state, pos.get("close_reason", "stop"), dry)
                         continue
@@ -881,8 +1050,8 @@ def main():
                 if near_early and not early_done and near_early <= t < near_close:
                     early_done = True
                     near_money_pass(ib, cfg, expiry, state, dry, cfg["near_money_dist_early"])
-                if t >= near_close:
-                    near_money_pass(ib, cfg, expiry, state, dry, cfg["near_money_dist"])
+                if now_et().time() >= near_close:
+                    near_money_final(ib, cfg, expiry, state, dry)
                     near_done = True
                     break
                 ib.sleep(cfg["monitor_seconds"])
