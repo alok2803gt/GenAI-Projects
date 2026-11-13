@@ -148,7 +148,15 @@ from ibkr_0dte_common import (
 )
 
 TWS_PORT = 7496
-CLIENT_ID = {"spy": 1660, "qqq": 1661, "iwm": 1662}
+# SPY moved off 1660 2026-11-12 -- the 2026-11-10 retry fix (10 min, 15s
+# sleep) proved the connect loop itself works, but the 2026-11-11 9:45am run
+# still burned the full 600s and never got in, every attempt rejected
+# "clientId 1660 already in use" (watch_ashley_be_fill.py also hardcodes
+# 1660 but was confirmed NOT running at the time -- looks like a stale/ghost
+# session TWS is holding on that id, not live contention). 1853 continues the
+# dedicated-id cluster (archive_iv_daily.py=1851, qqq_iv_divergence_monitor.py
+# =1852) rather than reusing anything else in this file.
+CLIENT_ID = {"spy": 1853, "qqq": 1661, "iwm": 1662}
 
 WING_STEP_DEFAULT = 4
 HARD_CLOSE_TIME = "15:47"   # Alpaca auto-closes 0DTE option positions at 15:45 ET on
@@ -521,7 +529,25 @@ def main():
 
     ib = IB()
     ib.errorEvent += lambda reqId, code, msg, contract: None
-    ib.connect("127.0.0.1", TWS_PORT, clientId=CLIENT_ID[ticker], timeout=20)
+    # Retry the initial connect for up to 10 min, same fix already proven for
+    # Ashley's trigger executor (2026-09-15: TWS's API port intermittently
+    # isn't accepting new connections for a few minutes right around the
+    # open, when SPY/QQQ/IWM butterfly all connect near-simultaneously).
+    # SPY's own history shows this clearly: 48 one-shot timeouts vs only 2
+    # each for QQQ/IWM, which share this script but connect under different
+    # clientIds -- SPY just has more other automation contending at 9:45.
+    # Safe to retry freely here -- nothing has run yet, so a retry can't
+    # double an order.
+    _connect_deadline = time.monotonic() + 600
+    while True:
+        try:
+            ib.connect("127.0.0.1", TWS_PORT, clientId=CLIENT_ID[ticker], timeout=20)
+            break
+        except Exception as exc:
+            if time.monotonic() >= _connect_deadline:
+                raise
+            print(f"IBKR connect failed, retrying: {exc}")
+            time.sleep(15)
     print("Connected to IBKR.")
 
     S0, sr_detail = get_entry_spot(ib, ticker, args.entry_mode)
@@ -645,7 +671,20 @@ def main():
 
     ib2 = IB()
     ib2.errorEvent += lambda reqId, code, msg, contract: None
-    ib2.connect("127.0.0.1", TWS_PORT, clientId=CLIENT_ID[ticker] + 100, timeout=20)
+    # Same retry as the primary connect above -- this is the position
+    # monitor/hard-close connection for an ALREADY-OPEN trade, so a crash
+    # here is worse than the entry-side failure (zero monitoring, zero
+    # chance of the hard-close/stop-loss firing), not just a missed entry.
+    _connect2_deadline = time.monotonic() + 600
+    while True:
+        try:
+            ib2.connect("127.0.0.1", TWS_PORT, clientId=CLIENT_ID[ticker] + 100, timeout=20)
+            break
+        except Exception as exc:
+            if time.monotonic() >= _connect2_deadline:
+                raise
+            print(f"IBKR connect (monitor leg) failed, retrying: {exc}")
+            time.sleep(15)
     crt_checked = False
     try:
         while True:

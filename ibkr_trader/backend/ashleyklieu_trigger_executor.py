@@ -65,7 +65,7 @@ from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import requests
-from ib_insync import IB, Option, Stock
+from ib_insync import IB, Index, Option, Stock
 
 sys.path.insert(0, ".")
 from alpaca_0dte_common import (
@@ -141,6 +141,44 @@ AFTERNOON_CUTOFF_HOUR_ET = 12
 def dte_kind_for(now_et: datetime) -> str:
     """"0dte" before noon ET, "3dte" at/after -- see AFTERNOON_CUTOFF_HOUR_ET."""
     return "0dte" if now_et.hour < AFTERNOON_CUTOFF_HOUR_ET else "3dte"
+
+
+# Regime filter for PUT entries only (added 2026-11-05, CEO-requested, backtested
+# against all 27 real Ashley trades 2026-10-06..2026-11-04 before being wired to
+# actually block anything). Two other candidate signals were tried first and did
+# NOT hold up: a 20-min pre-entry price-efficiency check on SPY came back BACKWARDS
+# (+0.25 correlation with pnl -- clean/efficient approaches won more, not less),
+# and today's realized range-so-far at entry time was only -0.14 correlated, too
+# weak on this sample size to trust. The prior trading day's VIX close was the one
+# signal with a clean, consistent split -- and specifically for puts, not calls:
+# calls won 8/10 in this sample regardless of VIX level (CALLS ARE NOT GATED
+# BELOW). Puts split sharply at a VIX close around 18: below it, 60% win rate;
+# at/above it, only 33% win rate and -$263 of puts' pnl, which is effectively the
+# entire month's -$219 net loss. n~27 is still a modest sample -- re-validate once
+# there's more history rather than treating this threshold as final.
+VIX_PUT_SKIP_THRESHOLD = 18.0
+
+
+async def prior_day_vix_close(ib) -> float | None:
+    """Most recent CBOE VIX daily close strictly before today -- the regime
+    signal for VIX_PUT_SKIP_THRESHOLD. Filters bars by date rather than taking
+    bars[-1]/bars[-2] by position, since whether today's own (partial) bar is
+    included depends on what time of day this is called -- comparing dates
+    directly is correct regardless of call time. Returns None (never blocks)
+    if VIX can't be fetched, so a data hiccup degrades to today's old behavior
+    rather than silently skipping every put."""
+    try:
+        vix = Index("VIX", "CBOE")
+        await ib.qualifyContractsAsync(vix)
+        bars = await ib.reqHistoricalDataAsync(
+            vix, endDateTime="", durationStr="10 D", barSizeSetting="1 day",
+            whatToShow="TRADES", useRTH=True)
+        prior = [b for b in bars if b.date < date.today()]
+        if prior:
+            return prior[-1].close
+    except Exception as exc:
+        print(f"prior_day_vix_close failed (non-fatal, regime filter disabled today): {exc}")
+    return None
 
 
 # Full-day NYSE closures (2026-2027; weekend holidays use the exchange's observed
@@ -315,17 +353,29 @@ TELEGRAM_CHAT = None
 CONTRACTS_OVERRIDE_FILE = "ashleyklieu_contracts_override.json"
 
 
-def contracts_for_today() -> int:
+def contracts_for_today(right: str | None = None) -> int:
     """Real per-setup contract quantity for TODAY only. Self-expiring by
     design (CEO ask 2026-08-31: "increase Ashley's SPY number of options to
     3 today") -- reads a small override file and only honors it if the
     stored date matches today, so tomorrow this silently reverts to the
     default of 1 without anyone needing to remember to change it back.
+
+    CEO instruction 2026-10-28: go more aggressive on CALLS specifically when
+    conditions are favorable (SPY below its 10-day SMA -- the regime a real
+    5-year SPY backtest that same night showed a small but statistically real
+    bounce tendency for, separate from Ashley's own call track record).
+    ashleyklieu_qty_decision.py computes that regime each morning and may
+    write an additional "qty_calls" key; it only applies when `right == "C"`.
+    Puts always fall through to the plain "qty" key -- the same audit found
+    puts were the account's drag in every regime cut, so they are
+    deliberately never bumped here.
     """
     try:
         with open(CONTRACTS_OVERRIDE_FILE) as f:
             o = json.load(f)
         if o.get("date") == date.today().isoformat():
+            if right == "C" and "qty_calls" in o:
+                return int(o["qty_calls"])
             return int(o["qty"])
     except (FileNotFoundError, json.JSONDecodeError, KeyError, ValueError):
         pass
@@ -843,6 +893,14 @@ async def run_daily_watch(setups, headers, last_message_id, alert_message_id=Non
     await ib.qualifyContractsAsync(spy)
     spy_td = ib.reqMktData(spy, "", False, False)
 
+    # Fetched once per day's watch, not per trigger -- see VIX_PUT_SKIP_THRESHOLD.
+    prior_vix = await prior_day_vix_close(ib)
+    if prior_vix is not None:
+        print(f"Regime filter: prior-day VIX close = {prior_vix} "
+              f"(puts blocked at/above {VIX_PUT_SKIP_THRESHOLD})")
+    else:
+        print("Regime filter: prior-day VIX unavailable today -- not blocking any puts.")
+
     # Two candidate contracts per not-yet-fired setup -- which one actually gets
     # bought is decided at trigger time by dte_kind_for(now), since a zone from
     # the SAME pre-market alert can trigger at 9:40 (0DTE) or 2pm (3DTE). Both
@@ -875,17 +933,21 @@ async def run_daily_watch(setups, headers, last_message_id, alert_message_id=Non
     contracts = dict(contracts0)  # today's 0DTE is the default "real" contract for a fresh setup
 
     today_qty = contracts_for_today()
-    print(f"Daily watch started {datetime.now(ET)}. Setups: {[s['name'] for s in setups]}. Qty/setup: {today_qty}")
+    today_qty_calls = contracts_for_today("C")
+    calls_note = f", calls: {today_qty_calls} (favorable regime)" if today_qty_calls != today_qty else ""
+    print(f"Daily watch started {datetime.now(ET)}. Setups: {[s['name'] for s in setups]}. "
+          f"Qty/setup: {today_qty}{calls_note}")
     telegram(
         "Ashley-trigger daily watcher LIVE: "
         + ", ".join(f"{s['name']} @ SPY {s['lo']}-{s['hi']}" for s in setups)
         + f". Real IBKR orders (ladder-filled) on entry trigger AND on her exit messages. "
-        + f"Qty/setup today: {today_qty}" + (" (one-day override)" if today_qty != 1 else ""),
+        + f"Qty/setup today: {today_qty}" + (" (one-day override)" if today_qty != 1 else "") + calls_note,
         high_priority=False,
     )
     oversight_log(
         f"Ashley-trigger daily watcher started for today's {len(setups)} setups.",
-        f"Scheduled daily run (CEO instruction 2026-08-27) -- {today_qty} contract(s) per setup, autonomous.",
+        f"Scheduled daily run (CEO instruction 2026-08-27) -- {today_qty} contract(s) per setup"
+        f"{calls_note}, autonomous.",
     )
 
     # Restart recovery, built 2026-08-31, generalized 2026-10-14 for 3DTE.
@@ -1115,6 +1177,25 @@ async def run_daily_watch(setups, headers, last_message_id, alert_message_id=Non
                     if s["name"] in fired:
                         continue
                     if s["lo"] <= spot <= s["hi"]:
+                        # VIX_PUT_SKIP_THRESHOLD regime filter -- puts only, see
+                        # its definition for the backtest this is based on. Marks
+                        # the zone fired (not just skipped-for-now) since prior_vix
+                        # is fixed for the whole day and will never change on a
+                        # later tick.
+                        if s["right"] == "P" and prior_vix is not None and prior_vix >= VIX_PUT_SKIP_THRESHOLD:
+                            txt = (f"Ashley {s['name']}: SPY hit zone [{s['lo']},{s['hi']}] but prior-day VIX "
+                                   f"close {prior_vix} is at/above the {VIX_PUT_SKIP_THRESHOLD} regime-filter "
+                                   f"threshold for puts -- NOT entering.")
+                            print(txt)
+                            telegram(txt, high_priority=True)
+                            oversight_log(txt,
+                                          "VIX regime filter blocked a put entry -- see VIX_PUT_SKIP_THRESHOLD "
+                                          "for the backtest (puts win 33% vs 60% at/above this VIX level).",
+                                          outcome="skipped_vix_regime")
+                            fired.add(s["name"])
+                            save_fired_today(fired)
+                            continue
+
                         dte_kind = dte_kind_for(now)
                         # MIN_MINUTES_BEFORE_FORCE_CLOSE only matters for a 0DTE
                         # entry (real case 2026-09-30: 21-second hold, -$24.78,
@@ -1174,7 +1255,7 @@ async def run_daily_watch(setups, headers, last_message_id, alert_message_id=Non
                         mid = (bid + ask) / 2 if bid and ask else None
                         ib.cancelMktData(c)
 
-                        qty = contracts_for_today()
+                        qty = contracts_for_today(s["right"])
                         est_cost = (ask or bid or 0) * 100 * qty
                         try:
                             vals = {v.tag: v.value for v in ib.accountValues()}

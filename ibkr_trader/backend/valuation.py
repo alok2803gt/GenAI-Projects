@@ -17,7 +17,7 @@ WHAT THIS FIXES (each step came from an actual wrong answer earlier today):
   5. a DCF on a cash burner just echoes the terminal assumption. RIVN gets a
      CASH RUNWAY calculation instead.
 
-Everything is sourced: EDGAR XBRL companyfacts for financials, Alpaca daily
+Everything is sourced: EDGAR XBRL companyfacts for financials, IBKR daily
 bars for beta, Polygon for market cap. One companyfacts call per company.
 
     ../venv/bin/python valuation.py            # the current IDR holdings
@@ -164,18 +164,59 @@ def smoothed_cagr(series):
 
 
 def beta_vs_spy(ticker, days=500):
-    H = {"APCA-API-KEY-ID": CFG["alpaca_api_key"], "APCA-API-SECRET-KEY": CFG["alpaca_secret_key"]}
-    start = (pd.Timestamp.utcnow() - pd.Timedelta(days=days)).strftime("%Y-%m-%d")
-    def bars(sym):
-        r = requests.get(f"https://data.alpaca.markets/v2/stocks/{sym}/bars",
-                         params={"timeframe": "1Day", "start": start, "limit": 10000, "feed": "sip"},
-                         headers=H, timeout=30)
-        b = pd.DataFrame(r.json().get("bars", []))
-        if b.empty:
-            return None
-        b["t"] = pd.to_datetime(b["t"]).dt.tz_convert("America/New_York").dt.date
-        return b.set_index("t")["c"]
-    s, m = bars(ticker), bars("SPY")
+    """Beta vs SPY from real IBKR daily bars (switched off Alpaca 2026-10-29 --
+    those API keys are dead/401'd system-wide, same root cause already seen in
+    Safe Income Trader's Alpaca position check; IBKR is the connection every
+    other live price fetch in this codebase already relies on). Fails closed
+    -- any connection or data problem returns None, and the caller (wacc())
+    already falls back to beta=1.0 rather than crashing."""
+    import asyncio
+    import math
+    from ib_insync import IB, Stock
+
+    # IBKR rejects "<n> D" durations over 365 days (Error 321) -- must be
+    # expressed in years past that point.
+    years = max(1, math.ceil(days / 365))
+    duration = f"{years} Y"
+
+    async def _fetch():
+        ib = IB()
+        await ib.connectAsync("127.0.0.1", 7496, clientId=9980)
+        try:
+            async def bars(sym):
+                c = Stock(sym, "SMART", "USD")
+                await ib.qualifyContractsAsync(c)
+                rows = await ib.reqHistoricalDataAsync(
+                    c, endDateTime="", durationStr=duration, barSizeSetting="1 day",
+                    whatToShow="TRADES", useRTH=True, formatDate=1, timeout=30,
+                )
+                if not rows:
+                    return None
+                b = pd.DataFrame({"t": [r.date for r in rows], "c": [r.close for r in rows]})
+                return b.set_index("t")["c"]
+            return await bars(ticker), await bars("SPY")
+        finally:
+            ib.disconnect()
+
+    # asyncio.run() always tears down the loop it creates and clears the
+    # thread's current event loop on exit -- save/restore whatever the
+    # caller had set (e.g. accumulation.py's main() sets one up for its own
+    # later sync ib_insync calls) so this function's internal use of
+    # asyncio.run() doesn't silently break every sync ib_insync call made
+    # after this one returns (root cause of the 2026-11-10 accumulation.py
+    # crash: it died at a *different* line than the one already patched,
+    # because the loop had been wiped out from under it by this call).
+    try:
+        _prior_loop = asyncio.get_event_loop_policy().get_event_loop()
+    except RuntimeError:
+        _prior_loop = None
+    try:
+        s, m = asyncio.run(_fetch())
+    except Exception:
+        return None
+    finally:
+        if _prior_loop is not None:
+            asyncio.set_event_loop(_prior_loop)
     if s is None or m is None:
         return None
     df = pd.concat([s.rename("s"), m.rename("m")], axis=1).dropna().pct_change().dropna()

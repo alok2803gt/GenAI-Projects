@@ -27,6 +27,7 @@ name that is merely falling.
     ../venv/bin/python accumulation.py --execute    # place the next due tranche
 """
 import argparse
+import asyncio
 import json
 from datetime import date, datetime
 from pathlib import Path
@@ -211,7 +212,14 @@ def recent_signal(ticker, days=3):
 
 def _tranche_filled(ticker, tranche) -> bool:
     """Did this recorded tranche actually fill? Checked against the commission
-    ledger, which is populated from IBKR's own execution reports."""
+    ledger, which is populated from IBKR's own execution reports.
+
+    is_paper=0 is NOT optional. This function is the single authority that the
+    tranche detector and the reconciler share -- disagreement between them is
+    what bought 3 TFC twice on 2026-10-01. A simulated fill in the same symbol
+    answering "yes, it filled" for a live tranche would recreate that failure
+    from the other direction, so a paper row must never be able to answer here.
+    COALESCE because rows written before 2026-10-01 predate the column."""
     import sqlite3
     db = HERE / "trade_journal.db"
     if not db.exists():
@@ -220,7 +228,8 @@ def _tranche_filled(ticker, tranche) -> bool:
         con = sqlite3.connect(db)
         n = con.execute(
             "SELECT COUNT(*) FROM executions WHERE symbol=? AND side='BOT' "
-            "AND trade_date >= ?", (ticker, str(tranche.get("date")))).fetchone()[0]
+            "AND trade_date >= ? AND COALESCE(is_paper,0)=0",
+            (ticker, str(tranche.get("date")))).fetchone()[0]
         con.close()
         return n > 0
     except Exception:
@@ -328,6 +337,12 @@ def main():
     ciks = {v["ticker"]: str(v["cik_str"]).zfill(10)
             for v in requests.get("https://www.sec.gov/files/company_tickers.json",
                                   headers=V.UA, timeout=30).json().values()}
+    # Python 3.13 removed implicit event-loop creation in a thread that never
+    # had one set -- ib_insync's sync wrapper (ib.connect/qualifyContracts)
+    # needs a real loop to exist before its first call, same fix as main.py's
+    # streaming_loop().
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     ib = IB()
     ib.connect("127.0.0.1", 7496, clientId=1690, timeout=20)
     # Per-execution commission capture (added 2026-09-28) -- tranche adds are
